@@ -12,14 +12,14 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import json
 import os
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 
 from tzrec.protos.export_pb2 import ExportConfig
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.protos.train_pb2 import TrainConfig
-from tzrec.utils import quant_util
+from tzrec.utils import env_util, quant_util
 from tzrec.utils.logging_util import logger
 
 
@@ -74,6 +74,17 @@ def is_input_tile_3_online() -> bool:
     if input_tile_3_online and input_tile_3_online[0] == "1":
         return True
     return False
+
+
+def is_hard_search_input_tile() -> bool:
+    """Judge is hard-search input tile or not."""
+    if os.environ.get("HARD_SEARCH_INPUT_TILE", "0") != "1":
+        return False
+    if not is_input_tile():
+        raise ValueError("HARD_SEARCH_INPUT_TILE=1 requires INPUT_TILE=2 or 3.")
+    if is_cuda_export() or env_util.use_rtp():
+        raise ValueError("HARD_SEARCH_INPUT_TILE only supports FX/TorchScript export.")
+    return True
 
 
 def is_aot() -> bool:
@@ -321,15 +332,18 @@ def mixed_precision_for_export(pipeline_config: EasyRecConfig) -> str:
 
 def export_acc_config(
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
-) -> Dict[str, Union[bool, str]]:
+    hard_search_input_tile_features: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """Export acc config for model online inference.
 
     Args:
         additional_export_config (dict, optional): extra key/value pairs merged
             into the acc config.
+        hard_search_input_tile_features (dict, optional): hard-search feature to
+            sequence mapping for HARD_SEARCH_INPUT_TILE.
     """
     # use int64 sparse id as input
-    acc_config: Dict[str, Union[bool, str]] = {"SPARSE_INT64": "1"}
+    acc_config: Dict[str, Any] = {"SPARSE_INT64": "1"}
     if "INPUT_TILE" in os.environ:
         acc_config["INPUT_TILE"] = os.environ["INPUT_TILE"]
     if "QUANT_EMB" in os.environ:
@@ -354,6 +368,11 @@ def export_acc_config(
         acc_config.update(additional_export_config)
     if use_distributed_embedding():
         acc_config["DISTRIBUTED_EMBEDDING"] = "1"
+    if hard_search_input_tile_features:
+        acc_config["hard_search_input_tile"] = {
+            "version": 1,
+            "features": hard_search_input_tile_features,
+        }
     return acc_config
 
 

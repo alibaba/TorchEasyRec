@@ -10,30 +10,47 @@
 # limitations under the License.
 
 
+import io
 import os
+import subprocess
+import sys
 import unittest
 from collections import OrderedDict
 from typing import Dict
+from unittest.mock import patch
 
 import torch
 from parameterized import param, parameterized
 from torch import nn
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
-from torchrec.modules.embedding_configs import PoolingType
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
+from tzrec.models.model import ScriptWrapper
+from tzrec.models.multi_tower import MultiTower
 from tzrec.modules.embedding import (
     EMPTY_KJT,
     EmbeddingGroup,
     EmbeddingGroupImpl,
+    HardSearchInputTileExpander,
     SequenceEmbeddingGroupImpl,
+    _pool_sequence_values,
     build_embedding_bag_configs,
     build_embedding_collection_configs,
 )
-from tzrec.protos import feature_pb2, model_pb2, module_pb2, seq_encoder_pb2
+from tzrec.protos import (
+    feature_pb2,
+    loss_pb2,
+    model_pb2,
+    module_pb2,
+    seq_encoder_pb2,
+    tower_pb2,
+)
+from tzrec.protos.models import rank_model_pb2
 from tzrec.utils import dynamicemb_util
 from tzrec.utils.fx_util import fx_mark_seq_ec_jt, symbolic_trace
+from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
     create_test_module,
@@ -232,6 +249,30 @@ def _create_shared_table_feature_configs(
             f.embedding_constraints.unique_id_factor = unique_id_factor
         configs.append(feature_pb2.FeatureConfig(id_feature=f))
     return configs
+
+
+class SequencePoolingTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            (pooling, values, lengths, expected)
+            for pooling in ("sum", "mean")
+            for values, lengths, expected in (
+                ([], [], []),
+                ([], [0], [[0.0, 0.0]]),
+                ([[2.0, 4.0]], [0, 1, 0], [[0.0, 0.0], [2.0, 4.0], [0.0, 0.0]]),
+            )
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_empty_sequence_and_query_segments(
+        self, pooling, values, lengths, expected
+    ):
+        values = torch.tensor(values, dtype=torch.float32).reshape(-1, 2)
+        lengths = torch.tensor(lengths, dtype=torch.int64)
+        expected = torch.tensor(expected, dtype=torch.float32).reshape(-1, 2)
+        result = _pool_sequence_values(values, lengths, pooling)
+        torch.testing.assert_close(result, expected)
+        self.assertTrue(torch.isfinite(result).all())
 
 
 class EmbeddingGroupTest(unittest.TestCase):
@@ -1956,6 +1997,703 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["buy.query"].size(), (2, 17))
         self.assertEqual(result["buy.sequence"].size(), (2, 2, 17))
         self.assertEqual(result["buy.sequence_length"].size(), (2,))
+
+
+@mark_ci_scope("gpu")
+class HardSearchEmbeddingGroupTest(unittest.TestCase):
+    def _run_in_subprocess(self):
+        test_name = (
+            f"tzrec.modules.embedding_test.{type(self).__name__}.{self._testMethodName}"
+        )
+        if os.environ.get("TZREC_HARD_SEARCH_TEST") == test_name:
+            return False
+        result = subprocess.run(
+            [sys.executable, "-m", "unittest", test_name],
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            env=dict(os.environ, TZREC_HARD_SEARCH_TEST=test_name, PYTHONPATH="."),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=180,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        return True
+
+    @staticmethod
+    def _create_features(pooling=None):
+        sparse_kwargs = dict(embedding_name="shared", embedding_dim=2, num_buckets=16)
+        if pooling is not None:
+            sparse_kwargs.update(value_dim=0, pooling=pooling)
+        configs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name=f"{side}_cat",
+                    expression=f"{side}:{side}_category",
+                    **sparse_kwargs,
+                )
+            )
+            for side in ("user", "item")
+        ] + [
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name=f"{side}_value", expression=f"{side}:{side}_value"
+                )
+            )
+            for side in ("user", "item")
+        ]
+        for sequence_name in ("history", "hard"):
+            sequence_kwargs = {}
+            if sequence_name == "hard":
+                sequence_kwargs["hard_search_key"] = "item:category"
+            configs.append(
+                feature_pb2.FeatureConfig(
+                    sequence_feature=feature_pb2.SequenceFeature(
+                        sequence_name=sequence_name,
+                        sequence_length=4,
+                        features=[
+                            feature_pb2.SeqFeatureConfig(
+                                id_feature=feature_pb2.IdFeature(
+                                    feature_name="cat",
+                                    expression="item:category",
+                                    **sparse_kwargs,
+                                )
+                            ),
+                            feature_pb2.SeqFeatureConfig(
+                                raw_feature=feature_pb2.RawFeature(
+                                    feature_name="value", expression="item:value"
+                                )
+                            ),
+                        ],
+                        **sequence_kwargs,
+                    )
+                )
+            )
+        return create_features(configs)
+
+    def _create_model(self, pooling=None):
+        features = self._create_features(pooling)
+        for feature in features:
+            if feature.name.startswith("hard__"):
+                feature.is_user_feat = True
+                self.assertTrue(feature.is_hard_search_feat)
+                self.assertFalse(feature.is_user_feat)
+            elif feature.is_sequence:
+                self.assertFalse(feature.is_hard_search_feat)
+                self.assertTrue(feature.is_user_feat)
+        group = _feature_group(
+            "deep", ["user_cat", "user_value", "item_cat", "item_value"]
+        )
+        for sequence_name in ("history", "hard"):
+            group.sequence_groups.add(
+                group_name=sequence_name,
+                feature_names=[
+                    "user_cat",
+                    "item_value",
+                    f"{sequence_name}__cat",
+                    f"{sequence_name}__value",
+                ],
+            )
+            group.sequence_encoders.add(
+                simple_attention=seq_encoder_pb2.SimpleAttention(input=sequence_name)
+            )
+        model = MultiTower(
+            model_config=model_pb2.ModelConfig(
+                feature_groups=[group],
+                multi_tower=rank_model_pb2.MultiTower(
+                    towers=[
+                        tower_pb2.Tower(
+                            input="deep", mlp=module_pb2.MLP(hidden_units=[4])
+                        )
+                    ]
+                ),
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            ),
+            features=features,
+            labels=["label"],
+        )
+        init_parameters(model, device=torch.device("cpu"))
+        rows = torch.arange(16, dtype=torch.float32)
+        weights = torch.stack((0.25 + rows / 8, 0.5 - rows / 16), dim=1)
+        tables = []
+        with torch.no_grad():
+            for module in model.modules():
+                if isinstance(module, (nn.Embedding, nn.EmbeddingBag)):
+                    module.weight.copy_(weights)
+                    tables.append(module.weight)
+            model.towers["deep"].mlp[0].perceptron[0].weight.copy_(
+                torch.arange(48, dtype=torch.float32).reshape(4, 12) / 100 - 0.2
+            )
+            model.towers["deep"].mlp[0].perceptron[0].bias.copy_(
+                torch.tensor([-0.1, 0.05, 0.15, -0.2])
+            )
+            model.output_mlp.weight.copy_(torch.tensor([[0.3, -0.2, 0.5, 0.1]]))
+            model.output_mlp.bias.fill_(0.07)
+        self.assertEqual(len(tables), 4 if os.environ["INPUT_TILE"] == "3" else 2)
+        for table in tables:
+            torch.testing.assert_close(table, weights, rtol=0, atol=0)
+        return model.eval()
+
+    @staticmethod
+    def _create_batch(tile, batch_size=3, pooling=None, all_empty=False):
+        has_mulval = pooling is not None
+        user_ids = [1, 3, 1] if has_mulval else [1]
+        item_ids = (
+            [[2, 2], [4], [2, 5], [6, 1]] if has_mulval else [[2], [4], [2], [6]]
+        )[:batch_size]
+        history_ids = [[1, 1], [3, 5]] if has_mulval else [[1], [3]]
+        hard_ids = (
+            [[[2, 2], [2, 4]], [], [[4, 4, 1]], [[6, 1], [1, 1], [6]]]
+            if has_mulval
+            else [[[2], [2]], [], [[4]], [[6], [1], [6]]]
+        )[:batch_size]
+        hard_values = [[-0.25, 0.75], [], [1.5], [0.125, -0.75, 1.25]][:batch_size]
+        if all_empty:
+            hard_ids = [[] for _ in range(batch_size)]
+            hard_values = [[] for _ in range(batch_size)]
+        item_values = [-0.75, 0.5, 1.25, -1.5][:batch_size]
+        sparse_rows = {
+            "user_cat": [user_ids] * (1 if tile == "3" else batch_size),
+            "item_cat": item_ids,
+            "history__cat": [sum(history_ids, [])] * (1 if tile == "3" else batch_size),
+            "hard__cat": [sum(row, []) for row in hard_ids],
+        }
+        sparse_features = {}
+        sequence_mulval_lengths = {}
+        for suffix in ("", "_user") if tile == "3" else ("",):
+            rows = {
+                key: value
+                for key, value in sparse_rows.items()
+                if tile != "3"
+                or (key in ("user_cat", "history__cat")) == (suffix == "_user")
+            }
+            sparse_features[BASE_DATA_GROUP + suffix] = (
+                KeyedJaggedTensor.from_lengths_sync(
+                    keys=list(rows),
+                    values=torch.tensor(
+                        [
+                            value
+                            for feature in rows.values()
+                            for row in feature
+                            for value in row
+                        ],
+                        dtype=torch.int64,
+                    ),
+                    lengths=torch.tensor(
+                        [len(row) for feature in rows.values() for row in feature],
+                        dtype=torch.int64,
+                    ),
+                )
+            )
+            if has_mulval:
+                sequence_rows = {
+                    key: value
+                    for key, value in {
+                        "history__cat": [history_ids]
+                        * (1 if tile == "3" else batch_size),
+                        "hard__cat": hard_ids,
+                    }.items()
+                    if key in rows
+                }
+                sequence_mulval_lengths[BASE_DATA_GROUP + suffix] = (
+                    KeyedJaggedTensor.from_lengths_sync(
+                        keys=list(sequence_rows),
+                        values=torch.tensor(
+                            [
+                                len(step)
+                                for feature in sequence_rows.values()
+                                for row in feature
+                                for step in row
+                            ],
+                            dtype=torch.int64,
+                        ),
+                        lengths=torch.tensor(
+                            [
+                                len(row)
+                                for feature in sequence_rows.values()
+                                for row in feature
+                            ],
+                            dtype=torch.int64,
+                        ),
+                    )
+                )
+        dense_features = {
+            BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                keys=["item_value"], tensors=[torch.tensor(item_values).reshape(-1, 1)]
+            ),
+            BASE_DATA_GROUP + "_user": KeyedTensor.from_tensor_list(
+                keys=["user_value"], tensors=[torch.tensor([[0.25]])]
+            ),
+        }
+        if tile == "0":
+            dense_features = {
+                BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                    keys=["user_value", "item_value"],
+                    tensors=[
+                        torch.full((batch_size, 1), 0.25),
+                        torch.tensor(item_values).reshape(-1, 1),
+                    ],
+                )
+            }
+        history_count = batch_size if tile == "0" else 1
+        batch = Batch(
+            sparse_features=sparse_features,
+            dense_features=dense_features,
+            sequence_dense_features={
+                "history__value": JaggedTensor(
+                    values=torch.tensor([[0.25], [-0.5]] * history_count),
+                    lengths=torch.tensor([2] * history_count),
+                ),
+                "hard__value": JaggedTensor(
+                    values=torch.tensor(
+                        [value for row in hard_values for value in row],
+                        dtype=torch.float32,
+                    ).reshape(-1, 1),
+                    lengths=torch.tensor([len(row) for row in hard_values]),
+                ),
+            },
+            sequence_mulval_lengths=sequence_mulval_lengths,
+            tile_size=batch_size if tile != "0" else -1,
+        )
+
+        def lookup(ids):
+            ids = torch.tensor(ids, dtype=torch.float32)
+            values = torch.stack((0.25 + ids / 8, 0.5 - ids / 16), dim=1)
+            return values.sum(0) if pooling == "sum" else values.mean(0)
+
+        user_embedding = lookup(user_ids).repeat(batch_size, 1)
+        query = torch.cat((user_embedding, torch.tensor(item_values).reshape(-1, 1)), 1)
+        history = torch.stack(
+            [
+                torch.cat((lookup(ids), torch.tensor([value])))
+                for ids, value in zip(history_ids, [0.25, -0.5])
+            ]
+        ).repeat(batch_size, 1, 1)
+        hard = torch.zeros(batch_size, max(map(len, hard_ids)), 3)
+        hard_encoded = torch.zeros(batch_size, 3)
+        for i, (row, dense_row) in enumerate(zip(hard_ids, hard_values)):
+            if row:
+                sequence = torch.stack(
+                    [
+                        torch.cat((lookup(ids), torch.tensor([value])))
+                        for ids, value in zip(row, dense_row)
+                    ]
+                )
+                hard[i, : len(row)] = sequence
+                scores = torch.softmax(sequence @ query[i], dim=0)
+                hard_encoded[i] = (scores.unsqueeze(1) * sequence).sum(0)
+        history_scores = torch.softmax((history * query.unsqueeze(1)).sum(2), dim=1)
+        history_encoded = (history_scores.unsqueeze(2) * history).sum(1)
+        deep = torch.cat(
+            (
+                user_embedding,
+                torch.full((batch_size, 1), 0.25),
+                torch.stack([lookup(ids) for ids in item_ids]),
+                torch.tensor(item_values).reshape(-1, 1),
+                history_encoded,
+                hard_encoded,
+            ),
+            dim=1,
+        )
+        expected = {
+            "history.query": query,
+            "history.sequence": history,
+            "history.sequence_length": torch.full((batch_size,), 2, dtype=torch.int64),
+            "hard.query": query,
+            "hard.sequence": hard,
+            "hard.sequence_length": torch.tensor([len(row) for row in hard_ids]),
+            "deep": deep,
+        }
+        tower = torch.relu(
+            deep @ (torch.arange(48, dtype=torch.float32).reshape(4, 12) / 100 - 0.2).T
+            + torch.tensor([-0.1, 0.05, 0.15, -0.2])
+        )
+        logits = tower @ torch.tensor([0.3, -0.2, 0.5, 0.1]) + 0.07
+        return batch, expected, {"logits": logits, "probs": torch.sigmoid(logits)}
+
+    @parameterized.expand(
+        [
+            (tile, pooling, online)
+            for tile, online in (("2", "0"), ("3", "0"), ("3", "1"))
+            for pooling in (None, "mean", "sum")
+        ],
+        name_func=parameterized_name_func,
+    )
+    @torch.no_grad()
+    def test_hard_search_input_tile_attention(self, tile, pooling, online):
+        if self._run_in_subprocess():
+            return
+        with patch.dict(
+            os.environ,
+            INPUT_TILE=tile,
+            INPUT_TILE_3_ONLINE=online,
+            HARD_SEARCH_INPUT_TILE="1",
+        ):
+            model = ScriptWrapper(self._create_model(pooling)).eval()
+            traced = symbolic_trace(model)
+            scripted = torch.jit.script(traced)
+            buffer = io.BytesIO()
+            torch.jit.save(scripted, buffer)
+            buffer.seek(0)
+            loaded = torch.jit.load(buffer)
+        for indices, all_empty in (([2, 0, 2, 1, 0], False), ([1, 1, 1, 1], True)):
+            batch, _, _ = self._create_batch("3", 3, pooling, all_empty)
+            compact = batch.to_dict()
+            index = torch.tensor(indices)
+            count = len(indices)
+            # Same history with different candidate queries must not share attention.
+            compact["item_value.values"] = torch.arange(count).float().view(-1, 1) / 4
+            item_ids = [2, 4, 2, 6, 1][:count]
+            compact["item_cat.values"] = torch.tensor(item_ids)
+            compact["item_cat.lengths"] = torch.ones(count, dtype=torch.int64)
+            compact["batch_size"] = torch.tensor(count)
+            compact["hard__inverse_indices"] = index
+            expanded = dict(compact)
+            del expanded["hard__inverse_indices"]
+            for name in ("hard__cat", "hard__value"):
+                lengths = compact[name + ".lengths"]
+                value_lengths = lengths
+                if name == "hard__cat" and pooling is not None:
+                    key_lengths = compact[name + ".key_lengths"]
+                    key_rows = key_lengths.split(lengths.tolist())
+                    expanded[name + ".key_lengths"] = torch.cat(
+                        [key_rows[i] for i in indices]
+                    )
+                    value_lengths = torch.tensor([row.sum() for row in key_rows])
+                rows = compact[name + ".values"].split(value_lengths.tolist())
+                expanded[name + ".values"] = torch.cat([rows[i] for i in indices])
+                expanded[name + ".lengths"] = lengths[index]
+            with patch.dict(
+                os.environ,
+                INPUT_TILE="3",
+                INPUT_TILE_3_ONLINE="0",
+                HARD_SEARCH_INPUT_TILE="0",
+            ):
+                reference = ScriptWrapper(self._create_model(pooling)).eval()(expanded)
+            with patch.dict(
+                os.environ,
+                INPUT_TILE=tile,
+                INPUT_TILE_3_ONLINE=online,
+                HARD_SEARCH_INPUT_TILE="1",
+            ):
+                for runner in (model, traced, scripted, loaded):
+                    torch.testing.assert_close(runner(compact), reference)
+                parsed = model._data_parser.to_batch(compact)
+                self.assertEqual(
+                    parsed.sparse_features[BASE_DATA_GROUP]["hard__cat"]
+                    .values()
+                    .numel(),
+                    compact["hard__cat.values"].numel(),
+                )
+                torch.testing.assert_close(
+                    parsed.to_dict()["hard__cat.lengths"], compact["hard__cat.lengths"]
+                )
+
+    @parameterized.expand(
+        [
+            param(pooling=None, all_empty=False),
+            param(pooling=None, all_empty=True),
+            param(pooling="mean", all_empty=False),
+            param(pooling="mean", all_empty=True),
+            param(pooling="sum", all_empty=False),
+            param(pooling="sum", all_empty=True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    @torch.no_grad()
+    def test_forward_hard_search_input_tile_numerical(self, pooling, all_empty):
+        if self._run_in_subprocess():
+            return
+        reference = {}
+        for tile, online in (("0", "0"), ("2", "0"), ("3", "0"), ("3", "1")):
+            with patch.dict(os.environ, INPUT_TILE=tile, INPUT_TILE_3_ONLINE=online):
+                model = self._create_model(pooling)
+                for batch_size in (3, 4):
+                    with self.subTest(tile=tile, online=online, batch_size=batch_size):
+                        batch, expected, predictions = self._create_batch(
+                            tile, batch_size, pooling, all_empty
+                        )
+                        grouped = model.embedding_group(batch)
+                        self.assertEqual(set(grouped), set(expected))
+                        for key, value in expected.items():
+                            torch.testing.assert_close(
+                                grouped[key], value, rtol=1e-6, atol=1e-6, msg=key
+                            )
+                        batch, _, _ = self._create_batch(
+                            tile, batch_size, pooling, all_empty
+                        )
+                        actual = model(batch)
+                        self.assertEqual(set(actual), set(predictions))
+                        if tile == "0":
+                            reference[batch_size] = actual
+                        for key, value in predictions.items():
+                            torch.testing.assert_close(
+                                actual[key], value, rtol=1e-6, atol=1e-6, msg=key
+                            )
+                            if batch_size in reference:
+                                torch.testing.assert_close(
+                                    actual[key],
+                                    reference[batch_size][key],
+                                    rtol=1e-6,
+                                    atol=1e-6,
+                                )
+
+    @parameterized.expand(
+        [
+            [graph_type, tile, online, pooling]
+            for graph_type in (TestGraphType.FX_TRACE, TestGraphType.JIT_SCRIPT)
+            for tile, online in (("0", "0"), ("2", "0"), ("3", "0"), ("3", "1"))
+            for pooling in (None, "mean")
+        ],
+        name_func=parameterized_name_func,
+    )
+    @torch.no_grad()
+    def test_forward_hard_search_graph_dynamic_batch(
+        self, graph_type, tile, online, pooling
+    ):
+        if self._run_in_subprocess():
+            return
+        with patch.dict(os.environ, INPUT_TILE="0", INPUT_TILE_3_ONLINE="0"):
+            eager = self._create_model(pooling)
+            reference = {}
+            for batch_size, all_empty in ((3, False), (4, False), (4, True)):
+                batch, _, expected = self._create_batch(
+                    "0", batch_size, pooling, all_empty
+                )
+                reference[batch_size, all_empty] = eager(batch)
+                for key in expected:
+                    torch.testing.assert_close(
+                        reference[batch_size, all_empty][key],
+                        expected[key],
+                        rtol=1e-6,
+                        atol=1e-6,
+                    )
+        with patch.dict(os.environ, INPUT_TILE=tile, INPUT_TILE_3_ONLINE=online):
+            model = symbolic_trace(ScriptWrapper(self._create_model(pooling)))
+            if graph_type == TestGraphType.JIT_SCRIPT:
+                model = torch.jit.script(model)
+            input_tile = "3" if tile == "2" else tile
+            batch, _, _ = self._create_batch(input_tile, 3, pooling)
+            result = model(batch.to_dict())
+            for key in reference[3, False]:
+                torch.testing.assert_close(
+                    result[key], reference[3, False][key], rtol=1e-6, atol=1e-6
+                )
+            with io.BytesIO() as buffer:
+                if graph_type == TestGraphType.JIT_SCRIPT:
+                    torch.jit.save(model, buffer)
+                    buffer.seek(0)
+                    restored = torch.jit.load(buffer)
+                else:
+                    restored = model
+                for all_empty in (False, True):
+                    with self.subTest(batch_size=4, all_empty=all_empty):
+                        batch, _, _ = self._create_batch(
+                            input_tile, 4, pooling, all_empty
+                        )
+                        result = restored(batch.to_dict())
+                        self.assertEqual(set(result), set(reference[4, all_empty]))
+                        for key in reference[4, all_empty]:
+                            torch.testing.assert_close(
+                                result[key],
+                                reference[4, all_empty][key],
+                                rtol=1e-6,
+                                atol=1e-6,
+                                msg=key,
+                            )
+
+    @parameterized.expand(
+        [
+            [names, nested]
+            for names in (
+                ["history__cat", "hard__cat"],
+                ["hard__cat", "history__cat"],
+                ["history__value", "hard__value"],
+                ["hard__cat", "history__value"],
+            )
+            for nested in (False, True)
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_build_embedding_collection_configs_mixed_hard_search_history(
+        self, names, nested
+    ):
+        if self._run_in_subprocess():
+            return
+        features = self._create_features()
+        group = (
+            model_pb2.SeqGroupConfig(group_name="mixed", feature_names=names)
+            if nested
+            else _feature_group("mixed", names, model_pb2.SEQUENCE)
+        )
+        for tile in ("0", "2", "3"):
+            with patch.dict(os.environ, INPUT_TILE=tile, INPUT_TILE_3_ONLINE="0"):
+                with (
+                    self.subTest(tile=tile),
+                    self.assertRaisesRegex(ValueError, "[Hh]ard.search"),
+                ):
+                    build_embedding_collection_configs(features, [group])
+
+    def test_build_embedding_collection_configs_different_hard_search_histories(self):
+        features = self._create_features()
+        extra = feature_pb2.FeatureConfig(
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="other_hard",
+                sequence_length=4,
+                sequence_delim=";",
+                hard_search_key="item:category",
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="cat",
+                            expression="item:category",
+                            embedding_dim=2,
+                            num_buckets=16,
+                        )
+                    )
+                ],
+            )
+        )
+        features.extend(create_features([extra]))
+        group = _feature_group(
+            "mixed", ["hard__cat", "other_hard__cat"], model_pb2.SEQUENCE
+        )
+        with self.assertRaisesRegex(
+            ValueError, "different hard-search sequence groups"
+        ):
+            build_embedding_collection_configs(features, [group])
+
+    def test_repeated_hard_search_history_keeps_candidate_rows(self):
+        with patch.dict(os.environ, INPUT_TILE="3", INPUT_TILE_3_ONLINE="1"):
+            model = self._create_model()
+            batch, _, _ = self._create_batch("3")
+            sparse = batch.sparse_features[BASE_DATA_GROUP]
+            batch.sparse_features[BASE_DATA_GROUP] = (
+                KeyedJaggedTensor.from_lengths_sync(
+                    keys=sparse.keys(),
+                    values=torch.tensor([2, 4, 2, 2, 2, 4, 2, 2]),
+                    lengths=torch.tensor([1, 1, 1, 2, 1, 2]),
+                )
+            )
+            batch.sequence_dense_features["hard__value"] = JaggedTensor(
+                values=torch.tensor([[-0.25], [0.75], [1.5], [-0.25], [0.75]]),
+                lengths=torch.tensor([2, 1, 2]),
+            )
+            grouped = model.embedding_group(batch)
+            torch.testing.assert_close(
+                grouped["hard.sequence_length"], torch.tensor([2, 1, 2])
+            )
+            torch.testing.assert_close(
+                grouped["hard.sequence"][0], grouped["hard.sequence"][2]
+            )
+            self.assertFalse(
+                torch.equal(grouped["hard.sequence"][0], grouped["hard.sequence"][1])
+            )
+
+    @parameterized.expand(
+        [["hard__cat"], ["hard__value"]], name_func=parameterized_name_func
+    )
+    def test_build_embedding_collection_configs_hard_search_jagged_sequence(self, name):
+        if self._run_in_subprocess():
+            return
+        features = self._create_features()
+        group = _feature_group(
+            "jagged", ["user_cat", "item_cat", name], model_pb2.JAGGED_SEQUENCE
+        )
+        for tile in ("0", "2", "3"):
+            with patch.dict(os.environ, INPUT_TILE=tile, INPUT_TILE_3_ONLINE="0"):
+                with (
+                    self.subTest(tile=tile),
+                    self.assertRaisesRegex(ValueError, "[Hh]ard.search"),
+                ):
+                    build_embedding_collection_configs(features, [group])
+
+    @parameterized.expand(
+        [[model_pb2.SEQUENCE], [model_pb2.JAGGED_SEQUENCE]],
+        name_func=parameterized_name_func,
+    )
+    def test_build_embedding_collection_configs_ordinary_history_mixed_queries(
+        self, group_type
+    ):
+        if self._run_in_subprocess():
+            return
+        features = self._create_features()
+        group = _feature_group(
+            "ordinary",
+            ["user_cat", "item_cat", "history__cat", "history__value"],
+            group_type,
+        )
+        for tile in ("0", "2", "3"):
+            with patch.dict(os.environ, INPUT_TILE=tile, INPUT_TILE_3_ONLINE="0"):
+                with self.subTest(tile=tile):
+                    configs = build_embedding_collection_configs(features, [group])
+                    regular = configs.ec[2]["shared"].feature_names
+                    if tile == "3":
+                        self.assertEqual(regular, ["item_cat"])
+                        self.assertEqual(
+                            configs.ec_user[2]["shared"].feature_names,
+                            ["user_cat", "history__cat"],
+                        )
+                    else:
+                        self.assertEqual(
+                            regular, ["user_cat", "item_cat", "history__cat"]
+                        )
+                        self.assertEqual(dict(configs.ec_user), {})
+
+    def test_hard_search_input_tile_expander(self):
+        tables = [
+            EmbeddingBagConfig(
+                name="t1", embedding_dim=2, num_embeddings=8, feature_names=["a", "b"]
+            ),
+            EmbeddingBagConfig(
+                name="t2", embedding_dim=3, num_embeddings=8, feature_names=["c"]
+            ),
+        ]
+        kt = KeyedTensor(
+            keys=["a", "b", "c"],
+            length_per_key=[2, 2, 3],
+            values=torch.arange(14, dtype=torch.float32).reshape(2, 7),
+        )
+        passthrough = HardSearchInputTileExpander(tables, {})
+        self.assertEqual(passthrough.blocks, [])
+        self.assertIs(passthrough(kt), kt)
+
+        single = HardSearchInputTileExpander(
+            tables, {"a": "seq_a", "b": "seq_a", "c": "seq_a"}
+        )
+        self.assertEqual(single.blocks, [(0, 7, "seq_a__inverse_indices")])
+        with self.assertRaisesRegex(ValueError, "inverse indices"):
+            single(kt)
+        expanded = single(kt, {"seq_a__inverse_indices": torch.tensor([1, 0, 1])})
+        torch.testing.assert_close(expanded.values(), kt.values()[[1, 0, 1]])
+
+        mixed = HardSearchInputTileExpander(tables, {"a": "seq_a", "b": "seq_a"})
+        self.assertEqual(mixed.blocks, [(0, 4, "seq_a__inverse_indices"), (4, 3, "")])
+        mixed_out = mixed(
+            KeyedTensor(
+                keys=["a", "b", "c"],
+                length_per_key=[2, 2, 3],
+                values=torch.tensor(
+                    [
+                        [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0],
+                        [5.0, 6.0, 7.0, 8.0, 40.0, 50.0, 60.0],
+                    ]
+                ),
+            ),
+            {"seq_a__inverse_indices": torch.tensor([1, 0])},
+        )
+        torch.testing.assert_close(
+            mixed_out.values(),
+            torch.tensor(
+                [
+                    [5.0, 6.0, 7.0, 8.0, 10.0, 20.0, 30.0],
+                    [1.0, 2.0, 3.0, 4.0, 40.0, 50.0, 60.0],
+                ]
+            ),
+        )
 
 
 if __name__ == "__main__":

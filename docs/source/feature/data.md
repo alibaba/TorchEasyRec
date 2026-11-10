@@ -104,9 +104,13 @@ data_config {
 - input_path: 按如下格式设置
 
   - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest`
+
   - 需以`&`分隔符来分隔kafka的参数，`group.id`是必选参数，其余参数参考[Kafka配置文档](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md)
+
   - `enable.auto.commit`默认设置为`false`，KafkaDataset使用自身的checkpoint机制管理消费位点，不依赖Kafka broker端的offset提交。如需启用自动提交，可在URI中显式设置`enable.auto.commit=true`
+
   - 支持`start.timestamp.ms`参数，指定从某个时间戳（毫秒）开始消费，消费者会从各分区中时间戳 >= 该值的最早offset开始读取。当同时存在checkpoint时，checkpoint优先级更高
+
     - 示例:
       - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest&start.timestamp.ms=1711929600000`
     - 使用`start.timestamp.ms`时，时间戳到offset的解析（`offsets_for_times`）会分批请求并带重试，可通过如下环境变量调优，避免分区较多时单次请求超时：
@@ -114,9 +118,13 @@ data_config {
       - `TZREC_KAFKA_OFFSETS_FOR_TIMES_TIMEOUT`: 每次`offsets_for_times`请求的超时时间（秒），默认`30.0`
       - `TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES`: 每批请求失败后的重试次数，默认`2`
 
+  - 如需按分区严格轮询读取，可设置`data_config.kafka_partition_round_robin: true`，默认为false
+
+  - 如需观察各worker的读取量，可设置`data_config.kafka_log_every_n_messages`，默认为0
+
 - 注意:
 
-  - Kafka 分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜
+  - 默认模式下，Kafka 分片数需是 `nproc-per-node * nnodes * num_workers` 的倍数，否则会导致数据倾斜；开启`kafka_partition_round_robin`后，只要求分片数不少于有效全局worker数（`world_size * max(data_config.num_workers, 1)`），不要求整除
   - 当输入数据为Datahub时，Datahub需设置为[Kafka兼容模式的Datahub](https://help.aliyun.com/zh/datahub/use-cases/datahub-kafka-compatibility-mode)， input_path按如下格式设置
     - `kafka://{dh_endpoint}/{dh_project.dh_topic}?group.id={dh_project.dh_group}&security.protocol=SASL_SSL&sasl.mechanism=PLAIN&sasl.username={access_id}&sasl.password={access_secrect}`
   - 当使用 Arrow IPC Stream 格式 (带 schema) 时，每个 Kafka消息应只包含一个 record batch。如果单个消息包含多个 record batches，只有第一个 batch 会被读取，后续 batches 将被忽略。如需发送多个 batches，请将其作为多个独立的 Kafka消息发送。
@@ -362,6 +370,16 @@ pipeline.global-job-parameters: |
 - 每个dataloader worker预先准备的batch数，默认为2；仅在`num_workers > 0`时生效
 - `in_order=true`时，一个worker读数据变慢（如ODPS读取抖动）会阻塞该rank，其他worker最多只能提前准备`prefetch_factor`个batch；调大该值可以吸收读取抖动、减少训练等数据的时间，同时保持batch顺序
 - 每个rank最多缓存`num_workers * prefetch_factor`个batch，调大时需关注内存占用
+
+### kafka_partition_round_robin
+
+- 仅对KafkaDataset生效，默认为false；开启后启动时按leader排序分区并分发到各worker（有效全局worker数为`world_size * max(data_config.num_workers, 1)`），每个worker为自己负责的分区各创建一个consumer，每次一条Kafka消息，轮流分区读取，当前分区没有消息时持续等待
+- 分区归属依据启动时的leader排序，运行期间固定；每个worker的consumer数量等于其负责的分区数
+
+### kafka_log_every_n_messages
+
+- 仅对KafkaDataset生效，默认为0，关闭worker解码计数与训练日志中的累计位点推进量两类日志；设置为N时，每个worker每成功解码N条Kafka消息，打印一次该worker按分区的累计解码消息数，例如`KafkaReader[rank-0|worker-1] decoded_messages=1000 partitions={'topic:1': 600, 'topic:3': 400}`；同时各rank的训练日志每隔`train_config.log_step_count_steps`步输出一次累计位点推进量
+- 一条消息计1条，包含零行消息和已解码但尚未训练的预取数据，不包含错误消息和解码失败的消息
 
 ### shuffle
 

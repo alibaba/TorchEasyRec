@@ -45,6 +45,18 @@ test -e ${MODEL_DIR}/model.ckpt-1000/_SUCCESS && cat ${MODEL_DIR}/model.ckpt-100
 # {"step": 1000, "data_ts": 1755000000.0, "tag": "20260828"}
 ```
 
+## Kafka位点推进日志
+
+开启`data_config.kafka_log_every_n_messages`（大于0）后，使用KafkaDataset训练时，每个rank每隔`train_config.log_step_count_steps`步输出一行该rank已训练分区的累计位点推进量，训练正常结束时补充一次（最终step已打印时不重复）：
+
+```text
+KafkaTrain[rank-0] step=1200 cumulative_offset_deltas={'topic:1': 600}
+```
+
+- `cumulative_offset_deltas = current_offset - baseline_offset`
+- `baseline_offset`是该分区首次参与训练时的最大offset（续训时已包含checkpoint恢复的最大offset）
+- `current_offset`是该rank已完成训练Batch涉及的最大offset
+
 ## 训练配置
 
 训练配置是指配置文件中的train_config，详细参考[配置参考手册](../reference.md)

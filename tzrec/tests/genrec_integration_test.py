@@ -195,7 +195,8 @@ class GenRecIntegrationTest(unittest.TestCase):
             for fc in config.feature_configs
             if fc.WhichOneof("feature") == "tokenize_feature"
         )
-        self.assertEqual(title.vocab_file, config.prompt_config.tokenizer_path)
+        tokenizer_path = config.prompt_config.tokenizer_path
+        self.assertEqual(title.vocab_file, tokenizer_path)
         with open(os.path.join(export_dir, "fg.json")) as f:
             fg_title = next(
                 fg
@@ -282,7 +283,6 @@ class GenRecIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(tokenizer.eos_token_id, compiled.sid_space.eos_token_id)
 
-        # decode runs only against a checkpoint: the exported front-end has no LM
         predict_dir = os.path.join(self.test_dir, "predict")
         self.success = utils.test_predict_checkpoint(
             trained,
@@ -293,15 +293,30 @@ class GenRecIntegrationTest(unittest.TestCase):
             self.test_dir,
         )
         self.assertTrue(self.success)
-        predicted = pq.read_table(predict_dir)
-        self.assertIn("answer", predicted.column_names)
-        sids = predicted.column("generated_sids").to_pylist()
-        self.assertEqual(len(sids), 8)
-        for row in sids:
-            # num_return_sequences beams of one local code per level
-            self.assertEqual([len(beam) for beam in row], [3, 3])
-            for beam in row:
-                self.assertTrue(all(0 <= c < n for c, n in zip(beam, _CODEBOOK)), beam)
+        # the export decodes on its own, with the training tokenizer gone
+        os.rename(tokenizer_path, tokenizer_path + ".moved")
+        export_predict_dir = os.path.join(self.test_dir, "predict_export")
+        self.success = utils.test_predict(
+            export_dir,
+            self.data_glob,
+            export_predict_dir,
+            "answer",
+            "generated_sids",
+            self.test_dir,
+        )
+        self.assertTrue(self.success)
+        for output_dir in (predict_dir, export_predict_dir):
+            predicted = pq.read_table(output_dir)
+            self.assertIn("answer", predicted.column_names)
+            sids = predicted.column("generated_sids").to_pylist()
+            self.assertEqual(len(sids), 8)
+            for row in sids:
+                # num_return_sequences beams of one local code per level
+                self.assertEqual([len(beam) for beam in row], [3, 3])
+                for beam in row:
+                    self.assertTrue(
+                        all(0 <= c < n for c, n in zip(beam, _CODEBOOK)), beam
+                    )
 
     @unittest.skipIf(*nv_gpu_unavailable)
     @unittest.skipIf(*flash_attn_unavailable)

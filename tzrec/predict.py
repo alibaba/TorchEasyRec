@@ -69,7 +69,7 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="predict threads num, default will use num_workers in data_config, "
-        "or one per GPU for a distributed embedding export.",
+        "or one per GPU for a distributed embedding or GenRec export.",
     )
     parser.add_argument(
         "--is_profiling",
