@@ -1006,6 +1006,7 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
             ("full", 1, 1, [False]),
             ("both", 0.37, 1, [False, True]),
             ("insufficient_cache", 0.1, 9, [False]),
+            ("one_byte", 1 / 16384, 1, [False, True]),
         ],
         name_func=parameterized_name_func,
     )
@@ -1014,6 +1015,13 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
         self.assertEqual(
             [(o.cache_params.load_factor, o.dynamicemb_options.caching) for o in opts],
             [(ratio, family) for family in families],
+        )
+
+    def test_subbyte_budget_becomes_zero_endpoint(self):
+        opts = self._options(ratio=0.5 / 16384)
+        self.assertEqual(
+            [(o.cache_load_factor, o.dynamicemb_options.caching) for o in opts],
+            [(0.0, False)],
         )
 
     def test_physical_dedup_keeps_distinct_budgets(self):

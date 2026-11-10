@@ -958,9 +958,20 @@ def _emit_dynamicemb_variants(
             ratio,
             caching=caching,
         )
+        if ratio > 0 and memory.local_hbm_for_values == 0:
+            if caching:
+                continue
+            ratio = 0.0
+            memory = dynamicemb_util._dynamicemb_shard_memory(
+                base_option.dynamicemb_options,
+                base_option.tensor,
+                rows,
+                ratio,
+                caching=False,
+            )
         if caching and memory.resident_rows < required:
             continue
-        # Equal tier rows with unequal budgets can change how a fused group fits.
+        # Preserve distinct runtime budgets even when bucket rounding yields equal rows.
         key = (caching, memory)
         if key in seen:
             continue
