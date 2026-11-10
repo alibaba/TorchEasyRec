@@ -243,7 +243,25 @@ def _dynamicemb_effective_cache_ratio(
     caching: bool,
     stats: Optional[Any] = None,
 ) -> float:
-    """Estimate HBM hits from the candidate's load factor or measured cache misses."""
+    """Effective HBM-hit ratio for the dynamicemb perf model.
+
+    The bandwidth model uses ``(x_eff*hbm_bw + (1-x_eff)*hbm_to_ddr_bw) / 10``.
+    The candidate's load factor ``x`` is its allocated HBM share; ``x_eff`` is
+    the bandwidth weight fitted from an A10 sweep (power-law access, alpha=1.05):
+
+      * Partial CACHING: 3.3x slower than HBM-only -> base 0.28.
+      * Partial HYBRID: 6.8x slower than HBM-only -> base 0.11.
+
+    Within each partial mode, measured performance was roughly flat. The
+    ``0.01 * x`` term lets the DP break ties. The roughly 8x jump in ``x_eff``
+    from HYBRID at x=0.9 to the full endpoint at x=1 is intentional: it
+    models the switch to the HBM-only kernel. The runtime makes that switch
+    when the entire fused group fits, not when a single member is fully funded.
+    The zero-budget non-caching endpoint is scored as host access (x_eff=0).
+
+    For CACHING candidates with measured stats, ``1 - stats.expected_miss_rate(x)``
+    overrides the fitted value, clamped to [0, 1].
+    """
     x = float(cache_load_factor) if cache_load_factor is not None else 0.0
     x = max(0.0, min(1.0, x))
     if caching and stats is not None:
