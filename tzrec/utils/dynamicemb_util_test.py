@@ -333,7 +333,7 @@ class AdmissionStrategyTest(unittest.TestCase):
     dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
 )
 @mark_ci_scope("gpu")
-class DynamicEmbUtilTest(unittest.TestCase):
+class DynamicEmbCapacityAndGroupingTest(unittest.TestCase):
     """Capacity estimates and native grouping for planner-built options."""
 
     def test_normal_cache_residency_excludes_overflow(self):
