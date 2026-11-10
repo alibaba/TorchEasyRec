@@ -23,6 +23,7 @@ not supported; Qwen2.5/Qwen3 are what CI covers.
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AttentionInterface
 
 from tzrec.datasets.utils import Batch
@@ -221,7 +222,10 @@ class GenRecCausalLMModel(BaseGenRecModel):
     def _multi_target_predictions(
         self, embeds: torch.Tensor, batch: Batch
     ) -> Dict[str, torch.Tensor]:
-        """Score independent SID branches over one packed prompt per row.
+        """Score independent SID branches over one prompt per row.
+
+        FA2 keeps the batch packed; other kernels run left-padded SDPA whose
+        per-row mask hides each target from its siblings.
 
         Args:
             embeds: packed embeddings, retaining one prefix per row.
@@ -230,8 +234,6 @@ class GenRecCausalLMModel(BaseGenRecModel):
         Returns:
             Per-target logits and labels, and each target's row weight.
         """
-        from torch.nn.attention.flex_attention import create_block_mask
-
         if self.lm.is_gradient_checkpointing:
             raise ValueError(
                 "Shared SID training requires gradient checkpointing to be disabled."
@@ -249,32 +251,42 @@ class GenRecCausalLMModel(BaseGenRecModel):
                     "Shared-prefix FA2 requires full attention and zero dropout."
                 )
             attention, attention_mask = _SHARED_PREFIX_ATTENTION, None
+            inputs_embeds = embeds.unsqueeze(0)
+            position_ids = layout.position_ids.unsqueeze(0)
+            token_mask = None
         else:
-            num_tokens = embeds.shape[0]
-            attention = "flex_attention"
-            attention_mask = create_block_mask(
-                layout.mask_mod,
-                1,
-                None,
-                num_tokens,
-                num_tokens,
-                device=embeds.device,
-                _compile=True,
+            attention = "sdpa"
+            inputs_embeds, padding_mask = self._left_pad(embeds, batch)
+            token_mask = padding_mask.bool()
+            position_ids = torch.zeros_like(padding_mask)
+            position_ids[token_mask] = layout.position_ids
+            # -2 marks left padding, which causality keeps attending to itself
+            targets = torch.full_like(padding_mask, -2)
+            targets[token_mask] = layout.token_targets
+            key_targets = targets[:, None, :]
+            attention_mask = (
+                ((key_targets == -1) | (key_targets == targets[:, :, None]))
+                .tril()
+                .unsqueeze(1)
             )
         previous_attention = self.lm.config._attn_implementation
         try:
             self.lm.set_attn_implementation(attention)
-            hidden = self.lm.base_model(
-                inputs_embeds=embeds.unsqueeze(0),
-                attention_mask={"full_attention": attention_mask},
-                position_ids=layout.position_ids.unsqueeze(0),
-                use_cache=False,
-                multi_target_layout=layout,
-            ).last_hidden_state
+            # NOTE: cuDNN's masked SDPA backward returns NaN dq at lengths that are
+            # odd multiples of 64 (torch 2.14, cuDNN 9.24); FA2 never reaches SDPA
+            with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                hidden = self.lm.base_model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask={"full_attention": attention_mask},
+                    position_ids=position_ids,
+                    use_cache=False,
+                    multi_target_layout=layout,
+                ).last_hidden_state
         finally:
             self.lm.set_attn_implementation(previous_attention)
+        hidden = hidden[0] if token_mask is None else hidden[token_mask]
         return {
-            "logits": self.lm.get_output_embeddings()(hidden[0][layout.score_indices]),
+            "logits": self.lm.get_output_embeddings()(hidden[layout.score_indices]),
             "labels": infos[INPUT_IDS][layout.label_indices],
             "target_weights": layout.target_weights,
         }

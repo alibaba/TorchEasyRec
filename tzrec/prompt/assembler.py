@@ -20,7 +20,7 @@ identity of each hole beside it.
 """
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Final, List, Tuple
+from typing import Dict, Final, List, Tuple
 
 import torch
 from torch import nn
@@ -376,7 +376,7 @@ class MultiTargetLayout:
         label_indices: packed indices of target tokens, shaped (targets, levels).
         score_indices: packed indices whose logits predict those labels.
         target_weights: inverse target count of each target's row.
-        mask_mod: the same visibility as a FlexAttention predicate over tokens.
+        token_targets: target index of every packed token, -1 in a prefix.
     """
 
     position_ids: torch.Tensor
@@ -387,9 +387,7 @@ class MultiTargetLayout:
     label_indices: torch.Tensor
     score_indices: torch.Tensor
     target_weights: torch.Tensor
-    mask_mod: Callable[
-        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
-    ]
+    token_targets: torch.Tensor
 
 
 def build_multi_target_layout(
@@ -478,14 +476,6 @@ def build_multi_target_layout(
     score_indices = label_indices - 1
     score_indices[:, 0] = cu_seqlens[target_rows] + prefix_lengths[target_rows] - 1
 
-    def mask_mod(b, h, q, kv):
-        """Keep causal prefix attention and isolate every target branch."""
-        return (
-            (token_rows[q] == token_rows[kv])
-            & (kv <= q)
-            & ((token_targets[kv] < 0) | (token_targets[kv] == token_targets[q]))
-        )
-
     return MultiTargetLayout(
         position_ids=position_ids,
         cu_seqlens_q=cu_seqlens_q.to(torch.int32),
@@ -495,5 +485,5 @@ def build_multi_target_layout(
         label_indices=label_indices,
         score_indices=score_indices,
         target_weights=target_counts[target_rows].float().reciprocal(),
-        mask_mod=mask_mod,
+        token_targets=token_targets,
     )

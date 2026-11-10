@@ -575,28 +575,22 @@ class MultiTargetTrainingTest(unittest.TestCase):
             after = self.model.predict(batch)["generated_sids"]
         torch.testing.assert_close(after, before, atol=0, rtol=0)
 
-    def test_backbone_and_prefix_stay_packed(self):
-        batch = self._batch()
-        shapes = []
-        handles = []
-        for layer in self.model.lm.base_model.layers:
-            for module in (layer.self_attn.q_proj, layer.mlp):
-                handles.append(
-                    module.register_forward_pre_hook(
-                        lambda module, inputs: shapes.append(inputs[0].shape[:2])
-                    )
-                )
-        try:
-            with mock.patch.object(
-                self.model, "_left_pad", side_effect=AssertionError("padded backbone")
-            ):
-                self.model.predict(batch)
-        finally:
-            for handle in handles:
-                handle.remove()
-        expected = (1, int(batch.additional_infos[CU_SEQLENS][-1]))
-        self.assertTrue(shapes)
-        self.assertTrue(all(tuple(shape) == expected for shape in shapes))
+    def test_masked_sdpa_avoids_cudnn(self) -> None:
+        cudnn_enabled = []
+        sdpa = nn.functional.scaled_dot_product_attention
+
+        def record(*args, **kwargs):
+            cudnn_enabled.append(torch.backends.cuda.cudnn_sdp_enabled())
+            return sdpa(*args, **kwargs)
+
+        with mock.patch.object(
+            nn.functional, "scaled_dot_product_attention", side_effect=record
+        ):
+            self.model.predict(self._batch())
+        self.assertEqual(
+            bool(cudnn_enabled), self.model._attn_kernel != "flash_attention_2"
+        )
+        self.assertNotIn(True, cudnn_enabled)
 
 
 @mark_ci_scope("h20", "gpu")
@@ -623,6 +617,29 @@ class FlashMultiTargetTrainingTest(MultiTargetTrainingTest):
             .eval()
         )
         self.model._attn_kernel = "flash_attention_2"
+
+    def test_backbone_and_prefix_stay_packed(self):
+        batch = self._batch()
+        shapes = []
+        handles = []
+        for layer in self.model.lm.base_model.layers:
+            for module in (layer.self_attn.q_proj, layer.mlp):
+                handles.append(
+                    module.register_forward_pre_hook(
+                        lambda module, inputs: shapes.append(inputs[0].shape[:2])
+                    )
+                )
+        try:
+            with mock.patch.object(
+                self.model, "_left_pad", side_effect=AssertionError("padded backbone")
+            ):
+                self.model.predict(batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+        expected = (1, int(batch.additional_infos[CU_SEQLENS][-1]))
+        self.assertTrue(shapes)
+        self.assertTrue(all(tuple(shape) == expected for shape in shapes))
 
 
 if __name__ == "__main__":

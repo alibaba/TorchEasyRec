@@ -476,13 +476,10 @@ class MultiTargetLayoutTest(unittest.TestCase):
                 expected[
                     target_start : target_start + 3, target_start : target_start + 3
                 ] = torch.ones(3, 3, dtype=torch.bool).tril()
-        actual = layout.mask_mod(
-            torch.tensor(0),
-            torch.tensor(0),
-            torch.arange(18)[:, None],
-            torch.arange(18)[None, :],
+        self.assertEqual(
+            layout.token_targets.tolist(),
+            [-1, -1, 0, 0, 0, 1, 1, 1, -1, -1, -1, -1, 2, 2, 2, -1, -1, -1],
         )
-        torch.testing.assert_close(actual, expected)
         # the FA2 segments, causal from the last key, give the same visibility
         from_segments = torch.zeros(18, 18, dtype=torch.bool)
         cu_q = layout.cu_seqlens_q.tolist()

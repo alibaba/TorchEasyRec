@@ -162,7 +162,7 @@ answer = [1, 8194, 16387, 4, 8197, 16390]
 
 模型根据标签长度和码本层数自动识别目标数量 N。多个目标共享同一份 Prompt 计算，各目标只依赖公共历史和自身前面的 SID token。先对每个目标的 token 计算平均交叉熵，再按 `1/N` 对目标平均，最后对原始样本平均。不同样本可以包含不同数量的目标，无须权重列或额外配置开关。
 
-多目标训练要求关闭 gradient checkpointing，整个 batch 保持 packed 计算，共同 Prompt 只计算一次。配置 `attn_kernel: "flash_attention_2"` 时，Prompt 和各目标分支在同一次 FlashAttention 2 varlen 计算中完成，支持 Qwen2/Qwen3 全注意力、CUDA、BF16/FP16 计算及 attention dropout 为0。配置其他后端时，多目标 batch 使用 FlexAttention 隔离目标分支，要求骨干模型和 GPU 支持 FlexAttention。
+多目标训练要求关闭 gradient checkpointing，共同 Prompt 只计算一次。配置 `attn_kernel: "flash_attention_2"` 时，整个 batch 保持 packed 计算，Prompt 和各目标分支在同一次 FlashAttention 2 varlen 计算中完成，支持 Qwen2/Qwen3 全注意力、CUDA、BF16/FP16 计算及 attention dropout 为0。配置其他后端时，多目标 batch 按行左侧补齐后使用 SDPA 计算，由注意力掩码隔离各目标分支，无需编译。
 
 训练与带标签评估使用同一规则；前向结束或异常时恢复原 attention 后端。预测和导出继续使用原来的 Prompt、beam search 及单个 SID 的生成长度，不读取训练标签；全部为单目标的 batch 保留原前向路径。模型参数和 checkpoint 结构不变。
 
