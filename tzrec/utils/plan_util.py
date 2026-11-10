@@ -912,6 +912,9 @@ def calculate_shard_storages(
         )
 
 
+_DYNAMICEMB_WORKING_SET_BATCHES = 5
+
+
 def _dynamicemb_partial_ratios(low: float) -> List[float]:
     """Sample five geometric points up to 0.5, then fixed tenths up to 0.9."""
     if low >= 1.0:
@@ -958,7 +961,9 @@ def _emit_dynamicemb_variants(
             raise ValueError(
                 f"{base_option.name}: unique_id_factor must be finite and non-negative"
             )
-        required = math.ceil(5 * unique_id_factor * base_option.batch_size)
+        required = math.ceil(
+            _DYNAMICEMB_WORKING_SET_BATCHES * unique_id_factor * base_option.batch_size
+        )
         floor = required / rows or 0.1
 
     params = base_option.cache_params
