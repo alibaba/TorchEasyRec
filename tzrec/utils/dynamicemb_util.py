@@ -94,14 +94,13 @@ class DynamicEmbTableMemory(NamedTuple):
         tensor: torch.Tensor,
         options: "dynamicemb.DynamicEmbTableOptions",
         *,
-        caching: bool,
         ratio: float,
     ) -> "DynamicEmbTableMemory":
         """Estimate the value budget and physical HBM and DDR bytes for one shard.
 
         The options carry the aligned per-rank max_capacity; the tensor supplies
-        the embedding width, dtype and optimizer. The candidate supplies its caching
-        choice and requested ratio.
+        the embedding width, dtype and optimizer. The caching mode comes from
+        the candidate's options.
         The runtime budget covers values and optimizer state only::
 
             optimizer_state_dim = round(dim * optimizer_multiplier)
@@ -136,6 +135,7 @@ class DynamicEmbTableMemory(NamedTuple):
         cannot form a HYBRID group. The storage estimator charges admission
         counters and pipeline I/O separately.
         """
+        caching = options.caching
         if not 0.0 <= ratio <= 1.0 or (caching and ratio in (0.0, 1.0)):
             raise ValueError(
                 f"invalid dynamicemb placement: caching={caching}, {ratio=}"

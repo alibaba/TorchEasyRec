@@ -73,17 +73,15 @@ class DynamicEmbTableMemoryTest(unittest.TestCase):
         from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
 
         tensor = torch.empty(4096, 32, device="meta")
-        opt = DynamicEmbTableOptions(max_capacity=4096)
-        m = DynamicEmbTableMemory.from_options(tensor, opt, caching=True, ratio=0.1)
+        opt = DynamicEmbTableOptions(max_capacity=4096, caching=True)
+        m = DynamicEmbTableMemory.from_options(tensor, opt, ratio=0.1)
         self.assertEqual((m.resident_rows, m.hbm_rows, m.host_rows), (1024, 4096, 4096))
         self.assertEqual(m.local_hbm_for_values, int(0.1 * 4096 * 32 * 4))
         opt.score_strategy = (
             DynamicEmbScoreStrategy.TIMESTAMP,
             DynamicEmbScoreStrategy.LFU,
         )
-        compound = DynamicEmbTableMemory.from_options(
-            tensor, opt, caching=True, ratio=0.1
-        )
+        compound = DynamicEmbTableMemory.from_options(tensor, opt, ratio=0.1)
         self.assertEqual(compound.hbm_index - m.hbm_index, 8192 * 8)
 
     def test_invalid_placements(self):
@@ -97,13 +95,12 @@ class DynamicEmbTableMemoryTest(unittest.TestCase):
             (True, 0),
             (True, 1),
         ]:
+            opt.caching = caching
             with (
                 self.subTest(caching=caching, ratio=ratio),
                 self.assertRaises(ValueError),
             ):
-                DynamicEmbTableMemory.from_options(
-                    tensor, opt, caching=caching, ratio=ratio
-                )
+                DynamicEmbTableMemory.from_options(tensor, opt, ratio=ratio)
 
 
 class OptimizerMultiplerTest(unittest.TestCase):
@@ -271,7 +268,7 @@ class AdmissionStrategyTest(unittest.TestCase):
             input_lengths=[1.0],
             num_poolings=[1.0],
             dynamicemb_memory=DynamicEmbTableMemory.from_options(
-                tensor, dynamicemb_options, caching=False, ratio=1.0
+                tensor, dynamicemb_options, ratio=1.0
             ),
             is_pooled=True,
             input_data_type_size=4,
@@ -637,9 +634,7 @@ class CapacityMirrorRuntimeParityTest(unittest.TestCase):
                     "FTRL": FTRL,
                 }[optim]
             ]
-            m = DynamicEmbTableMemory.from_options(
-                tensor, opt, caching=opt.caching, ratio=ratio
-            )
+            m = DynamicEmbTableMemory.from_options(tensor, opt, ratio=ratio)
             opt.local_hbm_for_values = m.local_hbm_for_values
             self.assertEqual(
                 opt.local_hbm_for_values,

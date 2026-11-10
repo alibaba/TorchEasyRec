@@ -927,7 +927,9 @@ def _emit_dynamicemb_variants(
 ) -> List[ShardingOption]:
     """Generate physically distinct candidates in ascending budget order per family."""
     tensor = base_option.tensor
-    options = base_option.dynamicemb_options
+    template = copy.copy(base_option)
+    template.dynamicemb_options = copy.copy(base_option.dynamicemb_options)
+    options = template.dynamicemb_options
     rows = base_option.shards[0].size[0]
     if any(shard.size[0] != options.max_capacity for shard in base_option.shards):
         raise ValueError("DynamicEmb shard rows must match the per-rank max_capacity")
@@ -957,28 +959,26 @@ def _emit_dynamicemb_variants(
     candidates = []
     seen = set()
     for caching, requested in requests:
+        options.caching = caching
         ratio = requested
-        memory = DynamicEmbTableMemory.from_options(
-            tensor, options, caching=caching, ratio=ratio
-        )
+        memory = DynamicEmbTableMemory.from_options(tensor, options, ratio=ratio)
         if ratio > 0 and memory.local_hbm_for_values == 0:
-            if caching:
+            if options.caching:
                 continue
             ratio = 0.0
-        elif caching and memory.resident_rows >= memory.host_rows:
+        elif options.caching and memory.resident_rows >= memory.host_rows:
             if params is None:
                 continue  # Automatic search already includes the full endpoint.
-            caching, ratio = False, 1.0
+            options.caching = False
+            ratio = 1.0
         if ratio != requested:
-            memory = DynamicEmbTableMemory.from_options(
-                tensor, options, caching=False, ratio=ratio
-            )
-        if caching and memory.resident_rows < required:
+            memory = DynamicEmbTableMemory.from_options(tensor, options, ratio=ratio)
+        if options.caching and memory.resident_rows < required:
             continue
         if params is None:
             endpoint = ratio if ratio in (0, 1) else None
             key = (
-                caching,
+                options.caching,
                 endpoint,
                 memory.hbm_rows,
                 memory.host_rows,
@@ -988,17 +988,16 @@ def _emit_dynamicemb_variants(
                 continue
             seen.add(key)
 
-        if caching:
+        if options.caching:
             allocated = memory.resident_rows / memory.host_rows
         elif 0 < ratio < 1:
             allocated = memory.hbm_rows / (memory.hbm_rows + memory.host_rows)
         else:
             allocated = ratio
-        option = copy.deepcopy(base_option)
+        option = copy.deepcopy(template)
         option.cache_params = CacheParams(
             load_factor=allocated, stats=params.stats if params else None
         )
-        option.dynamicemb_options.caching = caching
         option.dynamicemb_memory = memory
         candidates.append(option)
     return candidates
