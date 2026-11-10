@@ -950,7 +950,8 @@ def _emit_dynamicemb_variants(
 
     candidates = []
     seen = set()
-    for caching, ratio in requests:
+    for caching, requested in requests:
+        ratio = requested
         memory = dynamicemb_util._dynamicemb_shard_memory(
             base_option.dynamicemb_options,
             base_option.tensor,
@@ -962,6 +963,11 @@ def _emit_dynamicemb_variants(
             if caching:
                 continue
             ratio = 0.0
+        elif caching and memory.resident_rows >= memory.host_rows:
+            if params is None:
+                continue  # Automatic search already includes the full endpoint.
+            caching, ratio = False, 1.0
+        if ratio != requested:
             memory = dynamicemb_util._dynamicemb_shard_memory(
                 base_option.dynamicemb_options,
                 base_option.tensor,

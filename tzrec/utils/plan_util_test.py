@@ -975,11 +975,11 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("unmeasured", None, 0.1, 0.1, 9),
-            ("measured_zero", 0, 0.1, 0.1, 9),
-            ("small_working_set", 0.1, 64 / 4096, 0.1, 9),
-            ("half", 3.2, 0.1, 0.5, 5),
-            ("above_half", 4.8, 0.1, 0.75, 3),
+            ("unmeasured", None, 0.1, 0.1, 7),
+            ("measured_zero", 0, 0.1, 0.1, 7),
+            ("small_working_set", 0.1, 64 / 4096, 0.1, 7),
+            ("half", 3.2, 0.1, 0.5, 3),
+            ("above_half", 4.8, 0.1, 0.75, 1),
             ("full", 6.4, 0.1, None, 0),
         ],
         name_func=parameterized_name_func,
@@ -1018,21 +1018,36 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
         )
 
     def test_subbyte_budget_becomes_zero_endpoint(self):
-        opts = self._options(ratio=0.5 / 16384)
+        opts = self._options(ratio=0.5 / 4096, rows=1024)
         self.assertEqual(
             [(o.cache_load_factor, o.dynamicemb_options.caching) for o in opts],
             [(0.0, False)],
         )
 
+    @parameterized.expand(
+        [("exact", 1024), ("oversized_bucket", 512)], name_func=parameterized_name_func
+    )
+    def test_full_cache_becomes_one_non_caching_endpoint(self, _, rows):
+        options = self._options(rows=rows)
+        self.assertFalse(any(o.dynamicemb_options.caching for o in options))
+        self.assertEqual(sum(o.cache_load_factor == 1 for o in options), 1)
+
+        pinned = self._options(ratio=0.1, rows=rows)
+        self.assertEqual(
+            [(o.cache_load_factor, o.dynamicemb_options.caching) for o in pinned],
+            [(0.1, False), (1.0, False)],
+        )
+
     def test_physical_dedup_keeps_distinct_budgets(self):
-        # The low cache segment spans seven to eight fp16 rows. Its five
-        # requests buy just three distinct byte budgets in the same cache bucket.
-        opts = self._options(factor=7 / 640, rows=16, dtype=torch.float16)
+        # The five low ratios buy three byte budgets in the same partial cache.
+        opts = self._options(factor=2047 / 640, rows=4096, dtype=torch.float16)
         ratios = [
             o.cache_params.load_factor for o in opts if o.dynamicemb_options.caching
         ]
-        self.assertEqual(ratios[0], 7 / 16)
-        self.assertEqual([int(r * 32) for r in ratios], [14, 15, 16, 19, 22, 25, 28])
+        self.assertEqual(ratios[0], 2047 / 4096)
+        self.assertEqual(
+            [int(r * 8192) for r in ratios], [4094, 4095, 4096, 4915, 5734]
+        )
 
     def test_invalid_factor(self):
         for factor in (float("nan"), -1):
@@ -1045,7 +1060,6 @@ class DynamicEmbCandidateGridTest(unittest.TestCase):
             ("full", 1, False, 4096, False, 1),
             ("hybrid", 0.5, False, 4096, False, 0.11 + 0.01 * 0.5),
             ("cache", 0.1, True, 4096, False, 0.28 + 0.01 * 0.25),
-            ("cache_covers_shard", 0.1, True, 512, False, 0.28 + 0.01),
             ("measured_cache", 0.1, True, 4096, True, 0.6),
         ],
         name_func=parameterized_name_func,
