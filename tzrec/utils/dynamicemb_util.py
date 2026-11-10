@@ -242,19 +242,11 @@ def _dynamicemb_effective_cache_ratio(
     allocated_fraction: float,
     caching: bool,
     stats: Optional[Any] = None,
-    *,
-    full_endpoint: bool = False,
 ) -> float:
-    """Estimate HBM hits from allocated residency or measured cache misses.
-
-    Only the full non-caching endpoint takes the HBM-direct path. A cache
-    covering its entire backing table still uses the empirical cache model.
-    """
+    """Estimate HBM hits from the allocated share or measured cache misses."""
     x = max(0.0, min(1.0, float(allocated_fraction)))
-    if full_endpoint:
-        return 1.0
-    if x <= 0.0 and not caching:
-        return 0.0
+    if not caching and x in (0.0, 1.0):
+        return x
     if caching and stats is not None:
         miss_rate = float(stats.expected_miss_rate(x))
         return max(0.0, min(1.0, 1.0 - miss_rate))
@@ -858,13 +850,10 @@ if has_dynamicemb:
         dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
         original_cache_params = sharding_option.cache_params
         if dynamicemb_options is not None and shard_sizes:
-            allocated = sharding_option.cache_load_factor
-            caching = bool(dynamicemb_options.caching)
             x_eff = _dynamicemb_effective_cache_ratio(
-                allocated,
-                caching=caching,
+                sharding_option.cache_load_factor,
+                caching=bool(dynamicemb_options.caching),
                 stats=original_cache_params.stats if original_cache_params else None,
-                full_endpoint=allocated == 1 and not caching,
             )
             sharding_option.cache_params = (
                 dataclasses.replace(original_cache_params, load_factor=x_eff)
