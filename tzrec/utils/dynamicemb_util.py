@@ -111,11 +111,39 @@ def dynamicemb_table_memory(
     score_words: int = 1,
     no_eviction: bool = False,
 ) -> DynamicEmbTableMemory:
-    """Estimate physical storage and the value budget of a normalized row-wise shard.
+    """Estimate the value budget and physical HBM and DDR bytes for one shard.
 
-    Constraints align shard_rows and the runtime max_capacity before enumeration.
-    Zero and full budgets may share a HYBRID group: reserve its minimum tiers
-    as well as the standalone endpoint. NO_EVICTION cannot form a HYBRID group.
+    Constraints align shard_rows to the table's bucket width before enumeration.
+    The runtime budget covers values and optimizer state only::
+
+        row_bytes = (dim + optimizer_state_dim) * element_size
+        full_bytes = shard_rows * row_bytes
+
+    A zero or full request gets 0 or full_bytes. For a partial request, truncate
+    ratio * shard_rows * row_bytes to whole bytes and cap it at full_bytes - 1.
+    The runtime splits rows using that byte budget divided by full_bytes.
+
+    Physical table storage uses the resulting bucket-rounded capacities::
+
+        HBM = hbm_rows * row_bytes + hbm_index
+        DDR = host_rows * row_bytes
+        key_map_bytes = slots * (8 + 1 + 8 * score_words + 4) + 4 * buckets
+
+    HYBRID divides values between the two tiers. Each tier takes at least one
+    row, rounded up to a whole bucket: 1024 rows on HBM, the table's bucket
+    width on host. CACHING keeps the full backing table on host; its HBM rows
+    include the resident cache plus three overflow buckets. Only resident rows
+    count toward cache coverage.
+
+    Every tier's key map lives on HBM, including the host tier's. Each slot
+    stores a key, digest, score words and reference counter; each bucket also
+    has a size counter. The cache overflow has its own map. A full NO_EVICTION
+    map has twice as many slots as value rows.
+
+    For zero and full budgets, take the larger cost per field across the
+    standalone endpoint and its placement in a fused HYBRID group. NO_EVICTION
+    cannot form a HYBRID group. The storage estimator charges admission
+    counters and pipeline I/O separately.
     """
     if not 0.0 <= ratio <= 1.0 or (caching and ratio in (0.0, 1.0)):
         raise ValueError(f"invalid dynamicemb placement: caching={caching}, {ratio=}")
