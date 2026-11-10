@@ -333,8 +333,8 @@ class AdmissionStrategyTest(unittest.TestCase):
     dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
 )
 @mark_ci_scope("gpu")
-class DynamicEmbCapacityAndGroupingTest(unittest.TestCase):
-    """Capacity estimates and native grouping for planner-built options."""
+class DynamicEmbCapacityTest(unittest.TestCase):
+    """Capacity estimates and shard alignment for planner-built options."""
 
     def test_normal_cache_residency_excludes_overflow(self):
         from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
@@ -369,6 +369,38 @@ class DynamicEmbCapacityAndGroupingTest(unittest.TestCase):
             ):
                 DynamicEmbTableMemory.from_options(tensor, opt, ratio=ratio)
 
+    @parameterized.expand(
+        [
+            ("single", 250, 1, 128, 1, 256, 128, 128),
+            ("four_ranks", 1000, 4, 128, 512, 256, 128, 256),
+            ("three_ranks", 100003, 3, 256, 512, 33536, 256, 512),
+            ("one_bucket", 1000, 4, 2**63 - 1, 1, 256, 256, 256),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_normalized_row_capacity(
+        self, _, rows, ranks, bucket, initial, local, width, init
+    ):
+        table = EmbeddingBagConfig(num_embeddings=rows, embedding_dim=16)
+        cfg = feature_pb2.DynamicEmbedding(
+            max_capacity=rows, bucket_capacity=bucket, init_capacity_per_rank=initial
+        )
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": str(ranks)}):
+            opt = dynamicemb_util.build_dynamicemb_constraints(
+                cfg, table
+            ).dynamicemb_options
+        self.assertEqual(table.num_embeddings, local * ranks)
+        self.assertEqual(
+            (opt.max_capacity, opt.bucket_capacity, opt.init_capacity),
+            (local, width, init),
+        )
+
+
+@unittest.skipUnless(
+    dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
+)
+@mark_ci_scope("gpu")
+class DynamicEmbGroupingTest(unittest.TestCase):
     def test_group_tables_separates_caching_but_not_value_budgets(self):
         """TorchRec fuses different value budgets but separates caching tables."""
         from torchrec.distributed.embedding_sharding import (
@@ -412,32 +444,6 @@ class DynamicEmbCapacityAndGroupingTest(unittest.TestCase):
         self.assertEqual(
             names,
             [("t_cache",), ("t_full", "t_partial", "t_zero")],
-        )
-
-    @parameterized.expand(
-        [
-            ("single", 250, 1, 128, 1, 256, 128, 128),
-            ("four_ranks", 1000, 4, 128, 512, 256, 128, 256),
-            ("three_ranks", 100003, 3, 256, 512, 33536, 256, 512),
-            ("one_bucket", 1000, 4, 2**63 - 1, 1, 256, 256, 256),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_normalized_row_capacity(
-        self, _, rows, ranks, bucket, initial, local, width, init
-    ):
-        table = EmbeddingBagConfig(num_embeddings=rows, embedding_dim=16)
-        cfg = feature_pb2.DynamicEmbedding(
-            max_capacity=rows, bucket_capacity=bucket, init_capacity_per_rank=initial
-        )
-        with mock.patch.dict(os.environ, {"WORLD_SIZE": str(ranks)}):
-            opt = dynamicemb_util.build_dynamicemb_constraints(
-                cfg, table
-            ).dynamicemb_options
-        self.assertEqual(table.num_embeddings, local * ranks)
-        self.assertEqual(
-            (opt.max_capacity, opt.bucket_capacity, opt.init_capacity),
-            (local, width, init),
         )
 
 
