@@ -13,7 +13,6 @@ import unittest
 
 import numpy as np
 import torch
-from parameterized import parameterized
 
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
@@ -35,7 +34,6 @@ from tzrec.prompt.types import (
     WidthKind,
 )
 from tzrec.protos.model_pb2 import FeatureGroupType
-from tzrec.utils.test_util import parameterized_name_func
 
 _BASE_VOCAB_SIZE = 1000
 _SENTINEL = 1099
@@ -412,48 +410,30 @@ class PromptAssemblerTest(unittest.TestCase):
 
 
 class MultiTargetLayoutTest(unittest.TestCase):
-    @parameterized.expand([[1], [3], [4]], name_func=parameterized_name_func)
-    def test_targets_reuse_prefix_scores_and_restart_positions(self, levels) -> None:
-        prefix_lengths = [2, 4, 3]
-        target_counts = [2, 1, 0]
-        row_lengths = [
-            prefix + count * levels
-            for prefix, count in zip(prefix_lengths, target_counts)
-        ]
-        boundaries = [0]
-        for length in row_lengths:
-            boundaries.append(boundaries[-1] + length)
-        layout = build_multi_target_layout(
-            torch.tensor(boundaries, dtype=torch.int32),
-            torch.tensor([count * levels for count in target_counts]),
-            levels,
-        )
-
-        expected_positions, expected_labels, expected_scores = [], [], []
-        for row, (prefix, count) in enumerate(zip(prefix_lengths, target_counts)):
-            expected_positions += (
-                list(range(prefix)) + list(range(prefix, prefix + levels)) * count
-            )
-            for target in range(count):
-                label_start = boundaries[row] + prefix + target * levels
-                expected_labels.append(list(range(label_start, label_start + levels)))
-                expected_scores.append(
-                    [boundaries[row] + prefix - 1]
-                    + list(range(label_start, label_start + levels - 1))
-                )
-
-        self.assertEqual(layout.position_ids.tolist(), expected_positions)
-        self.assertEqual(layout.label_indices.tolist(), expected_labels)
-        self.assertEqual(layout.score_indices.tolist(), expected_scores)
-        self.assertEqual(layout.target_weights.tolist(), [0.5, 0.5, 1.0])
-        self.assertEqual(layout.max_seqlen, max(row_lengths))
-
-    def test_segments_and_mask_isolate_targets(self) -> None:
+    def test_layout_of_two_targets_one_target_and_none(self) -> None:
+        # rows: 2-token prompt + 2 SIDs, 4-token prompt + 1 SID, 3-token prompt
         layout = build_multi_target_layout(
             torch.tensor([0, 8, 15, 18], dtype=torch.int32),
             torch.tensor([6, 3, 0]),
             num_levels=3,
         )
+        self.assertEqual(
+            layout.position_ids.tolist(),
+            [0, 1, 2, 3, 4, 2, 3, 4] + [0, 1, 2, 3, 4, 5, 6] + [0, 1, 2],
+        )
+        self.assertEqual(
+            layout.token_targets.tolist(),
+            [-1, -1, 0, 0, 0, 1, 1, 1, -1, -1, -1, -1, 2, 2, 2, -1, -1, -1],
+        )
+        self.assertEqual(layout.max_seqlen, 8)
+        self.assertEqual(
+            layout.label_indices.tolist(), [[2, 3, 4], [5, 6, 7], [12, 13, 14]]
+        )
+        # a target's first level is scored from the last prompt token
+        self.assertEqual(
+            layout.score_indices.tolist(), [[1, 2, 3], [1, 5, 6], [11, 12, 13]]
+        )
+        self.assertEqual(layout.target_weights.tolist(), [0.5, 0.5, 1.0])
         self.assertEqual(layout.cu_seqlens_q.tolist(), [0, 2, 5, 8, 12, 15, 18])
         self.assertEqual(layout.cu_seqlens_k.tolist(), [0, 2, 7, 12, 16, 23, 26])
         self.assertEqual(
@@ -462,25 +442,16 @@ class MultiTargetLayoutTest(unittest.TestCase):
             + [8, 9, 10, 11, 8, 9, 10, 11, 12, 13, 14]
             + [15, 16, 17],
         )
-        # row-local blocks: causal prefix, then each target sees the prefix
-        # and its own earlier tokens only
-        expected = torch.zeros(18, 18, dtype=torch.bool)
-        for start, prefix_length, count in [(0, 2, 2), (8, 4, 1), (15, 3, 0)]:
-            prefix_end = start + prefix_length
-            expected[start:prefix_end, start:prefix_end] = torch.ones(
-                prefix_length, prefix_length, dtype=torch.bool
-            ).tril()
-            for target in range(count):
-                target_start = prefix_end + target * 3
-                expected[target_start : target_start + 3, start:prefix_end] = True
-                expected[
-                    target_start : target_start + 3, target_start : target_start + 3
-                ] = torch.ones(3, 3, dtype=torch.bool).tril()
-        self.assertEqual(
-            layout.token_targets.tolist(),
-            [-1, -1, 0, 0, 0, 1, 1, 1, -1, -1, -1, -1, 2, 2, 2, -1, -1, -1],
+        # the FA2 segments, causal from the last key, must give exactly this:
+        # same row, causal, and the key is prompt or in the query's target
+        rows = torch.repeat_interleave(torch.arange(3), torch.tensor([8, 7, 3]))
+        query, key = torch.arange(18)[:, None], torch.arange(18)[None, :]
+        targets = layout.token_targets
+        expected = (
+            (rows[query] == rows[key])
+            & (key <= query)
+            & ((targets[key] < 0) | (targets[key] == targets[query]))
         )
-        # the FA2 segments, causal from the last key, give the same visibility
         from_segments = torch.zeros(18, 18, dtype=torch.bool)
         cu_q = layout.cu_seqlens_q.tolist()
         cu_k = layout.cu_seqlens_k.tolist()

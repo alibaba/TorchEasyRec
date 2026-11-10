@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AttentionInterface
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -99,6 +100,27 @@ _SHARED_PREFIX_ATTENTION = "genrec_shared_prefix_fa2"
 AttentionInterface.register(_SHARED_PREFIX_ATTENTION, _shared_prefix_attention)
 
 
+def _padded_sdpa_attention(*args: Any, **kwargs: Any) -> Tuple[torch.Tensor, None]:
+    """Run HF's SDPA attention without cuDNN for a left-padded multi-target batch.
+
+    cuDNN's masked SDPA backward returns NaN dq at lengths that are odd
+    multiples of 64 (torch 2.14, cuDNN 9.24).
+
+    Args:
+        *args: HF attention interface arguments.
+        **kwargs: HF attention interface options.
+
+    Returns:
+        Attention output and no attention weights.
+    """
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+        return sdpa_attention_forward(*args, **kwargs)
+
+
+_PADDED_SDPA_ATTENTION = "genrec_padded_sdpa"
+AttentionInterface.register(_PADDED_SDPA_ATTENTION, _padded_sdpa_attention)
+
+
 class GenRecCausalLMModel(BaseGenRecModel):
     """An HF causal LM driven by a compiled prompt.
 
@@ -131,7 +153,9 @@ class GenRecCausalLMModel(BaseGenRecModel):
         self._generated_sids_key = common.generated_sids_key
         self._read_beam_config(common)
         response = self._prompt.prompt_plan.response_segments
-        self._has_sid_response = len(response) == 1 and isinstance(response[0], SlotSeg)
+        self._sid_only_response = len(response) == 1 and isinstance(
+            response[0], SlotSeg
+        )
 
     def _read_beam_config(self, common: GenRecModelConfig) -> None:
         """Parse the decode knobs; the schedule must match the codebook.
@@ -161,34 +185,9 @@ class GenRecCausalLMModel(BaseGenRecModel):
             return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}
         predictions = _fx_wrapped_forward(self, embeds, batch)
         keys = ("logits", "labels")
-        if self._has_sid_response:
+        if self._sid_only_response:
             keys += ("target_weights",)
         return {key: predictions[key] for key in keys}
-
-    def _training_predictions(
-        self, embeds: torch.Tensor, batch: Batch
-    ) -> Dict[str, torch.Tensor]:
-        """Select shared-prefix scoring for a response containing multiple SIDs.
-
-        Args:
-            embeds: assembled prompt and response embeddings.
-            batch: packed row boundaries and response lengths.
-
-        Returns:
-            Logits and labels, plus per-target row weights for a SID response.
-        """
-        if not self._has_sid_response:
-            logits, labels = self._forward(embeds, batch)
-            return {"logits": logits, "labels": labels}
-        lengths = batch.additional_infos[RESPONSE_LENGTHS]
-        if int(lengths.max()) > self._prompt.sid_space.num_levels:
-            return self._multi_target_predictions(embeds, batch)
-        logits, labels = self._forward(embeds, batch)
-        return {
-            "logits": logits,
-            "labels": labels,
-            "target_weights": (lengths > 0).float(),
-        }
 
     def _multi_target_predictions(
         self, embeds: torch.Tensor, batch: Batch
@@ -217,7 +216,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
             position_ids = layout.position_ids.unsqueeze(0)
             token_mask = None
         else:
-            attention = "sdpa"
+            attention = _PADDED_SDPA_ATTENTION
             inputs_embeds, padding_mask = _left_pad(
                 embeds, infos[CU_SEQLENS], layout.max_seqlen
             )
@@ -235,16 +234,13 @@ class GenRecCausalLMModel(BaseGenRecModel):
             )
         previous_attention = self.lm.config._attn_implementation
         self.lm.set_attn_implementation(attention)
-        # NOTE: cuDNN's masked SDPA backward returns NaN dq at lengths that are
-        # odd multiples of 64 (torch 2.14, cuDNN 9.24); FA2 never reaches SDPA
-        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
-            hidden = self.lm.base_model(
-                inputs_embeds=inputs_embeds,
-                attention_mask={"full_attention": attention_mask},
-                position_ids=position_ids,
-                use_cache=False,
-                multi_target_layout=layout,
-            ).last_hidden_state
+        hidden = self.lm.base_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask={"full_attention": attention_mask},
+            position_ids=position_ids,
+            use_cache=False,
+            multi_target_layout=layout,
+        ).last_hidden_state
         self.lm.set_attn_implementation(previous_attention)
         hidden = hidden[0] if token_mask is None else hidden[token_mask]
         return {
@@ -484,10 +480,12 @@ def generate_codes(
 def _fx_wrapped_forward(
     model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
 ) -> Dict[str, torch.Tensor]:
-    """Hide the packed forward from FX.
+    """Hide the packed forward and its per-batch routing from FX.
 
     ``TrainPipelineSparseDist`` symbolically traces the model whenever a
     sharded module exists, and the LM call reads ``max_seqlen`` as a host int.
+    A SID-only response whose batch has a row with several SIDs takes the
+    multi-target forward; every other batch keeps the response window.
 
     Args:
         model: the model whose response window to compute.
@@ -495,9 +493,21 @@ def _fx_wrapped_forward(
         batch: the batch being scored.
 
     Returns:
-        Training predictions and optional multi-target parent metadata.
+        Logits and labels, plus per-target row weights for a SID-only
+        response.
     """
-    return model._training_predictions(embeds, batch)
+    if not model._sid_only_response:
+        logits, labels = model._forward(embeds, batch)
+        return {"logits": logits, "labels": labels}
+    lengths = batch.additional_infos[RESPONSE_LENGTHS]
+    if int(lengths.max()) > model._prompt.sid_space.num_levels:
+        return model._multi_target_predictions(embeds, batch)
+    logits, labels = model._forward(embeds, batch)
+    return {
+        "logits": logits,
+        "labels": labels,
+        "target_weights": (lengths > 0).float(),
+    }
 
 
 @torch.fx.wrap

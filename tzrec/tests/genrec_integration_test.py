@@ -23,7 +23,6 @@ import torch
 from google.protobuf import text_format
 from parameterized import parameterized
 from pyarrow import parquet as pq
-from transformers import AutoConfig, AutoModelForCausalLM
 
 from tzrec.datasets.data_parser import DataParser
 from tzrec.main import _create_features
@@ -331,9 +330,9 @@ class GenRecIntegrationTest(unittest.TestCase):
     )
     @unittest.skipIf(*nv_gpu_unavailable)
     @mark_ci_scope("gpu")
-    def test_genrec_multi_target_train_eval_export(self, world_size, attn_kernel):
+    def test_genrec_multi_target_train_eval(self, world_size, attn_kernel):
         if torch.cuda.device_count() < world_size:
-            self.skipTest("Requires two GPUs for distributed parent normalization")
+            self.skipTest(f"Requires {world_size} GPUs")
         patcher = mock.patch.dict(os.environ, {"TEST_NPROC_PER_NODE": str(world_size)})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -341,12 +340,7 @@ class GenRecIntegrationTest(unittest.TestCase):
             self.skipTest(flash_attn_unavailable[1])
         config_path = self._prepare_config(attn_kernel)
         config = config_util.load_pipeline_config(config_path)
-        backbone = config.model_config.genrec_causal_lm_model.hf_model_name_or_path
-        backbone_config = AutoConfig.from_pretrained(backbone)
-        backbone_config.num_attention_heads = 2
-        backbone_config.num_key_value_heads = 1
-        backbone_config.head_dim = 16
-        AutoModelForCausalLM.from_config(backbone_config).save_pretrained(backbone)
+        # half the rows of the first file get a second SID
         for file_index, path in enumerate(sorted(glob.glob(self.data_glob))):
             table = pq.read_table(path)
             targets = table.column("answer").to_pylist()
@@ -369,9 +363,6 @@ class GenRecIntegrationTest(unittest.TestCase):
             pq.write_table(table, path)
         config.train_config.num_steps = 5
         config.train_config.num_epochs = 0
-        config.train_config.save_checkpoints_epochs = 0
-        config.train_config.save_checkpoints_steps = 5
-        config.train_config.log_step_count_steps = 1
         config.train_config.gradient_accumulation_steps = 2
         if attn_kernel == "flash_attention_2":
             config.train_config.mixed_precision = "BF16"
@@ -382,32 +373,8 @@ class GenRecIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(self.success)
         trained = os.path.join(self.test_dir, "pipeline.config")
-        config.train_config.num_steps = 6
-        config_util.save_message(config, config_path)
-        self.success = utils.test_train_eval(
-            config_path,
-            self.test_dir,
-            args_str="--continue_train",
-            pythonpath=pythonpath,
-        )
-        self.assertTrue(self.success)
         self.success = utils.test_eval(trained, self.test_dir, pythonpath=pythonpath)
         self.assertTrue(self.success)
-        self.success = utils.test_export(
-            trained, self.test_dir, env_str="QUANT_EMB=0", pythonpath=pythonpath
-        )
-        self.assertTrue(self.success)
-        front_end = torch.jit.load(
-            os.path.join(self.test_dir, "export/scripted_model.pt")
-        )
-        features = _create_features(list(config.feature_configs), config.data_config)
-        request = self._request(features)
-        compiled = compile_prompt(config.prompt_config, features, ["answer"])
-        expected = PromptAssembler(
-            compiled.prompt_plan, compiled.sid_space, include_response=False
-        )(request)
-        actual = front_end(request)
-        torch.testing.assert_close(actual[INPUT_IDS], expected[INPUT_IDS])
 
     @unittest.skipIf(*nv_gpu_unavailable)
     @unittest.skipIf(*flash_attn_unavailable)

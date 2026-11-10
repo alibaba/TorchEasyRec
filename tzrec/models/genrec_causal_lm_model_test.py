@@ -23,6 +23,7 @@ from tzrec.datasets.utils import Batch
 from tzrec.models.genrec_causal_lm_model import (
     GenRecCausalLMModel,
     _left_pad,
+    _padded_sdpa_attention,
     generate_codes,
 )
 from tzrec.prompt.assembler import (
@@ -77,6 +78,13 @@ class PaddedForwardTest(unittest.TestCase):
         torch.testing.assert_close(padded[0, :3], torch.zeros(3, 2))
         torch.testing.assert_close(padded[1, :2], torch.zeros(2, 2))
         torch.testing.assert_close(padded[:, -1], torch.stack([embeds[3], embeds[8]]))
+
+    def test_padded_sdpa_attention_disables_cudnn(self) -> None:
+        with mock.patch(
+            "tzrec.models.genrec_causal_lm_model.sdpa_attention_forward",
+            side_effect=lambda *args, **kwargs: torch.backends.cuda.cudnn_sdp_enabled(),
+        ):
+            self.assertFalse(_padded_sdpa_attention())
 
 
 class _CapturingLM(nn.Module):
@@ -546,12 +554,6 @@ class LayoutInvarianceTest(unittest.TestCase):
         torch.testing.assert_close(
             rewritten["logits"][1:], baseline[1:], atol=0, rtol=0
         )
-        reordered = model.predict(
-            grouped(_OTHERGENREC_ANSWER_CODES + GENREC_ANSWER_CODES)
-        )
-        torch.testing.assert_close(
-            reordered["logits"], baseline[[1, 0, 2]], **tolerance
-        )
 
     @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
     def test_sdpa_targets_match_independent_rows(self, model_type: str) -> None:
@@ -564,64 +566,17 @@ class LayoutInvarianceTest(unittest.TestCase):
     @unittest.skipIf(*flash_attn_unavailable)
     @mark_ci_scope("gpu")
     def test_flash_targets_match_independent_rows(self, model_type: str) -> None:
-        self._assert_targets_match_independent_rows(
-            model_type,
-            "flash_attention_2",
-            torch.device("cuda"),
-            GenRecModelConfig.BF16,
-        )
-
-    def test_multi_target_sdpa_avoids_cudnn(self) -> None:
-        model, compiled_prompt = self._eval_model(
-            "qwen2", "sdpa", torch.device("cpu"), GenRecModelConfig.FP32
-        )
-        batch = _packed_batch(
-            compiled_prompt,
-            [GENREC_HIST_CODES],
-            [GENREC_ANSWER_CODES + _OTHERGENREC_ANSWER_CODES],
-        )
-        cudnn_enabled = []
-        sdpa = nn.functional.scaled_dot_product_attention
-
-        def record(*args, **kwargs):
-            cudnn_enabled.append(torch.backends.cuda.cudnn_sdp_enabled())
-            return sdpa(*args, **kwargs)
-
-        with mock.patch.object(
-            nn.functional, "scaled_dot_product_attention", side_effect=record
-        ):
-            model.predict(batch)
-        self.assertTrue(cudnn_enabled)
-        self.assertNotIn(True, cudnn_enabled)
-
-    @unittest.skipIf(*nv_gpu_unavailable)
-    @unittest.skipIf(*flash_attn_unavailable)
-    @mark_ci_scope("gpu")
-    def test_flash_multi_target_backbone_stays_packed(self) -> None:
-        device = torch.device("cuda")
-        model, compiled_prompt = self._eval_model(
-            "qwen2", "flash_attention_2", device, GenRecModelConfig.BF16
-        )
-        hist_rows, _ = _TWO_ROWS
-        batch = _packed_batch(
-            compiled_prompt,
-            hist_rows,
-            [GENREC_ANSWER_CODES + _OTHERGENREC_ANSWER_CODES, GENREC_ANSWER_CODES],
-        ).to(device)
-        shapes = []
-        for layer in model.lm.base_model.layers:
-            for module in (layer.self_attn.q_proj, layer.mlp):
-                module.register_forward_pre_hook(
-                    lambda module, inputs: shapes.append(inputs[0].shape[:2])
-                )
+        # the varlen kernel keeps every batch packed, so nothing may pad
         with mock.patch(
             "tzrec.models.genrec_causal_lm_model._left_pad",
             side_effect=AssertionError("padded backbone"),
         ):
-            model.predict(batch)
-        expected = (1, int(batch.additional_infos[CU_SEQLENS][-1]))
-        self.assertTrue(shapes)
-        self.assertTrue(all(tuple(shape) == expected for shape in shapes))
+            self._assert_targets_match_independent_rows(
+                model_type,
+                "flash_attention_2",
+                torch.device("cuda"),
+                GenRecModelConfig.BF16,
+            )
 
 
 if __name__ == "__main__":

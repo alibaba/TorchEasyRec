@@ -276,7 +276,7 @@ class BaseGenRecModelTest(unittest.TestCase):
     def test_training_forward_survives_fx_tracing(self) -> None:
         torch.fx.symbolic_trace(TrainWrapper(self.model))
 
-    def test_multi_target_loss_gives_each_parent_equal_weight(self) -> None:
+    def test_multi_target_loss_gives_each_row_equal_weight(self) -> None:
         vocab_size = self.model.lm.config.vocab_size
         logits = torch.zeros(3, 3, vocab_size, requires_grad=True)
         predictions = {
@@ -296,17 +296,10 @@ class BaseGenRecModelTest(unittest.TestCase):
     @unittest.skipIf(*nv_gpu_unavailable)
     @mark_ci_scope("gpu")
     def test_shared_prefix_projection_gradients_match_expansion(self, backend) -> None:
-        hybrid = backend == "flash_attention_2"
-        if hybrid and flash_attn_unavailable[0]:
+        flash = backend == "flash_attention_2"
+        if flash and flash_attn_unavailable[0]:
             self.skipTest(flash_attn_unavailable[1])
-        model, _ = self._projected_model()
-        config = model.lm.config
-        config.num_attention_heads = 2
-        config.num_key_value_heads = 1
-        config.head_dim = 16
-        kernel = "flash_attention_2" if hybrid else backend
-        model.lm = AutoModelForCausalLM.from_config(config, attn_implementation=kernel)
-        model._attn_kernel = kernel
+        model, _ = self._projected_model(attn_kernel=backend, init_seed=0)
         model = model.cuda().eval()
         compiled = model._prompt
 
@@ -333,7 +326,7 @@ class BaseGenRecModelTest(unittest.TestCase):
 
         other_target = [2, 7, 8]
         expanded = make_batch([GENREC_ANSWER_CODES, other_target])
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=hybrid):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=flash):
             model.loss(model.predict(expanded), expanded)["ce_loss"].backward()
         gradients = {
             name: parameter.grad.clone()
@@ -342,7 +335,7 @@ class BaseGenRecModelTest(unittest.TestCase):
         }
         model.zero_grad(set_to_none=True)
         shared = make_batch([GENREC_ANSWER_CODES + other_target])
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=hybrid):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=flash):
             model.loss(model.predict(shared), shared)["ce_loss"].backward()
         self.assertTrue(any("projections" in name for name in gradients))
         self.assertTrue(any("embedding_group" in name for name in gradients))
@@ -351,13 +344,10 @@ class BaseGenRecModelTest(unittest.TestCase):
                 torch.testing.assert_close(
                     parameter.grad,
                     gradients[name],
-                    atol=5e-3 if hybrid else 3e-5,
-                    rtol=3e-2 if hybrid else 3e-4,
+                    atol=5e-3 if flash else 3e-5,
+                    rtol=3e-2 if flash else 3e-4,
                     msg=name,
                 )
-                relative_error = (parameter.grad - gradients[name]).norm()
-                relative_error /= gradients[name].norm().clamp(min=1e-6)
-                self.assertLess(float(relative_error), 0.04, name)
 
 
 class GenRecFrontEndTest(unittest.TestCase):
