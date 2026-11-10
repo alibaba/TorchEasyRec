@@ -239,17 +239,20 @@ def _validate_eval_initializer_for_tombstones(
 
 
 def _dynamicemb_effective_cache_ratio(
-    allocated_fraction: float,
+    cache_load_factor: Optional[float],
     caching: bool,
     stats: Optional[Any] = None,
 ) -> float:
-    """Estimate HBM hits from the allocated share or measured cache misses."""
-    x = max(0.0, min(1.0, float(allocated_fraction)))
-    if not caching and x in (0.0, 1.0):
-        return x
+    """Estimate HBM hits from the candidate's load factor or measured cache misses."""
+    x = float(cache_load_factor) if cache_load_factor is not None else 0.0
+    x = max(0.0, min(1.0, x))
     if caching and stats is not None:
         miss_rate = float(stats.expected_miss_rate(x))
         return max(0.0, min(1.0, 1.0 - miss_rate))
+    if x >= 1.0:
+        return 1.0
+    if not caching and cache_load_factor == 0.0:
+        return 0.0
     base = _DYNAMICEMB_CACHING_X_EFF_BASE if caching else _DYNAMICEMB_HYBRID_X_EFF_BASE
     return base + _DYNAMICEMB_X_EFF_TIEBREAK * x
 
