@@ -62,31 +62,24 @@ DYNAMICEMB_CACHE_BUCKET_CAPACITY = 1024
 _DYNAMICEMB_CACHE_OVERFLOW_BUCKETS = 3
 
 
-class DynamicEmbTableMemory(NamedTuple):
-    """Physical per-shard capacities of one dynamicemb candidate.
+class DynamicEmbTableStorage(NamedTuple):
+    """Per-shard capacities and table storage costs of one dynamicemb candidate.
 
     Fields:
-        hbm_values: value+optimizer bytes in HBM (cache tier plus its overflow
-            area for CACHING).
-        host_values: value+optimizer bytes on the host (full backing table for
-            CACHING, remainder partition for HYBRID).
-        hbm_index: HBM hash-map metadata bytes: per-slot key/digest/score
-            words and reference counters, plus per-bucket size counters.
-            Host tiers keep their key maps on HBM too.
-        hbm_rows: HBM value rows including the cache overflow area.
-        host_rows: host value rows.
-        resident_rows: rows credited toward normal cache residency -- the cache
-            tier without its overflow area (all HBM value rows otherwise).
-        local_hbm_for_values: requested value bytes, before physical tier rounding.
+        resident_rows: normal GPU cache capacity for CACHING, excluding its
+            overflow area; GPU partition capacity for other placements.
+        backing_rows: full backing-table capacity for CACHING; backing
+            partition capacity for HYBRID.
+        local_hbm_for_values: requested GPU value+optimizer bytes for the
+            runtime, before physical bucket rounding.
+        storage: table-only HBM/DDR/SSD costs, excluding admission counters,
+            pipeline I/O and any shared backend overhead.
     """
 
-    hbm_values: int
-    host_values: int
-    hbm_index: int
-    hbm_rows: int
-    host_rows: int
     resident_rows: int
+    backing_rows: int
     local_hbm_for_values: int
+    storage: Storage
 
     @classmethod
     def from_options(
@@ -95,7 +88,7 @@ class DynamicEmbTableMemory(NamedTuple):
         options: "dynamicemb.DynamicEmbTableOptions",
         *,
         ratio: float,
-    ) -> "DynamicEmbTableMemory":
+    ) -> "DynamicEmbTableStorage":
         """Estimate the value budget and physical HBM and DDR bytes for one shard.
 
         The options carry the aligned per-rank max_capacity; the tensor supplies
@@ -191,7 +184,10 @@ class DynamicEmbTableMemory(NamedTuple):
                 if ratio == 1:
                     index = max(index, full_index)
         return cls(
-            hbm * row_bytes, host * row_bytes, index, hbm, host, resident, budget
+            resident_rows=resident,
+            backing_rows=host,
+            local_hbm_for_values=budget,
+            storage=Storage(hbm=hbm * row_bytes + index, ddr=host * row_bytes, ssd=0),
         )
 
 
@@ -738,7 +734,7 @@ if has_dynamicemb:
                 optimizer_kwargs = getattr(tensor, "_optimizer_kwargs", [{}])[0]
                 dynamicemb_options.training = optimizer_class is not None
                 dynamicemb_options.local_hbm_for_values = (
-                    sharding_option.dynamicemb_memory.local_hbm_for_values
+                    sharding_option.dynamicemb_storage.local_hbm_for_values
                 )
                 # Fill in per-shard fields that used to be populated by
                 # dynamicemb's internal ``_get_dynamicemb_options_per_table``.
@@ -902,7 +898,7 @@ if has_dynamicemb:
         local_world_size: int,
         input_lengths: List[float],
         num_poolings: List[float],
-        dynamicemb_memory: DynamicEmbTableMemory,
+        dynamicemb_storage: DynamicEmbTableStorage,
         dynamicemb_options: dynamicemb.DynamicEmbTableOptions,
         is_pooled: bool,
         input_data_type_size: float,
@@ -941,7 +937,8 @@ if has_dynamicemb:
             is_inference: bool, whether the model is for inference.
             multipass_prefetch_max_pass (int): multipass prefetch max_pass
             dynamicemb_options (DynamicEmbTableOptions): dynamic embedding options.
-            dynamicemb_memory: capacity shared by all row-wise shards of this candidate.
+            dynamicemb_storage (DynamicEmbTableStorage): capacities and table
+                storage costs shared by all row-wise shards of this candidate.
 
         Returns:
             List[Storage]: storage object for each device in topology.
@@ -973,10 +970,10 @@ if has_dynamicemb:
             slots = _bucket_rounded_rows(counter.capacity, width)
             counter_hbm_specific_size = _keymap_bytes(slots, width, score_words=1)
 
+        table_storage = dynamicemb_storage.storage
         return [
             Storage(
-                hbm=dynamicemb_memory.hbm_values
-                + dynamicemb_memory.hbm_index
+                hbm=table_storage.hbm
                 + counter_hbm_specific_size
                 + shard_estimators.calculate_pipeline_io_cost(
                     input_size=input_size,
@@ -987,7 +984,8 @@ if has_dynamicemb:
                     count_ephemeral_storage_cost=count_ephemeral_storage_cost,
                     is_inference=is_inference,
                 ),
-                ddr=dynamicemb_memory.host_values,
+                ddr=table_storage.ddr,
+                ssd=table_storage.ssd,
             )
             for input_size, output_size in zip(input_sizes, output_sizes)
         ]
