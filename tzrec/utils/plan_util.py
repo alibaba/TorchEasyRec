@@ -1011,14 +1011,10 @@ def _emit_dynamicemb_variants(
     only the resident and backing rows. The DP proposer uses the candidates'
     HBM and host costs to select a plan.
 
-    With RocksDB planning, the built-in zero and partial non-caching (HYBRID)
-    budgets are excluded -- HybridStorage re-splits rows between its tiers
-    on load, so a near-capacity table overflows hash buckets and loses rows
-    on every restore -- while the full endpoint stays (its host tier is
-    empty). Eligible tables additionally get CACHING_PS candidates on one
-    geometric grid of ten ratios from the working-set floor up to ``0.5``,
-    both endpoints included; a floor above ``0.5`` leaves the table without
-    RocksDB candidates. DynamicEmb preserves each table's value budget
+    With RocksDB planning, eligible tables additionally get CACHING_PS
+    candidates on one geometric grid of ten ratios from the working-set floor
+    up to ``0.5``, both endpoints included. A floor above ``0.5`` leaves the
+    table without RocksDB candidates. DynamicEmb preserves each table's value budget
     when fusing tables with different ratios.
 
     The caller supplies base_option.dynamicemb_options. Each emitted option
@@ -1058,12 +1054,6 @@ def _emit_dynamicemb_variants(
             (True, r, None) for r in _dynamicemb_partial_ratios(max(floor, 0.1))
         )
         requests.append((False, 1.0, None))
-        if allow_rocksdb:
-            requests = [
-                (caching, ratio, storage)
-                for caching, ratio, storage in requests
-                if caching or ratio == 1.0
-            ]
     else:
         ratio = float(params.load_factor)
         requests = [(False, ratio, None)]

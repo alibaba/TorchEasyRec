@@ -1422,11 +1422,6 @@ class RocksDBPlannerTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_memory_table_layouts(self, _, input_lengths, rows):
-        # With RocksDB planning the built-in family keeps only the layouts
-        # every restore preserves -- partial CACHING plus the full endpoint
-        # with its empty host tier; no zero or partial HYBRID. The RocksDB
-        # CACHING_PS candidates span one geometric grid whose lower
-        # endpoint the working-set floor sets.
         model, constraints = _model_and_constraints(
             {"a": (rows, 64, {}, input_lengths[0])}
         )
@@ -1438,12 +1433,31 @@ class RocksDBPlannerTest(unittest.TestCase):
             allow_rocksdb=True,
         )
         options = enumerator.enumerate(model, plan_util.get_default_sharders())
-        for o in options:
-            if not rocksdb_util.is_rocksdb_options(o.dynamicemb_options):
-                self.assertTrue(
-                    o.dynamicemb_options.caching or o.cache_params.load_factor == 1.0,
-                    "only CACHING and the full endpoint stay in memory",
+        ordinary_options = plan_util.EmbeddingEnumerator(
+            topology=topology,
+            batch_size=128,
+            fqn_constraints=constraints,
+            allow_rocksdb=False,
+        ).enumerate(model, plan_util.get_default_sharders())
+        self.assertEqual(
+            [
+                (
+                    o.dynamicemb_options.caching,
+                    o.cache_load_factor,
+                    o.dynamicemb_storage,
                 )
+                for o in options
+                if not rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
+            ],
+            [
+                (
+                    o.dynamicemb_options.caching,
+                    o.cache_load_factor,
+                    o.dynamicemb_storage,
+                )
+                for o in ordinary_options
+            ],
+        )
         ps = [
             o for o in options if rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
         ]
@@ -1630,6 +1644,8 @@ class RocksDBPlannerTest(unittest.TestCase):
         perf = {}
         for o in options:
             rocksdb = rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
+            if not rocksdb and not o.dynamicemb_options.caching:
+                continue
             perf[(rocksdb, float(o.cache_load_factor))] = o.total_perf
         ps_ratios = sorted(r for rocksdb, r in perf if rocksdb)
         linear = sorted(r for rocksdb, r in perf if not rocksdb)
