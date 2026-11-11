@@ -46,46 +46,6 @@ from tzrec.utils.test_util import (
 )
 
 
-class PlannerHostMemoryTest(unittest.TestCase):
-    """The planner sizes its DDR budget by container RAM less a reserve.
-
-    ``HOST_MEMORY_RESERVE_PERCENT`` (default 0.15) holds back host RAM for
-    everything but embeddings; zero reserve disables only the margin,
-    never the container limit.
-    """
-
-    @parameterized.expand(
-        [
-            param("default_reserve", env=None, reserve=0.15),
-            param("explicit_reserve", env="0.5", reserve=0.5),
-            param("zero_reserve", env="0.0", reserve=0.0),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_reserve(self, _, env, reserve):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        environ = dict(os.environ)
-        environ.pop("HOST_MEMORY_RESERVE_PERCENT", None)
-        if env is not None:
-            environ["HOST_MEMORY_RESERVE_PERCENT"] = env
-        container = 100 << 30
-        with (
-            mock.patch.dict(os.environ, environ, clear=True),
-            mock.patch.object(
-                resource_util,
-                "_container_memory_limit_bytes",
-                return_value=container,
-            ),
-            mock.patch.object(plan_util, "get_local_size", return_value=1),
-            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
-        ):
-            planner = plan_util.create_planner(device, batch_size=8, model=nn.Module())
-            self.assertEqual(
-                planner._topology.devices[0].storage.ddr,
-                int(container * (1 - reserve)),
-            )
-
-
 class PlanUtilTest(unittest.TestCase):
     def setUp(self):
         self.maxDiff = None
@@ -416,6 +376,43 @@ class PlanUtilTest(unittest.TestCase):
         )
         # planning must not mutate the model's own constraint objects
         self.assertIsNone(constraint.sharding_types)
+
+    @parameterized.expand(
+        [
+            param("default_reserve", env=None, reserve=0.15),
+            param("explicit_reserve", env="0.5", reserve=0.5),
+            param("zero_reserve", env="0.0", reserve=0.0),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_host_memory_reserve(self, _, env, reserve):
+        """The planner sizes its DDR budget by container RAM less a reserve.
+
+        ``HOST_MEMORY_RESERVE_PERCENT`` (default 0.15) holds back host RAM
+        for everything but embeddings; zero reserve disables only the
+        margin, never the container limit.
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        environ = dict(os.environ)
+        environ.pop("HOST_MEMORY_RESERVE_PERCENT", None)
+        if env is not None:
+            environ["HOST_MEMORY_RESERVE_PERCENT"] = env
+        container = 100 << 30
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(
+                resource_util,
+                "_container_memory_limit_bytes",
+                return_value=container,
+            ),
+            mock.patch.object(plan_util, "get_local_size", return_value=1),
+            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
+        ):
+            planner = plan_util.create_planner(device, batch_size=8, model=nn.Module())
+            self.assertEqual(
+                planner._topology.devices[0].storage.ddr,
+                int(container * (1 - reserve)),
+            )
 
     @unittest.skipUnless(
         torch.cuda.is_available(), "CUDA is required for create_planner."

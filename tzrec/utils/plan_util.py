@@ -97,13 +97,12 @@ def create_planner(
     global_constraints_cfg: Optional[feature_pb2.ParameterConstraints] = None,
     model: Optional[nn.Module] = None,
 ) -> EmbeddingShardingPlanner:
-    """Create EmbeddingShardingPlanner.
+    """Create an embedding sharding planner.
 
-    Host memory per rank is the container's (cgroup-capped) RAM less
-    ``HOST_MEMORY_RESERVE_PERCENT`` (default 0.15) for everything but
-    embeddings, split among the host's ranks; the margin applies to every
-    configuration. ``STORAGE_RESERVE_PERCENT`` (default 0.15) holds back
-    GPU memory the same way.
+    Builds the hardware topology and storage reservation, resolves
+    per-table and global constraints, applies applicable sharding
+    constraints from a saved checkpoint plan, and configures the
+    enumerator and proposers.
     """
     if global_constraints_cfg is not None and (
         global_constraints_cfg.HasField("pooling_factor")
