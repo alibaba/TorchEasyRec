@@ -42,7 +42,7 @@ class HostMemoryCapacityTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            param("default_reserve", reserve=0.15, lws=8, files={}, total=1 << 40),
+            param("positive_reserve", reserve=0.15, lws=8, files={}, total=1 << 40),
             param("explicit_reserve", reserve=0.5, lws=8, files={}, total=1 << 40),
             param("zero_reserve", reserve=0.0, lws=8, files={}, total=1 << 40),
             param(

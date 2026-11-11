@@ -379,7 +379,7 @@ class PlanUtilTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            param("default_reserve", env=None, reserve=0.15),
+            param("default_reserve", env=None, reserve=0.0),
             param("explicit_reserve", env="0.5", reserve=0.5),
             param("zero_reserve", env="0.0", reserve=0.0),
         ],
@@ -388,7 +388,7 @@ class PlanUtilTest(unittest.TestCase):
     def test_host_memory_reserve(self, _, env, reserve):
         """The planner sizes its DDR budget by container RAM less a reserve.
 
-        ``HOST_MEMORY_RESERVE_PERCENT`` (default 0.15) holds back host RAM
+        ``HOST_MEMORY_RESERVE_PERCENT`` (default 0.0) can hold back host RAM
         for everything but embeddings; zero reserve disables only the
         margin, never the container limit.
         """

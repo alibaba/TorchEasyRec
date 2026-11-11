@@ -121,7 +121,7 @@ def create_planner(
     if torch.cuda.is_available():
         topo_kwargs["hbm_cap"] = torch.cuda.get_device_properties(device).total_memory
 
-    host_reserve_percent = float(os.environ.get("HOST_MEMORY_RESERVE_PERCENT", 0.15))
+    host_reserve_percent = float(os.environ.get("HOST_MEMORY_RESERVE_PERCENT", 0.0))
     topo_kwargs["ddr_cap"] = resource_util.host_memory_capacity_per_rank(
         local_world_size=local_world_size,
         reserve_percent=host_reserve_percent,
