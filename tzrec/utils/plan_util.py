@@ -152,11 +152,6 @@ def create_planner(
             else None,
             reserve_bytes=rocksdb_util.SSD_RESERVE_BYTES,
         )
-    else:
-        # Ordinary configurations never see SSD-billed shards, but an
-        # explicit zero keeps the default 2 TiB placeholder out of the
-        # topology.
-        topo_kwargs["ssd_cap"] = 0
     if "INTRA_NODE_BANDWIDTH" in os.environ:
         topo_kwargs["intra_host_bw"] = float(os.environ["INTRA_NODE_BANDWIDTH"])
     if "CROSS_NODE_BANDWIDTH" in os.environ:
@@ -174,7 +169,6 @@ def create_planner(
     storage_reserve_percent = 0.15
     if "STORAGE_RESERVE_PERCENT" in os.environ:
         storage_reserve_percent = float(os.environ["STORAGE_RESERVE_PERCENT"])
-
     storage_reservation = HeuristicalStorageReservation(
         percentage=storage_reserve_percent
     )
