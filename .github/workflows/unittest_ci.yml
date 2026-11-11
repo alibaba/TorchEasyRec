@@ -5,32 +5,25 @@ on:
     types: [opened, reopened, synchronize]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: unittest-ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
+  dsw-test:
+    uses: alibaba/TorchEasyRec/.github/workflows/dsw_ci.yml@master
+    with:
+      lane: gpu
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
   ci-test:
-    runs-on: tzrec-runner
-    container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5
-      options: --gpus all --ipc host --ulimit memlock=-1
+    needs: dsw-test
+    if: always()
+    runs-on: ubuntu-latest
     steps:
-      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: run_${{ github.run_id }}
-      - name: RunUnitTestCI
-        id: run_unittest_ci
-        run: |
-          CACHE_ROOT="/__w/TorchEasyRec/tzrec-ci-cache"
-          mkdir -p "$CACHE_ROOT/triton" "$CACHE_ROOT/inductor"
-          cd run_${{ github.run_id }}
-          # GHA overrides HOME to /github/home, hiding the image's warm pip cache.
-          PIP_CACHE_DIR=/root/.cache/pip \
-          TRITON_CACHE_DIR="$CACHE_ROOT/triton" \
-          TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/inductor" \
-          LD_LIBRARY_PATH=/usr/local/cuda-13/compat \
-          CUDA_HOME=/usr/local/cuda-13 \
-          bash scripts/ci/ci_test.sh --scope gpu
+      - name: Require the DSW test job to succeed
+        env:
+          TEST_RESULT: ${{ needs.dsw-test.result }}
+        run: test "$TEST_RESULT" = success
