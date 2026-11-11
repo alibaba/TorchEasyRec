@@ -667,7 +667,7 @@ class RocksDBTableTest(unittest.TestCase):
     def _constraints(self, *pooling, **kwargs):
         kwargs.setdefault("score_strategy", "NO_EVICTION")
         cfg = feature_pb2.DynamicEmbedding(max_capacity=self.NUM_EMBEDDINGS, **kwargs)
-        return dynamicemb_util.build_dynamicemb_constraints(
+        constraint = dynamicemb_util.build_dynamicemb_constraints(
             cfg,
             EmbeddingBagConfig(
                 name="dyn_table",
@@ -675,8 +675,10 @@ class RocksDBTableTest(unittest.TestCase):
                 embedding_dim=self.EMBEDDING_DIM,
                 feature_names=["user_id"],
             ),
-            *pooling,
         )
+        if pooling:
+            constraint.pooling_factors = list(pooling)
+        return constraint
 
     def test_constraints(self):
         # A feature's ids per sample reach the planner's lookup estimate; the

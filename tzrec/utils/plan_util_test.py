@@ -1342,11 +1342,12 @@ def _model_and_constraints(tables):
             feature_names=[f"f_{name}"],
         )
         configs.append(config)
-        constraints[f"sparse.ebc.{name}"] = build_dynamicemb_constraints(
-            feature_pb2.DynamicEmbedding(max_capacity=rows, **fields),
-            config,
-            *pooling,
+        constraint = build_dynamicemb_constraints(
+            feature_pb2.DynamicEmbedding(max_capacity=rows, **fields), config
         )
+        if pooling:
+            constraint.pooling_factors = list(pooling)
+        constraints[f"sparse.ebc.{name}"] = constraint
     return TestSparseNN(tables=configs, sparse_device=torch.device("meta")), constraints
 
 
@@ -1642,7 +1643,6 @@ class RocksDBPlannerTest(unittest.TestCase):
                         name="a",
                         feature_names=["f_a"],
                     ),
-                    1.0,
                 )
             },
             allow_rocksdb=True,
