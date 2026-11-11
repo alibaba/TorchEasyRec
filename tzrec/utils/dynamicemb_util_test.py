@@ -724,6 +724,10 @@ class RocksDBTableTest(unittest.TestCase):
         indexed = strategy == "STEP"
         index_bytes = index_entry_bytes() if indexed else 0
         meta = metadata_cache_bytes(rows, row_bytes, indexed)
+        writeback = memory.resident_rows * row_bytes
+        live_growth = math.ceil(
+            rocksdb_util.SST_FACTOR * rows * (row_bytes + index_bytes)
+        )
         for storage in storages:
             # The GPU cache tier alone on HBM -- its values and key maps,
             # without the backing table's map, which stays in the database
@@ -731,15 +735,23 @@ class RocksDBTableTest(unittest.TestCase):
             self.assertGreaterEqual(storage.hbm, memory.hbm_values)
             self.assertLess(storage.hbm, memory.hbm_values + memory.hbm_index)
             self.assertEqual(storage.ddr, meta)
-            self.assertGreaterEqual(
-                storage.ssd,
-                math.ceil(rocksdb_util.SST_FACTOR * rows * (row_bytes + index_bytes)),
-            )
+            # Saving flushes the cache before the export: the charged SSD
+            # covers the live table's growth plus that writeback.
+            self.assertGreaterEqual(storage.ssd, live_growth + writeback)
+        # With the full shared allowance -- compaction headroom, other DB
+        # files and this shard's restore spill -- the charged budget also
+        # covers the restoring phase's spill on top of the save bound.
+        activation = rocksdb_util.activation_storage(
+            local_world_size=1, restore_spill_bytes=rows * row_bytes
+        )
+        charged = storages[0].ssd + activation.ssd
+        self.assertGreaterEqual(charged, live_growth + writeback + rows * row_bytes)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required.")
     def test_fused_cache_matches_the_plan(self):
-        # Tables of different widths planned at one ratio fuse, and every
-        # table's cache gets exactly the planned rows.
+        # Tables of different widths planned at different ratios still
+        # fuse, and every table keeps the cache capacity its own planned
+        # budget buys -- the planner's DynamicEmbTableMemory estimate.
         from dynamicemb import (
             DynamicEmbPoolingMode,
             DynamicEmbScoreStrategy,
@@ -755,22 +767,26 @@ class RocksDBTableTest(unittest.TestCase):
         test_dir = make_test_dir()
         config = BackendConfig(32 << 20, 32 << 20, 1 << 20, 64 << 20, io_threads=2)
         session = RocksDBSession(config, os.path.join(test_dir, "db"))
-        ratio, tables = 0.01, [(300_000, 16), (700_000, 48)]
-        options = [
-            DynamicEmbTableOptions(
+        ratios, tables = [0.01, 0.04], [(300_000, 16), (700_000, 48)]
+        options, estimates = [], []
+        for i, ((rows, dim), ratio) in enumerate(zip(tables, ratios)):
+            option = DynamicEmbTableOptions(
                 dim=dim,
                 max_capacity=rows,
                 index_type=torch.int64,
                 embedding_dtype=torch.float32,
                 device_id=0,
                 caching=True,
-                # what the sharding plan sets for an Adam table (2 x dim state)
-                local_hbm_for_values=math.ceil(ratio * rows * 3 * dim * 4),
                 score_strategy=DynamicEmbScoreStrategy.STEP,
                 external_storage=RocksDBStorageFactory(config, f"m.t{i}", session),
             )
-            for i, (rows, dim) in enumerate(tables)
-        ]
+            # An Adam table carries 2 x dim optimizer state per row.
+            tensor = torch.empty(rows, dim)
+            tensor._optimizer_classes = [optimizers.Adam]
+            memory = DynamicEmbTableMemory.from_options(tensor, option, ratio=ratio)
+            option.local_hbm_for_values = memory.local_hbm_for_values
+            options.append(option)
+            estimates.append(memory.resident_rows)
         self.assertEqual(options[0], options[1])
         module = BatchedDynamicEmbeddingTablesV2(
             table_options=options,
@@ -782,7 +798,7 @@ class RocksDBTableTest(unittest.TestCase):
         try:
             self.assertEqual(
                 list(module.cache._state.key_index_map.per_table_capacity_),
-                [rocksdb_util.cache_rows(rows, ratio) for rows, _ in tables],
+                estimates,
             )
         finally:
             session.close()

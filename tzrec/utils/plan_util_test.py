@@ -1485,35 +1485,17 @@ class RocksDBPlannerTest(unittest.TestCase):
             o for o in options if rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
         ]
         required = math.ceil(128 * input_lengths[0])
-        expected = sorted(
-            {float(r) for r in np.geomspace(required / rows, 0.5, num=10)}
-        )
-        self.assertEqual(
-            sorted(o.dynamicemb_options.external_storage.cache_ratio for o in ps),
-            expected,
-        )
+        self.assertTrue(ps)
         for o in ps:
             # The working-set floor holds in the rows the runtime would
-            # actually allocate, and the factory keeps the planned ratio.
+            # actually allocate, and each factory carries its table's own
+            # namespace from construction.
             self.assertGreaterEqual(o.dynamicemb_memory.resident_rows, required)
             self.assertLess(o.dynamicemb_memory.resident_rows, rows)
-            twin = plan_util._ratio_keyed_factory_cls()(
-                None,
-                "",
-                cache_ratio=o.dynamicemb_options.external_storage.cache_ratio,
+            self.assertEqual(
+                o.dynamicemb_options.external_storage.table_namespace,
+                "sparse.ebc.a",
             )
-            # Same-ratio factories fuse into one group, where DynamicEmb
-            # keeps every member's planned ratio.
-            self.assertEqual(o.dynamicemb_options.external_storage, twin)
-            self.assertEqual(hash(o.dynamicemb_options.external_storage), hash(twin))
-        for i, o in enumerate(ps):
-            for other in ps[i + 1 :]:
-                # Different ratios must not fuse: one group's shared ratio
-                # would redistribute a planned cache budget.
-                self.assertNotEqual(
-                    o.dynamicemb_options.external_storage,
-                    other.dynamicemb_options.external_storage,
-                )
 
     def test_all_in_memory(self):
         _, offloaded, planner = self._plan_with_ssd_room(
@@ -1552,13 +1534,15 @@ class RocksDBPlannerTest(unittest.TestCase):
         for name, o in offloaded.items():
             factory = o.external_storage
             self.assertEqual(factory.table_namespace, f"sparse.ebc.{name}")
-            # DynamicEmb sizes a fused group's cache with its budget over
-            # its value bytes: the budget must be exactly a planned ratio's
-            # requested bytes (SGD carries no optimizer state).
-            self.assertEqual(
-                o.local_hbm_for_values,
-                int(factory.cache_ratio * o.max_capacity * o.dim * 4),
-            )
+            # The fused group keeps each table's own budget: the runtime
+            # budget must be exactly one planned grid ratio's requested
+            # bytes (SGD carries no optimizer state).
+            rows, required = o.max_capacity, 128
+            budgets = {
+                int(r * rows * o.dim * 4)
+                for r in np.geomspace(required / rows, 0.5, num=10)
+            }
+            self.assertIn(o.local_hbm_for_values, budgets)
         # No temporary DDR deduction: the topology keeps its original caps.
         self.assertEqual(planner._topology.devices[0].storage.ddr, int(4.75 * GIB))
 
@@ -1604,16 +1588,21 @@ class RocksDBPlannerTest(unittest.TestCase):
         if required > rows // 2:
             self.assertEqual(ps, [], "a floor above half the table offloads nothing")
             return
-        ratios = sorted(o.dynamicemb_options.external_storage.cache_ratio for o in ps)
+        # The grid maps to the requested byte budgets (SGD carries no
+        # optimizer state, so one value row is dim * 4 bytes).
         expected = sorted(
-            {float(r) for r in np.geomspace(required / rows, 0.5, num=10)}
+            {int(r * rows * 64 * 4) for r in np.geomspace(required / rows, 0.5, num=10)}
         )
-        self.assertEqual(ratios, expected)
+        self.assertEqual(
+            sorted(o.dynamicemb_memory.local_hbm_for_values for o in ps), expected
+        )
         if required * 2 == rows:
-            self.assertEqual(ratios, [0.5], "equal endpoints leave one candidate")
+            self.assertEqual(
+                expected, [int(0.5 * rows * 256)], "equal endpoints leave one candidate"
+            )
         if factor == 1024.0:
             # The lower endpoint holds exactly the required capacity.
-            self.assertEqual(rocksdb_util.cache_rows(rows, 5 / 128), required)
+            self.assertEqual(ps[0].dynamicemb_memory.resident_rows, required)
         for o in ps:
             self.assertGreaterEqual(o.dynamicemb_memory.resident_rows, required)
             self.assertLess(o.dynamicemb_memory.resident_rows, rows)

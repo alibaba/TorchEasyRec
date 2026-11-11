@@ -31,7 +31,6 @@ charged once when a plan uses RocksDB) and the runtime lifecycle.
 import dataclasses
 import glob
 import hashlib
-import math
 import os
 import shutil
 import time
@@ -54,10 +53,6 @@ _HOST_OVERHEAD_BYTES = 2 << 30
 WRITE_BUFFER_BYTES = 1 << 30
 STAGING_BUFFER_BYTES = 256 << 20
 BLOCK_CACHE_DATA_BYTES = 1 << 30
-# DynamicEmb sizes GPU caches in buckets of this many rows, beside an overflow
-# area of three buckets per table.
-CACHE_BUCKET_ROWS = 1024
-CACHE_OVERFLOW_ROWS = 3 * CACHE_BUCKET_ROWS
 
 # SST bytes per logical byte (uncompressed rows; 1.02-1.05 measured on a
 # 0.6 TB table set after sorted ingest and a day of training).
@@ -125,14 +120,6 @@ def is_rocksdb_options(options: Optional["DynamicEmbTableOptions"]) -> bool:
     from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
 
     return isinstance(options.external_storage, RocksDBStorageFactory)
-
-
-def cache_rows(rows: int, ratio: float) -> int:
-    """GPU cache rows DynamicEmb allocates for a table at ``ratio``."""
-    if ratio <= 0:
-        return 0
-    rows = max(1, int(rows * ratio))
-    return int(math.ceil(rows / CACHE_BUCKET_ROWS) * CACHE_BUCKET_ROWS)
 
 
 def rocksdb_modules(model: nn.Module) -> List[Any]:

@@ -745,11 +745,6 @@ if has_dynamicemb:
                 dynamicemb_options.local_hbm_for_values = (
                     sharding_option.dynamicemb_memory.local_hbm_for_values
                 )
-                if rocksdb_util.is_rocksdb_options(dynamicemb_options):
-                    dynamicemb_options.external_storage = dataclasses.replace(
-                        dynamicemb_options.external_storage,
-                        table_namespace=f"{sharding_option.path}.{sharding_option.name}",
-                    )
                 # Fill in per-shard fields that used to be populated by
                 # dynamicemb's internal ``_get_dynamicemb_options_per_table``.
                 # After the fused-storage refactor (NVIDIA recsys-examples

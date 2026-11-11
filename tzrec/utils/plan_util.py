@@ -264,12 +264,6 @@ def create_planner(
     hbm_bins = int(os.environ.get("TZREC_DP_HBM_BINS_PER_DEVICE", "100"))
     ddr_bins = int(os.environ.get("TZREC_DP_DDR_BINS_PER_DEVICE", "25"))
     ssd_bins = int(os.environ.get("TZREC_DP_SSD_BINS_PER_DEVICE", "20"))
-    dp_proposer: Any = DynamicProgrammingProposer(
-        hbm_bins_per_device=hbm_bins,
-        ddr_bins_per_device=ddr_bins,
-        ssd_bins_per_device=ssd_bins,
-        ssd_activation=None,
-    )
     partitioner: Any = None
     callbacks: Any = None
     if allow_rocksdb:
@@ -279,12 +273,6 @@ def create_planner(
             search_space = enumerator.enumerate(model, get_default_sharders())
             enumerator = _MemoizedSearchSpace(enumerator, search_space)
             activation = _ssd_activation_storage(search_space, local_world_size)
-            dp_proposer = DynamicProgrammingProposer(
-                hbm_bins_per_device=hbm_bins,
-                ddr_bins_per_device=ddr_bins,
-                ssd_bins_per_device=ssd_bins,
-                ssd_activation=activation,
-            )
         if activation is not None:
             partitioner = _ActivationAwarePartitioner(
                 GreedyPerfPartitioner(), activation
@@ -296,6 +284,12 @@ def create_planner(
                 local_world_size=local_world_size,
             )
         ]
+    dp_proposer: Any = DynamicProgrammingProposer(
+        hbm_bins_per_device=hbm_bins,
+        ddr_bins_per_device=ddr_bins,
+        ssd_bins_per_device=ssd_bins,
+        ssd_activation=activation,
+    )
     planner = EmbeddingShardingPlanner(
         topology=topology,
         batch_size=batch_size,
@@ -656,18 +650,19 @@ class DynamicProgrammingProposer(Proposer):
         ) * num_devices
 
         # Per-table option arrays in bin-units, with infeasible options
-        # pruned; SSD byte costs are kept aside for the axis decision.
+        # pruned; the integer SSD byte costs feed the axis decision before
+        # their float32 normalization.
         table_opts: List[
             Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
         ] = []
-        ssd_bytes_per_table: List[List[int]] = []
+        max_eligible_ssd = 0
         for sharding_options in self._sharding_options_by_fqn.values():
             hbm_list: List[float] = []
             ddr_list: List[float] = []
             ssd_list: List[float] = []
             perf_list: List[float] = []
             opt_id_list: List[int] = []
-            ssd_bytes_list: List[int] = []
+            table_max_ssd = 0
             for opt_id, sharding_option in enumerate(sharding_options):
                 max_shard_hbm = max(
                     (shard.storage.hbm or 0) for shard in sharding_option.shards
@@ -701,7 +696,7 @@ class DynamicProgrammingProposer(Proposer):
                 ssd_list.append(total_ssd)
                 perf_list.append(sharding_option.total_perf)
                 opt_id_list.append(opt_id)
-                ssd_bytes_list.append(total_ssd)
+                table_max_ssd = max(table_max_ssd, total_ssd)
             table_opts.append(
                 (
                     np.asarray(hbm_list, dtype=np.float32),
@@ -711,14 +706,13 @@ class DynamicProgrammingProposer(Proposer):
                     np.asarray(opt_id_list, dtype=np.int32),
                 )
             )
-            ssd_bytes_per_table.append(ssd_bytes_list)
+            max_eligible_ssd += table_max_ssd
 
         # The SSD axis binds only when the largest eligible costs plus one
         # activation charge could exceed the capacity; otherwise it
         # collapses to a single bin while keeping positive costs fractional
         # so requires_ssd and the activation state survive.
         ssd_bins = 1
-        max_eligible_ssd = sum(max(b, default=0) for b in ssd_bytes_per_table)
         if ssd_total > 0 and max_eligible_ssd + activation_ssd_bytes > ssd_total:
             ssd_bins = max(self._ssd_bins_per_device * num_devices, 1)
         ssd_bin_size = float(ssd_total) / ssd_bins if ssd_total > 0 else 1.0
@@ -1073,58 +1067,6 @@ def calculate_shard_storages(
         )
 
 
-_RATIO_KEYED_FACTORY_CLS: Optional[type] = None
-
-
-def _ratio_keyed_factory_cls() -> type:
-    """The process's RocksDB storage factory class, keyed by the cache ratio.
-
-    The class is created lazily so ordinary configurations never import the
-    native extension, and memoized so every factory instance stays comparable
-    within one process.
-    """
-    global _RATIO_KEYED_FACTORY_CLS
-    if _RATIO_KEYED_FACTORY_CLS is None:
-        from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
-
-        @dataclasses.dataclass(frozen=True)
-        class _RatioKeyedStorageFactory(RocksDBStorageFactory):
-            """A RocksDB factory whose identity includes the planned ratio.
-
-            DynamicEmb fuses tables whose options compare equal and sizes a
-            fused group's cache with one shared ratio: the group's budget over
-            its tables' value bytes. Equality must therefore include the
-            chosen ratio, so tables planned at different ratios fuse into
-            separate groups and no member's planned cache budget is
-            redistributed to another ratio. Same-ratio tables still fuse, and
-            the shared ratio then equals every member's planned one.
-            """
-
-            cache_ratio: float = dataclasses.field(kw_only=True)
-
-            def __reduce__(self) -> Any:
-                # A lazily created local class is not findable by pickle's
-                # qualified-name lookup; broadcast plans reconstruct through
-                # the module-level function, without the rank's session.
-                return _reconstruct_ratio_factory, (
-                    self.backend_config,
-                    self.table_namespace,
-                    self.cache_ratio,
-                )
-
-        _RATIO_KEYED_FACTORY_CLS = _RatioKeyedStorageFactory
-    return _RATIO_KEYED_FACTORY_CLS
-
-
-def _reconstruct_ratio_factory(
-    backend_config: Any, table_namespace: str, cache_ratio: float
-) -> Any:
-    """Unpickle a ratio-keyed RocksDB factory (see `_ratio_keyed_factory_cls`)."""
-    return _ratio_keyed_factory_cls()(
-        backend_config, table_namespace, cache_ratio=cache_ratio
-    )
-
-
 _DYNAMICEMB_WORKING_SET_MULTIPLIER = 5
 
 
@@ -1239,7 +1181,6 @@ def _emit_dynamicemb_variants(
                 memory.hbm_rows,
                 memory.host_rows,
                 memory.resident_rows,
-                False,
             )
             if key in seen:
                 continue
@@ -1279,16 +1220,15 @@ def _emit_dynamicemb_variants(
                     continue
                 if memory.resident_rows >= memory.host_rows:
                     continue  # A full cache stays on the built-in endpoint.
-                # No capacity dedup here: the chosen ratio is the candidate's
-                # identity (fusion grouping and runtime budget), and distinct
-                # grid ratios can round to the same resident rows.
                 option = copy.deepcopy(template)
                 option.cache_params = CacheParams(
                     load_factor=memory.resident_rows / memory.host_rows
                 )
                 option.dynamicemb_memory = memory
+                from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+
                 option.dynamicemb_options.external_storage = (  # pyre-ignore [16]
-                    _ratio_keyed_factory_cls()(None, "", cache_ratio=ratio)
+                    RocksDBStorageFactory(None, base_option.fqn)
                 )
                 candidates.append(option)
     return candidates
@@ -1668,12 +1608,6 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             sharding_option.use_dynamicemb = use_dynamicemb
                             # pyre-ignore [16]
                             sharding_option.dynamicemb_options = dynamicemb_options
-                            constraint = _constraints.get(key) if _constraints else None
-                            unique_id_factor = (
-                                getattr(constraint, "unique_id_factor", None)
-                                if constraint is not None
-                                else None
-                            )
                             sharding_options_per_table.extend(
                                 _emit_dynamicemb_variants(
                                     sharding_option,

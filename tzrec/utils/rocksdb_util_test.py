@@ -11,7 +11,6 @@
 
 import builtins
 import dataclasses
-import math
 import os
 import unittest
 from types import SimpleNamespace
@@ -76,11 +75,6 @@ class RocksDBRuntimeTest(unittest.TestCase):
                     self.train_config.rocksdb_config, "model", "eval"
                 )
             )
-
-    def test_cache_rows(self):
-        self.assertEqual(rocksdb_util.cache_rows(10**6, 0.0), 0)
-        self.assertEqual(rocksdb_util.cache_rows(10**6, 0.001), 1024)
-        self.assertEqual(rocksdb_util.cache_rows(10**6, 0.01), 10240)
 
     def test_bind_opens_one_session_per_rank(self):
         try:
@@ -181,28 +175,6 @@ class ActivationCostTest(unittest.TestCase):
             activation.ssd,
             overheads["compaction_headroom"] + overheads["other_files"] + 5 * GIB,
         )
-
-    def test_charged_budget_covers_training_save_and_restore(self):
-        # The additive cost model bounds each phase: charged_ssd = sum of
-        # per-shard ceil(SST*(L+O)) + W plus the shared activation, and that
-        # covers training (SST + compaction + other), saving (training plus
-        # writeback) and restoring (SST + compaction + other + max spill).
-        f = rocksdb_util.SST_FACTOR
-        # One shard: 1M rows, 100 B live, 20 B index, 1k overshoot, 10k cache.
-        live = (1 << 20) * (100 + 20)
-        overshoot = 1000 * (100 + 20)
-        writeback = 10_000 * 100
-        table_cost = math.ceil(f * (live + overshoot)) + writeback
-        activation = rocksdb_util.activation_storage(
-            local_world_size=1, restore_spill_bytes=(1 << 20) * 100
-        )
-        charged = table_cost + activation.ssd
-        training = math.ceil(f * live)  # per-shard tables sum equivalently
-        self.assertGreaterEqual(charged, training)
-        self.assertGreaterEqual(charged, training + writeback)
-        self.assertGreaterEqual(charged, math.ceil(f * live) + (1 << 20) * 100)
-        # Upward rounding never undershoots: ceil of the sum <= sum of ceils.
-        self.assertGreaterEqual(table_cost, int(f * (live + overshoot)) + writeback)
 
 
 if __name__ == "__main__":

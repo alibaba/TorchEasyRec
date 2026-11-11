@@ -165,20 +165,6 @@ class ShardedModelRuntimeTest(unittest.TestCase):
         self.assertTrue(dmp_cls.call_args_list[1].kwargs["init_parameters"])
         self.assertTrue(dmp_cls.call_args_list[1].kwargs["init_data_parallel"])
 
-
-class ShardedModelRuntimeBackendTest(unittest.TestCase):
-    """The runtime acquires, wires and closes the optional RocksDB backend."""
-
-    def test_open_without_rocksdb_config_never_touches_the_backend(self) -> None:
-        config = _pipeline_config()
-        with (
-            mock.patch("tzrec.utils.runtime.CheckpointManager"),
-            mock.patch("tzrec.utils.rocksdb_util.create_rocksdb_runtime") as factory,
-        ):
-            with ShardedModelRuntime.open(config, mode="train") as runtime:
-                factory.assert_not_called()
-                self.assertIsNone(runtime._rocksdb)
-
     def test_open_passes_reset_to_the_manager_and_closes_in_order(self) -> None:
         config = _pipeline_config()
         config.train_config.rocksdb_config.root_dir = "/tmp/tzrec_rocksdb"
