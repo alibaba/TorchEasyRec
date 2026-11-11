@@ -25,7 +25,7 @@ from torchrec.optim import optimizers, rowwise_adagrad
 from tzrec.optim.optimizer import FTRL, has_fbgemm_ftrl
 from tzrec.protos import feature_pb2
 from tzrec.utils import dynamicemb_util
-from tzrec.utils.dynamicemb_util import DynamicEmbTableMemory
+from tzrec.utils.dynamicemb_util import DynamicEmbTableStorage
 from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
 
 
@@ -340,16 +340,27 @@ class DynamicEmbCapacityTest(unittest.TestCase):
         from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
 
         tensor = torch.empty(4096, 32, device="meta")
-        opt = DynamicEmbTableOptions(max_capacity=4096, caching=True)
-        m = DynamicEmbTableMemory.from_options(tensor, opt, ratio=0.1)
-        self.assertEqual((m.resident_rows, m.hbm_rows, m.host_rows), (1024, 4096, 4096))
+        opt = DynamicEmbTableOptions(
+            max_capacity=4096,
+            caching=True,
+            bucket_capacity=128,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+        )
+        m = DynamicEmbTableStorage.from_options(tensor, opt, ratio=0.1)
+        self.assertEqual((m.resident_rows, m.backing_rows), (1024, 4096))
         self.assertEqual(m.local_hbm_for_values, int(0.1 * 4096 * 32 * 4))
+        # HBM: 524288 value bytes including overflow, plus 172168 key-map bytes.
+        self.assertEqual(
+            (m.storage.hbm, m.storage.ddr, m.storage.ssd),
+            (696456, 524288, 0),
+        )
         opt.score_strategy = (
             DynamicEmbScoreStrategy.TIMESTAMP,
             DynamicEmbScoreStrategy.LFU,
         )
-        compound = DynamicEmbTableMemory.from_options(tensor, opt, ratio=0.1)
-        self.assertEqual(compound.hbm_index - m.hbm_index, 8192 * 8)
+        compound = DynamicEmbTableStorage.from_options(tensor, opt, ratio=0.1)
+        # one extra 8-byte score word on each of the 8192 key-map slots
+        self.assertEqual(compound.storage.hbm - m.storage.hbm, 8192 * 8)
 
     def test_invalid_placements(self):
         from dynamicemb import DynamicEmbTableOptions
@@ -367,7 +378,7 @@ class DynamicEmbCapacityTest(unittest.TestCase):
                 self.subTest(caching=caching, ratio=ratio),
                 self.assertRaises(ValueError),
             ):
-                DynamicEmbTableMemory.from_options(tensor, opt, ratio=ratio)
+                DynamicEmbTableStorage.from_options(tensor, opt, ratio=ratio)
 
     @parameterized.expand(
         [
@@ -470,7 +481,7 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
             local_world_size=2,
             input_lengths=[1.0],
             num_poolings=[1.0],
-            dynamicemb_memory=DynamicEmbTableMemory.from_options(
+            dynamicemb_storage=DynamicEmbTableStorage.from_options(
                 tensor, dynamicemb_options, ratio=1.0
             ),
             is_pooled=True,
@@ -612,14 +623,14 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
                     "FTRL": FTRL,
                 }[optim]
             ]
-            m = DynamicEmbTableMemory.from_options(tensor, opt, ratio=ratio)
+            m = DynamicEmbTableStorage.from_options(tensor, opt, ratio=ratio)
             opt.local_hbm_for_values = m.local_hbm_for_values
             self.assertEqual(
                 opt.local_hbm_for_values,
                 int(ratio * opt.max_capacity * (dim + state_dim) * 4),
             )
             options.append(opt)
-            estimates.append((m.hbm_values, m.host_values, m.hbm_index))
+            estimates.append((m.storage.hbm, m.storage.ddr))
 
         def build(opts):
             return BatchedDynamicEmbeddingTablesV2(
@@ -633,11 +644,15 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
         module = build(options)
         self.assertEqual(module._storage_layout.name, layout)
         actual = self._allocated(module)
+        # values and key-map metadata both land on HBM, so compare the total
+        # HBM allocation against the estimated table HBM cost, and the host
+        # values against the estimated DDR cost
+        actual_totals = (actual[0] + actual[2], actual[1])
         expected = tuple(map(sum, zip(*estimates)))
         if layout in ("CACHING", "HYBRID") or score == "NO_EVICTION":
-            self.assertEqual(actual, expected)
+            self.assertEqual(actual_totals, expected)
         else:
-            for used, reserved in zip(actual, expected):
+            for used, reserved in zip(actual_totals, expected):
                 self.assertLessEqual(used, reserved)
         if ratios == (0, 1):
             self.assertEqual(self._allocated(build(options[::-1])), actual)

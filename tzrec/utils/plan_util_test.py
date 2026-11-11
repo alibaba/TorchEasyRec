@@ -1019,13 +1019,13 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         full_bytes = 4096 * 4
         grid = [0, *np.geomspace(hybrid_floor, 0.5, 5), 0.6, 0.7, 0.8, 0.9, 1]
         self.assertEqual(
-            [o.dynamicemb_memory.local_hbm_for_values for o in noncache],
+            [o.dynamicemb_storage.local_hbm_for_values for o in noncache],
             [int(r * full_bytes) for r in grid],
         )
         self.assertEqual(len(cache), ncache)
         if cache:
             self.assertEqual(
-                cache[0].dynamicemb_memory.local_hbm_for_values,
+                cache[0].dynamicemb_storage.local_hbm_for_values,
                 int(cache_floor * full_bytes),
             )
 
@@ -1042,7 +1042,10 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         opts = self._options(ratio=ratio, pooling=pooling)
         self.assertEqual(
             [
-                (o.dynamicemb_memory.local_hbm_for_values, o.dynamicemb_options.caching)
+                (
+                    o.dynamicemb_storage.local_hbm_for_values,
+                    o.dynamicemb_options.caching,
+                )
                 for o in opts
             ],
             [(int(ratio * 16384), family) for family in families],
@@ -1066,18 +1069,32 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         pinned = self._options(ratio=0.1, rows=rows)
         self.assertEqual(
             [
-                (o.dynamicemb_memory.local_hbm_for_values, o.dynamicemb_options.caching)
+                (
+                    o.dynamicemb_storage.local_hbm_for_values,
+                    o.dynamicemb_options.caching,
+                )
                 for o in pinned
             ],
             [(int(0.1 * rows * 4), False), (rows * 4, False)],
         )
 
     def test_physical_dedup_keeps_first_budget(self):
+        pinned = [
+            next(o for o in self._options(ratio=ratio) if o.dynamicemb_options.caching)
+            for ratio in (0.6, 0.7)
+        ]
+        first, second = [o.dynamicemb_storage for o in pinned]
+        for candidate in (first, second):
+            self.assertEqual(
+                (candidate.resident_rows, candidate.backing_rows), (3072, 4096)
+            )
+        self.assertEqual(first.storage, second.storage)
+        self.assertNotEqual(first.local_hbm_for_values, second.local_hbm_for_values)
         opts = self._options()
         caches = [o for o in opts if o.dynamicemb_options.caching]
         self.assertEqual(
             [
-                (o.cache_load_factor, o.dynamicemb_memory.local_hbm_for_values)
+                (o.cache_load_factor, o.dynamicemb_storage.local_hbm_for_values)
                 for o in caches
             ],
             [
@@ -1086,27 +1103,28 @@ class DynamicEmbPlannerTest(unittest.TestCase):
                 (0.75, int(0.6 * 16384)),
             ],
         )
+        self.assertEqual(caches[-1].dynamicemb_storage, first)
         hybrid, cache = self._options(ratio=0.15)
         self.assertFalse(hybrid.dynamicemb_options.caching)
         self.assertTrue(cache.dynamicemb_options.caching)
         self.assertEqual(cache.cache_load_factor, 0.25)
         for option in (hybrid, cache):
             self.assertEqual(
-                option.dynamicemb_memory.local_hbm_for_values, int(0.15 * 16384)
+                option.dynamicemb_storage.local_hbm_for_values, int(0.15 * 16384)
             )
 
     def test_equal_tier_rows_keep_zero_partial_and_full(self):
         opts = self._options(rows=16)
         self.assertEqual(
             [
-                (o.cache_load_factor, o.dynamicemb_memory.local_hbm_for_values)
+                (o.cache_load_factor, o.dynamicemb_storage.local_hbm_for_values)
                 for o in opts
             ],
             [(0, 0), (1024 / 1040, 6), (1, 64)],
         )
         self.assertEqual(
             {
-                (o.dynamicemb_memory.hbm_rows, o.dynamicemb_memory.host_rows)
+                (o.dynamicemb_storage.resident_rows, o.dynamicemb_storage.backing_rows)
                 for o in opts
             },
             {(1024, 16)},
