@@ -1207,10 +1207,13 @@ def _emit_dynamicemb_variants(
     ):
         min_ratio = required / rows if required else 0.01
         if min_ratio <= 0.5:
+            from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+
+            options.caching = True
+            options.external_storage = RocksDBStorageFactory(None, base_option.fqn)
             for ratio in sorted(
                 {float(r) for r in np.geomspace(min_ratio, 0.5, num=10)}
             ):
-                options.caching = True
                 memory = DynamicEmbTableMemory.from_options(
                     tensor, options, ratio=ratio
                 )
@@ -1225,11 +1228,6 @@ def _emit_dynamicemb_variants(
                     load_factor=memory.resident_rows / memory.host_rows
                 )
                 option.dynamicemb_memory = memory
-                from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
-
-                option.dynamicemb_options.external_storage = (  # pyre-ignore [16]
-                    RocksDBStorageFactory(None, base_option.fqn)
-                )
                 candidates.append(option)
     return candidates
 

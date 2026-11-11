@@ -689,6 +689,7 @@ class RocksDBTableTest(unittest.TestCase):
         self.assertIsNone(constraints.dynamicemb_options.external_storage)
 
     @parameterized.expand([("indexed", "STEP"), ("not_indexed", "NO_EVICTION")])
+    @mock.patch.dict(os.environ, {"WORLD_SIZE": "2"})
     def test_storage_estimate(self, _name, strategy):
         from tzrec_ext.rocksdb import (
             BackendConfig,
@@ -702,6 +703,7 @@ class RocksDBTableTest(unittest.TestCase):
         tensor = torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM)
         options = self._constraints(score_strategy=strategy).dynamicemb_options
         options.caching = True
+        host_memory = DynamicEmbTableMemory.from_options(tensor, options, ratio=ratio)
         options.external_storage = RocksDBStorageFactory(BackendConfig(0, 0, 0, 0), "")
         memory = DynamicEmbTableMemory.from_options(tensor, options, ratio=ratio)
         storages = dynamicemb_util.dynamicemb_calculate_shard_storages(
@@ -734,8 +736,8 @@ class RocksDBTableTest(unittest.TestCase):
             # The GPU cache tier alone on HBM -- its values and key maps,
             # without the backing table's map, which stays in the database
             # -- the block cache's share on DDR, the table's growth on SSD.
-            self.assertGreaterEqual(storage.hbm, memory.hbm_values)
-            self.assertLess(storage.hbm, memory.hbm_values + memory.hbm_index)
+            self.assertGreaterEqual(storage.hbm, memory.hbm_values + memory.hbm_index)
+            self.assertLess(storage.hbm, host_memory.hbm_values + host_memory.hbm_index)
             self.assertEqual(storage.ddr, meta)
             # Saving flushes the cache before the export: the charged SSD
             # covers the live table's growth plus that writeback.

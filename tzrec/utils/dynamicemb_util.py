@@ -74,7 +74,7 @@ class DynamicEmbTableMemory(NamedTuple):
             CACHING, remainder partition for HYBRID).
         hbm_index: HBM hash-map metadata bytes: per-slot key/digest/score
             words and reference counters, plus per-bucket size counters.
-            Host tiers keep their key maps on HBM too.
+            Host tiers keep their key maps on HBM too; RocksDB backings do not.
         hbm_rows: HBM value rows including the cache overflow area.
         host_rows: host value rows.
         resident_rows: rows credited toward normal cache residency -- the cache
@@ -125,7 +125,8 @@ class DynamicEmbTableMemory(NamedTuple):
         include the resident cache plus three overflow buckets. Only resident rows
         count toward cache coverage.
 
-        Every tier's key map lives on HBM, including the host tier's. Each slot
+        Built-in tiers keep their key maps on HBM, including the host tier.
+        A RocksDB backing keeps its key map in the database instead. Each slot
         stores a key, digest, score words and reference counter; each bucket also
         has a size counter. LRU+LFU stores two score words (timestamp and frequency);
         other policies store one. The cache overflow has its own map. A full
@@ -177,11 +178,11 @@ class DynamicEmbTableMemory(NamedTuple):
                 overflow = _DYNAMICEMB_CACHE_OVERFLOW_BUCKETS * cache_width
                 cache_words = 1 if no_eviction else score_words
                 hbm, host = resident + overflow, shard_rows
-                index = (
-                    full_index
-                    + _keymap_bytes(resident, cache_width, cache_words)
-                    + _keymap_bytes(overflow, overflow, cache_words)
-                )
+                index = _keymap_bytes(
+                    resident, cache_width, cache_words
+                ) + _keymap_bytes(overflow, overflow, cache_words)
+                if not rocksdb_util.is_rocksdb_options(options):
+                    index += full_index
             else:
                 hbm = resident
                 host = _bucket_rounded_rows(
@@ -195,6 +196,48 @@ class DynamicEmbTableMemory(NamedTuple):
         return cls(
             hbm * row_bytes, host * row_bytes, index, hbm, host, resident, budget
         )
+
+
+def _calculate_dynamicemb_table_storages(
+    *,
+    tensor: torch.Tensor,
+    shard_sizes: List[List[int]],
+    memory: DynamicEmbTableMemory,
+    options: "dynamicemb.DynamicEmbTableOptions",
+    admitted_rows: float,
+) -> List[Storage]:
+    """Estimate table storage per shard, excluding counters and pipeline I/O.
+
+    Args:
+        tensor: Table tensor carrying dtype and optimizer information.
+        shard_sizes: Dimensions of each row-wise shard.
+        memory: Physical per-shard memory of the candidate.
+        options: Candidate table options, including its storage backend.
+        admitted_rows: Estimated rows admitted per step before eviction.
+
+    Returns:
+        HBM, DDR and SSD table costs for each shard.
+    """
+    hbm = memory.hbm_values + memory.hbm_index
+    if not rocksdb_util.is_rocksdb_options(options):
+        return [Storage(hbm=hbm, ddr=memory.host_values, ssd=0) for _ in shard_sizes]
+
+    multiplier = _get_optimizer_multipler(
+        getattr(tensor, "_optimizer_classes", [None])[0], tensor.shape, tensor.dtype
+    )
+    storages = []
+    for rows, dim in shard_sizes:
+        backing = rocksdb_util.table_storage(
+            rows=int(rows),
+            embedding_dim=int(dim),
+            optimizer_state_dim=round(dim * multiplier),
+            element_size=tensor.element_size(),
+            indexed=options.score_strategy != DynamicEmbScoreStrategy.NO_EVICTION,
+            admitted_rows=admitted_rows,
+            cache_rows=memory.resident_rows,
+        )
+        storages.append(Storage(hbm=hbm, ddr=backing.ddr, ssd=backing.ssd))
+    return storages
 
 
 def _bucket_rounded_rows(rows: int, width: int) -> int:
@@ -978,51 +1021,13 @@ if has_dynamicemb:
             is_pooled=is_pooled,
         )
 
-        hbm_specific_sizes: List[int] = []
-        ddr_specific_sizes: List[int] = []
-        ssd_specific_sizes: List[int] = []
-        if rocksdb_util.is_rocksdb_options(dynamicemb_options):
-            strategy = dynamicemb_options.score_strategy
-            no_eviction = strategy == DynamicEmbScoreStrategy.NO_EVICTION
-            indexed = not no_eviction
-            score_words = score_policy_num_scores(get_score_policy(strategy).policy)
-            lookups = sum(b * n for b, n in zip(batch_sizes, input_lengths))
-            mult = _get_optimizer_multipler(
-                getattr(tensor, "_optimizer_classes", [None])[0],
-                tensor.shape,
-                tensor.dtype,
-            )
-            for size in shard_sizes:
-                rows, dim = int(size[0]), int(size[1])
-                backing = rocksdb_util.table_storage(
-                    rows=rows,
-                    embedding_dim=dim,
-                    optimizer_state_dim=round(dim * mult),
-                    element_size=tensor.element_size(),
-                    indexed=indexed,
-                    admitted_rows=lookups,
-                    cache_rows=dynamicemb_memory.resident_rows,
-                )
-                ssd_specific_sizes.append(backing.ssd)
-                ddr_specific_sizes.append(backing.ddr)
-                # The CACHING memory model charges the backing's key map on
-                # HBM; a database-backed table keeps it on disk instead.
-                backing_index = _keymap_bytes(
-                    rows * (2 if no_eviction else 1),
-                    dynamicemb_options.bucket_capacity,
-                    score_words,
-                )
-                hbm_specific_sizes.append(
-                    dynamicemb_memory.hbm_values
-                    + dynamicemb_memory.hbm_index
-                    - backing_index
-                )
-        else:
-            hbm_specific_sizes = [
-                dynamicemb_memory.hbm_values + dynamicemb_memory.hbm_index
-            ] * len(shard_sizes)
-            ddr_specific_sizes = [dynamicemb_memory.host_values] * len(shard_sizes)
-            ssd_specific_sizes = [0] * len(shard_sizes)
+        table_storages = _calculate_dynamicemb_table_storages(
+            tensor=tensor,
+            shard_sizes=shard_sizes,
+            memory=dynamicemb_memory,
+            options=dynamicemb_options,
+            admitted_rows=sum(b * n for b, n in zip(batch_sizes, input_lengths)),
+        )
         # The counter belongs to the strategy that counts with it; a
         # probabilistic admitter keeps no state, so it costs nothing.
         counter_hbm_specific_size = 0
@@ -1034,7 +1039,7 @@ if has_dynamicemb:
 
         return [
             Storage(
-                hbm=hbm_specific_size
+                hbm=table_storage.hbm
                 + counter_hbm_specific_size
                 + shard_estimators.calculate_pipeline_io_cost(
                     input_size=input_size,
@@ -1045,15 +1050,11 @@ if has_dynamicemb:
                     count_ephemeral_storage_cost=count_ephemeral_storage_cost,
                     is_inference=is_inference,
                 ),
-                ddr=ddr_size,
-                ssd=ssd_size,
+                ddr=table_storage.ddr,
+                ssd=table_storage.ssd,
             )
-            for input_size, output_size, hbm_specific_size, ddr_size, ssd_size in zip(
-                input_sizes,
-                output_sizes,
-                hbm_specific_sizes,
-                ddr_specific_sizes,
-                ssd_specific_sizes,
+            for input_size, output_size, table_storage in zip(
+                input_sizes, output_sizes, table_storages
             )
         ]
 
