@@ -1415,18 +1415,18 @@ class RocksDBPlannerTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            param("rocksdb", input_lengths=[1.0]),
-            param("rocksdb_lookup_floor", input_lengths=[5000.0]),
+            param("rocksdb", input_lengths=[1.0], rows=1 << 24),
+            param("rocksdb_lookup_floor", input_lengths=[5000.0], rows=1 << 24),
+            param("rounded_cache", input_lengths=[1.0], rows=4096),
         ],
         name_func=parameterized_name_func,
     )
-    def test_memory_table_layouts(self, _, input_lengths):
+    def test_memory_table_layouts(self, _, input_lengths, rows):
         # With RocksDB planning the built-in family keeps only the layouts
         # every restore preserves -- partial CACHING plus the full endpoint
         # with its empty host tier; no zero or partial HYBRID. The RocksDB
         # CACHING_PS candidates span one geometric grid whose lower
         # endpoint the working-set floor sets.
-        rows = 1 << 24
         model, constraints = _model_and_constraints(
             {"a": (rows, 64, {}, input_lengths[0])}
         )
@@ -1449,6 +1449,20 @@ class RocksDBPlannerTest(unittest.TestCase):
         ]
         required = math.ceil(128 * input_lengths[0])
         self.assertTrue(ps)
+        expected_budgets = [
+            int(r * rows * 64 * 4)
+            for r in sorted(set(np.geomspace(required / rows, 0.5, num=10)))
+        ]
+        self.assertEqual(
+            [o.dynamicemb_storage.local_hbm_for_values for o in ps], expected_budgets
+        )
+        memory_ratios = {
+            o.cache_load_factor
+            for o in options
+            if o.dynamicemb_options.caching
+            and not rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
+        }
+        self.assertTrue(memory_ratios.intersection(o.cache_load_factor for o in ps))
         for o in ps:
             # The working-set floor holds in the rows the runtime would
             # actually allocate, and each factory carries its table's own

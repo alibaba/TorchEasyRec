@@ -1004,9 +1004,10 @@ def _emit_dynamicemb_variants(
     budget. A cache must cover the working set; a cache covering the entire
     shard is represented by the full non-caching endpoint.
 
-    In automatic search, keep the first budget for each set of rounded tier
-    capacities within a mode. Zero, partial and full budgets remain distinct:
-    equal row estimates do not imply the same layout after native fusion.
+    In automatic search, keep the first built-in budget for each set of
+    rounded tier capacities within a mode. Zero, partial and full budgets
+    remain distinct: equal row estimates do not imply the same layout after
+    native fusion.
     Within a mode the HBM value rows follow from the resident rows -- equal
     for HYBRID, plus the fixed overflow area for CACHING -- so the key tracks
     only the resident and backing rows. The DP proposer uses the candidates'
@@ -1019,9 +1020,8 @@ def _emit_dynamicemb_variants(
     empty). Eligible tables additionally get CACHING_PS candidates on one
     geometric grid of ten ratios from the working-set floor up to ``0.5``,
     both endpoints included; a floor above ``0.5`` leaves the table without
-    RocksDB candidates. A RocksDB factory's identity includes the chosen
-    ratio, so DynamicEmb cannot fuse tables of different ratios into one
-    group and redistribute a planned cache budget to a shared ratio.
+    RocksDB candidates. DynamicEmb preserves each table's value budget
+    when fusing tables with different ratios.
 
     The caller supplies base_option.dynamicemb_options. Each emitted option
     owns a deep copy of its table options and reports the allocated share as
@@ -1050,27 +1050,46 @@ def _emit_dynamicemb_variants(
         floor = required / rows or 0.1
 
     params = base_option.cache_params
+    requests: List[Tuple[bool, float, Any]]
     if params is None:
-        requests = [(False, 0.0)]
-        requests.extend((False, r) for r in _dynamicemb_partial_ratios(min(floor, 0.1)))
-        requests.extend((True, r) for r in _dynamicemb_partial_ratios(max(floor, 0.1)))
-        requests.append((False, 1.0))
+        requests = [(False, 0.0, None)]
+        requests.extend(
+            (False, r, None) for r in _dynamicemb_partial_ratios(min(floor, 0.1))
+        )
+        requests.extend(
+            (True, r, None) for r in _dynamicemb_partial_ratios(max(floor, 0.1))
+        )
+        requests.append((False, 1.0, None))
         if allow_rocksdb:
             requests = [
-                (caching, ratio)
-                for caching, ratio in requests
+                (caching, ratio, storage)
+                for caching, ratio, storage in requests
                 if caching or ratio == 1.0
             ]
     else:
         ratio = float(params.load_factor)
-        requests = [(False, ratio)]
+        requests = [(False, ratio, None)]
         if 0 < ratio < 1:
-            requests.append((True, ratio))
+            requests.append((True, ratio, None))
+
+    if allow_rocksdb and params is None and options.score_strategy.name != "CUSTOMIZED":
+        min_ratio = required / rows if required else 0.01
+        if min_ratio <= 0.5:
+            from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+
+            factory = RocksDBStorageFactory(None, base_option.fqn)
+            requests.extend(
+                (True, ratio, factory)
+                for ratio in sorted(
+                    {float(r) for r in np.geomspace(min_ratio, 0.5, num=10)}
+                )
+            )
 
     candidates = []
     seen = set()
-    for caching, requested in requests:
+    for caching, requested, external_storage in requests:
         options.caching = caching
+        options.external_storage = external_storage
         ratio = requested
         dynamicemb_storage = DynamicEmbTableStorage.from_options(
             tensor, options, ratio=ratio
@@ -1093,7 +1112,7 @@ def _emit_dynamicemb_variants(
             )
         if options.caching and dynamicemb_storage.resident_rows < required:
             continue
-        if params is None:
+        if params is None and external_storage is None:
             endpoint = ratio if ratio in (0, 1) else None
             key = (
                 options.caching,
@@ -1122,36 +1141,6 @@ def _emit_dynamicemb_variants(
         option.dynamicemb_storage = dynamicemb_storage
         candidates.append(option)
 
-    if (
-        allow_rocksdb
-        and params is None
-        and base_option.dynamicemb_options.score_strategy.name  # pyre-ignore [16]
-        != "CUSTOMIZED"
-    ):
-        min_ratio = required / rows if required else 0.01
-        if min_ratio <= 0.5:
-            from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
-
-            options.caching = True
-            options.external_storage = RocksDBStorageFactory(None, base_option.fqn)
-            for ratio in sorted(
-                {float(r) for r in np.geomspace(min_ratio, 0.5, num=10)}
-            ):
-                memory = DynamicEmbTableStorage.from_options(
-                    tensor, options, ratio=ratio
-                )
-                if memory.local_hbm_for_values == 0:
-                    continue
-                if memory.resident_rows < required:
-                    continue
-                if memory.resident_rows >= memory.backing_rows:
-                    continue  # A full cache stays on the built-in endpoint.
-                option = copy.deepcopy(template)
-                option.cache_params = CacheParams(
-                    load_factor=memory.resident_rows / memory.backing_rows
-                )
-                option.dynamicemb_storage = memory
-                candidates.append(option)
     return candidates
 
 
