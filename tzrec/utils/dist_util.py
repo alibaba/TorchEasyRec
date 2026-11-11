@@ -57,7 +57,7 @@ _DATASET_PROCESS_GROUPS: Dict[Tuple[dist.ProcessGroup, int], dist.ProcessGroup] 
 
 
 def init_process_group() -> Tuple[torch.device, str]:
-    """Init process_group, device, rank, backend."""
+    """Initialize training and dataset groups and return the device and backend."""
     rank = int(os.environ.get("LOCAL_RANK", 0))
     if torch.cuda.is_available():
         device: torch.device = torch.device(f"cuda:{rank}")
@@ -73,6 +73,7 @@ def init_process_group() -> Tuple[torch.device, str]:
             seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
         )
     dist.init_process_group(backend=backend, timeout=pg_timeout)
+    # NOTE: Create the dataset group at the same point on every rank.
     get_dataset_process_group()
 
     return device, backend
@@ -86,11 +87,12 @@ def get_dataset_process_group(
     All ranks must call this in the same order when first requesting a group.
     Groups are reused within the current default process group. A single-rank
     WORLD_SIZE scope, such as export warm-up, skips communication even when
-    the training process group is still initialized.
+    the training process group is still initialized. New groups honor
+    PROCESS_GROUP_TIMEOUT_SECONDS when configured.
 
     Args:
-        world_size: Number of participating ranks, starting at rank zero.
-            Defaults to the WORLD_SIZE environment variable.
+        world_size: Group size spanning ranks 0 through world_size - 1.
+            Defaults to WORLD_SIZE; a value of 1 disables communication.
 
     Returns:
         A Gloo group, or None for local reading without collectives.
@@ -101,9 +103,16 @@ def get_dataset_process_group(
         return None
     key = (cast(dist.ProcessGroup, dist.group.WORLD), world_size)
     if key not in _DATASET_PROCESS_GROUPS:
+        pg_timeout = None
+        if "PROCESS_GROUP_TIMEOUT_SECONDS" in os.environ:
+            pg_timeout = timedelta(
+                seconds=int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"])
+            )
         _DATASET_PROCESS_GROUPS[key] = cast(
             dist.ProcessGroup,
-            dist.new_group(ranks=list(range(world_size)), backend="gloo"),
+            dist.new_group(
+                ranks=list(range(world_size)), backend="gloo", timeout=pg_timeout
+            ),
         )
     return _DATASET_PROCESS_GROUPS[key]
 

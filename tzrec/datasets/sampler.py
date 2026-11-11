@@ -85,6 +85,8 @@ def _get_np_type(field_type: pa.DataType) -> npt.DTypeLike:
 
 
 def _bootstrap(group_size: int, local_rank: int, group_rank: int) -> str:
+    """Exchange server addresses, or use the local address without a group."""
+
     def addr_to_tensor(ip: str, port: str) -> torch.Tensor:
         addr_array = [int(i) for i in (ip.split("."))] + [int(port)]
         addr_tensor = torch.tensor(addr_array, dtype=torch.int)

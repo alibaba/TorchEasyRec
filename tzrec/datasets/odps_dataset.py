@@ -717,7 +717,9 @@ class OdpsWriter(BaseWriter):
     Args:
         output_path (str): data output path.
         quota_name (str): storage api quota name.
-        world_size (int, optional): number of ranks, each rank has a writer.
+        world_size (int, optional): number of ranks sharing a write session.
+            Defaults to WORLD_SIZE. Use 1 for rank-zero-only writing without
+            cross-rank communication.
     """
 
     def __init__(

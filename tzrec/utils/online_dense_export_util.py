@@ -419,11 +419,10 @@ class OnlineDenseExportManager:
         the export-side model has user-side twin modules the training process
         never builds, and INPUT_TILE is read at model construction and
         batch-parse time. WORLD_SIZE gives the warm-up dataloader the same
-        single-rank view the full export runs under: the Parquet and ODPS
-        readers run startup collectives (file-metadata all-gather, scan
-        session exchange) on the dataset Gloo group when WORLD_SIZE > 1,
-        and this rank-zero-only build has no peer to join, which would
-        deadlock the collective. The training model and its dataloader
+        single-rank view the full export runs under. Dataset readers exchange
+        file, partition, or session metadata on the Gloo group when
+        WORLD_SIZE > 1. This rank-zero-only build must skip those collectives
+        because no other rank participates. The training model and its dataloader
         workers are already constructed by the time this runs, so the window
         cannot affect them.
 

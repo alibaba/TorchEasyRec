@@ -14,6 +14,7 @@ import shutil
 import time
 import unittest
 from datetime import timedelta
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
@@ -93,24 +94,49 @@ def _check_readers(test_dir, pg):
     case.assertEqual(odps_reader._sess_row_counts, {"session": 4})
 
 
-def _dataset_worker(rank, backend, test_dir):
+def _dataset_worker(rank, backend, timeout_seconds, test_dir):
     os.environ.update(WORLD_SIZE="2", RANK=str(rank), LOCAL_RANK=str(rank))
     if backend == "nccl":
         torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}" if backend == "nccl" else "cpu")
     case = unittest.TestCase()
+    if timeout_seconds is None:
+        os.environ.pop("PROCESS_GROUP_TIMEOUT_SECONDS", None)
+        expected_timeout = None
+    else:
+        os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"] = str(timeout_seconds)
+        expected_timeout = timedelta(seconds=timeout_seconds)
     # Reinitialize to check that the cache never returns a destroyed group.
     previous_pg = None
     for generation in range(2):
-        dist.init_process_group(
-            backend=backend,
-            init_method=f"file://{test_dir}/store-{generation}",
-            rank=rank,
-            world_size=2,
-            timeout=timedelta(seconds=45),
-        )
         try:
-            pg = dist_util.get_dataset_process_group()
+            with (
+                mock.patch.object(
+                    torch.cuda, "is_available", return_value=backend == "nccl"
+                ),
+                mock.patch.object(
+                    dist,
+                    "init_process_group",
+                    wraps=partial(
+                        dist.init_process_group,
+                        init_method=f"file://{test_dir}/store-{generation}",
+                        rank=rank,
+                        world_size=2,
+                    ),
+                ) as init_group,
+                mock.patch.object(dist, "new_group", wraps=dist.new_group) as new_group,
+            ):
+                actual_device, actual_backend = dist_util.init_process_group()
+                case.assertEqual(actual_device, device)
+                case.assertEqual(actual_backend, backend)
+                init_group.assert_called_once_with(
+                    backend=backend, timeout=expected_timeout
+                )
+                new_group.assert_called_once_with(
+                    ranks=[0, 1], backend="gloo", timeout=expected_timeout
+                )
+                pg = dist_util.get_dataset_process_group()
+                case.assertEqual(new_group.call_count, 1)
             case.assertIsNot(pg, dist.group.WORLD)
             case.assertIsNot(pg, previous_pg)
             case.assertEqual(dist.get_backend(pg), "gloo")
@@ -118,6 +144,11 @@ def _dataset_worker(rank, backend, test_dir):
             previous_pg = pg
 
             with (
+                mock.patch.object(
+                    dist,
+                    "new_group",
+                    side_effect=AssertionError("reader recreated dataset group"),
+                ),
                 mock.patch.object(
                     dist, "broadcast_object_list", wraps=dist.broadcast_object_list
                 ) as broadcast,
@@ -159,8 +190,11 @@ def _dataset_worker(rank, backend, test_dir):
 
 @mark_ci_scope("gpu")
 class DatasetProcessGroupTest(unittest.TestCase):
-    @parameterized.expand([["gloo"], ["nccl"]], name_func=parameterized_name_func)
-    def test_readers_and_rank_zero_warmup(self, backend):
+    @parameterized.expand(
+        [["gloo", None], ["gloo", 45], ["nccl", None], ["nccl", 45]],
+        name_func=parameterized_name_func,
+    )
+    def test_readers_and_rank_zero_warmup(self, backend, timeout_seconds):
         if backend == "nccl" and torch.cuda.device_count() < 2:
             self.skipTest("requires two CUDA devices")
         test_dir = os.path.abspath(make_test_dir())
@@ -172,7 +206,10 @@ class DatasetProcessGroupTest(unittest.TestCase):
             with open(os.path.join(test_dir, "data.csv"), "w") as f:
                 f.write("x\n1\n2\n")
             context = mp.spawn(
-                _dataset_worker, args=(backend, test_dir), nprocs=2, join=False
+                _dataset_worker,
+                args=(backend, timeout_seconds, test_dir),
+                nprocs=2,
+                join=False,
             )
             deadline = time.monotonic() + 120
             while not context.join(timeout=1):
