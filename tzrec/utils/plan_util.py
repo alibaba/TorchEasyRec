@@ -134,7 +134,8 @@ def create_planner(
 
     host_reserve_percent = float(os.environ.get("HOST_MEMORY_RESERVE_PERCENT", 0.0))
     topo_kwargs["ddr_cap"] = resource_util.host_memory_capacity_per_rank(
-        local_world_size=local_world_size, reserve_percent=host_reserve_percent
+        local_world_size=local_world_size,
+        reserve_percent=host_reserve_percent,
     )
     allow_rocksdb = rocksdb is not None
     activation = None
