@@ -110,11 +110,11 @@ def _dataset_worker(rank, backend, test_dir):
             timeout=timedelta(seconds=45),
         )
         try:
-            pg = dist_util.get_dist_object_pg()
+            pg = dist_util.get_dataset_process_group()
             case.assertIsNot(pg, dist.group.WORLD)
             case.assertIsNot(pg, previous_pg)
             case.assertEqual(dist.get_backend(pg), "gloo")
-            case.assertIs(pg, dist_util.get_dist_object_pg())
+            case.assertIs(pg, dist_util.get_dataset_process_group())
             previous_pg = pg
 
             with (
@@ -141,7 +141,7 @@ def _dataset_worker(rank, backend, test_dir):
                     mock.patch.object(dist, "all_gather_object") as gather,
                     mock.patch.object(dist, "all_reduce") as reduce,
                 ):
-                    case.assertIsNone(dist_util.get_dist_object_pg())
+                    case.assertIsNone(dist_util.get_dataset_process_group())
                     _check_readers(test_dir, None)
                     _bootstrap(1, 0, 0)
                     case.assertEqual(BaseDataset.get_worker_info(None), (0, 1, 1))
@@ -152,7 +152,7 @@ def _dataset_worker(rank, backend, test_dir):
             value = torch.tensor([rank + 1], device=device)
             dist.all_reduce(value)
             case.assertEqual(value.item(), 3)
-            case.assertIs(dist_util.get_dist_object_pg(), pg)
+            case.assertIs(dist_util.get_dataset_process_group(), pg)
         finally:
             dist.destroy_process_group()
 

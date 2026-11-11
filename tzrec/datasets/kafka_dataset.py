@@ -401,7 +401,7 @@ class KafkaReader(BaseReader):
             ValueError: if topic metadata cannot be read.
         """
         topic, config, _ = _parse_kafka_uri(self._input_path)
-        pg = dist_util.get_dist_object_pg()
+        pg = dist_util.get_dataset_process_group()
         rank = dist.get_rank(pg) if pg is not None else 0
         result: List[Any] = [None, None]
         if rank == 0:

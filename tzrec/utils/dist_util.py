@@ -53,7 +53,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.utils.logging_util import logger
 
-_OBJECT_PROCESS_GROUPS: Dict[Tuple[dist.ProcessGroup, int], dist.ProcessGroup] = {}
+_DATASET_PROCESS_GROUPS: Dict[Tuple[dist.ProcessGroup, int], dist.ProcessGroup] = {}
 
 
 def init_process_group() -> Tuple[torch.device, str]:
@@ -73,12 +73,14 @@ def init_process_group() -> Tuple[torch.device, str]:
             seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
         )
     dist.init_process_group(backend=backend, timeout=pg_timeout)
-    get_dist_object_pg()
+    get_dataset_process_group()
 
     return device, backend
 
 
-def get_dist_object_pg(world_size: Optional[int] = None) -> Optional[dist.ProcessGroup]:
+def get_dataset_process_group(
+    world_size: Optional[int] = None,
+) -> Optional[dist.ProcessGroup]:
     """Get a dedicated Gloo group for dataset metadata communication.
 
     All ranks must call this in the same order when first requesting a group.
@@ -98,12 +100,12 @@ def get_dist_object_pg(world_size: Optional[int] = None) -> Optional[dist.Proces
     if world_size <= 1 or not dist.is_initialized():
         return None
     key = (cast(dist.ProcessGroup, dist.group.WORLD), world_size)
-    if key not in _OBJECT_PROCESS_GROUPS:
-        _OBJECT_PROCESS_GROUPS[key] = cast(
+    if key not in _DATASET_PROCESS_GROUPS:
+        _DATASET_PROCESS_GROUPS[key] = cast(
             dist.ProcessGroup,
             dist.new_group(ranks=list(range(world_size)), backend="gloo"),
         )
-    return _OBJECT_PROCESS_GROUPS[key]
+    return _DATASET_PROCESS_GROUPS[key]
 
 
 # fix missing create_mean_pooling_callback of mc-ebc input_dist

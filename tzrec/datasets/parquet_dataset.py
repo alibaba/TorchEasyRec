@@ -188,7 +188,7 @@ class ParquetReader(BaseReader):
             batch_cost_size=batch_cost_size,
             **kwargs,
         )
-        self._pg = dist_util.get_dist_object_pg()
+        self._pg = dist_util.get_dataset_process_group()
         self._rebalance = rebalance
 
         self._ordered_cols = None

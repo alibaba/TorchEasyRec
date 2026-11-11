@@ -111,7 +111,7 @@ def _bootstrap(group_size: int, local_rank: int, group_rank: int) -> str:
         local_ip = "0.0.0.0"
         port = "0"
 
-    pg = dist_util.get_dist_object_pg()
+    pg = dist_util.get_dataset_process_group()
     if pg is None:
         return local_ip + ":" + port
 

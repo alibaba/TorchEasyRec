@@ -275,7 +275,7 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
     def _construct_with_dist(self, rank, consumer_cls, broadcast):
         with (
             mock.patch(
-                "tzrec.datasets.kafka_dataset.dist_util.get_dist_object_pg",
+                "tzrec.datasets.kafka_dataset.dist_util.get_dataset_process_group",
                 return_value=mock.sentinel.dataset_pg,
             ),
             mock.patch.multiple(
