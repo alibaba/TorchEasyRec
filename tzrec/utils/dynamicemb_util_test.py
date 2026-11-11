@@ -744,9 +744,11 @@ class RocksDBTableTest(unittest.TestCase):
         index_bytes = index_entry_bytes() if indexed else 0
         meta = metadata_cache_bytes(rows, row_bytes, indexed)
         writeback = memory.resident_rows * row_bytes
-        live_growth = math.ceil(
+        live_bytes = math.ceil(
             rocksdb_util.SST_FACTOR * rows * (row_bytes + index_bytes)
         )
+        self.assertEqual(memory.storage.ddr, meta)
+        self.assertEqual(memory.storage.ssd, live_bytes + writeback)
         for storage in storages:
             # The GPU cache tier alone on HBM -- its values and key maps,
             # without the backing table's map, which stays in the database
@@ -754,9 +756,7 @@ class RocksDBTableTest(unittest.TestCase):
             self.assertGreaterEqual(storage.hbm, memory.storage.hbm)
             self.assertLess(storage.hbm, host_memory.storage.hbm)
             self.assertEqual(storage.ddr, meta)
-            # Saving flushes the cache before the export: the charged SSD
-            # covers the live table's growth plus that writeback.
-            self.assertGreaterEqual(storage.ssd, live_growth + writeback)
+            self.assertEqual(storage.ssd, live_bytes + writeback)
         # With the full shared allowance -- compaction headroom, other DB
         # files and this shard's restore spill -- the charged budget also
         # covers the restoring phase's spill on top of the save bound.
@@ -764,7 +764,7 @@ class RocksDBTableTest(unittest.TestCase):
             local_world_size=1, restore_spill_bytes=rows * row_bytes
         )
         charged = storages[0].ssd + activation.ssd
-        self.assertGreaterEqual(charged, live_growth + writeback + rows * row_bytes)
+        self.assertGreaterEqual(charged, live_bytes + writeback + rows * row_bytes)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required.")
     def test_fused_cache_matches_the_plan(self):

@@ -92,7 +92,7 @@ class DynamicEmbTableStorage(NamedTuple):
         *,
         ratio: float,
     ) -> "DynamicEmbTableStorage":
-        """Estimate the value budget and physical HBM and DDR bytes for one shard.
+        """Estimate the value budget and HBM, DDR and SSD costs for one shard.
 
         The options carry the aligned per-rank max_capacity; the tensor supplies
         the embedding width, dtype and optimizer. The caching mode comes from
@@ -107,7 +107,7 @@ class DynamicEmbTableStorage(NamedTuple):
         ratio * shard_rows * row_bytes to whole bytes and cap it at full_bytes - 1.
         The runtime splits rows using that byte budget divided by full_bytes.
 
-        Physical table storage uses the resulting bucket-rounded capacities::
+        Built-in table storage uses the resulting bucket-rounded capacities::
 
             physical_hbm_rows = resident_rows + overflow_rows
             storage.hbm = physical_hbm_rows * row_bytes + key_map_bytes_total
@@ -131,6 +131,10 @@ class DynamicEmbTableStorage(NamedTuple):
         NO_EVICTION map stores the value row index in its score word and has twice
         as many slots as value rows.
 
+        RocksDB charges backing metadata to DDR and live records, eviction
+        indexes and cache-writeback versions to SSD. Temporary growth before
+        eviction uses the topology's SSD reserve rather than a batch-size term.
+
         For zero and full budgets, take the larger cost per field across the
         standalone endpoint and its placement in a fused HYBRID group. The
         host-only endpoint has the full shard as backing_rows; the ordinary
@@ -140,6 +144,7 @@ class DynamicEmbTableStorage(NamedTuple):
         and pipeline I/O separately.
         """
         caching = options.caching
+        rocksdb_backing = rocksdb_util.is_rocksdb_options(options)
         if not 0.0 <= ratio <= 1.0 or (caching and ratio in (0.0, 1.0)):
             raise ValueError(
                 f"invalid dynamicemb placement: caching={caching}, {ratio=}"
@@ -150,7 +155,8 @@ class DynamicEmbTableStorage(NamedTuple):
         multiplier = _get_optimizer_multipler(
             getattr(tensor, "_optimizer_classes", [None])[0], tensor.shape, tensor.dtype
         )
-        row_bytes = (dim + round(dim * multiplier)) * tensor.element_size()
+        optimizer_state_dim = round(dim * multiplier)
+        row_bytes = (dim + optimizer_state_dim) * tensor.element_size()
         width = options.bucket_capacity
         strategy = options.score_strategy
         score_words = score_policy_num_scores(get_score_policy(strategy).policy)
@@ -182,7 +188,7 @@ class DynamicEmbTableStorage(NamedTuple):
                 index = _keymap_bytes(
                     resident, cache_width, cache_words
                 ) + _keymap_bytes(overflow, overflow, cache_words)
-                if not rocksdb_util.is_rocksdb_options(options):
+                if not rocksdb_backing:
                     index += full_index
             else:
                 hbm = resident
@@ -194,54 +200,32 @@ class DynamicEmbTableStorage(NamedTuple):
                 )
                 if ratio == 1:
                     index = max(index, full_index)
+        storage = Storage(hbm=hbm * row_bytes + index, ddr=host * row_bytes, ssd=0)
+        if rocksdb_backing:
+            from tzrec_ext.rocksdb import (
+                index_entry_bytes,
+                logical_row_bytes,
+                metadata_cache_bytes,
+            )
+
+            record_bytes = logical_row_bytes(
+                dim, optimizer_state_dim, tensor.element_size()
+            )
+            index_bytes = index_entry_bytes() if not no_eviction else 0
+            storage.ddr = metadata_cache_bytes(
+                shard_rows, record_bytes, not no_eviction
+            )
+            live_bytes = shard_rows * (record_bytes + index_bytes)
+            storage.ssd = (
+                math.ceil(rocksdb_util.SST_FACTOR * live_bytes)
+                + resident * record_bytes
+            )
         return cls(
             resident_rows=resident,
             backing_rows=host,
             local_hbm_for_values=budget,
-            storage=Storage(hbm=hbm * row_bytes + index, ddr=host * row_bytes, ssd=0),
+            storage=storage,
         )
-
-
-def _calculate_dynamicemb_table_storages(
-    *,
-    tensor: torch.Tensor,
-    shard_sizes: List[List[int]],
-    memory: DynamicEmbTableStorage,
-    options: "dynamicemb.DynamicEmbTableOptions",
-    admitted_rows: float,
-) -> List[Storage]:
-    """Estimate table storage per shard, excluding counters and pipeline I/O.
-
-    Args:
-        tensor: Table tensor carrying dtype and optimizer information.
-        shard_sizes: Dimensions of each row-wise shard.
-        memory: Physical per-shard memory of the candidate.
-        options: Candidate table options, including its storage backend.
-        admitted_rows: Estimated rows admitted per step before eviction.
-
-    Returns:
-        HBM, DDR and SSD table costs for each shard.
-    """
-    hbm = memory.storage.hbm
-    if not rocksdb_util.is_rocksdb_options(options):
-        return [Storage(hbm=hbm, ddr=memory.storage.ddr, ssd=0) for _ in shard_sizes]
-
-    multiplier = _get_optimizer_multipler(
-        getattr(tensor, "_optimizer_classes", [None])[0], tensor.shape, tensor.dtype
-    )
-    storages = []
-    for rows, dim in shard_sizes:
-        backing = rocksdb_util.table_storage(
-            rows=int(rows),
-            embedding_dim=int(dim),
-            optimizer_state_dim=round(dim * multiplier),
-            element_size=tensor.element_size(),
-            indexed=options.score_strategy != DynamicEmbScoreStrategy.NO_EVICTION,
-            admitted_rows=admitted_rows,
-            cache_rows=memory.resident_rows,
-        )
-        storages.append(Storage(hbm=hbm, ddr=backing.ddr, ssd=backing.ssd))
-    return storages
 
 
 def _bucket_rounded_rows(rows: int, width: int) -> int:
@@ -1026,13 +1010,6 @@ if has_dynamicemb:
             is_pooled=is_pooled,
         )
 
-        table_storages = _calculate_dynamicemb_table_storages(
-            tensor=tensor,
-            shard_sizes=shard_sizes,
-            memory=dynamicemb_storage,
-            options=dynamicemb_options,
-            admitted_rows=sum(b * n for b, n in zip(batch_sizes, input_lengths)),
-        )
         # The counter belongs to the strategy that counts with it; a
         # probabilistic admitter keeps no state, so it costs nothing.
         counter_hbm_specific_size = 0
@@ -1042,6 +1019,7 @@ if has_dynamicemb:
             slots = _bucket_rounded_rows(counter.capacity, width)
             counter_hbm_specific_size = _keymap_bytes(slots, width, score_words=1)
 
+        table_storage = dynamicemb_storage.storage
         return [
             Storage(
                 hbm=table_storage.hbm
@@ -1058,9 +1036,7 @@ if has_dynamicemb:
                 ddr=table_storage.ddr,
                 ssd=table_storage.ssd,
             )
-            for input_size, output_size, table_storage in zip(
-                input_sizes, output_sizes, table_storages
-            )
+            for input_size, output_size in zip(input_sizes, output_sizes)
         ]
 
     from torchrec.sparse import jagged_tensor_validator as _jtv
