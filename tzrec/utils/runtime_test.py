@@ -256,10 +256,10 @@ class ShardedModelRuntimeTest(unittest.TestCase):
         self.assertEqual(order, ["bind", "dmp"])
         backend.bind.assert_called_once_with(planner.collective_plan.return_value)
         backend.attach.assert_called_once_with(dmp)
-        runtime.enforce_embedding_capacity()
+        runtime.maintain(global_step=1)
         backend.evict.assert_called_once()
 
-    def test_shard_and_enforce_without_backend_are_noops(self) -> None:
+    def test_shard_and_maintain_without_backend(self) -> None:
         runtime = ShardedModelRuntime(mock.Mock(), None)
         with (
             mock.patch("tzrec.utils.runtime.create_planner", return_value=mock.Mock()),
@@ -275,7 +275,7 @@ class ShardedModelRuntimeTest(unittest.TestCase):
                 batch_size=8,
                 checkpoint_path=None,
             )
-            runtime.enforce_embedding_capacity()
+            runtime.maintain(global_step=1)
 
 
 if __name__ == "__main__":

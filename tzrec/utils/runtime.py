@@ -176,13 +176,14 @@ class ShardedModelRuntime:
             self._rocksdb.attach(dmp_model)
         return dmp_model
 
-    def enforce_embedding_capacity(self) -> None:
-        """Evict offloaded dynamic tables above their planned capacity.
+    def maintain(self, *, global_step: int) -> None:
+        """Run synchronous maintenance at a safe training boundary.
 
-        Delegates to the attached backend when the job has one; without
-        one there is nothing to enforce. Call only with no lookup in
-        flight: after a completed update, and at the drained final-batch
-        boundary, before the step is published or saved.
+        Call with no lookup in flight, before publication or saving.
+
+        Args:
+            global_step: Current training step. Maintenance currently runs
+                on every call, independent of the step number.
         """
         if self._rocksdb is not None:
             self._rocksdb.evict()

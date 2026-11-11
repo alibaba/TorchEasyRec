@@ -690,9 +690,7 @@ def _train_and_evaluate(
                             kafka_baseline_offsets.setdefault(
                                 key, dataloader_state[key]
                             )
-                    # Offloaded dynamic tables evict above their planned
-                    # capacity before this step is published or saved.
-                    runtime.enforce_embedding_capacity()
+                    runtime.maintain(global_step=i_step)
                     _model.update_train_metric(predictions, batch)
                     if i_step % train_config.log_step_count_steps == 0:
                         train_metrics = _model.compute_train_metric()
@@ -721,10 +719,9 @@ def _train_and_evaluate(
                         dump_decision = delta_embedding_dumper.maybe_dump(i_step)
                 except StopIteration:
                     # The call that ran out of data may still have trained
-                    # the last queued batch; nothing is in flight now, so
-                    # offloaded tables can enforce their capacity before
-                    # the pass's saves.
-                    runtime.enforce_embedding_capacity()
+                    # the last queued batch; run maintenance with nothing
+                    # in flight before the pass's saves.
+                    runtime.maintain(global_step=i_step)
                     # pass completed: later saves should record positions
                     # within the next pass, on top of the completed-pass count.
                     epochs_completed += 1
