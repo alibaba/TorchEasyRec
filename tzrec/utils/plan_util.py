@@ -581,7 +581,6 @@ class DynamicProgrammingProposer(Proposer):
             ssd_list: List[float] = []
             perf_list: List[float] = []
             opt_id_list: List[int] = []
-            table_max_ssd = 0
             for opt_id, sharding_option in enumerate(sharding_options):
                 max_shard_hbm = max(
                     (shard.storage.hbm or 0) for shard in sharding_option.shards
@@ -615,7 +614,6 @@ class DynamicProgrammingProposer(Proposer):
                 ssd_list.append(total_ssd)
                 perf_list.append(sharding_option.total_perf)
                 opt_id_list.append(opt_id)
-                table_max_ssd = max(table_max_ssd, total_ssd)
             table_opts.append(
                 (
                     np.asarray(hbm_list, dtype=np.float32),
@@ -625,7 +623,7 @@ class DynamicProgrammingProposer(Proposer):
                     np.asarray(opt_id_list, dtype=np.int32),
                 )
             )
-            max_eligible_ssd += table_max_ssd
+            max_eligible_ssd += max(ssd_list, default=0)
 
         # Collapse the SSD axis when all eligible combinations fit.
         ssd_bins = 1
