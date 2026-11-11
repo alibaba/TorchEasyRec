@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   dsw-test:
-    uses: alibaba/TorchEasyRec/.github/workflows/dsw_ci.yml@master
+    uses: ./.github/workflows/dsw_ci.yml
     with:
       lane: ppu
       ref: ${{ github.sha }}
