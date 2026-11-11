@@ -34,7 +34,7 @@ import hashlib
 import os
 import shutil
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, cast
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, cast
 
 from torch import nn
 
@@ -43,6 +43,7 @@ from tzrec.utils.logging_util import logger
 
 if TYPE_CHECKING:
     from dynamicemb import DynamicEmbTableOptions
+    from torchrec.distributed.planner.types import ShardingOption
 
 # Host memory a rank needs beyond the planned RocksDB budgets (table readers,
 # iterators, pinned blocks, allocator slack).
@@ -70,23 +71,94 @@ def fixed_host_bytes() -> int:
     )
 
 
-def backend_config(local_world_size: int, **budgets: int) -> Any:
+def backend_config(
+    local_world_size: int,
+    *,
+    block_cache_bytes: int,
+    import_budget_bytes: int,
+) -> Any:
     """The common backend configuration a plan derives its budgets from.
 
     Threads follow the CPUs one rank may use; the fixed buffers are planned
-    constants. Selected-plan budgets (block cache, import memory) arrive as
-    ``budgets``.
+    constants. Block-cache and import budgets come from the selected plan.
+
+    Args:
+        local_world_size: Number of ranks sharing the host's CPUs.
+        block_cache_bytes: Block-cache capacity per rank, including metadata.
+        import_budget_bytes: Temporary host-memory budget for checkpoint import.
     """
     from tzrec_ext.rocksdb import BackendConfig
 
     cpus = max(1, len(os.sched_getaffinity(0)) // max(local_world_size, 1))
     return BackendConfig(
+        block_cache_bytes=block_cache_bytes,
         write_buffer_bytes=WRITE_BUFFER_BYTES,
         staging_buffer_bytes=STAGING_BUFFER_BYTES,
+        import_budget_bytes=import_budget_bytes,
         io_threads=max(4, cpus),
         max_background_jobs=max(2, cpus // 4),
-        **budgets,
     )
+
+
+def configure_backend(
+    selected: List["ShardingOption"],
+    *,
+    ddr_caps: Tuple[int, ...],
+    local_world_size: int,
+) -> List["ShardingOption"]:
+    """Configure the shared RocksDB backend from selected shard budgets.
+
+    Args:
+        selected: Selected options with ranks assigned to their shards.
+        ddr_caps: Per-rank host capacities before the shared RocksDB reserve.
+        local_world_size: Number of ranks sharing one host.
+
+    Returns:
+        The selected options with backend configuration attached to their
+        RocksDB factories. Other table options are unchanged.
+    """
+    rocksdb_options = []
+    metadata_bytes_per_rank = [0] * len(ddr_caps)
+    import_available_per_rank = list(ddr_caps)
+    for option in selected:
+        is_rocksdb = is_rocksdb_options(option.dynamicemb_options)
+        if is_rocksdb:
+            rocksdb_options.append(option)
+        for shard in option.shards:
+            rank = cast(int, shard.rank)
+            ddr_bytes = shard.storage.ddr or 0
+            if is_rocksdb:
+                metadata_bytes_per_rank[rank] += ddr_bytes
+            else:
+                import_available_per_rank[rank] -= ddr_bytes
+
+    if not rocksdb_options:
+        return selected
+
+    block_cache_bytes = BLOCK_CACHE_DATA_BYTES + max(metadata_bytes_per_rank)
+    # Import reuses the empty memtable/cache budgets; built-in tables remain resident.
+    import_budget_bytes = (
+        min(import_available_per_rank) - STAGING_BUFFER_BYTES - _HOST_OVERHEAD_BYTES
+    )
+    config = backend_config(
+        local_world_size=local_world_size,
+        block_cache_bytes=block_cache_bytes,
+        import_budget_bytes=import_budget_bytes,
+    )
+    for option in rocksdb_options:
+        options = option.dynamicemb_options
+        options.external_storage = dataclasses.replace(
+            options.external_storage, backend_config=config
+        )
+    logger.info(
+        "dynamicemb tables offloaded to RocksDB (per rank): "
+        + ", ".join(
+            f"{option.fqn} cache ratio {option.cache_load_factor}"
+            for option in rocksdb_options
+        )
+        + f"; backend {config}"
+    )
+    return selected
 
 
 def shared_storage(local_world_size: int) -> Any:

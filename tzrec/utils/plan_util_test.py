@@ -1396,7 +1396,7 @@ class RocksDBPlannerTest(unittest.TestCase):
             ],
             callbacks=[
                 partial(
-                    plan_util._attach_backend_config,
+                    rocksdb_util.configure_backend,
                     ddr_caps=ddr_caps,
                     local_world_size=1,
                 )

@@ -165,6 +165,45 @@ class SharedStorageTest(unittest.TestCase):
             shared.ssd, overheads["compaction_headroom"] + overheads["other_files"]
         )
 
+    def test_configure_backend_budgets(self):
+        try:
+            from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+        except ModuleNotFoundError as e:
+            self.skipTest(f"tzrec_ext.rocksdb.storage needs {e.name}")
+
+        gib = 1 << 30
+        selected = [
+            SimpleNamespace(
+                fqn=name,
+                cache_load_factor=0.1,
+                dynamicemb_options=SimpleNamespace(
+                    external_storage=(
+                        RocksDBStorageFactory(_backend_config(), name)
+                        if name != "plain"
+                        else None
+                    )
+                ),
+                shards=[
+                    SimpleNamespace(rank=rank, storage=SimpleNamespace(ddr=ddr))
+                    for rank, ddr in enumerate(ddr_bytes)
+                ],
+            )
+            for name, ddr_bytes in (
+                ("plain", [3 * gib, 7 * gib]),
+                ("sparse.a", [gib // 4, gib // 2]),
+                ("sparse.b", [3 * gib // 4, gib]),
+            )
+        ]
+        configured = rocksdb_util.configure_backend(
+            selected, ddr_caps=(16 * gib, 16 * gib), local_world_size=2
+        )
+        self.assertIsNone(configured[0].dynamicemb_options.external_storage)
+        for option in configured[1:]:
+            factory = option.dynamicemb_options.external_storage
+            self.assertEqual(factory.table_namespace, option.fqn)
+            self.assertEqual(factory.backend_config.block_cache_bytes, 5 * gib // 2)
+            self.assertEqual(factory.backend_config.import_budget_bytes, 27 * gib // 4)
+
 
 if __name__ == "__main__":
     unittest.main()

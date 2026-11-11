@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import copy
-import dataclasses
 import json
 import math
 import os
@@ -254,7 +253,7 @@ def create_planner(
     if allow_rocksdb:
         callbacks = [
             partial(
-                _attach_backend_config,
+                rocksdb_util.configure_backend,
                 ddr_caps=ddr_caps,
                 local_world_size=local_world_size,
             )
@@ -1128,73 +1127,6 @@ def _emit_dynamicemb_variants(
         candidates.append(option)
 
     return candidates
-
-
-def _attach_backend_config(
-    selected: List[ShardingOption],
-    *,
-    ddr_caps: Tuple[int, ...],
-    local_world_size: int,
-) -> List[ShardingOption]:
-    """Derive and attach the backend config of the selected plan.
-
-    The ordinary planner invokes this on its chosen options before they
-    become a ShardingPlan. SSD tables are identified by their actual
-    external-storage factory; nothing is charged here, the topology already
-    reserves the shared backend resources. The block-cache and import budgets
-    come from the selected shards and original per-device host capacities; the
-    common config uses a sufficient per-rank budget without summing every
-    rank's copies into one rank's budget.
-    """
-    ssd_options = [
-        option
-        for option in selected
-        if rocksdb_util.is_rocksdb_options(option.dynamicemb_options)
-    ]
-    if not ssd_options:
-        return selected
-    ssd_ids = {id(option) for option in ssd_options}
-
-    # At restore the block cache and memtables are still empty, but every
-    # built-in table's host memory is already allocated.
-    builtin_ddr = [0] * len(ddr_caps)
-    for option in selected:
-        if id(option) in ssd_ids:
-            continue
-        for shard in option.shards:
-            if shard.rank is not None:
-                builtin_ddr[shard.rank] += shard.storage.ddr or 0
-
-    metadata_ddr: Dict[int, int] = {}
-    for option in ssd_options:
-        for shard in option.shards:
-            if shard.rank is not None:
-                metadata_ddr[shard.rank] = metadata_ddr.get(shard.rank, 0) + (
-                    shard.storage.ddr or 0
-                )
-    config = rocksdb_util.backend_config(
-        local_world_size,
-        block_cache_bytes=rocksdb_util.BLOCK_CACHE_DATA_BYTES
-        + max(metadata_ddr.values(), default=0),
-        import_budget_bytes=min(d - b for d, b in zip(ddr_caps, builtin_ddr))
-        - rocksdb_util.STAGING_BUFFER_BYTES
-        - rocksdb_util._HOST_OVERHEAD_BYTES,
-    )
-    for option in ssd_options:
-        option.dynamicemb_options.external_storage = (  # pyre-ignore [16]
-            dataclasses.replace(
-                option.dynamicemb_options.external_storage, backend_config=config
-            )
-        )
-    logger.info(
-        "dynamicemb tables offloaded to RocksDB (per rank): "
-        + ", ".join(
-            f"{option.fqn} cache ratio {option.cache_load_factor}"
-            for option in ssd_options
-        )
-        + f"; backend {config}"
-    )
-    return selected
 
 
 class EmbeddingEnumerator(_EmbeddingEnumerator):
