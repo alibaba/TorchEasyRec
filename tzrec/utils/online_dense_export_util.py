@@ -421,7 +421,7 @@ class OnlineDenseExportManager:
         batch-parse time. WORLD_SIZE gives the warm-up dataloader the same
         single-rank view the full export runs under: the Parquet and ODPS
         readers run startup collectives (file-metadata all-gather, scan
-        session broadcast) on the default process group when WORLD_SIZE > 1,
+        session exchange) on the dataset Gloo group when WORLD_SIZE > 1,
         and this rank-zero-only build has no peer to join, which would
         deadlock the collective. The training model and its dataloader
         workers are already constructed by the time this runs, so the window

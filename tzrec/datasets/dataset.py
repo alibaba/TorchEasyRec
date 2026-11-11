@@ -310,7 +310,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
 
-        if dist.is_initialized():
+        if dist.is_initialized() and int(os.environ.get("WORLD_SIZE", 1)) > 1:
             rank = dist.get_rank()
             world_size = dist.get_world_size()
         else:

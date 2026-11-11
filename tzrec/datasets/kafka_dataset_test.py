@@ -274,6 +274,10 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
 
     def _construct_with_dist(self, rank, consumer_cls, broadcast):
         with (
+            mock.patch(
+                "tzrec.datasets.kafka_dataset.dist_util.get_dist_object_pg",
+                return_value=mock.sentinel.dataset_pg,
+            ),
             mock.patch.multiple(
                 "tzrec.datasets.kafka_dataset.dist",
                 is_initialized=mock.Mock(return_value=True),
@@ -307,12 +311,15 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         consumer_cls = mock.Mock(return_value=query_consumer)
         broadcast = mock.Mock()
         rank0_reader = self._construct_with_dist(0, consumer_cls, broadcast)
-        broadcast.assert_called_once_with([None, [1, 0, 2]])
+        broadcast.assert_called_once_with(
+            [None, [1, 0, 2]], group=mock.sentinel.dataset_pg
+        )
         payload = broadcast.call_args.args[0]
         self.assertEqual(rank0_reader._round_robin_partition_order, [1, 0, 2])
         query_consumer.close.assert_called_once()
 
-        def _broadcast(object_list):
+        def _broadcast(object_list, group):
+            self.assertIs(group, mock.sentinel.dataset_pg)
             object_list[:] = payload
 
         rank1_consumer_cls = mock.Mock()
@@ -336,7 +343,8 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         self.assertIn("unknown topic", payload[0])
         query_consumer.close.assert_called_once()
 
-        def _broadcast(object_list):
+        def _broadcast(object_list, group):
+            self.assertIs(group, mock.sentinel.dataset_pg)
             object_list[:] = payload
 
         consumer_cls.reset_mock()

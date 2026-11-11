@@ -39,6 +39,7 @@ from tzrec.datasets.utils import (
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
+from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
 
 
@@ -400,8 +401,8 @@ class KafkaReader(BaseReader):
             ValueError: if topic metadata cannot be read.
         """
         topic, config, _ = _parse_kafka_uri(self._input_path)
-        distributed = dist.is_initialized() and dist.get_world_size() > 1
-        rank = dist.get_rank() if distributed else 0
+        pg = dist_util.get_dist_object_pg()
+        rank = dist.get_rank(pg) if pg is not None else 0
         result: List[Any] = [None, None]
         if rank == 0:
             try:
@@ -431,8 +432,8 @@ class KafkaReader(BaseReader):
             except Exception as e:
                 result = [f"{type(e).__name__}: {e}", None]
 
-        if distributed:
-            dist.broadcast_object_list(result)
+        if pg is not None:
+            dist.broadcast_object_list(result, group=pg)
 
         error, partition_order = result
         if error is not None:
