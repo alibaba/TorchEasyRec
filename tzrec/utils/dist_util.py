@@ -13,7 +13,7 @@ import copy
 import os
 from datetime import timedelta
 from queue import Queue
-from typing import Callable, Iterator, List, Optional, Tuple, Type, cast
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Type, cast
 
 import torch
 from torch import distributed as dist
@@ -53,9 +53,11 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.utils.logging_util import logger
 
+_DATASET_PROCESS_GROUPS: Dict[Tuple[dist.ProcessGroup, int], dist.ProcessGroup] = {}
+
 
 def init_process_group() -> Tuple[torch.device, str]:
-    """Init process_group, device, rank, backend."""
+    """Initialize training and dataset groups and return the device and backend."""
     rank = int(os.environ.get("LOCAL_RANK", 0))
     if torch.cuda.is_available():
         device: torch.device = torch.device(f"cuda:{rank}")
@@ -71,24 +73,48 @@ def init_process_group() -> Tuple[torch.device, str]:
             seconds=(int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"]))
         )
     dist.init_process_group(backend=backend, timeout=pg_timeout)
+    # NOTE: Create the dataset group at the same point on every rank.
+    get_dataset_process_group()
 
     return device, backend
 
 
-def get_dist_object_pg(world_size: Optional[int] = None) -> Optional[dist.ProcessGroup]:
-    """New ProcessGroup used for broadcast_object or gather_object."""
-    pg = None
-    world_size = world_size or int(os.environ.get("WORLD_SIZE", 1))
-    if world_size > 1:
-        # pyre-ignore [16]
-        if dist.is_initialized() and dist.GroupMember.WORLD.size() == world_size:
-            pg = dist.GroupMember.WORLD
-        else:
-            pg = cast(
-                Optional[dist.ProcessGroup],
-                dist.new_group(ranks=list(range(world_size)), backend="gloo"),
+def get_dataset_process_group(
+    world_size: Optional[int] = None,
+) -> Optional[dist.ProcessGroup]:
+    """Get a dedicated Gloo group for dataset metadata communication.
+
+    All ranks must call this in the same order when first requesting a group.
+    Groups are reused within the current default process group. A single-rank
+    WORLD_SIZE scope, such as export warm-up, skips communication even when
+    the training process group is still initialized. New groups honor
+    PROCESS_GROUP_TIMEOUT_SECONDS when configured.
+
+    Args:
+        world_size: Group size spanning ranks 0 through world_size - 1.
+            Defaults to WORLD_SIZE; a value of 1 disables communication.
+
+    Returns:
+        A Gloo group, or None for local reading without collectives.
+    """
+    if world_size is None:
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size <= 1 or not dist.is_initialized():
+        return None
+    key = (cast(dist.ProcessGroup, dist.group.WORLD), world_size)
+    if key not in _DATASET_PROCESS_GROUPS:
+        pg_timeout = None
+        if "PROCESS_GROUP_TIMEOUT_SECONDS" in os.environ:
+            pg_timeout = timedelta(
+                seconds=int(os.environ["PROCESS_GROUP_TIMEOUT_SECONDS"])
             )
-    return pg
+        _DATASET_PROCESS_GROUPS[key] = cast(
+            dist.ProcessGroup,
+            dist.new_group(
+                ranks=list(range(world_size)), backend="gloo", timeout=pg_timeout
+            ),
+        )
+    return _DATASET_PROCESS_GROUPS[key]
 
 
 # fix missing create_mean_pooling_callback of mc-ebc input_dist

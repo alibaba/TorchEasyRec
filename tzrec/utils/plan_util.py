@@ -93,7 +93,7 @@ from torchrec.modules.embedding_modules import (
 from tzrec.protos import feature_pb2
 from tzrec.utils import env_util, resource_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import (
-    DynamicEmbTableMemory,
+    DynamicEmbTableStorage,
     _get_optimizer_multipler,
     has_dynamicemb,
 )
@@ -108,25 +108,12 @@ def create_planner(
     model: Optional[nn.Module] = None,
     rocksdb: Optional["rocksdb_util.RocksDBRuntime"] = None,
 ) -> EmbeddingShardingPlanner:
-    """Create EmbeddingShardingPlanner, with or without RocksDB candidates.
+    """Create an embedding sharding planner.
 
-    Host memory per rank is the container's (cgroup-capped) RAM less
-    ``HOST_MEMORY_RESERVE_PERCENT`` (default 0.15) for everything but
-    embeddings, split among the host's ranks; the margin applies to every
-    configuration. ``STORAGE_RESERVE_PERCENT`` (default 0.15) holds back GPU
-    memory the same way.
-
-    With a RocksDB runtime, one combined search enumerates built-in CACHING
-    and eligible RocksDB CACHING_PS candidates together over HBM, DDR and
-    SSD budgets: the SSD quota is the observed free space of
-    ``rocksdb_config.root_dir`` (capped by ``ssd_budget_bytes``) less the
-    reserve, split across the ranks sharing the volume --
-    ``shared_across_nodes`` picks that sharing scope. The shared backend
-    activation is charged once to combinations that use it, by the DP
-    proposer's activation state and the activation-aware partitioner. Only
-    the DP proposer is registered, and the ordinary planner scores every
-    proposal with its performance model; a mixed plan wins whenever the
-    estimated objective is better, with no absolute memory preference.
+    Builds the hardware topology and storage reservation, resolves
+    per-table and global constraints, applies applicable sharding
+    constraints from a saved checkpoint plan, and configures the
+    enumerator and proposers.
     """
     if global_constraints_cfg is not None and (
         global_constraints_cfg.HasField("pooling_factor")
@@ -145,7 +132,7 @@ def create_planner(
     if torch.cuda.is_available():
         topo_kwargs["hbm_cap"] = torch.cuda.get_device_properties(device).total_memory
 
-    host_reserve_percent = float(os.environ.get("HOST_MEMORY_RESERVE_PERCENT", 0.15))
+    host_reserve_percent = float(os.environ.get("HOST_MEMORY_RESERVE_PERCENT", 0.0))
     topo_kwargs["ddr_cap"] = resource_util.host_memory_capacity_per_rank(
         local_world_size=local_world_size, reserve_percent=host_reserve_percent
     )
@@ -944,7 +931,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 kv_cache_load_factor=kv_cache_load_factor,
                 use_virtual_table=use_virtual_table,
                 dynamicemb_options=dynamicemb_options,
-                dynamicemb_memory=getattr(sharding_option, "dynamicemb_memory", None),
+                dynamicemb_storage=getattr(sharding_option, "dynamicemb_storage", None),
             )
             for shard, storage in zip(sharding_option.shards, shard_storages):
                 shard.storage = storage
@@ -974,7 +961,7 @@ def calculate_shard_storages(
     kv_cache_load_factor: float = KV_CACHING_RATIO,
     use_virtual_table: bool = False,
     dynamicemb_options=None,
-    dynamicemb_memory: Optional[DynamicEmbTableMemory] = None,
+    dynamicemb_storage: Optional[DynamicEmbTableStorage] = None,
 ) -> List[Storage]:
     """Calculates estimated storage sizes.
 
@@ -1009,7 +996,8 @@ def calculate_shard_storages(
         kv_cache_load_factor (float): ratio of kv caching.
         use_virtual_table (bool): use virtual table or not.
         dynamicemb_options (DynamicEmbTableOptions): dynamic embedding options.
-        dynamicemb_memory: per-shard capacity of the DynamicEmb candidate.
+        dynamicemb_storage (DynamicEmbTableStorage): per-shard capacities and
+            table storage costs of the DynamicEmb candidate.
 
     Returns:
         List[Storage]: storage object for each device in topology.
@@ -1017,7 +1005,7 @@ def calculate_shard_storages(
     if dynamicemb_options is not None:
         from tzrec.utils.dynamicemb_util import dynamicemb_calculate_shard_storages
 
-        assert dynamicemb_memory is not None
+        assert dynamicemb_storage is not None
         return dynamicemb_calculate_shard_storages(
             sharder_data=sharder_data,
             sharding_type=sharding_type,
@@ -1038,7 +1026,7 @@ def calculate_shard_storages(
             is_inference=is_inference,
             multipass_prefetch_max_pass=multipass_prefetch_max_pass,
             dynamicemb_options=dynamicemb_options,
-            dynamicemb_memory=dynamicemb_memory,
+            dynamicemb_storage=dynamicemb_storage,
         )
     else:
         return tzrec_calculate_shard_storages(
@@ -1097,7 +1085,10 @@ def _emit_dynamicemb_variants(
     In automatic search, keep the first budget for each set of rounded tier
     capacities within a mode. Zero, partial and full budgets remain distinct:
     equal row estimates do not imply the same layout after native fusion.
-    The DP proposer uses the candidates' HBM and host costs to select a plan.
+    Within a mode the HBM value rows follow from the resident rows -- equal
+    for HYBRID, plus the fixed overflow area for CACHING -- so the key tracks
+    only the resident and backing rows. The DP proposer uses the candidates'
+    HBM and host costs to select a plan.
 
     With RocksDB planning, the built-in zero and partial non-caching (HYBRID)
     budgets are excluded -- HybridStorage re-splits rows between its tiers
@@ -1112,7 +1103,7 @@ def _emit_dynamicemb_variants(
 
     The caller supplies base_option.dynamicemb_options. Each emitted option
     owns a deep copy of its table options and reports the allocated share as
-    its load factor; its memory estimate retains the byte budget for runtime.
+    its load factor; its storage estimate retains the byte budget for runtime.
     """
     tensor = base_option.tensor
     template = copy.copy(base_option)
@@ -1159,44 +1150,54 @@ def _emit_dynamicemb_variants(
     for caching, requested in requests:
         options.caching = caching
         ratio = requested
-        memory = DynamicEmbTableMemory.from_options(tensor, options, ratio=ratio)
-        if ratio > 0 and memory.local_hbm_for_values == 0:
+        dynamicemb_storage = DynamicEmbTableStorage.from_options(
+            tensor, options, ratio=ratio
+        )
+        if ratio > 0 and dynamicemb_storage.local_hbm_for_values == 0:
             if options.caching:
                 continue
             ratio = 0.0
-        elif options.caching and memory.resident_rows >= memory.host_rows:
+        elif (
+            options.caching
+            and dynamicemb_storage.resident_rows >= dynamicemb_storage.backing_rows
+        ):
             if params is None:
                 continue  # Automatic search already includes the full endpoint.
             options.caching = False
             ratio = 1.0
         if ratio != requested:
-            memory = DynamicEmbTableMemory.from_options(tensor, options, ratio=ratio)
-        if options.caching and memory.resident_rows < required:
+            dynamicemb_storage = DynamicEmbTableStorage.from_options(
+                tensor, options, ratio=ratio
+            )
+        if options.caching and dynamicemb_storage.resident_rows < required:
             continue
         if params is None:
             endpoint = ratio if ratio in (0, 1) else None
             key = (
                 options.caching,
                 endpoint,
-                memory.hbm_rows,
-                memory.host_rows,
-                memory.resident_rows,
+                dynamicemb_storage.backing_rows,
+                dynamicemb_storage.resident_rows,
             )
             if key in seen:
                 continue
             seen.add(key)
 
         if options.caching:
-            allocated = memory.resident_rows / memory.host_rows
+            allocated = (
+                dynamicemb_storage.resident_rows / dynamicemb_storage.backing_rows
+            )
         elif 0 < ratio < 1:
-            allocated = memory.hbm_rows / (memory.hbm_rows + memory.host_rows)
+            allocated = dynamicemb_storage.resident_rows / (
+                dynamicemb_storage.resident_rows + dynamicemb_storage.backing_rows
+            )
         else:
             allocated = ratio
         option = copy.deepcopy(template)
         option.cache_params = CacheParams(
             load_factor=allocated, stats=params.stats if params else None
         )
-        option.dynamicemb_memory = memory
+        option.dynamicemb_storage = dynamicemb_storage
         candidates.append(option)
 
     if (
@@ -1214,20 +1215,20 @@ def _emit_dynamicemb_variants(
             for ratio in sorted(
                 {float(r) for r in np.geomspace(min_ratio, 0.5, num=10)}
             ):
-                memory = DynamicEmbTableMemory.from_options(
+                memory = DynamicEmbTableStorage.from_options(
                     tensor, options, ratio=ratio
                 )
                 if memory.local_hbm_for_values == 0:
                     continue
                 if memory.resident_rows < required:
                     continue
-                if memory.resident_rows >= memory.host_rows:
+                if memory.resident_rows >= memory.backing_rows:
                     continue  # A full cache stays on the built-in endpoint.
                 option = copy.deepcopy(template)
                 option.cache_params = CacheParams(
-                    load_factor=memory.resident_rows / memory.host_rows
+                    load_factor=memory.resident_rows / memory.backing_rows
                 )
-                option.dynamicemb_memory = memory
+                option.dynamicemb_storage = memory
                 candidates.append(option)
     return candidates
 

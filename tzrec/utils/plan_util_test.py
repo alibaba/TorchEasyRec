@@ -60,7 +60,7 @@ from tzrec.utils.test_util import (
 class PlannerHostMemoryTest(unittest.TestCase):
     """Every configuration sizes host memory by the container-aware budget.
 
-    ``HOST_MEMORY_RESERVE_PERCENT`` (default 0.15) holds back host RAM for
+    ``HOST_MEMORY_RESERVE_PERCENT`` (default 0) holds back host RAM for
     non-embedding use in ordinary CPU/HYBRID/CACHING plans as well as in
     RocksDB plans; zero reserve disables only the margin, never the
     container limit.
@@ -68,7 +68,7 @@ class PlannerHostMemoryTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            param("default_reserve", env=None, reserve=0.15),
+            param("default_reserve", env=None, reserve=0.0),
             param("explicit_reserve", env="0.5", reserve=0.5),
             param("zero_reserve", env="0.0", reserve=0.0),
         ],
@@ -443,6 +443,43 @@ class PlanUtilTest(unittest.TestCase):
         )
         # planning must not mutate the model's own constraint objects
         self.assertIsNone(constraint.sharding_types)
+
+    @parameterized.expand(
+        [
+            param("default_reserve", env=None, reserve=0.0),
+            param("explicit_reserve", env="0.5", reserve=0.5),
+            param("zero_reserve", env="0.0", reserve=0.0),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_host_memory_reserve(self, _, env, reserve):
+        """The planner sizes its DDR budget by container RAM less a reserve.
+
+        ``HOST_MEMORY_RESERVE_PERCENT`` (default 0.0) can hold back host RAM
+        for everything but embeddings; zero reserve disables only the
+        margin, never the container limit.
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        environ = dict(os.environ)
+        environ.pop("HOST_MEMORY_RESERVE_PERCENT", None)
+        if env is not None:
+            environ["HOST_MEMORY_RESERVE_PERCENT"] = env
+        container = 100 << 30
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(
+                resource_util,
+                "_container_memory_limit_bytes",
+                return_value=container,
+            ),
+            mock.patch.object(plan_util, "get_local_size", return_value=1),
+            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
+        ):
+            planner = plan_util.create_planner(device, batch_size=8, model=nn.Module())
+            self.assertEqual(
+                planner._topology.devices[0].storage.ddr,
+                int(container * (1 - reserve)),
+            )
 
     @unittest.skipUnless(
         torch.cuda.is_available(), "CUDA is required for create_planner."
@@ -1190,13 +1227,13 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         full_bytes = 4096 * 4
         grid = [0, *np.geomspace(hybrid_floor, 0.5, 5), 0.6, 0.7, 0.8, 0.9, 1]
         self.assertEqual(
-            [o.dynamicemb_memory.local_hbm_for_values for o in noncache],
+            [o.dynamicemb_storage.local_hbm_for_values for o in noncache],
             [int(r * full_bytes) for r in grid],
         )
         self.assertEqual(len(cache), ncache)
         if cache:
             self.assertEqual(
-                cache[0].dynamicemb_memory.local_hbm_for_values,
+                cache[0].dynamicemb_storage.local_hbm_for_values,
                 int(cache_floor * full_bytes),
             )
 
@@ -1213,7 +1250,10 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         opts = self._options(ratio=ratio, pooling=pooling)
         self.assertEqual(
             [
-                (o.dynamicemb_memory.local_hbm_for_values, o.dynamicemb_options.caching)
+                (
+                    o.dynamicemb_storage.local_hbm_for_values,
+                    o.dynamicemb_options.caching,
+                )
                 for o in opts
             ],
             [(int(ratio * 16384), family) for family in families],
@@ -1237,18 +1277,32 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         pinned = self._options(ratio=0.1, rows=rows)
         self.assertEqual(
             [
-                (o.dynamicemb_memory.local_hbm_for_values, o.dynamicemb_options.caching)
+                (
+                    o.dynamicemb_storage.local_hbm_for_values,
+                    o.dynamicemb_options.caching,
+                )
                 for o in pinned
             ],
             [(int(0.1 * rows * 4), False), (rows * 4, False)],
         )
 
     def test_physical_dedup_keeps_first_budget(self):
+        pinned = [
+            next(o for o in self._options(ratio=ratio) if o.dynamicemb_options.caching)
+            for ratio in (0.6, 0.7)
+        ]
+        first, second = [o.dynamicemb_storage for o in pinned]
+        for candidate in (first, second):
+            self.assertEqual(
+                (candidate.resident_rows, candidate.backing_rows), (3072, 4096)
+            )
+        self.assertEqual(first.storage, second.storage)
+        self.assertNotEqual(first.local_hbm_for_values, second.local_hbm_for_values)
         opts = self._options()
         caches = [o for o in opts if o.dynamicemb_options.caching]
         self.assertEqual(
             [
-                (o.cache_load_factor, o.dynamicemb_memory.local_hbm_for_values)
+                (o.cache_load_factor, o.dynamicemb_storage.local_hbm_for_values)
                 for o in caches
             ],
             [
@@ -1257,27 +1311,28 @@ class DynamicEmbPlannerTest(unittest.TestCase):
                 (0.75, int(0.6 * 16384)),
             ],
         )
+        self.assertEqual(caches[-1].dynamicemb_storage, first)
         hybrid, cache = self._options(ratio=0.15)
         self.assertFalse(hybrid.dynamicemb_options.caching)
         self.assertTrue(cache.dynamicemb_options.caching)
         self.assertEqual(cache.cache_load_factor, 0.25)
         for option in (hybrid, cache):
             self.assertEqual(
-                option.dynamicemb_memory.local_hbm_for_values, int(0.15 * 16384)
+                option.dynamicemb_storage.local_hbm_for_values, int(0.15 * 16384)
             )
 
     def test_equal_tier_rows_keep_zero_partial_and_full(self):
         opts = self._options(rows=16)
         self.assertEqual(
             [
-                (o.cache_load_factor, o.dynamicemb_memory.local_hbm_for_values)
+                (o.cache_load_factor, o.dynamicemb_storage.local_hbm_for_values)
                 for o in opts
             ],
             [(0, 0), (1024 / 1040, 6), (1, 64)],
         )
         self.assertEqual(
             {
-                (o.dynamicemb_memory.hbm_rows, o.dynamicemb_memory.host_rows)
+                (o.dynamicemb_storage.resident_rows, o.dynamicemb_storage.backing_rows)
                 for o in opts
             },
             {(1024, 16)},
@@ -1491,8 +1546,8 @@ class RocksDBPlannerTest(unittest.TestCase):
             # The working-set floor holds in the rows the runtime would
             # actually allocate, and each factory carries its table's own
             # namespace from construction.
-            self.assertGreaterEqual(o.dynamicemb_memory.resident_rows, required)
-            self.assertLess(o.dynamicemb_memory.resident_rows, rows)
+            self.assertGreaterEqual(o.dynamicemb_storage.resident_rows, required)
+            self.assertLess(o.dynamicemb_storage.resident_rows, rows)
             self.assertEqual(
                 o.dynamicemb_options.external_storage.table_namespace,
                 "sparse.ebc.a",
@@ -1595,7 +1650,7 @@ class RocksDBPlannerTest(unittest.TestCase):
             {int(r * rows * 64 * 4) for r in np.geomspace(required / rows, 0.5, num=10)}
         )
         self.assertEqual(
-            sorted(o.dynamicemb_memory.local_hbm_for_values for o in ps), expected
+            sorted(o.dynamicemb_storage.local_hbm_for_values for o in ps), expected
         )
         if required * 2 == rows:
             self.assertEqual(
@@ -1603,10 +1658,10 @@ class RocksDBPlannerTest(unittest.TestCase):
             )
         if factor == 1024.0:
             # The lower endpoint holds exactly the required capacity.
-            self.assertEqual(ps[0].dynamicemb_memory.resident_rows, required)
+            self.assertEqual(ps[0].dynamicemb_storage.resident_rows, required)
         for o in ps:
-            self.assertGreaterEqual(o.dynamicemb_memory.resident_rows, required)
-            self.assertLess(o.dynamicemb_memory.resident_rows, rows)
+            self.assertGreaterEqual(o.dynamicemb_storage.resident_rows, required)
+            self.assertLess(o.dynamicemb_storage.resident_rows, rows)
 
     def test_shared_table_factor_takes_the_maximum(self):
         # Two features share table "a"; the working-set floor uses the
@@ -1625,7 +1680,7 @@ class RocksDBPlannerTest(unittest.TestCase):
         for o in options:
             if rocksdb_util.is_rocksdb_options(o.dynamicemb_options):
                 self.assertGreaterEqual(
-                    o.dynamicemb_memory.resident_rows, 5 * 3000 * 128
+                    o.dynamicemb_storage.resident_rows, 5 * 3000 * 128
                 )
 
     def test_rocksdb_misses_cost_disk_bandwidth(self):
