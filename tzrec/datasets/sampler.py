@@ -30,6 +30,7 @@ from torch.utils.data import get_worker_info
 
 from tzrec.datasets.utils import HARD_NEG_INDICES
 from tzrec.protos import sampler_pb2
+from tzrec.utils import dist_util
 from tzrec.utils.env_util import use_hash_node_id
 from tzrec.utils.load_class import get_register_class_meta
 from tzrec.utils.logging_util import logger
@@ -84,6 +85,8 @@ def _get_np_type(field_type: pa.DataType) -> npt.DTypeLike:
 
 
 def _bootstrap(group_size: int, local_rank: int, group_rank: int) -> str:
+    """Exchange server addresses, or use the local address without a group."""
+
     def addr_to_tensor(ip: str, port: str) -> torch.Tensor:
         addr_array = [int(i) for i in (ip.split("."))] + [int(port)]
         addr_tensor = torch.tensor(addr_array, dtype=torch.int)
@@ -99,9 +102,7 @@ def _bootstrap(group_size: int, local_rank: int, group_rank: int) -> str:
     ) -> str:
         comm_tensor = torch.zeros([group_size, 5], dtype=torch.int32)
         comm_tensor[group_rank] = addr_tensor
-        if dist.get_backend() == dist.Backend.NCCL:
-            comm_tensor = comm_tensor.cuda()
-        dist.all_reduce(comm_tensor, op=dist.ReduceOp.MAX)
+        dist.all_reduce(comm_tensor, op=dist.ReduceOp.MAX, group=pg)
         cluster_server_info = ",".join([tensor_to_addr(t) for t in comm_tensor])
         return cluster_server_info
 
@@ -112,7 +113,8 @@ def _bootstrap(group_size: int, local_rank: int, group_rank: int) -> str:
         local_ip = "0.0.0.0"
         port = "0"
 
-    if not dist.is_initialized():  # stand-alone
+    pg = dist_util.get_dataset_process_group()
+    if pg is None:
         return local_ip + ":" + port
 
     gl_server_info = exchange_gl_server_info(
