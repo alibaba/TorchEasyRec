@@ -209,6 +209,14 @@ export NCCL_P2P_LEVEL=PHB
 export STORAGE_RESERVE_PERCENT=0.5
 ```
 
+主机内存（DDR）的规划预算由 `HOST_MEMORY_RESERVE_PERCENT` 控制，默认值为 `0.15`，为数据读取、特征处理和 pinned memory 等开销预留规划余量。TorchEasyRec 将物理内存与检测到的 cgroup 容器内存上限取较小值，扣除该比例后，再按本机 rank 数均分。该设置适用于所有模型；`STORAGE_RESERVE_PERCENT` 控制的是 HBM 侧预留，不能调整 DDR 预算。
+
+升级后，依赖 host embedding 的模型可能选择不同的分片方案，或因预算不足而无法规划。需要取消默认的 15% host 余量时，可设置为 `0`；此时仍遵守检测到的容器内存上限：
+
+```bash
+export HOST_MEMORY_RESERVE_PERCENT=0
+```
+
 (embedding-sharding-constraints)=
 
 ### Embedding分片约束
