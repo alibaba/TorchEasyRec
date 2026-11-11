@@ -31,6 +31,7 @@ charged once when a plan uses RocksDB) and the runtime lifecycle.
 import dataclasses
 import glob
 import hashlib
+import math
 import os
 import shutil
 import time
@@ -43,6 +44,7 @@ from tzrec.utils.logging_util import logger
 
 if TYPE_CHECKING:
     from dynamicemb import DynamicEmbTableOptions
+    from torchrec.distributed.planner.types import Storage
 
 # Host memory a rank needs beyond the planned RocksDB budgets (table readers,
 # iterators, pinned blocks, allocator slack).
@@ -110,6 +112,49 @@ def activation_storage(local_world_size: int, restore_spill_bytes: int) -> Any:
         ssd=overheads["compaction_headroom"]
         + overheads["other_files"]
         + restore_spill_bytes,
+    )
+
+
+def table_storage(
+    *,
+    rows: int,
+    embedding_dim: int,
+    optimizer_state_dim: int,
+    element_size: int,
+    indexed: bool,
+    admitted_rows: float,
+    cache_rows: int,
+) -> "Storage":
+    """Estimate per-shard RocksDB backing storage, excluding shared costs.
+
+    Args:
+        rows: Planned backing-table capacity.
+        embedding_dim: Embedding elements per row.
+        optimizer_state_dim: Optimizer-state elements per row.
+        element_size: Bytes per embedding or optimizer-state element.
+        indexed: Whether the table maintains an eviction index.
+        admitted_rows: Estimated extra rows admitted before eviction, not a
+            guaranteed upper bound when derived from average input lengths.
+        cache_rows: Resident cache rows used to estimate writeback overlap.
+
+    Returns:
+        DDR metadata and SSD storage costs. GPU cache costs are separate.
+    """
+    from torchrec.distributed.planner.types import Storage
+    from tzrec_ext.rocksdb import (
+        index_entry_bytes,
+        logical_row_bytes,
+        metadata_cache_bytes,
+    )
+
+    row_bytes = logical_row_bytes(embedding_dim, optimizer_state_dim, element_size)
+    index_bytes = index_entry_bytes() if indexed else 0
+    live = rows * (row_bytes + index_bytes)
+    overshoot = (admitted_rows if indexed else 0) * (row_bytes + index_bytes)
+    return Storage(
+        hbm=0,
+        ddr=metadata_cache_bytes(rows, row_bytes, indexed),
+        ssd=math.ceil(SST_FACTOR * (live + overshoot)) + cache_rows * row_bytes,
     )
 
 

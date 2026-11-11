@@ -978,28 +978,14 @@ if has_dynamicemb:
             is_pooled=is_pooled,
         )
 
-        # A RocksDB candidate keeps its table on disk: HBM holds the GPU
-        # cache tier alone -- the backing's key map sits in the database,
-        # not in HBM like a host tier's -- DDR holds the block cache's
-        # share of its filters and index, and SSD holds the live table
-        # with one step of admitted overshoot plus the overwritten
-        # versions a full cache writeback leaves until compaction.
         hbm_specific_sizes: List[int] = []
         ddr_specific_sizes: List[int] = []
         ssd_specific_sizes: List[int] = []
         if rocksdb_util.is_rocksdb_options(dynamicemb_options):
-            from tzrec_ext.rocksdb import (
-                index_entry_bytes,
-                logical_row_bytes,
-                metadata_cache_bytes,
-            )
-
             strategy = dynamicemb_options.score_strategy
             no_eviction = strategy == DynamicEmbScoreStrategy.NO_EVICTION
             indexed = not no_eviction
             score_words = score_policy_num_scores(get_score_policy(strategy).policy)
-            # One step's admitted overshoot bounds the extra rows a
-            # completed update can add before eviction runs.
             lookups = sum(b * n for b, n in zip(batch_sizes, input_lengths))
             mult = _get_optimizer_multipler(
                 getattr(tensor, "_optimizer_classes", [None])[0],
@@ -1008,19 +994,17 @@ if has_dynamicemb:
             )
             for size in shard_sizes:
                 rows, dim = int(size[0]), int(size[1])
-                row_bytes = logical_row_bytes(
-                    dim, round(dim * mult), tensor.element_size()
+                backing = rocksdb_util.table_storage(
+                    rows=rows,
+                    embedding_dim=dim,
+                    optimizer_state_dim=round(dim * mult),
+                    element_size=tensor.element_size(),
+                    indexed=indexed,
+                    admitted_rows=lookups,
+                    cache_rows=dynamicemb_memory.resident_rows,
                 )
-                index_bytes = index_entry_bytes() if indexed else 0
-                live = rows * (row_bytes + index_bytes)
-                overshoot = (lookups if indexed else 0) * (row_bytes + index_bytes)
-                ssd_specific_sizes.append(
-                    math.ceil(rocksdb_util.SST_FACTOR * (live + overshoot))
-                    + dynamicemb_memory.resident_rows * row_bytes
-                )
-                ddr_specific_sizes.append(
-                    metadata_cache_bytes(rows, row_bytes, indexed)
-                )
+                ssd_specific_sizes.append(backing.ssd)
+                ddr_specific_sizes.append(backing.ddr)
                 # The CACHING memory model charges the backing's key map on
                 # HBM; a database-backed table keeps it on disk instead.
                 backing_index = _keymap_bytes(
