@@ -33,22 +33,10 @@ from tzrec.utils.plan_util import create_planner, get_default_sharders
 class ShardedModelRuntime:
     """Own the checkpoint manager and the sharding setup of one job.
 
-    Train, standalone eval and checkpoint prediction repeat the same
-    sharded-model sequence: create the planner with the effective global
-    embedding constraints, run collective planning, log the plan on rank
-    zero and construct the DMP model. This runtime shares that sequence and
-    owns the ``CheckpointManager`` for the job's whole lifetime, so setup
-    failures and early returns inside :meth:`open` still close the manager
-    and drain its queued prune work. What differs between the entries --
-    when and what to restore -- stays with the caller through
-    ``self.checkpoints``.
-
-    With ``train_config.rocksdb_config`` the runtime also owns this rank's
-    optional RocksDB backend: it acquires it at open time, binds the
-    planned external storages to the rank-local session inside
-    :meth:`shard`, attaches the built caches to their storage, and closes
-    it after the checkpoint manager on every exit path. Ordinary
-    configurations run without the backend and without importing it.
+    Shares collective planning and DMP construction across job entry points.
+    Owns the checkpoint manager and optional rank-local RocksDB backend,
+    closing the manager first on every exit path. Callers restore weights
+    through ``self.checkpoints``.
     """
 
     def __init__(
@@ -81,14 +69,9 @@ class ShardedModelRuntime:
     ) -> Iterator["ShardedModelRuntime"]:
         """Open the runtime for one entry point of the job.
 
-        Constructs and owns the real ``CheckpointManager``: training keeps
-        its retention and export settings, while the other entries keep
-        the read-only defaults. The manager is closed on every exit path,
-        including setup failures and early returns inside the ``with``
-        body; without a prune worker, close is a no-op. With
-        ``rocksdb_config`` the optional rank-local backend is acquired
-        here and closed after the manager, so its working directory never
-        outlives queued checkpoint work.
+        Applies training retention and export settings in train mode and
+        manager defaults otherwise. On exit or setup failure, closes the
+        checkpoint manager before the optional RocksDB backend.
 
         Args:
             pipeline_config: the job's pipeline configuration.
@@ -147,16 +130,10 @@ class ShardedModelRuntime:
     ) -> _DistributedModelParallel:
         """Collectively plan and shard one model, returning the DMP model.
 
-        Uses the caller's device, sampled batch size and optional saved
-        plan, with the constraints captured at open time. The broadcast
-        plan is bound to this rank's backend session before the DMP model
-        is constructed from it, and the built caches are attached to their
-        storage afterwards; the backend stays None for ordinary
-        configurations. Keeps the DMP defaults; RTP's FX tracing passes
-        False for both flags to trace the unsharded view. Does not
-        initialize a process group, create features, change the train/eval
-        mode or restore weights; restore belongs to the caller via
-        ``self.checkpoints``.
+        Uses the constraints captured at open time and an optional saved plan.
+        Binds the RocksDB backend before DMP construction and attaches caches
+        afterwards, when configured. RTP tracing disables both initialization
+        flags. Callers restore weights through ``self.checkpoints``.
 
         Args:
             model: the wrapped model to shard.

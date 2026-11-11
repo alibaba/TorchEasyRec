@@ -573,16 +573,12 @@ def _build_dynamicemb_initializer(
 
 
 def build_dynamicemb_constraints(
-    dynamicemb_cfg: feature_pb2.DynamicEmbedding,
-    emb_config: BaseEmbeddingConfig,
+    dynamicemb_cfg: feature_pb2.DynamicEmbedding, emb_config: BaseEmbeddingConfig
 ) -> ParameterConstraints:
     """Build row-wise constraints with matching tensor and table capacities.
 
     Normalize the shared table config before EBC/EC materializes its tensor.
     Initializer and admission defaults continue to use the configured row count.
-    The constraint starts at the default pooling factor of one id per
-    sample; ``feature.parameter_constraints`` applies an explicit
-    ``embedding_constraints.pooling_factor`` on top.
     """
     if not has_dynamicemb:
         raise RuntimeError(
@@ -688,7 +684,6 @@ def build_dynamicemb_constraints(
 
     constraints = DynamicEmbParameterConstraints(
         use_dynamicemb=True,
-        pooling_factors=[1.0],
         sharding_types=[ShardingType.ROW_WISE.value],
         compute_kernels=[EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value],
         dynamicemb_options=dynamicemb_options,
