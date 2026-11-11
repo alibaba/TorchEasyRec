@@ -280,6 +280,4 @@ python -m tzrec.tools.add_pooling_factor_to_config \
     --num_batches 100
 ```
 
-- 表的划分从配置的`feature_groups`解析（与模型构建一致，含ZCH表），不构建模型；遵循标准`feature_groups`语义的自定义模型无需导入模型类即可使用。ZCH表的去重计数基于原始Id，不代表碰撞后的行工作集
-
 注: 数据分布变化后请重新测量；测量值不保证覆盖未来的数据
