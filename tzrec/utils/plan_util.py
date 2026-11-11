@@ -48,7 +48,6 @@ from torchrec.distributed.planner.enumerators import (
 from torchrec.distributed.planner.enumerators import (
     EmbeddingEnumerator as _EmbeddingEnumerator,
 )
-from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
 from torchrec.distributed.planner.proposers import UniformProposer
 from torchrec.distributed.planner.shard_estimators import (
     EmbeddingPerfEstimator,
@@ -62,7 +61,6 @@ from torchrec.distributed.planner.storage_reservations import (
 )
 from torchrec.distributed.planner.types import (
     Enumerator,
-    Partitioner,
     PlannerError,
     PlannerErrorType,
     Proposer,
@@ -92,11 +90,7 @@ from torchrec.modules.embedding_modules import (
 
 from tzrec.protos import feature_pb2
 from tzrec.utils import env_util, resource_util, rocksdb_util
-from tzrec.utils.dynamicemb_util import (
-    DynamicEmbTableStorage,
-    _get_optimizer_multipler,
-    has_dynamicemb,
-)
+from tzrec.utils.dynamicemb_util import DynamicEmbTableStorage, has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 
@@ -138,7 +132,6 @@ def create_planner(
         reserve_percent=host_reserve_percent,
     )
     allow_rocksdb = rocksdb is not None
-    activation = None
     if allow_rocksdb:
         cfg = rocksdb.config
         sharing_ranks = (
@@ -162,6 +155,17 @@ def create_planner(
         compute_device=device.type,
         **topo_kwargs,
     )
+
+    ddr_caps = tuple(d.storage.ddr or 0 for d in topology.devices)
+    if allow_rocksdb:
+        shared = rocksdb_util.shared_storage(local_world_size)
+        for device_storage in topology.devices:
+            if not shared.fits_in(device_storage.storage):
+                raise PlannerError(
+                    "insufficient capacity for the configured RocksDB shared reserve",
+                    PlannerErrorType.INSUFFICIENT_STORAGE,
+                )
+            device_storage.storage = device_storage.storage - shared
 
     # build storage reservation
     # If experience OOM, increase the percentage. see
@@ -246,23 +250,12 @@ def create_planner(
     hbm_bins = int(os.environ.get("TZREC_DP_HBM_BINS_PER_DEVICE", "100"))
     ddr_bins = int(os.environ.get("TZREC_DP_DDR_BINS_PER_DEVICE", "25"))
     ssd_bins = int(os.environ.get("TZREC_DP_SSD_BINS_PER_DEVICE", "20"))
-    partitioner: Any = None
     callbacks: Any = None
     if allow_rocksdb:
-        if is_rank_zero:
-            # One enumeration feeds both the activation estimate and the
-            # search itself; other ranks only receive the broadcast plan.
-            search_space = enumerator.enumerate(model, get_default_sharders())
-            enumerator = _MemoizedSearchSpace(enumerator, search_space)
-            activation = _ssd_activation_storage(search_space, local_world_size)
-        if activation is not None:
-            partitioner = _ActivationAwarePartitioner(
-                GreedyPerfPartitioner(), activation
-            )
         callbacks = [
             partial(
                 _attach_backend_config,
-                ddr_caps=tuple(d.storage.ddr or 0 for d in topology.devices),
+                ddr_caps=ddr_caps,
                 local_world_size=local_world_size,
             )
         ]
@@ -270,7 +263,6 @@ def create_planner(
         hbm_bins_per_device=hbm_bins,
         ddr_bins_per_device=ddr_bins,
         ssd_bins_per_device=ssd_bins,
-        ssd_activation=activation,
     )
     planner = EmbeddingShardingPlanner(
         topology=topology,
@@ -280,7 +272,6 @@ def create_planner(
         # With RocksDB candidates the DP is the only proposer: Uniform's
         # data-parallel proposals are not SSD-aware.
         proposer=[dp_proposer] if allow_rocksdb else [dp_proposer, UniformProposer()],
-        partitioner=partitioner,
         callbacks=callbacks,
         debug=True,
     )
@@ -340,15 +331,13 @@ def _sparse_dp_proposor_numpy(
     hbm_bins: int,
     ddr_bins: int,
     ssd_bins: int,
-    activation_ddr_units: float = 0.0,
-    activation_ssd_units: float = 0.0,
 ) -> List[List[int]]:
-    """Sparse-K NumPy DP over (hbm, ddr, ssd, backend-active) reachable cells.
+    """Sparse-K NumPy DP over (hbm, ddr, ssd) reachable cells.
 
     Per table, broadcasts (K_prev, N) candidates and uses :func:`_argmin_per_group`
     (lexsort + first-of-run) for groupby-argmin on the destination cell.
     Reachable cells K_t saturate at the actual reachable count, not
-    ``hbm_bins * ddr_bins * ssd_bins * 2``. Backtracking walks T x K_t int32
+    ``hbm_bins * ddr_bins * ssd_bins``. Backtracking walks T x K_t int32
     arrays in O(T) Python steps.
 
     ``table_opts`` entries are ``(opt_hbm, opt_ddr, opt_ssd, opt_perf,
@@ -357,18 +346,9 @@ def _sparse_dp_proposor_numpy(
     performance in float32 cost units, and the index one in opt-id space,
     used to reconstruct proposals.
 
-    ``activation_ddr_units`` / ``activation_ssd_units`` are the aggregate
-    (all-devices) fixed backend costs in bin units, charged once on the
-    transition from an inactive combination to one that selects an
-    SSD-billed option. The activation bit is part of the cell key, so an
-    active and an inactive partial combination with equal resource bins are
-    never merged: the inactive one still owes the charge when its first
-    SSD table arrives.
-
     Totals equal to a capacity land in the last bin (exact-byte equality is
     feasible); anything above is rejected before binning. Returns one
-    perf-best proposal per (HBM bin, activation state) in decreasing-HBM
-    order, inactive before active within a bin.
+    perf-best proposal per HBM bin in decreasing-HBM order.
 
     Returns:
         A list of proposals; each proposal is a list of opt-id integers,
@@ -378,13 +358,10 @@ def _sparse_dp_proposor_numpy(
     if table_count == 0:
         return []
 
-    # Neutral empty seed: nothing placed, backend not yet active; the first
-    # real table transitions exactly like every later one.
     dp_hbm = np.zeros(1, dtype=np.float32)
     dp_ddr = np.zeros(1, dtype=np.float32)
     dp_ssd = np.zeros(1, dtype=np.float32)
     dp_perf = np.zeros(1, dtype=np.float32)
-    dp_active = np.zeros(1, dtype=bool)
     dp_hbm_i = np.zeros(1, dtype=np.int32)
     back_opt_j: List[np.ndarray] = []
     back_prev_cell_i: List[np.ndarray] = []
@@ -397,20 +374,9 @@ def _sparse_dp_proposor_numpy(
             dp_perf = np.zeros(0)
             break
 
-        requires_ssd = cur_ssd > 0
-        newly_active = (~dp_active[:, None]) & requires_ssd[None, :]
-        new_active = dp_active[:, None] | requires_ssd[None, :]
         new_hbm = dp_hbm[:, None] + cur_hbm[None, :]
-        new_ddr = (
-            dp_ddr[:, None]
-            + cur_ddr[None, :]
-            + newly_active * np.float32(activation_ddr_units)
-        )
-        new_ssd = (
-            dp_ssd[:, None]
-            + cur_ssd[None, :]
-            + newly_active * np.float32(activation_ssd_units)
-        )
+        new_ddr = dp_ddr[:, None] + cur_ddr[None, :]
+        new_ssd = dp_ssd[:, None] + cur_ssd[None, :]
         new_perf = dp_perf[:, None] + cur_perf[None, :]
         # Exact equality to a capacity is feasible and lands in the last
         # bin; anything above the capacity is rejected here, before binning.
@@ -425,14 +391,13 @@ def _sparse_dp_proposor_numpy(
         new_ddr_i = np.minimum(new_ddr[valid_mask].astype(np.int32), ddr_bins - 1)
         new_ssd_i = np.minimum(new_ssd[valid_mask].astype(np.int32), ssd_bins - 1)
         flat_cell_i = (
-            (new_hbm_i.astype(np.int64) * ddr_bins + new_ddr_i) * ssd_bins + new_ssd_i
-        ) * 2 + new_active[valid_mask].astype(np.int64)
+            new_hbm_i.astype(np.int64) * ddr_bins + new_ddr_i
+        ) * ssd_bins + new_ssd_i
 
         valid_new_perf = new_perf[valid_mask]
         valid_new_hbm = new_hbm[valid_mask]
         valid_new_ddr = new_ddr[valid_mask]
         valid_new_ssd = new_ssd[valid_mask]
-        valid_new_active = new_active[valid_mask]
         valid_prev_cell_i, valid_opt_j = np.where(valid_mask)
 
         winners = _argmin_per_group(group_keys=flat_cell_i, perf_keys=valid_new_perf)
@@ -441,7 +406,6 @@ def _sparse_dp_proposor_numpy(
         dp_hbm = valid_new_hbm[winners]
         dp_ddr = valid_new_ddr[winners]
         dp_ssd = valid_new_ssd[winners]
-        dp_active = valid_new_active[winners]
         dp_hbm_i = new_hbm_i[winners]
         back_opt_j.append(cur_opt_id[valid_opt_j[winners]])
         back_prev_cell_i.append(valid_prev_cell_i[winners].astype(np.int32))
@@ -449,13 +413,8 @@ def _sparse_dp_proposor_numpy(
     if dp_perf.size == 0:
         return []
 
-    # Best proposal per (HBM bin, activation state): the memory-only
-    # alternative stays available for exact partitioning.
-    state_keys = dp_hbm_i.astype(np.int64) * 2 + dp_active.astype(np.int64)
-    chosen_cell_i = _argmin_per_group(group_keys=state_keys, perf_keys=dp_perf)
-    chosen_cell_i = sorted(
-        chosen_cell_i, key=lambda i: (-int(dp_hbm_i[i]), bool(dp_active[i]))
-    )
+    chosen_cell_i = _argmin_per_group(group_keys=dp_hbm_i, perf_keys=dp_perf)
+    chosen_cell_i = sorted(chosen_cell_i, key=lambda i: -int(dp_hbm_i[i]))
 
     proposals: List[List[int]] = []
     for last_cell_i in chosen_cell_i:
@@ -476,30 +435,17 @@ class DynamicProgrammingProposer(Proposer):
     we need to select one sharding option for each table such that the total
     performance is minimized, while keeping the HBM constraint :math:`K_h`,
     the host DDR constraint :math:`K_d` and the SSD constraint :math:`K_s`
-    in check, plus a one-time backend activation charge for combinations that
-    use SSD-backed options.
+    in check. Shared backend resources are already reserved in the topology.
 
-    This problem is tackled with dynamic programming over discretized
-    resource bins, extended by a two-valued activation state: the state after
-    each table is a reachable (hbm, ddr, ssd, active) cell, and a
-    combination that has not yet selected an SSD-billed option still owes
-    the fixed activation when its first one arrives. Performance-based
-    winner selection happens within a cell; one proposal is emitted per
-    (HBM bin, activation state).
-
-    The SSD axis uses per-device bins and only binds when the largest
-    eligible SSD costs plus one activation charge could exceed the capacity;
-    otherwise it collapses to a single bin, keeping the fractional positive
-    SSD costs and the activation state so fixed charges are never erased.
+    Each DP state is a reachable (hbm, ddr, ssd) cell. Performance determines
+    the winner within each cell; one proposal is emitted per HBM bin.
+    The SSD axis uses per-device bins when candidate costs can exceed the
+    capacity and otherwise collapses to one bin.
 
     Args:
         hbm_bins_per_device (int): per-device HBM bins for DP precision.
         ddr_bins_per_device (int): per-device DDR bins for DP precision.
         ssd_bins_per_device (int): per-device SSD bins for DP precision.
-        ssd_activation (Optional[Storage]): per-rank fixed DDR and SSD cost
-            of the RocksDB backend, charged once per rank when a proposal
-            first selects an SSD-billed option; None when no SSD backend is
-            planned.
     """
 
     def __init__(
@@ -507,13 +453,11 @@ class DynamicProgrammingProposer(Proposer):
         hbm_bins_per_device: int = 100,
         ddr_bins_per_device: int = 25,
         ssd_bins_per_device: int = 20,
-        ssd_activation: Optional[Storage] = None,
     ) -> None:
         self._inited: bool = False
         self._hbm_bins_per_device: int = max(hbm_bins_per_device, 1)
         self._ddr_bins_per_device: int = max(ddr_bins_per_device, 1)
         self._ssd_bins_per_device: int = max(ssd_bins_per_device, 1)
-        self._ssd_activation: Optional[Storage] = ssd_activation
         self._sharding_options_by_fqn: OrderedDict[str, List[ShardingOption]] = (
             OrderedDict()
         )
@@ -548,7 +492,7 @@ class DynamicProgrammingProposer(Proposer):
         """Propose a sharding plan.
 
         The first proposal is the initial shortcut: each table's
-        smallest-memory option, validated as a whole (activation included) by
+        smallest-memory option, validated as a whole by
         the partitioner like every later proposal.
         """
         if not self._inited:
@@ -624,13 +568,6 @@ class DynamicProgrammingProposer(Proposer):
         hbm_bin_size = float(hbm_total) / hbm_bins if hbm_total > 0 else 1.0
         ddr_bin_size = float(ddr_total) / ddr_bins if ddr_total > 0 else 1.0
 
-        activation_ddr_bytes = (
-            (self._ssd_activation.ddr or 0) if self._ssd_activation else 0
-        ) * num_devices
-        activation_ssd_bytes = (
-            (self._ssd_activation.ssd or 0) if self._ssd_activation else 0
-        ) * num_devices
-
         # Per-table option arrays in bin-units, with infeasible options
         # pruned; the integer SSD byte costs feed the axis decision before
         # their float32 normalization.
@@ -690,14 +627,10 @@ class DynamicProgrammingProposer(Proposer):
             )
             max_eligible_ssd += table_max_ssd
 
-        # The SSD axis binds only when the largest eligible costs plus one
-        # activation charge could exceed the capacity; otherwise it
-        # collapses to a single bin while keeping positive costs fractional
-        # so requires_ssd and the activation state survive.
+        # Collapse the SSD axis when all eligible combinations fit.
         ssd_bins = 1
-        if ssd_total > 0 and max_eligible_ssd + activation_ssd_bytes > ssd_total:
+        if ssd_total > 0 and max_eligible_ssd > ssd_total:
             ssd_bins = max(self._ssd_bins_per_device * num_devices, 1)
-        ssd_bin_size = float(ssd_total) / ssd_bins if ssd_total > 0 else 1.0
         for opts in table_opts:
             opts[2][:] = opts[2] * (ssd_bins / max(ssd_total, 1))
 
@@ -706,12 +639,6 @@ class DynamicProgrammingProposer(Proposer):
             hbm_bins,
             ddr_bins,
             ssd_bins,
-            activation_ddr_units=(
-                activation_ddr_bytes / ddr_bin_size if ddr_total > 0 else 0.0
-            ),
-            activation_ssd_units=(
-                activation_ssd_bytes / ssd_bin_size if ssd_total > 0 else 0.0
-            ),
         )
         if self._proposal_list:
             self._current_proposal = 0
@@ -1228,95 +1155,6 @@ def _emit_dynamicemb_variants(
     return candidates
 
 
-class _MemoizedSearchSpace:
-    """Reuse one enumeration for activation derivation and the search."""
-
-    def __init__(self, enumerator: Any, options: List[ShardingOption]) -> None:
-        self._enumerator = enumerator
-        self._options = options
-
-    def enumerate(
-        self, module: nn.Module, sharders: List[ModuleSharder[nn.Module]]
-    ) -> List[ShardingOption]:
-        """Return the options enumerated once at planner construction."""
-        return self._options
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._enumerator, name)
-
-
-def _ssd_activation_storage(
-    search_space: List[ShardingOption], local_world_size: int
-) -> Storage:
-    """The per-rank backend activation estimated from the searched candidates.
-
-    The restore-spill envelope is the largest per-rank primary-row footprint
-    of any eligible SSD candidate shard, recomputed from the candidate itself;
-    it is charged once if SSD activates, never to memory-only combinations.
-    """
-    from tzrec_ext.rocksdb import logical_row_bytes
-
-    spill = 0
-    for option in search_space:
-        if not rocksdb_util.is_rocksdb_options(option.dynamicemb_options):
-            continue
-        tensor = option.tensor
-        optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
-        mult = _get_optimizer_multipler(optimizer_class, tensor.shape, tensor.dtype)
-        row_bytes = logical_row_bytes(
-            int(tensor.shape[1]),
-            round(int(tensor.shape[1]) * mult),
-            tensor.element_size(),
-        )
-        spill = max(
-            spill, max(int(shard.size[0]) for shard in option.shards) * row_bytes
-        )
-    return rocksdb_util.activation_storage(local_world_size, spill)
-
-
-class _ActivationAwarePartitioner(Partitioner):
-    """Charge the shared backend activation once, then delegate placement.
-
-    A proposal whose candidates carry no SSD cost delegates untouched; one
-    that uses SSD pays the per-rank activation from each participating
-    device's storage before the ordinary partitioner places shards against
-    the reduced capacities. Proposals found by the DP already accounted for
-    the activation inside their search arithmetic; this adapter re-validates
-    those same costs against a fresh capacity copy instead of charging
-    their table costs a second time.
-
-    Args:
-        partitioner (Partitioner): the partitioner proposals then go to.
-        activation (Storage): per-rank fixed backend cost.
-    """
-
-    def __init__(self, partitioner: Partitioner, activation: Storage) -> None:
-        self._partitioner = partitioner
-        self._activation = activation
-
-    def partition(
-        self, proposal: List[ShardingOption], storage_constraint: Topology
-    ) -> List[ShardingOption]:
-        """Partition ``proposal``, charging backend activation when SSD is used."""
-        if not any((option.total_storage.ssd or 0) > 0 for option in proposal):
-            return self._partitioner.partition(proposal, storage_constraint)
-        constraint = copy.deepcopy(storage_constraint)
-        for device in constraint.devices:
-            device.storage = device.storage - self._activation
-            if (
-                device.storage.hbm < 0
-                or device.storage.ddr < 0
-                or device.storage.ssd < 0
-            ):
-                raise PlannerError(
-                    "the RocksDB backend's fixed cost "
-                    f"(ddr {self._activation.ddr}, ssd {self._activation.ssd} "
-                    "bytes per rank) leaves no room for the selected tables",
-                    PlannerErrorType.INSUFFICIENT_STORAGE,
-                )
-        return self._partitioner.partition(proposal, constraint)
-
-
 def _attach_backend_config(
     selected: List[ShardingOption],
     *,
@@ -1327,14 +1165,12 @@ def _attach_backend_config(
 
     The ordinary planner invokes this on its chosen options before they
     become a ShardingPlan. SSD tables are identified by their actual
-    external-storage factory; nothing is charged here, the search already
-    established feasibility. The block-cache and import budgets come from
-    the selected shards and the original per-device host capacities, and the
+    external-storage factory; nothing is charged here, the topology already
+    reserves the shared backend resources. The block-cache and import budgets
+    come from the selected shards and original per-device host capacities; the
     common config uses a sufficient per-rank budget without summing every
     rank's copies into one rank's budget.
     """
-    from tzrec_ext.rocksdb import logical_row_bytes, metadata_cache_bytes
-
     ssd_options = [
         option
         for option in selected
@@ -1356,23 +1192,11 @@ def _attach_backend_config(
 
     metadata_ddr: Dict[int, int] = {}
     for option in ssd_options:
-        tensor = option.tensor
-        optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
-        mult = _get_optimizer_multipler(optimizer_class, tensor.shape, tensor.dtype)
-        row_bytes = logical_row_bytes(
-            int(tensor.shape[1]),
-            round(int(tensor.shape[1]) * mult),
-            tensor.element_size(),
-        )
-        indexed = (
-            option.dynamicemb_options.score_strategy.name  # pyre-ignore [16]
-            != "NO_EVICTION"
-        )
         for shard in option.shards:
             if shard.rank is not None:
-                metadata_ddr[shard.rank] = metadata_ddr.get(
-                    shard.rank, 0
-                ) + metadata_cache_bytes(int(shard.size[0]), row_bytes, indexed)
+                metadata_ddr[shard.rank] = metadata_ddr.get(shard.rank, 0) + (
+                    shard.storage.ddr or 0
+                )
     config = rocksdb_util.backend_config(
         local_world_size,
         block_cache_bytes=rocksdb_util.BLOCK_CACHE_DATA_BYTES

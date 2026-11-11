@@ -102,14 +102,45 @@ class PlannerHostMemoryTest(unittest.TestCase):
                 rank_dir="/tmp/db", config=mock.Mock(root_dir="/tmp/db")
             )
             with mock.patch.object(
-                resource_util, "ssd_capacity_per_rank", return_value=0
+                resource_util, "ssd_capacity_per_rank", return_value=100 << 30
             ):
                 planner = plan_util.create_planner(
                     device, batch_size=8, model=nn.Module(), rocksdb=rocksdb
                 )
+            shared = rocksdb_util.shared_storage(1)
             self.assertEqual(
                 planner._topology.devices[0].storage.ddr,
-                int(container * (1 - reserve)),
+                int(container * (1 - reserve)) - shared.ddr,
+            )
+            self.assertEqual(
+                planner._topology.devices[0].storage.ssd, (100 << 30) - shared.ssd
+            )
+
+    @parameterized.expand(
+        [("ddr", 3, 100), ("ssd", 100, 7)],
+        name_func=parameterized_name_func,
+    )
+    def test_shared_reserve_exceeds_capacity(self, _, ddr, ssd):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        with (
+            mock.patch.object(
+                resource_util, "host_memory_capacity_per_rank", return_value=ddr
+            ),
+            mock.patch.object(resource_util, "ssd_capacity_per_rank", return_value=ssd),
+            mock.patch.object(
+                rocksdb_util,
+                "shared_storage",
+                return_value=Storage(hbm=0, ddr=4, ssd=8),
+            ),
+            mock.patch.object(plan_util, "get_local_size", return_value=1),
+            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
+            self.assertRaisesRegex(PlannerError, "shared reserve"),
+        ):
+            create_planner(
+                device,
+                batch_size=8,
+                model=nn.Module(),
+                rocksdb=mock.Mock(),
             )
 
 
@@ -548,37 +579,10 @@ class _FakeStorage:
         self.ddr = ddr
         self.ssd = ssd
 
-    def __sub__(self, other):
-        return _FakeStorage(
-            self.hbm - other.hbm, self.ddr - other.ddr, self.ssd - other.ssd
-        )
-
 
 class _FakeShard:
     def __init__(self, hbm, ddr, ssd=0):
         self.storage = _FakeStorage(hbm, ddr, ssd)
-
-
-class _FakePartitioner:
-    """Places a proposal when every shard fits the first device's storage."""
-
-    def __init__(self):
-        self.seen = []
-
-    def partition(self, proposal, storage_constraint):
-        self.seen.append(storage_constraint)
-        device = storage_constraint.devices[0]
-        for option in proposal:
-            for shard in option.shards:
-                if not (
-                    shard.storage.hbm <= device.storage.hbm
-                    and shard.storage.ddr <= device.storage.ddr
-                    and shard.storage.ssd <= device.storage.ssd
-                ):
-                    raise PlannerError(
-                        "shard does not fit", PlannerErrorType.INSUFFICIENT_STORAGE
-                    )
-        return proposal
 
 
 class _FakeShardingOption:
@@ -624,7 +628,7 @@ def _make_random_table_opts(
 
     Per-option bin contributions stay in [0, axis/2) so combined plans can fit
     several tables without saturating any axis. Some options carry SSD cost
-    so the activation state is exercised.
+    so the SSD axis is exercised.
     """
     rng = random.Random(seed)
     table_opts = []
@@ -657,31 +661,21 @@ def _exhaustive_best_proposals(
     hbm_bins,
     ddr_bins,
     ssd_bins,
-    activation_ddr_units=0.0,
-    activation_ssd_units=0.0,
 ):
     """Exhaustive-combination oracle for the binned DP on a tiny input.
 
     Enumerates every per-table option combination directly -- no second
     implementation of the sparse DP -- keeps the feasible ones (exact
-    equality to a capacity lands in the last bin), charges the shared
-    activation on the first SSD-billed option, and keeps the best proposal
-    per (HBM bin, activation state). Mirrors the semantics specified for
-    the in-tree DP: same feasibility rule, same grouping, same tie order
-    (inactive first within a bin).
+    equality to a capacity lands in the last bin), and keeps the best
+    proposal per HBM bin in decreasing-HBM order.
     """
     import itertools
 
     best = {}
     for combo in itertools.product(*(range(len(t[3])) for t in table_opts)):
         hbm = ddr = ssd = perf = 0.0
-        active = False
         for table_i, opt_j in enumerate(combo):
             _, _, opt_ssd, opt_perf, _ = table_opts[table_i]
-            if opt_ssd[opt_j] > 0 and not active:
-                active = True
-                ddr += activation_ddr_units
-                ssd += activation_ssd_units
             hbm += float(table_opts[table_i][0][opt_j])
             ddr += float(table_opts[table_i][1][opt_j])
             ssd += float(opt_ssd[opt_j])
@@ -689,10 +683,10 @@ def _exhaustive_best_proposals(
         if hbm > hbm_bins or ddr > ddr_bins or ssd > ssd_bins:
             continue
         hbm_i = min(int(hbm), hbm_bins - 1)
-        key = (hbm_i, active)
+        key = hbm_i
         if key not in best or perf < best[key][0]:
             best[key] = (perf, combo)
-    ordered = sorted(best.items(), key=lambda kv: (-kv[0][0], kv[0][1]))
+    ordered = sorted(best.items(), key=lambda kv: -kv[0])
     return [list(kv[1][1]) for kv in ordered]
 
 
@@ -816,15 +810,7 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_shared_activation_cost_combinations(self, _, ssd_cap):
-        # One table offers an SSD option (cheap) beside a memory option; the
-        # other is memory-only. The activation is charged once to any
-        # combination that selects the SSD option: its 1000 ddr plus the 500
-        # activation fits the 1500 device exactly, so a missing charge admits
-        # an infeasible plan and a second charge breaks the active one. The
-        # all-memory alternative never pays it, and survives even when the
-        # SSD axis cannot bind (the fixed DDR charge and the inactive
-        # alternative both survive the collapse).
+    def test_ssd_capacity_combinations(self, _, ssd_cap):
         tables = [
             _FakeShardingOption("t.a", hbm=100, ddr=1000, perf=10.0, ssd=2000),
             _FakeShardingOption("t.a", hbm=100, ddr=0, perf=90.0, ssd=0),
@@ -833,79 +819,15 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         topology = _make_topology(
             num_devices=1,
             hbm_per_device=1000,
-            ddr_per_device=1500,
+            ddr_per_device=1000,
             ssd_per_device=ssd_cap,
         )
-        activation = Storage(hbm=0, ddr=500, ssd=3000)
-        proposer = DynamicProgrammingProposer(
-            hbm_bins_per_device=20,
-            ddr_bins_per_device=20,
-            ssd_bins_per_device=20,
-            ssd_activation=activation,
-        )
-        # load() groups by fqn; each fqn's options keep insertion order.
-        proposer.load(tables)
-        proposer.propose()
-        proposer.feedback(partitionable=True, storage_constraint=topology)
-        proposals = []
-        proposal = proposer.propose()
-        while proposal:
-            proposals.append(proposal)
-            proposer.feedback(partitionable=True, storage_constraint=topology)
-            proposal = proposer.propose()
-
-        active = [p for p in proposals if any(o.total_storage.ssd > 0 for o in p)]
-        inactive = [p for p in proposals if not any(o.total_storage.ssd > 0 for o in p)]
-        self.assertTrue(inactive, "the all-memory alternative must survive")
-        if ssd_cap == 0:
-            # Positive SSD cost with zero capacity is infeasible.
-            self.assertFalse(active)
-            return
-        self.assertTrue(active, "the one-charge active plan must fit exactly")
-        # The active plan pays the activation exactly once: its shards carry
-        # 1000 ddr and the budget is 1500, so a second 500 charge would
-        # leave it infeasible.
-        for plan in active:
-            self.assertEqual(sorted(o.fqn for o in plan), ["t.a", "t.b"])
-
-    def test_shortcut_pays_activation_before_acceptance(self):
-        # The initial shortcut (each table's smallest-memory option) fits by
-        # additive cost but exceeds capacity once the shared activation is
-        # charged; the adapter must reject it, and the shared topology must
-        # stay untouched while a pure-memory proposal delegates untouched.
-        ssd_table = _FakeShardingOption("t.ssd", hbm=100, ddr=1000, perf=10.0, ssd=100)
-        mem_table = _FakeShardingOption("t.b", hbm=100, ddr=0, perf=50.0, ssd=0)
-        topology = _make_topology(
-            num_devices=1, hbm_per_device=1000, ddr_per_device=1200, ssd_per_device=5000
-        )
-        activation = Storage(hbm=0, ddr=500, ssd=0)
-        before = (
-            topology.devices[0].storage.hbm,
-            topology.devices[0].storage.ddr,
-            topology.devices[0].storage.ssd,
-        )
-        partitioner = plan_util._ActivationAwarePartitioner(
-            _FakePartitioner(), activation
-        )
-        # Additive cost fits (1000 + 0 <= 1200); after the activation the
-        # device keeps 700, below the SSD option's 1000 ddr.
-        with self.assertRaises(PlannerError):
-            partitioner.partition([ssd_table, mem_table], topology)
+        proposals = _dp_proposals(tables, topology)
+        self.assertTrue(proposals)
+        best = min(proposals, key=lambda p: sum(o.total_perf for o in p))
         self.assertEqual(
-            (
-                topology.devices[0].storage.hbm,
-                topology.devices[0].storage.ddr,
-                topology.devices[0].storage.ssd,
-            ),
-            before,
-            "the shared topology must not be mutated",
+            sum(o.total_storage.ssd for o in best), 0 if ssd_cap == 0 else 2000
         )
-        # A pure-memory proposal delegates untouched and passes.
-        self.assertEqual(partitioner.partition([mem_table], topology), [mem_table])
-        # The charged copy is fresh each time: a retry starts from full
-        # capacity, never from the previous deduction.
-        with self.assertRaises(PlannerError):
-            partitioner.partition([ssd_table, mem_table], topology)
 
     def test_per_machine_ddr_prune_on_multi_host_topology(self):
         # 4 GPUs across 2 machines (local_world_size=2). Each machine has
@@ -929,19 +851,8 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
         )
         self.assertGreater(len(proposals_fit), 0)
 
-    @parameterized.expand(
-        [
-            (seed, act_ddr, act_ssd)
-            for seed in [0, 1, 7, 42, 1337]
-            for act_ddr, act_ssd in [(0.0, 0.0), (1.5, 2.0), (0.0, 3.0)]
-        ]
-    )
-    def test_sparse_numpy_matches_exhaustive_reference(
-        self, seed, activation_ddr, activation_ssd
-    ):
-        # Property test: the sparse-K NumPy DP must produce the same proposal
-        # set as exhaustively enumerating every tiny input's combinations,
-        # including SSD costs and the shared activation charge.
+    @parameterized.expand([(seed,) for seed in [0, 1, 7, 42, 1337]])
+    def test_sparse_numpy_matches_exhaustive_reference(self, seed):
         table_opts = _make_random_table_opts(
             seed, table_count=4, option_count=3, hbm_bins=8, ddr_bins=8, ssd_bins=8
         )
@@ -950,16 +861,12 @@ class DynamicProgrammingProposerTest(unittest.TestCase):
             hbm_bins=8,
             ddr_bins=8,
             ssd_bins=8,
-            activation_ddr_units=activation_ddr,
-            activation_ssd_units=activation_ssd,
         )
         expected = _exhaustive_best_proposals(
             table_opts,
             hbm_bins=8,
             ddr_bins=8,
             ssd_bins=8,
-            activation_ddr_units=activation_ddr,
-            activation_ssd_units=activation_ssd,
         )
         self.assertEqual(
             {tuple(p) for p in actual},
@@ -1423,10 +1330,8 @@ class RocksDBPlannerTest(unittest.TestCase):
     def _planner(self, tables, hbm_gib, ddr_gib, ssd_gib=None, ssd_mem_bw=None):
         """Build the unified planner over a synthetic topology.
 
-        Mirrors ``create_planner``'s RocksDB path -- one memoized
-        enumeration, the activation estimate, the SSD-aware DP as the only
-        proposer, and the activation-aware partitioner -- but takes the
-        HBM/DDR/SSD capacities directly so tests are deterministic.
+        Uses the same upfront shared reserve and ordinary partitioner as
+        ``create_planner``, with deterministic device capacities.
         """
         model, constraints = _model_and_constraints(tables)
         topo_kwargs = {}
@@ -1437,9 +1342,17 @@ class RocksDBPlannerTest(unittest.TestCase):
             compute_device="cuda",
             hbm_cap=int(hbm_gib * GIB),
             ddr_cap=int(ddr_gib * GIB),
-            ssd_cap=0 if ssd_gib is None else int(ssd_gib * GIB),
+            ssd_cap=(1 << 50) if ssd_gib is None else int(ssd_gib * GIB),
             **topo_kwargs,
         )
+        ddr_caps = tuple(d.storage.ddr for d in topology.devices)
+        shared = rocksdb_util.shared_storage(1)
+        for device in topology.devices:
+            if not shared.fits_in(device.storage):
+                raise PlannerError(
+                    "insufficient shared reserve", PlannerErrorType.INSUFFICIENT_STORAGE
+                )
+            device.storage = device.storage - shared
         enumerator: Any = plan_util.EmbeddingEnumerator(
             topology=topology,
             batch_size=128,
@@ -1448,8 +1361,6 @@ class RocksDBPlannerTest(unittest.TestCase):
         )
         sharders = plan_util.get_default_sharders()
         search_space = enumerator.enumerate(model, sharders)
-        enumerator = plan_util._MemoizedSearchSpace(enumerator, search_space)
-        activation = plan_util._ssd_activation_storage(search_space, 1)
         planner = EmbeddingShardingPlanner(
             topology=topology,
             batch_size=128,
@@ -1460,16 +1371,12 @@ class RocksDBPlannerTest(unittest.TestCase):
                     hbm_bins_per_device=20,
                     ddr_bins_per_device=20,
                     ssd_bins_per_device=20,
-                    ssd_activation=activation,
                 )
             ],
-            partitioner=plan_util._ActivationAwarePartitioner(
-                GreedyPerfPartitioner(), activation
-            ),
             callbacks=[
                 partial(
                     plan_util._attach_backend_config,
-                    ddr_caps=tuple(d.storage.ddr or 0 for d in topology.devices),
+                    ddr_caps=ddr_caps,
                     local_world_size=1,
                 )
             ],
@@ -1491,19 +1398,19 @@ class RocksDBPlannerTest(unittest.TestCase):
     def _plan_with_ssd_room(self, tables, hbm_gib, ddr_gib, **kwargs):
         """Plan with an SSD budget that fits offloading every table fully.
 
-        The backend's fixed activation grows with the machine's visible
+        The backend's shared reserve grows with the machine's visible
         CPUs, so a hardcoded budget makes offload infeasible on large CI
-        runners; derive the budget from the real activation and the worst
+        runners; derive the budget from the shared reserve and the worst
         per-table candidate cost instead.
         """
         _, _, space = self._planner(tables, hbm_gib, ddr_gib, **kwargs)
-        activation = plan_util._ssd_activation_storage(space, 1)
+        shared = rocksdb_util.shared_storage(1)
         worst = {}
         for o in space:
             ssd = o.total_storage.ssd or 0
             if ssd:
                 worst[o.fqn] = max(ssd, worst.get(o.fqn, 0))
-        budget_gib = (activation.ssd + sum(worst.values())) / GIB
+        budget_gib = (shared.ssd + sum(worst.values())) / GIB
         return self._plan(tables, hbm_gib, ddr_gib, ssd_gib=budget_gib, **kwargs)
 
     @parameterized.expand(
@@ -1558,9 +1465,10 @@ class RocksDBPlannerTest(unittest.TestCase):
             {"a": self.BIG, "b": self.BIG}, 80, 64
         )
         self.assertEqual(offloaded, {})
-        # The topology carries pre-activation capacity; nothing is deducted
-        # from it for a memory-only plan.
-        self.assertEqual(planner._topology.devices[0].storage.ddr, 64 * GIB)
+        self.assertEqual(
+            planner._topology.devices[0].storage.ddr,
+            64 * GIB - rocksdb_util.shared_storage(1).ddr,
+        )
 
     def test_faster_mixed_choice_beats_the_fitting_memory_plan(self):
         # The old absolute memory preference is gone: an all-memory plan
@@ -1599,8 +1507,10 @@ class RocksDBPlannerTest(unittest.TestCase):
                 for r in np.geomspace(required / rows, 0.5, num=10)
             }
             self.assertIn(o.local_hbm_for_values, budgets)
-        # No temporary DDR deduction: the topology keeps its original caps.
-        self.assertEqual(planner._topology.devices[0].storage.ddr, int(4.75 * GIB))
+        self.assertEqual(
+            planner._topology.devices[0].storage.ddr,
+            int(4.75 * GIB) - rocksdb_util.shared_storage(1).ddr,
+        )
 
     def test_overrides_stay_in_memory(self):
         tables = {
@@ -1684,7 +1594,7 @@ class RocksDBPlannerTest(unittest.TestCase):
                 )
 
     def test_rocksdb_misses_cost_disk_bandwidth(self):
-        _, model, _ = self._planner({"a": self.BIG}, 4, 4, ssd_gib=100)
+        _, model, _ = self._planner({"a": self.BIG}, 4, 8, ssd_gib=100)
         topology = Topology(world_size=1, compute_device="cuda", ssd_mem_bw=104857.6)
         enumerator = plan_util.EmbeddingEnumerator(
             topology=topology,
@@ -1736,13 +1646,12 @@ class RocksDBPlannerTest(unittest.TestCase):
                 and o.fqn == fqn
             ]
             ssd_cost[fqn] = min(costs, default=0)
-        planner, _, _ = self._planner(tables, 1.76, 12, ssd_gib=100)
-        activation = planner._partitioner._activation
+        shared = rocksdb_util.shared_storage(1)
         self.assertGreater(ssd_cost["sparse.ebc.a"], ssd_cost["sparse.ebc.b"])
-        # A budget that admits "b" plus the shared activation but not "a"
+        # A budget that admits "b" plus the shared reserve but not "a"
         # plus it: only the "b" plan can pass the exact SSD check.
-        fits_b = ssd_cost["sparse.ebc.b"] + activation.ssd
-        fits_a = ssd_cost["sparse.ebc.a"] + activation.ssd
+        fits_b = ssd_cost["sparse.ebc.b"] + shared.ssd
+        fits_a = ssd_cost["sparse.ebc.a"] + shared.ssd
         ssd_gib = (fits_b + (fits_a - fits_b) / 2) / GIB
         _, offloaded, _ = self._plan(tables, 1.76, 12, ssd_gib=ssd_gib)
         self.assertEqual(set(offloaded), {"b"})
@@ -1758,7 +1667,11 @@ class RocksDBPlannerTest(unittest.TestCase):
         # plan, and the failed attempts never mutate the shared topology.
         tables = {"a": self.BIG, "b": self.BIG}
         planner, model, _ = self._planner(
-            tables, 80, 64, ssd_gib=1, ssd_mem_bw=100 * 1024**3 / 1000
+            tables,
+            80,
+            64,
+            ssd_gib=rocksdb_util.shared_storage(1).ssd / GIB + 1,
+            ssd_mem_bw=100 * 1024**3 / 1000,
         )
         before = (
             planner._topology.devices[0].storage.hbm,

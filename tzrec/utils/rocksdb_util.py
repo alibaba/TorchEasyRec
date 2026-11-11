@@ -24,8 +24,8 @@ restore always imports them into a fresh working DB.
 
 Planning-time capacities come from ``resource_util``: homogeneous scalar
 budgets per rank, with the sharing scope set by ``shared_across_nodes``. This
-module keeps the shared backend cost accounting (the per-rank activation
-charged once when a plan uses RocksDB) and the runtime lifecycle.
+module keeps the shared backend reservation, charged whenever RocksDB is
+configured, and the runtime lifecycle.
 """
 
 import dataclasses
@@ -54,15 +54,14 @@ WRITE_BUFFER_BYTES = 1 << 30
 STAGING_BUFFER_BYTES = 256 << 20
 BLOCK_CACHE_DATA_BYTES = 1 << 30
 
-# SST bytes per logical byte (uncompressed rows; 1.02-1.05 measured on a
-# 0.6 TB table set after sorted ingest and a day of training).
+# Empirical SSD allowance for SST overhead and restore spill, not a peak bound.
 SST_FACTOR = 1.1
 # Shared free-space margin for transient growth, including rows awaiting eviction.
 SSD_RESERVE_BYTES = 16 << 30
 
 
 def fixed_host_bytes() -> int:
-    """Host memory a rank spends on RocksDB once any table is offloaded."""
+    """Host memory reserved per rank whenever RocksDB planning is enabled."""
     return (
         WRITE_BUFFER_BYTES
         + STAGING_BUFFER_BYTES
@@ -90,13 +89,12 @@ def backend_config(local_world_size: int, **budgets: int) -> Any:
     )
 
 
-def activation_storage(local_world_size: int, restore_spill_bytes: int) -> Any:
-    """Per-rank fixed cost of one activated RocksDB backend, as Storage.
+def shared_storage(local_world_size: int) -> Any:
+    """Shared per-rank resources reserved before RocksDB candidate enumeration.
 
-    DDR carries the write buffer, staging, shared block-cache data and host
-    headroom; SSD carries compaction headroom, other DB files and the
-    restore-spill envelope of the searched candidates. The SSD reserve is
-    already removed from the topology capacity and is not charged here.
+    DDR covers fixed buffers and host headroom; SSD covers compaction and
+    other DB files. Table SSD estimates use SST_FACTOR as an empirical
+    allowance for restore spill. Filesystem reserve is deducted separately.
     """
     from torchrec.distributed.planner.types import Storage
     from tzrec_ext.rocksdb import disk_overheads
@@ -107,9 +105,7 @@ def activation_storage(local_world_size: int, restore_spill_bytes: int) -> Any:
     return Storage(
         hbm=0,
         ddr=fixed_host_bytes(),
-        ssd=overheads["compaction_headroom"]
-        + overheads["other_files"]
-        + restore_spill_bytes,
+        ssd=overheads["compaction_headroom"] + overheads["other_files"],
     )
 
 

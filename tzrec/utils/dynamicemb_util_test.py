@@ -757,14 +757,6 @@ class RocksDBTableTest(unittest.TestCase):
             self.assertLess(storage.hbm, host_memory.storage.hbm)
             self.assertEqual(storage.ddr, meta)
             self.assertEqual(storage.ssd, live_bytes + writeback)
-        # With the full shared allowance -- compaction headroom, other DB
-        # files and this shard's restore spill -- the charged budget also
-        # covers the restoring phase's spill on top of the save bound.
-        activation = rocksdb_util.activation_storage(
-            local_world_size=1, restore_spill_bytes=rows * row_bytes
-        )
-        charged = storages[0].ssd + activation.ssd
-        self.assertGreaterEqual(charged, live_bytes + writeback + rows * row_bytes)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required.")
     def test_fused_cache_matches_the_plan(self):

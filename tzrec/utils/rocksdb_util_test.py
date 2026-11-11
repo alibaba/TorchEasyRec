@@ -27,9 +27,6 @@ try:
 except ImportError:
     has_rocksdb = False
 
-GIB = 1 << 30
-OVERHEADS = {"compaction_headroom": 10 * GIB, "other_files": GIB}
-
 
 def _backend_config():
     from tzrec_ext.rocksdb import BackendConfig
@@ -146,8 +143,8 @@ class RocksDBRuntimeTest(unittest.TestCase):
         self.assertEqual(os.listdir(rt.rank_dir), ["eval-1-2"])
 
 
-class ActivationCostTest(unittest.TestCase):
-    """The shared per-rank backend activation and the phase-bound arithmetic."""
+class SharedStorageTest(unittest.TestCase):
+    """Shared resources reserved per rank for RocksDB planning."""
 
     def setUp(self):
         try:
@@ -155,25 +152,17 @@ class ActivationCostTest(unittest.TestCase):
         except ImportError:
             self.skipTest("tzrec_ext.rocksdb is not installed")
 
-    def test_activation_charges_fixed_costs_once(self):
-        # DDR carries the planned fixed buffers and headroom; SSD carries
-        # compaction, other DB files and the restore-spill envelope; the
-        # SSD reserve is already gone from the topology capacity.
-        activation = rocksdb_util.activation_storage(
-            local_world_size=1, restore_spill_bytes=5 * GIB
-        )
-        self.assertEqual(activation.hbm, 0)
-        self.assertEqual(activation.ddr, rocksdb_util.fixed_host_bytes())
+    def test_shared_storage(self):
         from tzrec_ext.rocksdb import disk_overheads
 
-        # The overheads come from the same backend configuration the runtime
-        # derives its budgets from.
+        shared = rocksdb_util.shared_storage(local_world_size=1)
+        self.assertEqual(shared.hbm, 0)
+        self.assertEqual(shared.ddr, rocksdb_util.fixed_host_bytes())
         overheads = disk_overheads(
             rocksdb_util.backend_config(1, block_cache_bytes=0, import_budget_bytes=0)
         )
         self.assertEqual(
-            activation.ssd,
-            overheads["compaction_headroom"] + overheads["other_files"] + 5 * GIB,
+            shared.ssd, overheads["compaction_headroom"] + overheads["other_files"]
         )
 
 
