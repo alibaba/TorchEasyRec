@@ -1657,7 +1657,9 @@ class RocksDBPlannerTest(unittest.TestCase):
                 )
 
     def test_rocksdb_misses_cost_disk_bandwidth(self):
-        _, model, _ = self._planner({"a": self.BIG}, 4, 8, ssd_gib=100)
+        # The upfront shared reserve grows with the runner's CPUs; this
+        # call only needs the model, so it takes the capless default.
+        _, model, _ = self._planner({"a": self.BIG}, 4, 8, ssd_gib=None)
         topology = Topology(world_size=1, compute_device="cuda", ssd_mem_bw=104857.6)
         enumerator = plan_util.EmbeddingEnumerator(
             topology=topology,
@@ -1701,7 +1703,9 @@ class RocksDBPlannerTest(unittest.TestCase):
             "b": (1 << 24, 64, {}, 100.0),
             "c": (1 << 20, 64, {}),
         }
-        _, model, space = self._planner(tables, 1.76, 12, ssd_gib=100)
+        # Construction only needs the model and the candidate space; the
+        # capless default keeps the machine-scaled shared reserve in budget.
+        _, model, space = self._planner(tables, 1.76, 12, ssd_gib=None)
         ssd_cost = {}
         for fqn in ("sparse.ebc.a", "sparse.ebc.b"):
             costs = [
