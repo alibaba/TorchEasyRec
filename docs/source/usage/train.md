@@ -209,9 +209,9 @@ export NCCL_P2P_LEVEL=PHB
 export STORAGE_RESERVE_PERCENT=0.5
 ```
 
-主机内存（DDR）的规划预算由 `HOST_MEMORY_RESERVE_PERCENT` 控制，默认值为 `0`，不额外扣除预留比例。TorchEasyRec 将物理内存与检测到的 cgroup 容器内存上限取较小值，扣除配置的预留比例后，再按本机 rank 数均分。该设置适用于所有模型；`STORAGE_RESERVE_PERCENT` 控制的是 HBM 侧预留，不能调整 DDR 预算。
+主机内存（DDR）的规划预算由 `HOST_MEMORY_RESERVE_PERCENT` 控制，默认值为 `0`，不额外扣除预留比例。`STORAGE_RESERVE_PERCENT` 控制的是 HBM 侧预留，不能调整 DDR 预算。
 
-未设置此变量且没有容器内存限制时，DDR 预算保持原来的物理内存均分行为；容器内的预算仍受检测到的 cgroup 上限约束，可能因此改变分片方案。需要为数据读取、特征处理和 pinned memory 等开销预留规划余量时，可显式配置，例如预留 15%：
+未设置此变量且没有容器内存限制时，DDR 预算保持原来的物理内存均分行为。需要为数据读取、特征处理和 pinned memory 等开销预留规划余量时，可显式配置，例如预留 15%：
 
 ```bash
 export HOST_MEMORY_RESERVE_PERCENT=0.15
