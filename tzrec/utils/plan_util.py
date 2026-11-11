@@ -996,8 +996,10 @@ def _emit_dynamicemb_variants(
     """Expand a DynamicEmb sharding option into caching and non-caching candidates.
 
     Without an explicit load factor, search the zero and full value budgets
-    and both partial-budget modes. The working set sets the lower bounds of
-    the partial grids: up to five geometric points through 0.5, then fixed
+    and both partial-budget modes. A configured unique-id factor sets the
+    same working-set floor for every backend; zero requests at least one row.
+    Without that factor, built-in grids start at 0.1 and RocksDB at 0.01.
+    The built-in partial grids use five geometric points through 0.5, then fixed
     tenths up to 0.9. An explicit partial ratio requests both modes at that
     budget. A cache must cover the working set; a cache covering the entire
     shard is represented by the full non-caching endpoint.
@@ -1030,7 +1032,7 @@ def _emit_dynamicemb_variants(
         raise ValueError("DynamicEmb shard rows must match the per-rank max_capacity")
     if unique_id_factor is None:
         required = math.ceil(base_option.batch_size * sum(base_option.input_lengths))
-        floor = 0.1
+        builtin_floor, rocksdb_floor = 0.1, 0.01
     else:
         if not math.isfinite(unique_id_factor) or unique_id_factor < 0:
             raise ValueError(
@@ -1041,18 +1043,15 @@ def _emit_dynamicemb_variants(
             * unique_id_factor
             * base_option.batch_size
         )
-        floor = required / rows or 0.1
+        builtin_floor = rocksdb_floor = max(required, 1) / rows
 
     params = base_option.cache_params
     requests: List[Tuple[bool, float, Any]]
     if params is None:
         requests = [(False, 0.0, None)]
-        requests.extend(
-            (False, r, None) for r in _dynamicemb_partial_ratios(min(floor, 0.1))
-        )
-        requests.extend(
-            (True, r, None) for r in _dynamicemb_partial_ratios(max(floor, 0.1))
-        )
+        partial_ratios = _dynamicemb_partial_ratios(builtin_floor)
+        requests.extend((False, r, None) for r in partial_ratios)
+        requests.extend((True, r, None) for r in partial_ratios)
         requests.append((False, 1.0, None))
     else:
         ratio = float(params.load_factor)
@@ -1061,15 +1060,14 @@ def _emit_dynamicemb_variants(
             requests.append((True, ratio, None))
 
     if allow_rocksdb and params is None and options.score_strategy.name != "CUSTOMIZED":
-        min_ratio = required / rows if required else 0.01
-        if min_ratio <= 0.5:
+        if rocksdb_floor <= 0.5:
             from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
 
             factory = RocksDBStorageFactory(None, base_option.fqn)
             requests.extend(
                 (True, ratio, factory)
                 for ratio in sorted(
-                    {float(r) for r in np.geomspace(min_ratio, 0.5, num=10)}
+                    {float(r) for r in np.geomspace(rocksdb_floor, 0.5, num=10)}
                 )
             )
 
