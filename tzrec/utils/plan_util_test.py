@@ -22,11 +22,12 @@ from parameterized import param, parameterized
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import get_default_sharders
+from torchrec.distributed.planner.estimator.types import HardwarePerfConfig
 from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
 from torchrec.distributed.planner.proposers import GridSearchProposer
-from torchrec.distributed.planner.types import PlannerError, Topology
+from torchrec.distributed.planner.types import PlannerError, SharderData, Topology
 from torchrec.distributed.test_utils.test_model import TestSparseNN
-from torchrec.distributed.types import CacheParams, ShardingType
+from torchrec.distributed.types import CacheParams, ShardingType, StorageUsageType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 from tzrec.protos import feature_pb2
@@ -1137,17 +1138,20 @@ class DynamicEmbPlannerTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("zero", 0, False, 4096, False, 0),
-            ("full", 1, False, 4096, False, 1),
-            ("hybrid", 0.1, False, 4096, False, 0.11 + 0.01 * 1024 / (1024 + 3696)),
-            ("cache", 0.1, True, 4096, False, 0.28 + 0.01 * 0.25),
-            ("measured_cache", 0.1, True, 4096, True, 0.6),
+            ("zero", 0, False, None, 0),
+            ("full", 1, False, None, 1),
+            ("hybrid", 0.1, False, None, 0.11 + 0.01 * 1024 / (1024 + 3696)),
+            ("cache", 0.1, True, None, 0.28 + 0.01 * 0.25),
+            ("measured_cache", 0.1, True, 2.4, 0.6),
+            ("miss_rate_above_one", 0.1, True, -1.0, 0),
+            ("miss_rate_below_zero", 0.1, True, 8.0, 1),
         ],
         name_func=parameterized_name_func,
     )
-    def test_performance_uses_allocated_share_only(
-        self, _, ratio, caching, rows, measured, expected
+    def test_performance_bandwidth_preserves_allocated_share(
+        self, _, ratio, caching, stats_scale, expected_weight
     ):
+        rows = 4096
         opt = next(
             o
             for o in self._options(ratio=ratio, rows=rows)
@@ -1155,22 +1159,38 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         )
         original = opt.cache_params
         allocated = opt.cache_load_factor
-        if measured:
+        if stats_scale is not None:
             original.stats = mock.Mock()
-            original.stats.expected_miss_rate.return_value = 0.4
-        with mock.patch.object(
-            dynamicemb_util,
-            "_orig_build_shard_perf_contexts",
-            side_effect=lambda *args: opt.cache_params.load_factor,
-        ):
-            hit_rate = dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
-                None, [[rows, 1]], opt, None, None, None
+            original.stats.expected_miss_rate.side_effect = lambda share: (
+                1 - stats_scale * share
             )
-        if measured:
-            original.stats.expected_miss_rate.assert_called_once_with(0.25)
-        self.assertAlmostEqual(hit_rate, expected)
+        topology = Topology(
+            world_size=1, compute_device="cuda", hbm_mem_bw=1000, hbm_to_ddr_mem_bw=20
+        )
+        config = HardwarePerfConfig()
+        fused_key = ("cuda", EmbeddingComputeKernel.FUSED.value)
+        config.kernel_device_bandwidths = {fused_key: 37.0}
+        sharder_data = SharderData(
+            fused_params={},
+            qcomm_dtype_sizes={},
+            storage_usage_type=StorageUsageType.DEFAULT,
+        )
+        contexts = dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
+            config, [[rows, 1]], opt, topology, {}, sharder_data
+        )
+        self.assertEqual(len(contexts), 1)
+        self.assertAlmostEqual(contexts[0].device_bw, 2 + 98 * expected_weight)
+        self.assertEqual(contexts[0].caching_ratio, allocated)
+        self.assertEqual(contexts[0].hbm_to_ddr_mem_bw, 20)
         self.assertIs(opt.cache_params, original)
         self.assertEqual(opt.cache_load_factor, allocated)
+        self.assertEqual(config.kernel_device_bandwidths, {fused_key: 37.0})
+        opt.dynamicemb_options = None
+        opt.compute_kernel = EmbeddingComputeKernel.FUSED.value
+        contexts = dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
+            config, [[rows, 1]], opt, topology, {}, sharder_data
+        )
+        self.assertEqual(contexts[0].device_bw, 37.0)
 
 
 if __name__ == "__main__":
