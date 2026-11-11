@@ -92,7 +92,11 @@ from torchrec.modules.embedding_modules import (
 
 from tzrec.protos import feature_pb2
 from tzrec.utils import env_util, resource_util, rocksdb_util
-from tzrec.utils.dynamicemb_util import _get_optimizer_multipler, has_dynamicemb
+from tzrec.utils.dynamicemb_util import (
+    DynamicEmbTableMemory,
+    _get_optimizer_multipler,
+    has_dynamicemb,
+)
 from tzrec.utils.logging_util import logger
 
 
@@ -783,7 +787,6 @@ def _extract_constraints_for_param(
         if hasattr(constraints[name], "dynamicemb_options"):
             # pyre-ignore [16]
             dynamicemb_options = constraints[name].dynamicemb_options
-
     return (
         input_lengths,
         col_wise_shard_dim,
@@ -920,6 +923,8 @@ class EmbeddingStorageEstimator(ShardEstimator):
             dynamicemb_options = None
             if use_dynamicemb:
                 dynamicemb_options = sharding_option.dynamicemb_options
+            elif not caching_ratio:
+                caching_ratio = UVM_CACHING_RATIO
 
             shard_storages = calculate_shard_storages(
                 sharder_data=sharder_data,
@@ -933,7 +938,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 local_world_size=self._topology.local_world_size,
                 input_lengths=sharding_option.input_lengths,
                 num_poolings=num_poolings,
-                caching_ratio=caching_ratio if caching_ratio else UVM_CACHING_RATIO,
+                caching_ratio=caching_ratio,
                 is_pooled=sharding_option.is_pooled,
                 input_data_type_size=input_data_type_size,
                 output_data_type_size=output_data_type_size,
@@ -945,6 +950,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 kv_cache_load_factor=kv_cache_load_factor,
                 use_virtual_table=use_virtual_table,
                 dynamicemb_options=dynamicemb_options,
+                dynamicemb_memory=getattr(sharding_option, "dynamicemb_memory", None),
             )
             for shard, storage in zip(sharding_option.shards, shard_storages):
                 shard.storage = storage
@@ -974,6 +980,7 @@ def calculate_shard_storages(
     kv_cache_load_factor: float = KV_CACHING_RATIO,
     use_virtual_table: bool = False,
     dynamicemb_options=None,
+    dynamicemb_memory: Optional[DynamicEmbTableMemory] = None,
 ) -> List[Storage]:
     """Calculates estimated storage sizes.
 
@@ -1007,13 +1014,16 @@ def calculate_shard_storages(
             cache.
         kv_cache_load_factor (float): ratio of kv caching.
         use_virtual_table (bool): use virtual table or not.
-        dynamicemb_options (DynamicEmbTableOptions): dynamice embedding options
+        dynamicemb_options (DynamicEmbTableOptions): dynamic embedding options.
+        dynamicemb_memory: per-shard capacity of the DynamicEmb candidate.
+
     Returns:
         List[Storage]: storage object for each device in topology.
     """
     if dynamicemb_options is not None:
         from tzrec.utils.dynamicemb_util import dynamicemb_calculate_shard_storages
 
+        assert dynamicemb_memory is not None
         return dynamicemb_calculate_shard_storages(
             sharder_data=sharder_data,
             sharding_type=sharding_type,
@@ -1026,7 +1036,6 @@ def calculate_shard_storages(
             local_world_size=local_world_size,
             input_lengths=input_lengths,
             num_poolings=num_poolings,
-            caching_ratio=caching_ratio,
             is_pooled=is_pooled,
             input_data_type_size=input_data_type_size,
             output_data_type_size=output_data_type_size,
@@ -1035,6 +1044,7 @@ def calculate_shard_storages(
             is_inference=is_inference,
             multipass_prefetch_max_pass=multipass_prefetch_max_pass,
             dynamicemb_options=dynamicemb_options,
+            dynamicemb_memory=dynamicemb_memory,
         )
     else:
         return tzrec_calculate_shard_storages(
@@ -1115,136 +1125,173 @@ def _reconstruct_ratio_factory(
     )
 
 
+_DYNAMICEMB_WORKING_SET_MULTIPLIER = 5
+
+
+def _dynamicemb_partial_ratios(low: float) -> List[float]:
+    """Sample five geometric points up to 0.5, then fixed tenths up to 0.9."""
+    if low >= 1.0:
+        return []
+    ratios = {low, *(r for r in (0.5, 0.6, 0.7, 0.8, 0.9) if r >= low)}
+    if low < 0.5:
+        ratios.update(float(r) for r in np.geomspace(low, 0.5, 5)[1:-1])
+    return sorted(ratios)
+
+
 def _emit_dynamicemb_variants(
     base_option: ShardingOption,
+    unique_id_factor: Optional[float],
     allow_rocksdb: bool = False,
-    unique_id_factor: Optional[float] = None,
 ) -> List[ShardingOption]:
-    """Expand a dynamicemb ShardingOption into its placement candidates.
+    """Expand a DynamicEmb sharding option into caching and non-caching candidates.
 
-    The built-in families keep the linear ratio grid ``0.1, 0.2, ..., 1.0``:
-    HYBRID (``caching=False``) below 1.0 and CACHING (``caching=True``) on
-    the whole grid. A 1.0 value budget covers the whole table, so the
-    runtime drops the host tier (HBM_ONLY) regardless of the family label;
-    only the CACHING 1.0 candidate is emitted. With RocksDB planning,
-    built-in HYBRID is excluded entirely: HybridStorage re-splits rows
-    between its tiers on load, so a near-capacity table overflows hash
-    buckets and loses rows on every restore.
+    Without an explicit load factor, search the zero and full value budgets
+    and both partial-budget modes. The working set sets the lower bounds of
+    the partial grids: up to five geometric points through 0.5, then fixed
+    tenths up to 0.9. An explicit partial ratio requests both modes at that
+    budget. A cache must cover the working set; a cache covering the entire
+    shard is represented by the full non-caching endpoint.
 
-    An explicit ``cache_load_factor`` pins the built-in placement: it never
-    enables automatic RocksDB placement, and an explicit CACHING ratio that
-    cannot hold the configured working set is rejected instead of silently
-    raised. An explicit HYBRID value-tier ratio is exempt from that rule.
+    In automatic search, keep the first budget for each set of rounded tier
+    capacities within a mode. Zero, partial and full budgets remain distinct:
+    equal row estimates do not imply the same layout after native fusion.
+    The DP proposer uses the candidates' HBM and host costs to select a plan.
 
-    RocksDB CACHING_PS candidates span one geometric grid of ten ratios
-    from the working-set floor up to ``0.5``, both endpoints included.
-    ``unique_id_factor`` is the physical table's measured unique ids per
-    sample, resolved from its effective constraints (shared tables keep the
-    maximum of the members' configured values); when configured, the lower
-    endpoint is ``ceil(2 * unique_id_factor * batch_size) /
-    local_table_rows`` and the floor is those rows, otherwise the endpoint
-    is ``0.01`` and the existing lookup estimate (batch size times the
-    pooling factors) is the floor. A floor above ``0.5`` leaves the table
-    without RocksDB candidates. Every ratio must hold the floor in the
-    capacity the runtime would actually allocate (the cache's overflow area
-    never counts toward it) and stay below the full table, which the
-    built-in placement serves.
+    With RocksDB planning, the built-in zero and partial non-caching (HYBRID)
+    budgets are excluded -- HybridStorage re-splits rows between its tiers
+    on load, so a near-capacity table overflows hash buckets and loses rows
+    on every restore -- while the full endpoint stays (its host tier is
+    empty). Eligible tables additionally get CACHING_PS candidates on one
+    geometric grid of ten ratios from the working-set floor up to ``0.5``,
+    both endpoints included; a floor above ``0.5`` leaves the table without
+    RocksDB candidates. A RocksDB factory's identity includes the chosen
+    ratio, so DynamicEmb cannot fuse tables of different ratios into one
+    group and redistribute a planned cache budget to a shared ratio.
 
-    Each emitted option owns a deep-copied ``dynamicemb_options`` instance
-    so per-option mutations do not bleed across variants. Storage
-    estimation, not this generator, fills shard HBM/DDR/SSD costs.
+    The caller supplies base_option.dynamicemb_options. Each emitted option
+    owns a deep copy of its table options and reports the allocated share as
+    its load factor; its memory estimate retains the byte budget for runtime.
     """
-    explicit_ratio = None
-    stats = None
-    if base_option.cache_params is not None:
-        explicit_ratio = base_option.cache_params.load_factor
-        stats = base_option.cache_params.stats
-
-    def _emit(ratio: float, external: bool) -> ShardingOption:
-        opt = copy.deepcopy(base_option)
-        opt.cache_params = CacheParams(load_factor=ratio, stats=stats)
-        opt.dynamicemb_options.caching = True  # pyre-ignore [16]
-        if external:
-            opt.dynamicemb_options.external_storage = (  # pyre-ignore [16]
-                _ratio_keyed_factory_cls()(None, "", cache_ratio=ratio)
-            )
-        return opt
-
-    required = None
-    if unique_id_factor is not None:
-        required = math.ceil(2 * unique_id_factor * base_option.batch_size)
-
-    if explicit_ratio is not None:
-        # The pin always emits the CACHING placement; the working-set rule
-        # validates that placement, never the HYBRID value-tier split.
-        local_rows = int(base_option.shards[0].size[0])
-        if required is not None:
-            capacity = rocksdb_util.cache_rows(local_rows, explicit_ratio)
-            if capacity < required:
-                raise ValueError(
-                    f"table {base_option.fqn} pins cache_load_factor "
-                    f"{explicit_ratio} ({capacity} cache rows), which cannot "
-                    f"hold the configured working set of {required} rows; "
-                    "raise the ratio or the table's unique_id_factor"
-                )
-        variants = [_emit(explicit_ratio, external=False)]
-        if not allow_rocksdb:
-            opt = copy.deepcopy(base_option)
-            opt.cache_params = CacheParams(load_factor=explicit_ratio, stats=stats)
-            opt.dynamicemb_options.caching = False  # pyre-ignore [16]
-            variants.append(opt)
-        return variants
-
-    linear_grid = [(i + 1) / 10 for i in range(10)]
-    # Both families' 1.0 candidates build HBM_ONLY -- the runtime drops the
-    # host tier when the value budget covers the whole table -- so only the
-    # CACHING one is emitted.
-    if allow_rocksdb:
-        # No built-in HYBRID with RocksDB planning; CACHING only.
-        variants: List[ShardingOption] = [_emit(r, False) for r in linear_grid]
+    tensor = base_option.tensor
+    template = copy.copy(base_option)
+    template.dynamicemb_options = copy.copy(base_option.dynamicemb_options)
+    options = template.dynamicemb_options
+    rows = base_option.shards[0].size[0]
+    if any(shard.size[0] != options.max_capacity for shard in base_option.shards):
+        raise ValueError("DynamicEmb shard rows must match the per-rank max_capacity")
+    if unique_id_factor is None:
+        required = math.ceil(base_option.batch_size * sum(base_option.input_lengths))
+        floor = 0.1
     else:
-        variants = []
-        for ratio in linear_grid[:-1]:
-            opt = copy.deepcopy(base_option)
-            opt.cache_params = CacheParams(load_factor=ratio, stats=stats)
-            opt.dynamicemb_options.caching = False  # pyre-ignore [16]
-            variants.append(opt)
-        variants.extend(_emit(r, False) for r in linear_grid)
+        if not math.isfinite(unique_id_factor) or unique_id_factor < 0:
+            raise ValueError(
+                f"{base_option.name}: unique_id_factor must be finite and non-negative"
+            )
+        required = math.ceil(
+            _DYNAMICEMB_WORKING_SET_MULTIPLIER
+            * unique_id_factor
+            * base_option.batch_size
+        )
+        floor = required / rows or 0.1
 
-    if not (
+    params = base_option.cache_params
+    if params is None:
+        requests = [(False, 0.0)]
+        requests.extend((False, r) for r in _dynamicemb_partial_ratios(min(floor, 0.1)))
+        requests.extend((True, r) for r in _dynamicemb_partial_ratios(max(floor, 0.1)))
+        requests.append((False, 1.0))
+        if allow_rocksdb:
+            requests = [
+                (caching, ratio)
+                for caching, ratio in requests
+                if caching or ratio == 1.0
+            ]
+    else:
+        ratio = float(params.load_factor)
+        requests = [(False, ratio)]
+        if 0 < ratio < 1:
+            requests.append((True, ratio))
+
+    candidates = []
+    seen = set()
+    for caching, requested in requests:
+        options.caching = caching
+        ratio = requested
+        memory = DynamicEmbTableMemory.from_options(tensor, options, ratio=ratio)
+        if ratio > 0 and memory.local_hbm_for_values == 0:
+            if options.caching:
+                continue
+            ratio = 0.0
+        elif options.caching and memory.resident_rows >= memory.host_rows:
+            if params is None:
+                continue  # Automatic search already includes the full endpoint.
+            options.caching = False
+            ratio = 1.0
+        if ratio != requested:
+            memory = DynamicEmbTableMemory.from_options(tensor, options, ratio=ratio)
+        if options.caching and memory.resident_rows < required:
+            continue
+        if params is None:
+            endpoint = ratio if ratio in (0, 1) else None
+            key = (
+                options.caching,
+                endpoint,
+                memory.hbm_rows,
+                memory.host_rows,
+                memory.resident_rows,
+                False,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+
+        if options.caching:
+            allocated = memory.resident_rows / memory.host_rows
+        elif 0 < ratio < 1:
+            allocated = memory.hbm_rows / (memory.hbm_rows + memory.host_rows)
+        else:
+            allocated = ratio
+        option = copy.deepcopy(template)
+        option.cache_params = CacheParams(
+            load_factor=allocated, stats=params.stats if params else None
+        )
+        option.dynamicemb_memory = memory
+        candidates.append(option)
+
+    if (
         allow_rocksdb
-        and base_option.cache_params is None
+        and params is None
         and base_option.dynamicemb_options.score_strategy.name  # pyre-ignore [16]
         != "CUSTOMIZED"
     ):
-        return variants
-    local_rows = int(base_option.shards[0].size[0])
-    if required:
-        # The working-set floor: twice the factor's batch ids.
-        floor = required
-        min_ratio = required / local_rows
-    else:
-        # Without a measured working set, the existing lookup estimate is
-        # the floor: batch size times the pooling factors, a lower bound
-        # on the ids a step brings.
-        floor = int(base_option.batch_size * sum(base_option.input_lengths))
-        min_ratio = 0.01
-    if min_ratio > 0.5:
-        # The working set needs more than half the table; only the built-in
-        # placements remain.
-        return variants
-    # One geometric grid over both endpoints; equal endpoints leave one
-    # distinct candidate. The capacity check uses the rows the runtime
-    # would actually allocate, never the cache's overflow area.
-    ps_ratios = sorted(
-        {
-            float(r)
-            for r in np.geomspace(min_ratio, 0.5, num=10)
-            if floor <= rocksdb_util.cache_rows(local_rows, float(r)) < local_rows
-        }
-    )
-    variants.extend(_emit(r, True) for r in ps_ratios)
-    return variants
+        min_ratio = required / rows if required else 0.01
+        if min_ratio <= 0.5:
+            for ratio in sorted(
+                {float(r) for r in np.geomspace(min_ratio, 0.5, num=10)}
+            ):
+                options.caching = True
+                memory = DynamicEmbTableMemory.from_options(
+                    tensor, options, ratio=ratio
+                )
+                if memory.local_hbm_for_values == 0:
+                    continue
+                if memory.resident_rows < required:
+                    continue
+                if memory.resident_rows >= memory.host_rows:
+                    continue  # A full cache stays on the built-in endpoint.
+                # No capacity dedup here: the chosen ratio is the candidate's
+                # identity (fusion grouping and runtime budget), and distinct
+                # grid ratios can round to the same resident rows.
+                option = copy.deepcopy(template)
+                option.cache_params = CacheParams(
+                    load_factor=memory.resident_rows / memory.host_rows
+                )
+                option.dynamicemb_memory = memory
+                option.dynamicemb_options.external_storage = (  # pyre-ignore [16]
+                    _ratio_keyed_factory_cls()(None, "", cache_ratio=ratio)
+                )
+                candidates.append(option)
+    return candidates
 
 
 class _MemoizedSearchSpace:
@@ -1547,6 +1594,13 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                     use_dynamicemb,
                     dynamicemb_options,
                 ) = _extract_constraints_for_param(_constraints, key)
+                # the union measurement rides on the resolved constraint;
+                # absence stays None, distinct from a measured zero
+                unique_id_factor = (
+                    getattr(_constraints[key], "unique_id_factor", None)
+                    if _constraints and _constraints.get(key)
+                    else None
+                )
 
                 # skip for other device groups
                 if device_group and device_group != self._compute_device:
@@ -1623,8 +1677,8 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             sharding_options_per_table.extend(
                                 _emit_dynamicemb_variants(
                                     sharding_option,
-                                    self.allow_rocksdb,
                                     unique_id_factor,
+                                    self.allow_rocksdb,
                                 )
                             )
                         else:

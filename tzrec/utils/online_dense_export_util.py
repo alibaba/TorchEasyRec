@@ -380,18 +380,32 @@ class OnlineDenseExportManager:
                 daemon=True,
             )
             self._worker.start()
-            self._finalizer = weakref.finalize(
-                self,
-                type(self)._drain_worker,
-                self._worker,
-                self._cond,
-                self._drain_event,
-                self._close_timeout,
-            )
-            logger.info(
-                "ONLINE_DENSE_EXPORT enabled; dense versions will be exported under %s",
-                self._export_root,
-            )
+            try:
+                self._finalizer = weakref.finalize(
+                    self,
+                    type(self)._drain_worker,
+                    self._worker,
+                    self._cond,
+                    self._drain_event,
+                    self._close_timeout,
+                )
+                logger.info(
+                    "ONLINE_DENSE_EXPORT enabled; dense versions will be "
+                    "exported under %s",
+                    self._export_root,
+                )
+            except BaseException:
+                # The worker is already live and no caller-side guard can clean
+                # up a constructor that fails after starting it: drain it here
+                # or it leaks as an unattended publisher.
+                try:
+                    self.close()
+                except Exception:
+                    logger.exception(
+                        "Failed to drain the online dense export worker "
+                        "after a startup error"
+                    )
+                raise
 
     @property
     def enabled(self) -> bool:

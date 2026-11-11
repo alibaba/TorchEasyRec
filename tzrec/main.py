@@ -1511,7 +1511,7 @@ def predict(
         dataset_type (str, optional): dataset type, default use the type in pipeline.
         predict_threads (int, optional): predict threads num, default will
             use num_workers in data_config, or one per GPU for a distributed
-            embedding export.
+            embedding or GenRec export.
         writer_type (int, optional): data writer type, default will be same as
             dataset_type in data_config.
         edit_config_json (str, optional): edit pipeline config json str.
@@ -1547,6 +1547,9 @@ def predict(
     is_trt: bool = acc_utils.is_trt_predict(scripted_model_path)
     is_input_tile: bool = acc_utils.is_input_tile_predict(scripted_model_path)
     is_dist_emb: bool = acc_utils.is_distributed_embedding_predict(scripted_model_path)
+    is_genrec: bool = (
+        pipeline_config.model_config.WhichOneof("model") == "genrec_causal_lm_model"
+    )
 
     if dataset_type:
         pipeline_config.data_config.dataset_type = getattr(DatasetType, dataset_type)
@@ -1570,15 +1573,14 @@ def predict(
     data_config.drop_remainder = False
     # Build feature
     features = _create_features(list(pipeline_config.feature_configs), data_config)
-    compiled_prompt = _compile_prompt(pipeline_config, features)
 
+    # an export assembles its own prompt, so predicting it needs no tokenizer
     infer_dataloader = create_dataloader(
         data_config,
         features,
         predict_input_path,
         reserved_columns=reserved_cols,
         mode=Mode.PREDICT,
-        compiled_prompt=compiled_prompt,
         debug_level=debug_level,
     )
     infer_iterator = infer_dataloader.get_iterator()  # pyre-ignore[16]
@@ -1626,10 +1628,11 @@ def predict(
         prof.start()
 
     if predict_threads is None:
-        # with a distributed embedding, each lookup stream holds its own NVE buffers.
+        # with a distributed embedding, each lookup stream holds its own NVE buffers;
+        # with a genrec export, each decode holds its own KV cache.
         predict_threads = (
             len(forward_devices)
-            if is_dist_emb
+            if is_dist_emb or is_genrec
             else max(data_config.num_workers, len(forward_devices))
         )
     elif is_dist_emb and predict_threads > len(forward_devices):
@@ -1637,6 +1640,11 @@ def predict(
             f"predict_threads={predict_threads} runs more than one lookup stream per "
             "GPU; each holds its own NVE lookup buffers outside the GPU cache budget, "
             "set a lower DIST_EMB_GPU_CACHE_RATIO if GPU memory runs out."
+        )
+    elif is_genrec and predict_threads > len(forward_devices):
+        logger.warning(
+            f"predict_threads={predict_threads} runs more than one decode per GPU; "
+            "each holds its own beam KV cache, lower it if GPU memory runs out."
         )
     # NVE keeps one lookup context per CUDA stream, so each worker gets its own.
     worker_streams = (
@@ -1734,6 +1742,7 @@ def predict(
             scripted_model_path,
             forward_devices,
             log_model=is_profiling and is_rank_zero,
+            pipeline_config=pipeline_config,
         )
         while True:
             try:

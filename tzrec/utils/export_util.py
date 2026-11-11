@@ -66,6 +66,7 @@ from tzrec.features.feature import (
     BaseFeature,
     create_feature_configs,
     create_fg_json,
+    get_hard_search_input_tile_features,
 )
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
@@ -384,14 +385,20 @@ def _write_export_metadata(
     export_config.ClearField("feature_configs")
     export_config.feature_configs.extend(feature_configs)
     config_util.save_message(export_config, os.path.join(save_dir, "pipeline.config"))
+    hard_search_input_tile_features = get_hard_search_input_tile_features(features)
+    hard_search_input_tile_features = {
+        feature.grouped_sequence_prefix
+        + node["feature_name"]: hard_search_input_tile_features[feature.name]
+        for feature in features
+        if feature.name in hard_search_input_tile_features
+        for node in feature.fg_json()
+    }
+    acc_config = acc_utils.export_acc_config(
+        additional_export_config=additional_export_config,
+        hard_search_input_tile_features=hard_search_input_tile_features,
+    )
     with open(os.path.join(save_dir, "model_acc.json"), "w") as output:
-        json.dump(
-            acc_utils.export_acc_config(
-                additional_export_config=additional_export_config
-            ),
-            output,
-            indent=4,
-        )
+        json.dump(acc_config, output, indent=4)
     has_fg_asset = False
     for asset in assets or []:
         has_fg_asset = has_fg_asset or asset.endswith("fg.json")

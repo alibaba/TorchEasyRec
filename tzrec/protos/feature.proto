@@ -1112,6 +1112,8 @@ message SequenceFeature {
     repeated SeqFeatureConfig features = 5;
     // FeatureStore entity for serving; unset preserves legacy entity resolution
     optional string sequence_entity = 6;
+    // Candidate item field (item:<field>) used to filter this sequence in FeatureDB.
+    optional string hard_search_key = 7;
 }
 
 message FeatureConfig {
