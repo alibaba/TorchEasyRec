@@ -340,26 +340,19 @@ class DynamicEmbCapacityTest(unittest.TestCase):
         from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
 
         tensor = torch.empty(4096, 32, device="meta")
-        opt = DynamicEmbTableOptions(max_capacity=4096, caching=True)
+        opt = DynamicEmbTableOptions(
+            max_capacity=4096,
+            caching=True,
+            bucket_capacity=128,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+        )
         m = DynamicEmbTableStorage.from_options(tensor, opt, ratio=0.1)
         self.assertEqual((m.resident_rows, m.backing_rows), (1024, 4096))
         self.assertEqual(m.local_hbm_for_values, int(0.1 * 4096 * 32 * 4))
-        # The backing table sits whole on DDR. The HBM cost spans the resident
-        # cache plus three overflow buckets of value rows, and every key map
-        # -- backing, resident cache, overflow -- lives on HBM too.
-        overflow = (
-            dynamicemb_util._DYNAMICEMB_CACHE_OVERFLOW_BUCKETS
-            * dynamicemb_util.DYNAMICEMB_CACHE_BUCKET_CAPACITY
-        )
-        expected_hbm = (
-            (1024 + overflow) * 32 * 4
-            + dynamicemb_util._keymap_bytes(4096, opt.bucket_capacity, 1)
-            + dynamicemb_util._keymap_bytes(1024, 1024, 1)
-            + dynamicemb_util._keymap_bytes(overflow, overflow, 1)
-        )
+        # HBM: 524288 value bytes including overflow, plus 172168 key-map bytes.
         self.assertEqual(
             (m.storage.hbm, m.storage.ddr, m.storage.ssd),
-            (expected_hbm, 4096 * 32 * 4, 0),
+            (696456, 524288, 0),
         )
         opt.score_strategy = (
             DynamicEmbScoreStrategy.TIMESTAMP,

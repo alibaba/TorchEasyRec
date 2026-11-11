@@ -1079,6 +1079,17 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         )
 
     def test_physical_dedup_keeps_first_budget(self):
+        pinned = [
+            next(o for o in self._options(ratio=ratio) if o.dynamicemb_options.caching)
+            for ratio in (0.6, 0.7)
+        ]
+        first, second = [o.dynamicemb_storage for o in pinned]
+        for candidate in (first, second):
+            self.assertEqual(
+                (candidate.resident_rows, candidate.backing_rows), (3072, 4096)
+            )
+        self.assertEqual(first.storage, second.storage)
+        self.assertNotEqual(first.local_hbm_for_values, second.local_hbm_for_values)
         opts = self._options()
         caches = [o for o in opts if o.dynamicemb_options.caching]
         self.assertEqual(
@@ -1092,6 +1103,7 @@ class DynamicEmbPlannerTest(unittest.TestCase):
                 (0.75, int(0.6 * 16384)),
             ],
         )
+        self.assertEqual(caches[-1].dynamicemb_storage, first)
         hybrid, cache = self._options(ratio=0.15)
         self.assertFalse(hybrid.dynamicemb_options.caching)
         self.assertTrue(cache.dynamicemb_options.caching)

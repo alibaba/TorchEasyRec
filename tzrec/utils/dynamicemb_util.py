@@ -69,7 +69,8 @@ class DynamicEmbTableStorage(NamedTuple):
         resident_rows: normal GPU cache capacity for CACHING, excluding its
             overflow area; GPU partition capacity for other placements.
         backing_rows: full backing-table capacity for CACHING; backing
-            partition capacity for HYBRID.
+            partition capacity for HYBRID, including conservative endpoint
+            capacity needed for fused layouts.
         local_hbm_for_values: requested GPU value+optimizer bytes for the
             runtime, before physical bucket rounding.
         storage: table-only HBM/DDR/SSD costs, excluding admission counters,
@@ -106,9 +107,13 @@ class DynamicEmbTableStorage(NamedTuple):
 
         Physical table storage uses the resulting bucket-rounded capacities::
 
-            HBM = hbm_rows * row_bytes + hbm_index
-            DDR = host_rows * row_bytes
+            physical_hbm_rows = resident_rows + overflow_rows
+            storage.hbm = physical_hbm_rows * row_bytes + key_map_bytes_total
+            storage.ddr = backing_rows * row_bytes
             key_map_bytes = slots * (8 + 1 + 8 * score_words + 4) + 4 * buckets
+
+        Here overflow_rows is zero outside CACHING, and key_map_bytes_total
+        includes all tier maps charged to HBM.
 
         HYBRID divides values between the two tiers. Each tier takes at least one
         row, rounded up to a whole bucket: 1024 rows on HBM, the table's bucket
@@ -124,9 +129,12 @@ class DynamicEmbTableStorage(NamedTuple):
         as many slots as value rows.
 
         For zero and full budgets, take the larger cost per field across the
-        standalone endpoint and its placement in a fused HYBRID group. NO_EVICTION
-        cannot form a HYBRID group. The storage estimator charges admission
-        counters and pipeline I/O separately.
+        standalone endpoint and its placement in a fused HYBRID group. The
+        host-only endpoint has the full shard as backing_rows; the ordinary
+        full endpoint retains one backing bucket for a fused HYBRID layout.
+        NO_EVICTION cannot form a HYBRID group and has zero backing_rows at
+        the full endpoint. The storage estimator charges admission counters
+        and pipeline I/O separately.
         """
         caching = options.caching
         if not 0.0 <= ratio <= 1.0 or (caching and ratio in (0.0, 1.0)):
