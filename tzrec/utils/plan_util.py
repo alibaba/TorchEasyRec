@@ -18,7 +18,6 @@ from queue import Queue
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
-import psutil
 import torch
 from torch import distributed as dist
 from torch import nn
@@ -86,7 +85,7 @@ from torchrec.modules.embedding_modules import (
 )
 
 from tzrec.protos import feature_pb2
-from tzrec.utils import env_util
+from tzrec.utils import env_util, resource_util
 from tzrec.utils.dynamicemb_util import DynamicEmbTableMemory, has_dynamicemb
 from tzrec.utils.logging_util import logger
 
@@ -98,7 +97,14 @@ def create_planner(
     global_constraints_cfg: Optional[feature_pb2.ParameterConstraints] = None,
     model: Optional[nn.Module] = None,
 ) -> EmbeddingShardingPlanner:
-    """Create EmbeddingShardingPlanner."""
+    """Create EmbeddingShardingPlanner.
+
+    Host memory per rank is the container's (cgroup-capped) RAM less
+    ``HOST_MEMORY_RESERVE_PERCENT`` (default 0.15) for everything but
+    embeddings, split among the host's ranks; the margin applies to every
+    configuration. ``STORAGE_RESERVE_PERCENT`` (default 0.15) holds back
+    GPU memory the same way.
+    """
     if global_constraints_cfg is not None and (
         global_constraints_cfg.HasField("pooling_factor")
         or global_constraints_cfg.HasField("unique_id_factor")
@@ -116,8 +122,11 @@ def create_planner(
     if torch.cuda.is_available():
         topo_kwargs["hbm_cap"] = torch.cuda.get_device_properties(device).total_memory
 
-    ddr_cap_per_rank = int(float(psutil.virtual_memory().total) / local_world_size)
-    topo_kwargs["ddr_cap"] = ddr_cap_per_rank
+    host_reserve_percent = float(os.environ.get("HOST_MEMORY_RESERVE_PERCENT", 0.15))
+    topo_kwargs["ddr_cap"] = resource_util.host_memory_capacity_per_rank(
+        local_world_size=local_world_size,
+        reserve_percent=host_reserve_percent,
+    )
     if "INTRA_NODE_BANDWIDTH" in os.environ:
         topo_kwargs["intra_host_bw"] = float(os.environ["INTRA_NODE_BANDWIDTH"])
     if "CROSS_NODE_BANDWIDTH" in os.environ:
