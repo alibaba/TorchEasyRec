@@ -12,9 +12,10 @@
 import unittest
 
 from tzrec.ops.utils import prev_power_of_2
-from tzrec.utils.test_util import mark_ci_scope
+from tzrec.utils.test_util import ci_resources, mark_ci_scope
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("h20", "gpu")
 class OpUtilsTest(unittest.TestCase):
     def test_prev_power_of_2(self):

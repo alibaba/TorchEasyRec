@@ -19,6 +19,7 @@ from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
 from tzrec.utils.test_util import (
+    ci_resources,
     cleanup_cuda_memory,
     generate_sparse_seq_len,
     get_test_dtypes,
@@ -29,6 +30,7 @@ from tzrec.utils.test_util import (
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("h20", "gpu")
 class HSTUComputeTest(unittest.TestCase):
     def teardown_example(self, example):
@@ -492,6 +494,7 @@ class HSTUComputeTest(unittest.TestCase):
             )
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("h20", "gpu")
 class Hstu4WayRematParityTest(unittest.TestCase):
     """Forward + backward parity for ``hstu_compute_uqvk``'s 4 remat combos.

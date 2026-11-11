@@ -26,9 +26,15 @@ from tzrec.models.dssm import DSSM
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, tower_pb2
 from tzrec.protos.models import match_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import TestGraphType, create_test_model, mark_ci_scope
+from tzrec.utils.test_util import (
+    TestGraphType,
+    ci_resources,
+    create_test_model,
+    mark_ci_scope,
+)
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("gpu")
 class DSSMTest(unittest.TestCase):
     @parameterized.expand(

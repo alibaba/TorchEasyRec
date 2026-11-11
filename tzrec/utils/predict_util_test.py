@@ -49,6 +49,7 @@ from tzrec.utils.predict_util import (
     load_predict_model,
 )
 from tzrec.utils.test_util import (
+    ci_resources,
     create_tiny_causal_lm,
     make_test_dir,
     mark_ci_scope,
@@ -677,6 +678,7 @@ def _lookup_batch(bags, weights, kjts=None):
     return Batch(sparse_features=sparse)
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
 class DistributedEmbeddingLookupTest(unittest.TestCase):
@@ -985,6 +987,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         torch.testing.assert_close(outs[0].cpu(), outs[1].cpu())
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
 class DistributedEmbeddingModelTest(unittest.TestCase):

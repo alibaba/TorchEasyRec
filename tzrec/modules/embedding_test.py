@@ -54,6 +54,7 @@ from tzrec.utils.fx_util import fx_mark_seq_ec_jt, symbolic_trace
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
+    ci_resources,
     create_test_module,
     mark_ci_scope,
     parameterized_name_func,
@@ -276,6 +277,7 @@ class SequencePoolingTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(result).all())
 
 
+@ci_resources(devices=2, split="case")
 class EmbeddingGroupTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("INPUT_TILE", None)
@@ -2034,6 +2036,7 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["buy.sequence_length"].size(), (2,))
 
 
+@ci_resources(devices=2, split="case")
 @mark_ci_scope("gpu")
 class HardSearchEmbeddingGroupTest(unittest.TestCase):
     def _run_in_subprocess(self):

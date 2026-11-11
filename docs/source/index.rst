@@ -57,6 +57,7 @@ Welcome to TorchEasyRec's documentation!
    :caption: DEVELOP
 
    develop
+   dsw_ci
 
 .. toctree::
    :maxdepth: 2

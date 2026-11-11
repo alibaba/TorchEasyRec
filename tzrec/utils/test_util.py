@@ -232,6 +232,24 @@ class hypothesis_settings(_settings):
         )
 
 
+def ci_resources(devices: int = 2, split: str = "module") -> Any:
+    """Declare a test boundary that can run on a CI device group.
+
+    Args:
+        devices: Minimum number of visible accelerators, one or two.
+        split: Smallest certified fixture boundary: module, class, or case.
+    """
+    if devices not in (1, 2) or split not in ("module", "class", "case"):
+        raise ValueError("invalid CI resource declaration")
+
+    def decorate(obj: Any) -> Any:
+        """Attach resource requirements to a test class or method."""
+        obj._ci_resources = (devices, split)
+        return obj
+
+    return decorate
+
+
 def mark_ci_scope(*scopes: str) -> Any:
     """Tag a unittest method or class as in-scope for the given CI lane(s).
 

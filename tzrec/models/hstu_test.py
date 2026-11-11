@@ -36,6 +36,7 @@ from tzrec.protos.models import match_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
+    ci_resources,
     create_test_model,
     gpu_unavailable,
     mark_ci_scope,
@@ -237,6 +238,7 @@ def _build_batch(
     ).to(device)
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("gpu")
 class HSTUMatchTest(unittest.TestCase):
     @given(

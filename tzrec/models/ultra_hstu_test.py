@@ -38,6 +38,7 @@ from tzrec.protos.models import multi_task_rank_pb2
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
+    ci_resources,
     cleanup_cuda_memory,
     create_test_model,
     gpu_unavailable,
@@ -326,6 +327,7 @@ def _build_batch(device: torch.device, channel_names: List[str]) -> Batch:
     ).to(device)
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("gpu")
 class UltraHSTUTest(unittest.TestCase):
     def teardown_example(self, example):

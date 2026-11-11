@@ -8,9 +8,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Lint: every test that skips on the CPU lane must carry a gpu/h20 marker.
+"""Lint: every test that skips on the CPU lane must carry a gpu marker.
 
-Such a test runs only on a scoped GPU lane (``run.py --scope gpu``/``h20``);
+Such a test runs only on a scoped GPU lane (``run.py --scope gpu``);
 without the marker it is filtered out there too and runs on no per-PR lane.
 """
 
@@ -59,7 +59,7 @@ def _has_scope(decorators) -> bool:
     for dec in decorators:
         # ast.unparse normalizes string quotes to single, so normalize before matching.
         s = _src(dec).replace("'", '"')
-        if "mark_ci_scope" in s and ('"gpu"' in s or '"h20"' in s):
+        if "mark_ci_scope" in s and '"gpu"' in s:
             return True
     return False
 
@@ -91,7 +91,7 @@ class CIScopeCoverageTest(unittest.TestCase):
         self.assertEqual(
             violations,
             [],
-            'GPU-only tests missing @mark_ci_scope("gpu"/"h20") -- they skip on '
+            'GPU-only tests missing @mark_ci_scope("gpu") -- they skip on '
             "the CPU lane and are filtered out of the scoped GPU lanes, so they run "
             "on NO per-PR lane:\n  " + "\n  ".join(violations),
         )

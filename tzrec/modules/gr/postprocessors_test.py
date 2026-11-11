@@ -18,9 +18,10 @@ from tzrec.modules.gr.postprocessors import (
     LayerNormPostprocessor,
     TimestampLayerNormPostprocessor,
 )
-from tzrec.utils.test_util import mark_ci_scope
+from tzrec.utils.test_util import ci_resources, mark_ci_scope
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("h20", "gpu")
 class PostprocessorTest(unittest.TestCase):
     def test_l2norm_postprocessor(self):

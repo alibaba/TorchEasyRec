@@ -25,11 +25,12 @@ from tzrec.modules.gr.onerank_cross_task import (
     build_cross_task_mask,
 )
 from tzrec.ops import Kernel
-from tzrec.utils.test_util import mark_ci_scope
+from tzrec.utils.test_util import ci_resources, mark_ci_scope
 
 _TASK_NAMES = ["is_click", "is_like", "is_comment"]
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("h20", "gpu")
 class OneRankCrossTaskDetachmentTest(unittest.TestCase):
     """Strategic Gradient Detachment semantics (paper 2.4).
@@ -150,6 +151,7 @@ class OneRankCrossTaskDetachmentTest(unittest.TestCase):
         self.assertGreater(rv_undetached.grad[:, :2].abs().max().item(), 0.0)
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("h20", "gpu")
 class BuildCrossTaskMaskTest(unittest.TestCase):
     """Table-driven tests for ``build_cross_task_mask``.

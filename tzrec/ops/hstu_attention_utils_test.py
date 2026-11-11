@@ -32,6 +32,7 @@ from tzrec.ops.hstu_attention_utils import (
 )
 from tzrec.utils.test_util import (
     TestGraphType,
+    ci_resources,
     create_test_module,
     mark_ci_scope,
     reference_stu_truncation,
@@ -143,6 +144,7 @@ class _ReplayTruncationWrapper(nn.Module):
         return torch.cat([out_x, out_ts], dim=-1)
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("h20", "gpu")
 class BuildSlaFuncTensorTest(unittest.TestCase):
     """Verify the per-position interval values written to the func tensor.
@@ -322,6 +324,7 @@ _TRUNCATION_CASES = [
 ]
 
 
+@ci_resources(devices=2, split="module")
 @mark_ci_scope("h20", "gpu")
 class StuTruncationTest(unittest.TestCase):
     """``compute_stu_truncation_plan`` + ``apply_stu_truncation_plan``.

@@ -1,0 +1,63 @@
+name: DSW CI execution
+
+on:
+  workflow_call:
+    inputs:
+      lane:
+        required: true
+        type: string
+      ref:
+        required: true
+        type: string
+    secrets:
+      ALIBABA_CLOUD_ECS_METADATA:
+        required: false
+      CI_ODPS_PROJECT_NAME:
+        required: false
+      ODPS_ENDPOINT:
+        required: false
+      CI_ALIKAFKA_INSTANCE_ID:
+        required: false
+      CI_ALIKAFKA_BROKERS:
+        required: false
+      CI_REGION:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on:
+      - tzci-dsw
+      - ${{ inputs.lane == 'gpu' && 'tzrec-h20-runner' || inputs.lane == 'ppu' && 'dsw-ppu' || 'dsw-cpu' }}
+    timeout-minutes: ${{ inputs.lane == 'ppu' && 1440 || 360 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Run tests in isolated containers
+        id: tests
+        env:
+          TZCI_LANE: ${{ inputs.lane }}
+          ALIBABA_CLOUD_ECS_METADATA: ${{ inputs.lane == 'cpu' && secrets.ALIBABA_CLOUD_ECS_METADATA || '' }}
+          CI_ODPS_PROJECT_NAME: ${{ inputs.lane == 'cpu' && secrets.CI_ODPS_PROJECT_NAME || '' }}
+          ODPS_ENDPOINT: ${{ inputs.lane == 'cpu' && secrets.ODPS_ENDPOINT || '' }}
+          CI_ALIKAFKA_INSTANCE_ID: ${{ inputs.lane == 'cpu' && secrets.CI_ALIKAFKA_INSTANCE_ID || '' }}
+          CI_ALIKAFKA_BROKERS: ${{ inputs.lane == 'cpu' && secrets.CI_ALIKAFKA_BROKERS || '' }}
+          CI_REGION: ${{ inputs.lane == 'cpu' && secrets.CI_REGION || '' }}
+        run: |
+          mode=native
+          if [ ! -f "$GITHUB_WORKSPACE/tzrec/tests/dispatch.py" ]; then
+            mode=legacy
+          fi
+          /opt/tzci/current/bin/tzci-job run --lane "$TZCI_LANE" \
+            --mode "$mode" --checkout "$GITHUB_WORKSPACE"
+      - name: Retain test evidence
+        if: always() && steps.tests.outputs.report_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsw-${{ inputs.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.tests.outputs.report_dir }}
+          retention-days: 14

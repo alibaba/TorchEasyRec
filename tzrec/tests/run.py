@@ -152,6 +152,9 @@ class TZRecTestRunner(TextTestRunner):
                 # run subproc test in subprocess to prevent some global var fork problem
                 for subp_test_group in subproc_test:
                     for one_subp_test in subp_test_group:
+                        if hasattr(result, "run_subprocess"):
+                            result.run_subprocess(one_subp_test)
+                            continue
                         subp_test_module = f"tzrec.{one_subp_test.__module__}"
                         subp_test_name = f"{one_subp_test.__class__.__name__}.{one_subp_test._testMethodName}"  # NOQA
                         try:
@@ -247,12 +250,42 @@ if __name__ == "__main__":
         help="filter tests by CI scope marker (e.g. 'h20'); "
         "default None runs the full suite",
     )
+    parser.add_argument(
+        "--report-dir", help="write CI results and a durable outcome journal"
+    )
     args = parser.parse_args()
 
     runner = TZRecTestRunner()
     test_suite_main, test_suite_subproc = _gather_test_cases(args)
 
-    if not args.list_tests:
+    if not args.list_tests and args.report_dir:
+        from functools import partial
+        from pathlib import Path
+
+        from tzrec.tests import ci_execution, ci_protocol
+
+        report_dir = Path(args.report_dir)
+        report_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["TZREC_CI_EVENT_LOG"] = str(report_dir / "events.jsonl")
+        report_cases = [
+            {"id": case.id()}
+            for suite in (test_suite_main, test_suite_subproc)
+            for case in ci_execution.leaves(suite)
+        ]
+        runner = TZRecTestRunner(
+            resultclass=partial(ci_execution.RecordingResult, test_dir=args.test_dir)
+        )
+        runner_result = runner.run(test_suite_main, test_suite_subproc)
+        report = runner_result.report(report_cases)
+        report.update(
+            version=ci_protocol.VERSION,
+            session_id=os.environ.get("TZREC_CI_SESSION_ID", ""),
+            planned=len(report_cases),
+            reported=len(report["cases"]),
+        )
+        ci_protocol.write_json(report_dir / "serial-result.json", report)
+        sys.exit(report["code"])
+    elif not args.list_tests:
         runner_result = runner.run(test_suite_main, test_suite_subproc)
         failed, errored = len(runner_result.failures), len(runner_result.errors)
         if failed > 0 or errored > 0:
