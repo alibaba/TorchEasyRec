@@ -26,8 +26,15 @@ from torch.utils.data import DataLoader
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetReader, ParquetWriter
+from tzrec.datasets.utils import CKPT_SOURCE_ID, DATA_TIMESTAMP
 from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
+from tzrec.tests.utils import (
+    drain_sample,
+    raw_c_features,
+    sample_data_config,
+    stop_sample,
+)
 from tzrec.utils import misc_util
 from tzrec.utils.checkpoint_util import EPOCHS_COMPLETED, update_dataloder_state
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
@@ -638,6 +645,207 @@ class ParquetWriterTest(unittest.TestCase):
         table = parquet.read_table(os.path.join(self.test_dir, "part-0.parquet"))
         self.assertEqual(table.num_rows, 5)
         self.assertEqual(table.column("int_a").to_pylist(), [1, 2, 3, 4, 5])
+
+
+class ParquetSampleShuffleTest(unittest.TestCase):
+    """Sample-level shuffle on real parquet files."""
+
+    def _create_unique_parquet_data(self, test_dir: str, num_rows: int) -> None:
+        t = pa.Table.from_arrays(
+            [
+                pa.array([float(i) for i in range(num_rows)]),
+                pa.array([i % 2 for i in range(num_rows)]),
+            ],
+            names=["raw_c", "label"],
+        )
+        ds.write_dataset(
+            t,
+            test_dir,
+            format="parquet",
+            max_rows_per_file=37,
+            max_rows_per_group=17,
+        )
+
+    @parameterized.expand(
+        [
+            ("rolling_workers", data_pb2.SAMPLE_ROLLING, 2),
+            ("window_workers", data_pb2.SAMPLE_WINDOW, 2),
+            ("rolling_no_workers", data_pb2.SAMPLE_ROLLING, 0),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sample_shuffle_epochs(self, _name, mode, num_workers):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_unique_parquet_data(test_dir, 100)
+            dataloader = create_dataloader(
+                sample_data_config(
+                    data_pb2.DatasetType.ParquetDataset, mode, num_workers
+                ),
+                raw_c_features(),
+                f"{test_dir}/*.parquet",
+                mode=Mode.TRAIN,
+            )
+            iterator = None
+            try:
+                for _ in range(2):
+                    iterator = dataloader.get_iterator()
+                    sizes, values, state = drain_sample(iterator)
+                    self.assertEqual(sum(sizes), 100)
+                    self.assertEqual(sorted(sizes), [4] + [8] * 12)
+                    self.assertEqual(sorted(values), list(range(100)))
+                    self.assertTrue(state)
+            finally:
+                stop_sample(dataloader, iterator)
+
+    @parameterized.expand(
+        [
+            [100, 0, False, 100],
+            [100, 5, False, 96],
+            [101, 0, True, 96],
+            [101, 2, False, 101],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sample_shuffle_tail_rules(
+        self, num_rows, min_batch_size, drop_remainder, expected_rows
+    ):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_unique_parquet_data(test_dir, num_rows)
+            dataloader = create_dataloader(
+                sample_data_config(
+                    data_pb2.DatasetType.ParquetDataset,
+                    data_pb2.SAMPLE_ROLLING,
+                    2,
+                    min_batch_size=min_batch_size,
+                    drop_remainder=drop_remainder,
+                ),
+                raw_c_features(),
+                f"{test_dir}/*.parquet",
+                mode=Mode.TRAIN,
+            )
+            iterator = None
+            try:
+                iterator = dataloader.get_iterator()
+                sizes, _, _ = drain_sample(iterator)
+                self.assertEqual(sum(sizes), expected_rows)
+                self.assertTrue(all(s <= 8 for s in sizes))
+            finally:
+                stop_sample(dataloader, iterator)
+
+    def test_sample_shuffle_resume_then_full_pass(self):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_unique_parquet_data(test_dir, 100)
+            cfg = sample_data_config(
+                data_pb2.DatasetType.ParquetDataset, data_pb2.SAMPLE_ROLLING, 2
+            )
+            features = raw_c_features()
+            path = f"{test_dir}/*.parquet"
+
+            dataloader = create_dataloader(cfg, features, path, mode=Mode.TRAIN)
+            iterator = None
+            try:
+                iterator = dataloader.get_iterator()
+                _, values, state = drain_sample(iterator)
+                self.assertEqual(sorted(values), list(range(100)))
+            finally:
+                stop_sample(dataloader, iterator)
+
+            # leave a three-row tail in every source interval
+            tail_state = {k: v - 3 for k, v in state.items()}
+            dataloader = create_dataloader(
+                cfg, features, path, mode=Mode.TRAIN, checkpoint_state=tail_state
+            )
+            iterator = None
+            try:
+                iterator = dataloader.get_iterator()
+                _, values, _ = drain_sample(iterator)
+                self.assertEqual(len(values), 3 * len(state))
+                # the next pass ignores the consumed checkpoint
+                iterator = dataloader.get_iterator()
+                _, values, _ = drain_sample(iterator)
+                self.assertEqual(sorted(values), list(range(100)))
+            finally:
+                stop_sample(dataloader, iterator)
+
+    def test_sample_shuffle_empty_resume_reads_full_pass(self):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_unique_parquet_data(test_dir, 100)
+            cfg = sample_data_config(
+                data_pb2.DatasetType.ParquetDataset, data_pb2.SAMPLE_ROLLING, 2
+            )
+            features = raw_c_features()
+            path = f"{test_dir}/*.parquet"
+
+            # learn the end-of-data positions of a full pass
+            dataloader = create_dataloader(cfg, features, path, mode=Mode.TRAIN)
+            iterator = None
+            try:
+                iterator = dataloader.get_iterator()
+                _, values, state = drain_sample(iterator)
+                self.assertEqual(sorted(values), list(range(100)))
+            finally:
+                stop_sample(dataloader, iterator)
+
+            # resume exactly at the end: the first pass is empty, the next
+            # is a full one
+            dataloader = create_dataloader(
+                cfg, features, path, mode=Mode.TRAIN, checkpoint_state=state
+            )
+            iterator = None
+            try:
+                iterator = dataloader.get_iterator()
+                sizes, _, _ = drain_sample(iterator)
+                self.assertEqual(sizes, [])
+                iterator = dataloader.get_iterator()
+                _, values, _ = drain_sample(iterator)
+                self.assertEqual(sorted(values), list(range(100)))
+            finally:
+                stop_sample(dataloader, iterator)
+
+    def test_sample_shuffle_rejects_batch_cost_size(self):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_unique_parquet_data(test_dir, 20)
+            with self.assertRaisesRegex(ValueError, "batch_cost_size"):
+                create_dataloader(
+                    sample_data_config(
+                        data_pb2.DatasetType.ParquetDataset,
+                        data_pb2.SAMPLE_ROLLING,
+                        1,
+                        sample_cost_field="raw_c",
+                        batch_cost_size=1024,
+                    ),
+                    raw_c_features(),
+                    f"{test_dir}/*.parquet",
+                    mode=Mode.TRAIN,
+                )
+
+    @parameterized.expand(
+        [[100, 50, 50], [101, 51, 50]], name_func=parameterized_name_func
+    )
+    def test_sample_shuffle_multi_rank_plan(self, num_rows, rank0_rows, rank1_rows):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._create_unique_parquet_data(test_dir, num_rows)
+            dataset = ParquetDataset(
+                sample_data_config(
+                    data_pb2.DatasetType.ParquetDataset, data_pb2.SAMPLE_ROLLING, 2
+                ),
+                raw_c_features(),
+                f"{test_dir}/*.parquet",
+                mode=Mode.TRAIN,
+            )
+            plans = [dataset._reader.create_read_plan(rank, 2, 2) for rank in range(2)]
+            self.assertNotIn(DATA_TIMESTAMP, plans[0].schema.names)
+            self.assertIn(CKPT_SOURCE_ID, plans[0].schema.names)
+            self.assertEqual([p.planned_rows for p in plans], [rank0_rows, rank1_rows])
+            covered = set()
+            for plan in plans:
+                rows = 0
+                for task in plan.tasks:
+                    for start, end in task.kwargs["intervals"]:
+                        rows += end - start
+                        covered.update(range(start, end))
+                self.assertEqual(rows, plan.planned_rows)
+            self.assertEqual(covered, set(range(num_rows)))
 
 
 if __name__ == "__main__":

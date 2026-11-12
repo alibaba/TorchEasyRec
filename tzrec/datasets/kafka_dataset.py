@@ -10,32 +10,28 @@
 # limitations under the License.
 
 
-import atexit
 import math
-import multiprocessing as mp
 import os
-import queue
 import threading
 import time
 from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
-import numpy as np
 import pyarrow as pa
 import torch.distributed as dist
 from confluent_kafka import (
     OFFSET_INVALID,
     Consumer,
     KafkaException,
-    Message,
     TopicPartition,
 )
 
 from tzrec.constant import Mode
-from tzrec.datasets.dataset import (
-    BaseDataset,
-    BaseReader,
-    sample_shuffle_enabled,
+from tzrec.datasets.dataset import BaseDataset, BaseReader
+from tzrec.datasets.sample_shuffle import (
+    ReadPlan,
+    ReadTask,
+    make_sample_table_schema,
 )
 from tzrec.datasets.utils import (
     CKPT_ROW_IDX,
@@ -47,24 +43,8 @@ from tzrec.datasets.utils import (
 )
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
-from tzrec.protos.data_pb2 import SAMPLE_ROLLING, SAMPLE_WINDOW
 from tzrec.utils import dist_util
 from tzrec.utils.logging_util import logger
-
-# capacity of the reader -> coordinator input queue, in decoded tables
-_INPUT_QUEUE_TABLES_PER_READER = 2
-# capacity of the shared dispatch queue matches the DataLoader prefetch
-# depth (default 2 batches) times the worker count
-_DISPATCH_QUEUE_BATCHES_PER_WORKER = 2
-# coordinator loop wakeups per second while idle
-_LOOP_TICK_SECS = 0.1
-_WATCHDOG_TICK_SECS = 5.0
-# shutdown budget for reaping reader processes: a graceful phase then a
-# forced phase, each shared by all readers; the handle's stop timeout must
-# comfortably exceed the sum
-_READER_GRACEFUL_STOP_SECS = 6.0
-_READER_FORCED_STOP_SECS = 2.0
-_STATS_LOG_INTERVAL_SECS = 60.0
 
 _EARLIEST_RESETS = ("earliest", "smallest", "beginning")
 _LATEST_RESETS = ("latest", "largest", "end")
@@ -151,7 +131,7 @@ def _decode_kafka_messages(
     Returns:
         table: one table with the reader columns plus CKPT_SOURCE_ID,
             CKPT_ROW_IDX and DATA_TIMESTAMP columns; None when no message
-            carried rows.
+            was decoded, including when every message was an error event.
         num_msgs: successfully decoded messages, for consume sizing.
         num_rows: total rows decoded.
     """
@@ -408,6 +388,109 @@ def _consume_decoded_tables(
                 logger.warning(f"consumer.close() failed: {e}")
 
 
+def _consume_round_robin_tables(
+    consumer_factory: Callable[..., Consumer],
+    topic: str,
+    config: Dict[str, Any],
+    partition_order: List[int],
+    worker_id: int,
+    num_workers: int,
+    set_start_offsets: Callable[[Consumer, List[TopicPartition]], None],
+    stop_event: Any,
+    has_embedded_schema: bool,
+    full_schema: pa.Schema,
+    reader_schema: pa.Schema,
+    log_prefix: str,
+    orphan_pid: Optional[int] = None,
+    on_decoded: Optional[Callable[[str], None]] = None,
+) -> Iterator[pa.Table]:
+    """Read this worker's owned partitions strictly in round-robin order.
+
+    Partitions are sliced from the leader-ordered list by global reader id,
+    then read in ascending partition order. Each partition gets its own
+    assigned consumer and one message per turn. Timeouts and error events
+    keep the current partition; successfully decoded zero-row messages
+    advance the rotation.
+
+    Args:
+        consumer_factory: consumer builder, called once per owned partition.
+        topic: kafka topic name.
+        config: kafka consumer configuration.
+        partition_order: partition ids ordered by leader and partition id.
+        worker_id: global reader id.
+        num_workers: total number of global readers.
+        set_start_offsets: callback that sets offsets on all owned partitions
+            before the first consumer is assigned.
+        stop_event: set to end the loop.
+        has_embedded_schema: whether messages embed an IPC stream schema.
+        full_schema: full schema for schema-less messages.
+        reader_schema: schema to project and cast to.
+        log_prefix: log line prefix identifying this reader.
+        orphan_pid: when set, exit once the parent pid changes.
+        on_decoded: optional callback for each successfully decoded source id.
+
+    Yields:
+        One decoded and projected table per successful message.
+
+    Raises:
+        ValueError: if the topic has fewer partitions than global readers.
+    """
+    consumers: List[Consumer] = []
+    try:
+        if len(partition_order) < num_workers:
+            raise ValueError(
+                f"kafka topic {topic} has {len(partition_order)} partition(s), "
+                f"fewer than the {num_workers} dataloader workers; "
+                "kafka_partition_round_robin requires at least one partition "
+                "per worker."
+            )
+        owned_partitions = [
+            TopicPartition(topic, partition)
+            for partition in sorted(partition_order[worker_id::num_workers])
+        ]
+        consumer = consumer_factory(config)
+        consumers.append(consumer)
+        set_start_offsets(consumer, owned_partitions)
+        consumer.assign([owned_partitions[0]])
+        for tp in owned_partitions[1:]:
+            consumer = consumer_factory(config)
+            consumers.append(consumer)
+            consumer.assign([tp])
+        logger.info(f"{log_prefix} assignment: {owned_partitions}")
+
+        projections: Dict[pa.Schema, Optional[List[int]]] = {}
+        idx = 0
+        while not stop_event.is_set():
+            if orphan_pid is not None and os.getppid() != orphan_pid:
+                logger.error(f"{log_prefix}: owner process gone, exiting")
+                return
+            messages = consumers[idx].consume(1, timeout=1.0)
+            if not messages:
+                continue
+            table, _, _ = _decode_kafka_messages(
+                messages,
+                has_embedded_schema,
+                full_schema,
+                reader_schema,
+                projections,
+                topic,
+                on_decoded,
+            )
+            if table is None:
+                continue
+            yield table
+            idx = (idx + 1) % len(consumers)
+    except Exception as e:
+        logger.error(f"{log_prefix} exception: {e}")
+        raise
+    finally:
+        for consumer in reversed(consumers):
+            try:
+                consumer.close()
+            except Exception as e:
+                logger.warning(f"consumer.close() failed: {e}")
+
+
 def _build_projection(
     src_schema: pa.Schema, dst_schema: pa.Schema
 ) -> Optional[List[int]]:
@@ -539,8 +622,163 @@ def _offsets_for_times_batched(
     return resolved_map
 
 
+def _consume_kafka(
+    input_path: str,
+    consumer_factory: Optional[Any],
+    reader_id: int,
+    num_readers: int,
+    batch_size: int,
+    reader_schema: pa.Schema,
+    full_schema: pa.Schema,
+    has_embedded_schema: bool,
+    start_offsets: Optional[Dict[int, int]] = None,
+    checkpoint_state: Optional[Dict[str, Any]] = None,
+    stop_event: Optional[Any] = None,
+    orphan_pid: Optional[int] = None,
+    round_robin_partition_order: Optional[List[int]] = None,
+    kafka_log_every_n_messages: int = 0,
+) -> Iterator[pa.RecordBatch]:
+    """Consume and decode Kafka with one of the two assignment policies.
+
+    When ``start_offsets`` is given every (re)assignment seeks to this run's
+    fixed offsets and a partition created after startup fails loudly; without
+    it the BATCH policy (checkpoint offsets, ``start.timestamp.ms``, then
+    ``auto.offset.reset``) is used. Consumer creation, decoding and the
+    consumption loops are shared by both paths.
+
+    Args:
+        input_path: kafka URI.
+        consumer_factory: consumer builder; the default builds real consumers.
+        reader_id: global consumer slot passed to the factory.
+        num_readers: global consumer slot count passed to the factory.
+        batch_size: target rows per consume round.
+        reader_schema: schema to project and cast each message to.
+        full_schema: full schema for schema-less messages.
+        has_embedded_schema: whether messages embed an IPC stream schema.
+        start_offsets: fixed {partition: offset} start of a sample-shuffle run.
+        checkpoint_state: BATCH resume state {topic:partition: offset}.
+        stop_event: consume loop stop signal; a private event by default.
+        orphan_pid: when set, the loop exits once its parent pid changes.
+        round_robin_partition_order: leader-ordered partition ids, or None
+            for ordinary consumer-group subscription.
+        kafka_log_every_n_messages: decoded-message log interval, 0 disables.
+
+    Yields:
+        PyArrow RecordBatch.
+    """
+    topic, config, start_timestamp_ms = _parse_kafka_uri(input_path)
+    factory = consumer_factory or _default_consumer_factory
+    stop_event = stop_event if stop_event is not None else threading.Event()
+    log_prefix = f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{reader_id}]"
+    on_decoded = None
+    if kafka_log_every_n_messages > 0:
+        # process-local decoded-message counter and periodic logger
+        decoded_message_count = 0
+        decoded_partition_counts: Dict[str, int] = {}
+
+        def on_decoded(source_id: str) -> None:
+            """Count one decoded message and log at the configured interval."""
+            nonlocal decoded_message_count
+            decoded_partition_counts[source_id] = (
+                decoded_partition_counts.get(source_id, 0) + 1
+            )
+            decoded_message_count += 1
+            if decoded_message_count % kafka_log_every_n_messages == 0:
+                logger.info(
+                    f"{log_prefix} "
+                    f"decoded_messages={decoded_message_count} "
+                    f"partitions={decoded_partition_counts}"
+                )
+
+    def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
+        """Resolve fixed run offsets or the ordinary checkpoint/timestamp policy."""
+        if start_offsets is not None:
+            for tp in partitions:
+                if tp.partition not in start_offsets:
+                    # a partition created after startup has no resolved start
+                    # offset; fail loudly instead of silently reading latest
+                    raise ValueError(
+                        f"new kafka partition {tp.partition} of {tp.topic} appeared "
+                        "after startup; sample-level shuffle does not support "
+                        "partition expansion during a run"
+                    )
+                # every takeover starts from this run's fixed start offset
+                tp.offset = start_offsets[tp.partition]
+            return
+
+        ts_partitions = []
+        for tp in partitions:
+            source_key = f"{tp.topic}:{tp.partition}"
+            if checkpoint_state and source_key in checkpoint_state:
+                # Resume after last consumed offset
+                tp.offset = checkpoint_state[source_key] + 1
+            elif start_timestamp_ms is not None:
+                ts_partitions.append(tp)
+            else:
+                tp.offset = OFFSET_INVALID
+
+        if ts_partitions:
+            assert start_timestamp_ms is not None
+            resolved_map = _offsets_for_times_batched(
+                consumer, ts_partitions, start_timestamp_ms
+            )
+            for tp in ts_partitions:
+                res_offset = resolved_map.get((tp.topic, tp.partition))
+                if res_offset is not None and res_offset >= 0:
+                    tp.offset = res_offset
+                else:
+                    logger.warning(
+                        f"No offset found for timestamp "
+                        f"{start_timestamp_ms} on "
+                        f"{tp.topic}:{tp.partition}, "
+                        f"falling back to auto.offset.reset"
+                    )
+                    tp.offset = OFFSET_INVALID
+
+    if round_robin_partition_order is not None:
+        loop = _consume_round_robin_tables(
+            factory,
+            topic,
+            config,
+            round_robin_partition_order,
+            reader_id,
+            num_readers,
+            on_assign,
+            stop_event,
+            has_embedded_schema,
+            full_schema,
+            reader_schema,
+            log_prefix,
+            orphan_pid=orphan_pid,
+            on_decoded=on_decoded,
+        )
+    else:
+        max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
+        consumer = factory(config, reader_id=reader_id, num_readers=num_readers)
+        loop = _consume_decoded_tables(
+            consumer,
+            topic,
+            on_assign,
+            stop_event,
+            max_poll_interval_ms,
+            batch_size,
+            has_embedded_schema,
+            full_schema,
+            reader_schema,
+            log_prefix,
+            orphan_pid=orphan_pid,
+            on_decoded=on_decoded,
+        )
+    try:
+        for t in loop:
+            for batch in t.to_batches():
+                yield batch
+    finally:
+        loop.close()
+
+
 # ------------------------------------------------------------------------
-# sample-level shuffle: shared per-rank pool, message ledger, coordination
+# sample-level shuffle: fixed per-run start offsets
 # ------------------------------------------------------------------------
 
 
@@ -647,203 +885,6 @@ def resolve_start_offsets(
         consumer.close()
 
 
-class SamplePool:
-    """Chunked raw-sample pool with sample-level shuffle.
-
-    Rows stay in the chunk they arrived in; a numpy arena of (chunk, row)
-    pairs is the sampling domain. SAMPLE_WINDOW freezes the pool content
-    into a shuffled window once the pool reaches capacity and emits all
-    full batches of it before refilling; SAMPLE_ROLLING extracts a random
-    batch once the pool is refilled to capacity. Both modes wait while the
-    pool is short of capacity and retain sub-batch leftovers.
-
-    Checkpoint metadata columns (CKPT_SOURCE_ID/CKPT_ROW_IDX) and the
-    event-time column ride through the pool together with the feature
-    columns, so ``_build_batch`` can aggregate per-batch source offsets
-    downstream.
-
-    Args:
-        capacity_rows: pool capacity in samples.
-        batch_size: training batch size in samples.
-        mode: SAMPLE_WINDOW or SAMPLE_ROLLING.
-        rng: random source, injectable for tests.
-    """
-
-    def __init__(
-        self,
-        capacity_rows: int,
-        batch_size: int,
-        mode: int,
-        rng: Optional[np.random.Generator] = None,
-    ) -> None:
-        if capacity_rows <= 0 or batch_size <= 0:
-            raise ValueError("capacity_rows and batch_size must be positive")
-        if mode not in (SAMPLE_WINDOW, SAMPLE_ROLLING):
-            raise ValueError(f"unsupported sample shuffle mode: {mode}")
-        self.capacity_rows = capacity_rows
-        self.batch_size = batch_size
-        self.mode = mode
-        self.rng = rng if rng is not None else np.random.default_rng()
-        # arrival chunks carry feature + checkpoint metadata + event-time
-        # columns; the arena indexes live rows as (chunk, row) pairs
-        self._chunks: List[pa.RecordBatch] = []
-        self._arena_chunk = np.empty(0, dtype=np.int32)
-        self._arena_row = np.empty(0, dtype=np.int32)
-        self.total_rows = 0
-        self._dead_rows = 0
-        # window mode state
-        self._frozen_chunk: Optional[np.ndarray] = None
-        self._frozen_row: Optional[np.ndarray] = None
-        self._frozen_pos = 0
-        # stats
-        self.num_emits = 0
-        self.num_compactions = 0
-        self.rows_in = 0
-        self.rows_out = 0
-
-    def add(self, batch: pa.RecordBatch) -> None:
-        """Add a decoded record batch to the pool."""
-        n = batch.num_rows
-        if n == 0:
-            return
-        cid = len(self._chunks)
-        self._chunks.append(batch)
-        self._arena_chunk = np.concatenate(
-            [self._arena_chunk, np.full(n, cid, dtype=np.int32)]
-        )
-        self._arena_row = np.concatenate(
-            [self._arena_row, np.arange(n, dtype=np.int32)]
-        )
-        self.total_rows += n
-        self.rows_in += n
-        # frozen-window rows are outside the arena; compaction only runs
-        # when no window is frozen so their chunk positions stay valid
-        if self._dead_rows > self.capacity_rows and self._frozen_chunk is None:
-            self._compact()
-
-    def emit(self) -> Optional[pa.RecordBatch]:
-        """Try to emit one full shuffled batch; None while the pool is short."""
-        if self.mode == SAMPLE_WINDOW:
-            return self._emit_window()
-        return self._emit_rolling()
-
-    def _emit_window(self) -> Optional[pa.RecordBatch]:
-        """Fixed-window emit: freeze, permute, then emit all full batches."""
-        if self._frozen_chunk is not None:
-            # emit the frozen window's full batches; arrivals join the
-            # next window instead of the frozen one
-            n = len(self._frozen_chunk)
-            if self._frozen_pos + self.batch_size > n - (n % self.batch_size):
-                # window exhausted; leftover rows join the next fill phase
-                leftover = slice(n - (n % self.batch_size), n)
-                if n % self.batch_size > 0:
-                    self._arena_chunk = np.concatenate(
-                        [self._arena_chunk, self._frozen_chunk[leftover]]
-                    )
-                    self._arena_row = np.concatenate(
-                        [self._arena_row, self._frozen_row[leftover]]
-                    )
-                self._frozen_chunk = None
-                self._frozen_row = None
-                # the window boundary is a safe point to reclaim dead chunk
-                # buffers: leftover rows are back in the arena and the
-                # frozen arrays no longer reference chunk positions
-                if self._dead_rows > self.capacity_rows:
-                    self._compact()
-                return None
-            sel = slice(self._frozen_pos, self._frozen_pos + self.batch_size)
-            self._frozen_pos += self.batch_size
-            batch = self._gather(self._frozen_chunk[sel], self._frozen_row[sel])
-            self._remove_from_live(batch.num_rows)
-            return batch
-        if self.total_rows < self.capacity_rows:
-            # wait until the pool is full
-            return None
-        n_freeze = self.total_rows
-        perm = self.rng.permutation(n_freeze)
-        self._frozen_chunk = self._arena_chunk[perm]
-        self._frozen_row = self._arena_row[perm]
-        self._arena_chunk = np.empty(0, dtype=np.int32)
-        self._arena_row = np.empty(0, dtype=np.int32)
-        self._frozen_pos = 0
-        return self._emit_window()
-
-    def _emit_rolling(self) -> Optional[pa.RecordBatch]:
-        """Rolling-pool emit: draw a random batch once the pool is refilled."""
-        if self.total_rows < self.capacity_rows:
-            # wait until the pool is refilled to capacity
-            return None
-        sel = self.rng.choice(
-            len(self._arena_chunk), size=self.batch_size, replace=False
-        )
-        batch = self._gather(self._arena_chunk[sel], self._arena_row[sel])
-        keep = np.ones(len(self._arena_chunk), dtype=bool)
-        keep[sel] = False
-        self._arena_chunk = self._arena_chunk[keep]
-        self._arena_row = self._arena_row[keep]
-        self._remove_from_live(batch.num_rows)
-        return batch
-
-    def _gather(self, sel_chunk: np.ndarray, sel_row: np.ndarray) -> pa.RecordBatch:
-        """Materialize selected rows into one batch."""
-        order = np.argsort(sel_chunk, kind="stable")
-        sorted_cids = sel_chunk[order]
-        sorted_rows = sel_row[order]
-        uniq, starts, counts = np.unique(
-            sorted_cids, return_index=True, return_counts=True
-        )
-        out_batches = []
-        for u, s, c in zip(uniq, starts, counts):
-            out_batches.append(
-                self._chunks[int(u)].take(
-                    pa.array(sorted_rows[s : s + c].astype(np.int64))
-                )
-            )
-        batch = pa.Table.from_batches(out_batches).combine_chunks()
-        return batch.to_batches(max_chunksize=batch.num_rows)[0]
-
-    def _remove_from_live(self, n: int) -> None:
-        """Account emitted rows; they stay as dead rows in chunk buffers."""
-        self.total_rows -= n
-        self.rows_out += n
-        self.num_emits += 1
-        self._dead_rows += n
-
-    def _compact(self) -> None:
-        """Physically drop taken rows and dead chunk slots, rebuild densely.
-
-        Only runs while no window is frozen: frozen rows reference chunk
-        positions that compaction would move. Chunk lists are rebuilt with
-        live chunks only, so their size stays proportional to the number of
-        live chunks rather than the number of tables ever received.
-        """
-        # group arena entries by chunk without per-row python loops
-        order = np.argsort(self._arena_chunk, kind="stable")
-        arena_c = self._arena_chunk[order]
-        arena_r = self._arena_row[order]
-        uniq, starts, counts = np.unique(arena_c, return_index=True, return_counts=True)
-        new_chunks: List[pa.RecordBatch] = []
-        for u, st, c in zip(uniq, starts, counts):
-            cid = int(u)
-            rows = arena_r[st : st + c]
-            sorted_rows = np.sort(rows)
-            chunk = self._chunks[cid]
-            if len(rows) != chunk.num_rows:
-                chunk = chunk.take(pa.array(sorted_rows.astype(np.int64)))
-            id_map = len(new_chunks)
-            new_chunks.append(chunk)
-            # remap entries: new chunk id, and new row id = rank in sorted order
-            arena_c[st : st + c] = id_map
-            arena_r[st : st + c] = np.searchsorted(sorted_rows, rows)
-        # the arena feeds random sampling only, so the chunk-grouped order
-        # is fine as-is
-        self._chunks = new_chunks
-        self._arena_chunk = arena_c
-        self._arena_row = arena_r
-        self._dead_rows = 0
-        self.num_compactions += 1
-
-
 class KafkaDataset(BaseDataset):
     """Dataset for reading data from Kafka (each message is a serialized Arrow batch).
 
@@ -880,51 +921,6 @@ class KafkaDataset(BaseDataset):
             kafka_partition_round_robin=self._data_config.kafka_partition_round_robin,
             kafka_log_every_n_messages=self._data_config.kafka_log_every_n_messages,
         )
-        # created in prepare_for_loading; forked worker copies inherit it, but
-        # only the trainer process starts and stops it
-        self._sample_shuffle: Optional[SampleShuffleHandle] = None
-
-    def prepare_for_loading(self, checkpoint_state: Optional[Dict[str, Any]]) -> None:
-        """In sample mode: create the handle and configure the reader.
-
-        The reader object is kept; it serves pre-shuffled batches from the
-        shared queue once configured. In batch mode this defers to the
-        default checkpoint handling.
-        """
-        if not sample_shuffle_enabled(self._data_config, self._mode):
-            super().prepare_for_loading(checkpoint_state)
-            return
-        kafka_reader = self._reader
-        # the reader captured the module default factory at construction
-        # time; pass it explicitly so spawned processes do not need the patch
-        handle = SampleShuffleHandle(
-            self._data_config,
-            self._input_path,
-            checkpoint_state,
-            consumer_factory=kafka_reader._consumer_factory,
-        )
-        kafka_reader._configure_sample_shuffle(
-            handle.shared_dispatch_queue,
-            handle.stop_event,
-            handle.fatal_event,
-        )
-        self._sample_shuffle = handle
-
-    def is_sample_shuffled(self) -> bool:
-        """Whether the sample-level shuffle path serves this dataset."""
-        return self._sample_shuffle is not None
-
-    def start_loading(self) -> None:
-        """Spawn the coordinator once the DataLoader workers exist."""
-        if self._sample_shuffle is not None:
-            reader = self._reader
-            assert isinstance(reader, KafkaReader)
-            self._sample_shuffle.start(reader)
-
-    def stop_loading(self) -> None:
-        """Stop the coordinator and its reader processes; idempotent."""
-        if self._sample_shuffle is not None:
-            self._sample_shuffle.stop()
 
 
 class KafkaReader(BaseReader):
@@ -941,10 +937,8 @@ class KafkaReader(BaseReader):
         input_fields (list): list of pa.Field for schema definition.
         consumer_factory: consumer builder; tests inject a double, the
             default builds real consumers.
-        kafka_partition_round_robin (bool): whether to read the partitions owned
-            by each worker in strict round-robin order.
-        kafka_log_every_n_messages (int): log per-worker decoded message counts
-            every N messages, 0 disables.
+        kafka_partition_round_robin: read owned partitions strictly in turn.
+        kafka_log_every_n_messages: decoded-message log interval, 0 disables.
     """
 
     def __init__(
@@ -972,19 +966,12 @@ class KafkaReader(BaseReader):
 
         self._consumer_factory = consumer_factory or _default_consumer_factory
         self._has_embedded_schema = False
-        # bound by _configure_sample_shuffle when the shared-pool path serves
-        # this reader; the forked worker copies inherit the binding
-        self._sample_queue: Optional[Any] = None
-        self._sample_stop_event: Optional[Any] = None
-        self._sample_fatal_event: Optional[Any] = None
-        self._sample_table_schema: Optional[pa.Schema] = None
-        self._kafka_partition_round_robin = kafka_partition_round_robin
-        self._log_every_n_messages = kafka_log_every_n_messages
-        self._round_robin_partition_order: List[int] = (
+        self._round_robin_partition_order: Optional[List[int]] = (
             self._get_round_robin_partition_order()
             if kafka_partition_round_robin
-            else []
+            else None
         )
+        self._log_every_n_messages = kafka_log_every_n_messages
 
         if input_fields:
             self._full_schema = pa.schema(input_fields)
@@ -1121,111 +1108,19 @@ class KafkaReader(BaseReader):
             )
         return partition_order
 
-    def _set_start_offsets(
-        self,
-        consumer: Consumer,
-        partitions: List[TopicPartition],
-        start_timestamp_ms: Optional[int],
-    ) -> None:
-        """Set start offsets on partitions from checkpoint or start timestamp.
-
-        Args:
-            consumer (Consumer): the kafka consumer used for offset lookups.
-            partitions (list): partitions whose offsets are modified in place.
-            start_timestamp_ms (int, optional): start timestamp in milliseconds.
-        """
-        ts_partitions = []
-        for tp in partitions:
-            source_key = f"{tp.topic}:{tp.partition}"
-            if self._checkpoint_state and source_key in self._checkpoint_state:
-                # Resume after last consumed offset
-                tp.offset = self._checkpoint_state[source_key] + 1
-            elif start_timestamp_ms is not None:
-                ts_partitions.append(tp)
-            else:
-                tp.offset = OFFSET_INVALID
-
-        if ts_partitions:
-            assert start_timestamp_ms is not None
-            resolved_map = _offsets_for_times_batched(
-                consumer,
-                ts_partitions,
-                start_timestamp_ms,
-            )
-            for tp in ts_partitions:
-                res_offset = resolved_map.get((tp.topic, tp.partition))
-                if res_offset is not None and res_offset >= 0:
-                    tp.offset = res_offset
-                else:
-                    logger.warning(
-                        f"No offset found for timestamp "
-                        f"{start_timestamp_ms} on "
-                        f"{tp.topic}:{tp.partition}, "
-                        f"falling back to auto.offset.reset"
-                    )
-                    tp.offset = OFFSET_INVALID
-
-    def _decode_messages(
-        self,
-        messages: List[Message],
-        topic: str,
-        projections: Dict[pa.Schema, Optional[List[int]]],
-    ) -> Tuple[Optional[pa.Table], int]:
-        """Decode Kafka messages and record per-worker message counts.
-
-        Args:
-            messages: Kafka messages to decode.
-            topic: topic name for checkpoint source ids.
-            projections: schema projection cache reused across calls.
-
-        Returns:
-            table: combined table, or None when no message was decoded.
-            num_decoded: successfully decoded messages, including zero-row messages.
-        """
-        table, num_decoded, _ = _decode_kafka_messages(
-            messages,
-            self._has_embedded_schema,
-            self._full_schema,
-            self._schema,
-            projections,
-            topic,
-            self._record_decoded_message if self._log_every_n_messages > 0 else None,
-        )
-        return table, num_decoded
-
-    def _record_decoded_message(self, source_id: str) -> None:
-        """Count one decoded message and log at the configured interval.
-
-        Args:
-            source_id: topic and partition of the decoded message.
-        """
-        self._decoded_partition_counts[source_id] = (
-            self._decoded_partition_counts.get(source_id, 0) + 1
-        )
-        self._decoded_message_count += 1
-        if self._decoded_message_count % self._log_every_n_messages == 0:
-            logger.info(
-                f"KafkaReader[rank-{os.environ.get('RANK', 0)}"
-                f"|worker-{self._worker_id}] "
-                f"decoded_messages={self._decoded_message_count} "
-                f"partitions={self._decoded_partition_counts}"
-            )
-
     def _reader(
         self, worker_id: int = 0, num_workers: int = 1
     ) -> Generator[pa.RecordBatch, None, None]:
         """Read Arrow batches from Kafka.
 
-        When partition round-robin is enabled the partitions owned by this
-        worker are read strictly in turn by :meth:`_round_robin_reader`.
-        Otherwise a background heartbeat thread monitors idle time (time since
-        the last ``consume()`` call).  When the generator is blocked at
-        ``yield`` for longer than 80% of ``max.poll.interval.ms``, the
-        heartbeat thread pauses all partitions and calls ``consumer.poll(0)``
-        periodically to reset the application poll timer and keep the consumer
-        in its group.  This prevents ``MAX_POLL_EXCEEDED`` errors during long
-        downstream pauses (checkpoint saves, evaluation, compilation warmup,
-        etc.).
+        Strict round-robin assigns one consumer per owned partition. In the
+        ordinary subscription path, a background heartbeat thread monitors
+        idle time since the last ``consume()`` call. When blocked at ``yield`` for
+        longer than 80% of ``max.poll.interval.ms``, the heartbeat thread
+        pauses all partitions and calls ``consumer.poll(0)`` periodically to
+        reset the application poll timer and keep the consumer in its group.
+        This prevents ``MAX_POLL_EXCEEDED`` errors during long downstream
+        pauses (checkpoint saves, evaluation, compilation warmup, etc.).
 
         Args:
             worker_id: Worker ID
@@ -1234,168 +1129,102 @@ class KafkaReader(BaseReader):
         Yields:
             PyArrow RecordBatch
         """
-        self._worker_id = worker_id
-        self._decoded_message_count = 0
-        self._decoded_partition_counts: Dict[str, int] = {}
-
-        topic, config, start_timestamp_ms = _parse_kafka_uri(self._input_path)
-        if self._kafka_partition_round_robin:
-            yield from self._round_robin_reader(
-                topic, config, start_timestamp_ms, worker_id, num_workers
-            )
-            return
-
-        max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
-        consumer = self._consumer_factory(
-            config, reader_id=worker_id, num_readers=num_workers
-        )
-
-        def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
-            """Resolve offsets for this worker's assigned partitions."""
-            self._set_start_offsets(consumer, partitions, start_timestamp_ms)
-
-        loop = _consume_decoded_tables(
-            consumer,
-            topic,
-            on_assign,
-            threading.Event(),
-            max_poll_interval_ms,
+        yield from _consume_kafka(
+            self._input_path,
+            self._consumer_factory,
+            worker_id,
+            num_workers,
             self._batch_size,
-            self._has_embedded_schema,
-            self._full_schema,
             self._schema,
-            f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}]",
-            on_decoded=(
-                self._record_decoded_message if self._log_every_n_messages > 0 else None
-            ),
-        )
-        try:
-            for t in loop:
-                for batch in t.to_batches():
-                    yield batch
-        finally:
-            loop.close()
-
-    def _configure_sample_shuffle(
-        self,
-        shared_dispatch_queue: Any,
-        stop_event: Any,
-        fatal_event: Any,
-    ) -> None:
-        """Bind the shared-pool path's communication objects to this reader.
-
-        After this call ``to_batches`` consumes batches produced by the
-        per-rank coordinator instead of reading Kafka in the workers. The
-        dispatch schema is the reader schema plus the checkpoint metadata and
-        event-time columns that ride through the pool.
-
-        Args:
-            shared_dispatch_queue: the shared dispatch queue.
-            stop_event: shared clean-stop signal.
-            fatal_event: set when the coordinator died unexpectedly.
-        """
-        self._sample_queue = shared_dispatch_queue
-        self._sample_stop_event = stop_event
-        self._sample_fatal_event = fatal_event
-        self._sample_table_schema = pa.schema(
-            list(self._schema)
-            + [
-                pa.field(CKPT_SOURCE_ID, pa.string()),
-                pa.field(CKPT_ROW_IDX, pa.int64()),
-                pa.field(DATA_TIMESTAMP, pa.float64()),
-            ]
+            self._full_schema,
+            self._has_embedded_schema,
+            checkpoint_state=self._checkpoint_state,
+            round_robin_partition_order=self._round_robin_partition_order,
+            kafka_log_every_n_messages=self._log_every_n_messages,
         )
 
-    def _round_robin_reader(
-        self,
-        topic: str,
-        config: Dict[str, Any],
-        start_timestamp_ms: Optional[int],
-        worker_id: int,
-        num_workers: int,
-    ) -> Generator[pa.RecordBatch, None, None]:
-        """Read this worker's partitions strictly in round-robin order.
+    def create_read_plan(
+        self, rank: int, world_size: int, num_readers: int
+    ) -> ReadPlan:
+        """Build a per-rank Kafka read plan with fixed start offsets.
 
-        Partitions are sliced from the leader-ordered list resolved at reader
-        construction, then read in ascending partition order.  Each owned
-        partition gets its own consumer, assigned up front.  The rotation
-        cursor does not advance while the current partition has no valid message.
+        Each rank's reader slots use global ids. Round-robin tasks receive
+        the parent-resolved partition order; ordinary tasks subscribe to the
+        shared consumer group. Rank 0
+        resolves and broadcasts the run's fixed start offsets so a rank
+        failure cannot leave the others waiting at the next collective.
 
         Args:
-            topic (str): kafka topic name.
-            config (dict): kafka consumer configuration.
-            start_timestamp_ms (int, optional): start timestamp in milliseconds.
-            worker_id (int): global worker ID.
-            num_workers (int): total number of global workers.
+            rank: this process's rank.
+            world_size: number of ranks.
+            num_readers: number of reader processes on this rank.
 
-        Yields:
-            PyArrow RecordBatch
-
-        Raises:
-            ValueError: if the topic has fewer partitions than the total number
-                of workers.
+        Returns:
+            a non-finite read plan with one task per reader.
         """
-        consumers: List[Consumer] = []
-        try:
-            if len(self._round_robin_partition_order) < num_workers:
-                raise ValueError(
-                    f"kafka topic {topic} has "
-                    f"{len(self._round_robin_partition_order)} partition(s), "
-                    f"fewer than the {num_workers} dataloader workers; "
-                    "kafka_partition_round_robin requires at least one partition "
-                    "per worker."
-                )
-            owned_partitions = [
-                TopicPartition(topic, partition)
-                for partition in sorted(
-                    self._round_robin_partition_order[worker_id::num_workers]
-                )
-            ]
-            consumer = self._consumer_factory(config)
-            consumers.append(consumer)
-            self._set_start_offsets(consumer, owned_partitions, start_timestamp_ms)
-            consumer.assign([owned_partitions[0]])
-            for tp in owned_partitions[1:]:
-                consumer = self._consumer_factory(config)
-                consumers.append(consumer)
-                consumer.assign([tp])
-            logger.info(
-                f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}] "
-                f"assignment: {owned_partitions}"
+        from tzrec.datasets.sample_shuffle_readers import read_kafka
+
+        start_offsets = self._resolve_start_offsets_for_run()
+        global_num_readers = world_size * num_readers
+        tasks = [
+            ReadTask(
+                fn=read_kafka,
+                kwargs=dict(
+                    input_path=self._input_path,
+                    reader_id=rank * num_readers + reader_id,
+                    num_readers=global_num_readers,
+                    start_offsets=start_offsets,
+                    reader_schema=self._schema,
+                    full_schema=self._full_schema,
+                    has_embedded_schema=self._has_embedded_schema,
+                    batch_size=self._batch_size,
+                    consumer_factory=self._consumer_factory,
+                    round_robin_partition_order=self._round_robin_partition_order,
+                    kafka_log_every_n_messages=self._log_every_n_messages,
+                ),
+                # local slot: groups tasks for this rank's reader processes
+                reader_id=reader_id,
             )
+            for reader_id in range(num_readers)
+        ]
+        return ReadPlan(
+            tasks=tasks,
+            # kafka batches carry the event-time column
+            schema=make_sample_table_schema(self._schema, with_timestamp=True),
+            is_finite=False,
+            planned_rows=None,
+            num_readers=num_readers,
+        )
 
-            projections: Dict[pa.Schema, Optional[List[int]]] = {}
-            idx = 0
-            while True:
-                messages = consumers[idx].consume(1, timeout=1.0)
-                if not messages:
-                    continue
-                t, _ = self._decode_messages(messages, topic, projections)
-                if t is None:
-                    continue
-                # A zero-row message advances the rotation even though it
-                # yields no record batch.
-                for batch in t.to_batches():
-                    yield batch
-                idx = (idx + 1) % len(consumers)
-        except Exception as e:
-            logger.error(f"KafkaReader exception: {e}")
-            raise e
-        finally:
-            for consumer in reversed(consumers):
+    def _resolve_start_offsets_for_run(self) -> Dict[int, int]:
+        """Resolve this run's start offsets, broadcasting rank 0's outcome."""
+        if dist.is_initialized():
+            error = None
+            start_offsets = None
+            if dist.get_rank() == 0:
                 try:
-                    consumer.close()
+                    start_offsets = resolve_start_offsets(
+                        self._input_path,
+                        self._checkpoint_state,
+                        self._consumer_factory,
+                    )
                 except Exception as e:
-                    logger.warning(f"consumer.close() failed: {e}")
+                    error = f"{type(e).__name__}: {e}"
+            obj_list = [(start_offsets, error)]
+            dist.broadcast_object_list(obj_list, src=0)
+            start_offsets, error = obj_list[0]
+            if error is not None:
+                raise RuntimeError(f"failed to resolve kafka start offsets: {error}")
+            assert start_offsets is not None
+            return start_offsets
+        return resolve_start_offsets(
+            self._input_path, self._checkpoint_state, self._consumer_factory
+        )
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator.
-
-        In BATCH mode this reads Kafka in the worker and shuffles whole
-        batches; when sample shuffle is configured it takes pre-shuffled
-        batches from the shared dispatch queue instead.
 
         Args:
             worker_id: Worker ID
@@ -1405,504 +1234,8 @@ class KafkaReader(BaseReader):
         Yields:
             Dict of column name to PyArrow Array
         """
-        if self._sample_queue is None:
-            reader = self._reader(worker_id, num_workers)
-            try:
-                yield from self._arrow_reader_iter(reader)
-            finally:
-                reader.close()
-            return
-        yield from self._sample_batches(self._sample_queue)
-
-    def _sample_batches(self, q: Any) -> Iterator[Dict[str, pa.Array]]:
-        """Yield pre-batched raw columns from the shared dispatch queue."""
-        while True:
-            try:
-                payload = q.get(timeout=1.0)
-            except queue.Empty:
-                if self._sample_fatal_event.is_set():
-                    raise RuntimeError(
-                        "sample-shuffle coordinator exited unexpectedly"
-                    ) from None
-                if self._sample_stop_event.is_set():
-                    return
-                continue
-            if self._sample_stop_event.is_set():
-                # clean stop: end the pass
-                return
-            rb = pa.ipc.read_record_batch(payload, self._sample_table_schema)
-            yield {name: rb.column(i) for i, name in enumerate(rb.schema.names)}
-
-
-def _reader_process_main(
-    input_path: str,
-    reader_id: int,
-    num_readers: int,
-    coordinator_pid: int,
-    start_offsets: Dict[int, int],
-    input_q: Any,
-    stop_event: Any,
-    reader_schema: pa.Schema,
-    full_schema: pa.Schema,
-    has_embedded_schema: bool,
-    batch_size: int,
-    consumer_factory: Optional[Any] = None,
-) -> None:
-    """Reader process: one consumer, decode, send tables to the coordinator.
-
-    Shares the consume loop (heartbeat pause/resume, decode, EMA sizing) with
-    KafkaReader via ``_consume_decoded_tables``; only the assignment policy
-    (fixed start offsets for this run) and the output sink differ.
-    ``consumer_factory`` is the test injection point; the default builds a
-    real consumer and ignores the reader context.
-    """
-    topic, config, _ = _parse_kafka_uri(input_path)
-    max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
-    factory = consumer_factory or _default_consumer_factory
-    consumer = factory(config, reader_id=reader_id, num_readers=num_readers)
-
-    def _put(item: Tuple) -> None:
-        # bounded queue: block as backpressure, but stay stoppable
-        while not stop_event.is_set():
-            try:
-                input_q.put(item, timeout=0.5)
-                return
-            except queue.Full:
-                if os.getppid() != coordinator_pid:
-                    return
-
-    def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
-        for tp in partitions:
-            if tp.partition not in start_offsets:
-                # a partition created after startup has no resolved start
-                # offset; fail loudly instead of silently reading from latest
-                raise ValueError(
-                    f"new kafka partition {tp.partition} of {tp.topic} appeared "
-                    "after startup; sample-level shuffle does not support "
-                    "partition expansion during a run"
-                )
-            # every takeover starts from this run's fixed start offset
-            tp.offset = start_offsets[tp.partition]
-
-    loop = _consume_decoded_tables(
-        consumer,
-        topic,
-        on_assign,
-        stop_event,
-        max_poll_interval_ms,
-        batch_size,
-        has_embedded_schema,
-        full_schema,
-        reader_schema,
-        f"sample-shuffle reader {reader_id}",
-        orphan_pid=coordinator_pid,
-    )
-    try:
-        for t in loop:
-            if t.num_rows == 0:
-                continue
-            payload = t.to_batches(max_chunksize=t.num_rows)[0].serialize().to_pybytes()
-            _put(payload)
-    finally:
-        # the queue feeder thread may hold undelivered data; without this the
-        # interpreter would wait for the flush on exit and hang on a full pipe
-        input_q.cancel_join_thread()
-        loop.close()
-
-
-class _Coordinator:
-    """Per-rank sample pool and dispatch event loop.
-
-    Args:
-        input_path: kafka URI.
-        num_readers: number of reader processes to fork.
-        start_offsets: resolved per-partition start offsets R.
-        input_q: bounded queue from readers, items are payload bytes.
-        stop_event: shared stop signal; when set, the coordinator exits.
-        shared_dispatch_queue: the one bounded queue to the workers.
-        mode: SAMPLE_WINDOW or SAMPLE_ROLLING.
-        capacity_rows: pool capacity in samples.
-        batch_size: training batch size.
-        input_table_schema: schema of decoded tables on input_q.
-        reader_schema: projected reader schema for decoding.
-        full_schema: full message schema for schema-less decoding.
-        has_embedded_schema: whether messages embed an IPC stream schema.
-        trainer_pid: trainer process pid; the coordinator exits when its
-            parent changes (trainer died without stopping it).
-        consumer_factory: consumer builder for reader processes; tests inject
-            a double, the default builds real consumers.
-    """
-
-    def __init__(
-        self,
-        input_path: str,
-        num_readers: int,
-        start_offsets: Dict[int, int],
-        input_q: Any,
-        stop_event: Any,
-        shared_dispatch_queue: Any,
-        mode: int,
-        capacity_rows: int,
-        batch_size: int,
-        input_table_schema: pa.Schema,
-        reader_schema: pa.Schema,
-        full_schema: pa.Schema,
-        has_embedded_schema: bool,
-        trainer_pid: int,
-        consumer_factory: Optional[Any] = None,
-    ) -> None:
-        self._trainer_pid = trainer_pid
-        self._input_path = input_path
-        self._num_readers = num_readers
-        self._input_q = input_q
-        self._stop_event = stop_event
-        self._shared_dispatch_queue = shared_dispatch_queue
-        self._input_table_schema = input_table_schema
-        self._reader_schema = reader_schema
-        self._full_schema = full_schema
-        self._has_embedded_schema = has_embedded_schema
-        self._consumer_factory = consumer_factory
-        self._pool = SamplePool(capacity_rows, batch_size, mode)
-        self._start_offsets = start_offsets
-        self._batch_size = batch_size
-        self._pending_dispatch: Optional[bytes] = None
-        self._readers: List[Any] = []
-
-    def _start_readers(self) -> None:
-        """Fork the reader processes."""
-        # fork before the event loop starts: the coordinator is still
-        # single-threaded and holds no consumer, so fork is safe
-        ctx = mp.get_context("fork")
-        pid = os.getpid()
-        for i in range(self._num_readers):
-            p = ctx.Process(
-                target=_reader_process_main,
-                args=(
-                    self._input_path,
-                    i,
-                    self._num_readers,
-                    pid,
-                    self._start_offsets,
-                    self._input_q,
-                    self._stop_event,
-                    self._reader_schema,
-                    self._full_schema,
-                    self._has_embedded_schema,
-                    self._batch_size,
-                    self._consumer_factory,
-                ),
-                daemon=True,
-                name=f"tzrec-sample-reader-{i}",
-            )
-            p.start()
-            self._readers.append(p)
-
-    def _emit_and_dispatch(self) -> int:
-        """Retry the pending dispatch, then emit and send pool batches.
-
-        At most one payload is in flight, so a blocked output never drains
-        the pool: the next batch is emitted only after the pending one was
-        accepted. Returns how many batches were dispatched this call,
-        including a pending payload that the output queue finally accepted.
-        """
-        n = 0
-        while True:
-            if self._pending_dispatch is None:
-                out = self._pool.emit()
-                if out is None:
-                    return n
-                self._pending_dispatch = out.serialize().to_pybytes()
-            try:
-                self._shared_dispatch_queue.put_nowait(self._pending_dispatch)
-            except queue.Full:
-                # keep servicing control while the output is blocked
-                return n
-            self._pending_dispatch = None
-            n += 1
-
-    def _service_input(self, timeout: float) -> None:
-        """Take one decoded table into the pool."""
+        reader = self._reader(worker_id, num_workers)
         try:
-            payload = self._input_q.get(timeout=timeout)
-        except queue.Empty:
-            return
-        self._pool.add(pa.ipc.read_record_batch(payload, self._input_table_schema))
-
-    def _check_readers(self) -> None:
-        """Fail when any reader process died."""
-        for p in self._readers:
-            if not p.is_alive():
-                raise RuntimeError(
-                    f"sample-shuffle reader exited unexpectedly (code {p.exitcode})"
-                )
-
-    def _log_stats(self) -> None:
-        """Log pool counters."""
-        logger.info(
-            f"sample-shuffle stats: pool {self._pool.total_rows} rows "
-            f"(capacity {self._pool.capacity_rows}), rows in {self._pool.rows_in} "
-            f"out {self._pool.rows_out}, emits {self._pool.num_emits}, "
-            f"compactions {self._pool.num_compactions}"
-        )
-
-    def run(self) -> None:
-        """Fork readers, then serve input until the shared stop event fires."""
-        self._start_readers()
-        last_watchdog = time.monotonic()
-        last_stats = time.monotonic()
-        try:
-            while not self._stop_event.is_set():
-                now = time.monotonic()
-                took_input = False
-                if self._pool.total_rows < self._pool.capacity_rows:
-                    self._service_input(_LOOP_TICK_SECS)
-                    took_input = True
-                emitted = self._emit_and_dispatch()
-                if not took_input and emitted == 0:
-                    # pool full while the output is blocked: pace the loop
-                    # so control stays serviced without busy spinning
-                    time.sleep(_LOOP_TICK_SECS)
-                if now - last_watchdog >= _WATCHDOG_TICK_SECS:
-                    if os.getppid() != self._trainer_pid:
-                        logger.error("sample-shuffle coordinator orphaned; exiting")
-                        break
-                    self._check_readers()
-                    last_watchdog = now
-                if now - last_stats >= _STATS_LOG_INTERVAL_SECS:
-                    self._log_stats()
-                    last_stats = now
+            yield from self._arrow_reader_iter(reader)
         finally:
-            self._log_stats()
-            self._shutdown_readers()
-            # drop undelivered dispatch payloads instead of hanging this
-            # process on a full queue's feeder thread
-            self._shared_dispatch_queue.cancel_join_thread()
-
-    def _shutdown_readers(self) -> None:
-        """Reap all readers: one shared graceful deadline, then a forced one.
-
-        Readers watch the shared stop event (clean stop) or their parent pid
-        (coordinator death), so nothing needs signaling here.
-        """
-        deadline = time.monotonic() + _READER_GRACEFUL_STOP_SECS
-        for p in self._readers:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            p.join(timeout=remaining)
-        deadline = time.monotonic() + _READER_FORCED_STOP_SECS
-        for p in self._readers:
-            if p.is_alive():
-                p.terminate()
-        for p in self._readers:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            p.join(timeout=remaining)
-
-
-def _coordinator_entry(**kwargs: Any) -> None:
-    """Coordinator process entry point."""
-    try:
-        _Coordinator(**kwargs).run()
-    except Exception:
-        logger.error("sample-shuffle coordinator failed", exc_info=True)
-        raise
-
-
-class SampleShuffleHandle:
-    """Owns the per-rank sample-shuffle background resources end to end.
-
-    Created before the DataLoader forks its workers (the queues and events
-    are inherited by them); ``start()`` spawns the coordinator process after
-    the fork; ``stop()`` shuts everything down. The trainer interacts with
-    it only through ``KafkaDataset``'s loading lifecycle methods.
-
-    Args:
-        data_config: dataloader config.
-        input_path: kafka URI.
-        checkpoint_state: trusted baseline from a previous checkpoint.
-        consumer_factory: consumer builder; tests inject a double, the
-            default builds real consumers.
-    """
-
-    def __init__(
-        self,
-        data_config: data_pb2.DataConfig,
-        input_path: str,
-        checkpoint_state: Optional[Dict[str, Any]],
-        consumer_factory: Optional[Any] = None,
-    ) -> None:
-        validate_sample_shuffle_config(data_config)
-        if dist.is_initialized():
-            # rank 0 resolves and broadcasts the outcome; a failure on rank 0
-            # must fail every rank, not leave the others waiting at the next
-            # collective
-            error = None
-            start_offsets = None
-            if dist.get_rank() == 0:
-                try:
-                    start_offsets = resolve_start_offsets(
-                        input_path, checkpoint_state, consumer_factory
-                    )
-                except Exception as e:
-                    error = f"{type(e).__name__}: {e}"
-            obj_list = [(start_offsets, error)]
-            dist.broadcast_object_list(obj_list, src=0)
-            start_offsets, error = obj_list[0]
-            if error is not None:
-                raise RuntimeError(f"failed to resolve kafka start offsets: {error}")
-        else:
-            start_offsets = resolve_start_offsets(
-                input_path, checkpoint_state, consumer_factory
-            )
-
-        self.start_offsets = start_offsets
-        num_workers = max(data_config.num_workers, 1)
-        # workers need the dispatch queue and events before they fork, so
-        # they are created here; input_q is created in start() instead
-        self._ctx = mp.get_context("spawn")
-        self.input_q: Optional[Any] = None
-        # sample contents are shuffled pool-wide, so dispatch always goes
-        # through one shared queue and in_order stays irrelevant
-        self.shared_dispatch_queue = self._ctx.Queue(
-            maxsize=_DISPATCH_QUEUE_BATCHES_PER_WORKER * num_workers
-        )
-        # stop_event: clean shutdown observed by coordinator, readers and
-        # workers; fatal_event: abnormal coordinator death, workers raise
-        self.stop_event = self._ctx.Event()
-        self.fatal_event = self._ctx.Event()
-        self._data_config = data_config
-        self._input_path = input_path
-        self._consumer_factory = consumer_factory
-        self._proc: Optional[Any] = None
-        self._atexit_cleanup = None
-
-    def start(self, reader: "KafkaReader") -> None:
-        """Spawn the coordinator; the DataLoader workers must already exist.
-
-        Args:
-            reader: the dataset's Kafka reader, configured for shared
-                dispatch; the coordinator and its reader processes decode
-                with the schemas it carries.
-        """
-        if self._proc is not None:
-            return
-        table_schema = reader._sample_table_schema
-        assert table_schema is not None, "reader is not configured for sample shuffle"
-        num_workers = max(self._data_config.num_workers, 1)
-        capacity_rows = (
-            self._data_config.batch_size * self._data_config.shuffle_buffer_size
-        )
-        mode_name = data_pb2.ShuffleMode.Name(self._data_config.shuffle_mode)
-        logger.info(
-            f"sample-shuffle starting: mode={mode_name} "
-            f"pool capacity {capacity_rows} rows (batch_size "
-            f"{self._data_config.batch_size} x buffer "
-            f"{self._data_config.shuffle_buffer_size}), readers {num_workers}"
-        )
-        # created here (not in __init__) so a never-started handle holds no
-        # reader output buffer; the handle keeps it alive until the
-        # coordinator owns it
-        input_q = self._ctx.Queue(maxsize=_INPUT_QUEUE_TABLES_PER_READER * num_workers)
-        self.input_q = input_q
-        try:
-            proc = self._ctx.Process(
-                target=_coordinator_entry,
-                kwargs=dict(
-                    input_path=self._input_path,
-                    num_readers=num_workers,
-                    start_offsets=self.start_offsets,
-                    input_q=input_q,
-                    stop_event=self.stop_event,
-                    shared_dispatch_queue=self.shared_dispatch_queue,
-                    mode=self._data_config.shuffle_mode,
-                    capacity_rows=capacity_rows,
-                    batch_size=self._data_config.batch_size,
-                    input_table_schema=table_schema,
-                    reader_schema=reader.schema,
-                    full_schema=reader._full_schema,
-                    has_embedded_schema=reader._has_embedded_schema,
-                    trainer_pid=os.getpid(),
-                    consumer_factory=self._consumer_factory,
-                ),
-                # not daemon: daemonic processes cannot fork reader children;
-                # orphan self-exit is handled via trainer_pid checks instead
-                daemon=False,
-                name="tzrec-sample-shuffle-coordinator",
-            )
-            proc.start()
-        except Exception:
-            input_q.close()
-            input_q.join_thread()
-            self.input_q = None
-            raise
-
-        def _terminate_if_alive(p=proc):
-            if p.is_alive():
-                p.terminate()
-
-        # interpreters can exit without stop_loading() on training-init
-        # failures; this runs before multiprocessing joins the non-daemon
-        # child, so initialization failures cannot hang the exit
-        atexit.register(_terminate_if_alive)
-        self._atexit_cleanup = _terminate_if_alive
-        self._proc = proc
-        self._start_watchdog()
-
-    def _start_watchdog(self) -> None:
-        """Watch the coordinator; set fatal_event on unexpected exit."""
-        proc = self._proc
-
-        def _watch() -> None:
-            proc.join()
-            if self._proc is not None:
-                self.fatal_event.set()
-                logger.error(
-                    f"sample-shuffle coordinator exited unexpectedly "
-                    f"(code {proc.exitcode})"
-                )
-
-        threading.Thread(
-            target=_watch, name="sample-shuffle-watchdog", daemon=True
-        ).start()
-
-    def stop(self) -> None:
-        """Stop the coordinator and its readers; idempotent."""
-        if self._proc is None:
-            return
-        proc = self._proc
-        self._proc = None
-        self.stop_event.set()
-        proc.join(timeout=15.0)
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=5.0)
-        if self._atexit_cleanup is not None:
-            atexit.unregister(self._atexit_cleanup)
-            self._atexit_cleanup = None
-
-
-def validate_sample_shuffle_config(data_config: data_pb2.DataConfig) -> None:
-    """Validate Kafka-specific config for the sample-level shuffle path.
-
-    ``enable.auto.commit`` is passed through to librdkafka unchanged, same
-    as the BATCH path; only the fields the shared pool relies on are checked.
-
-    Args:
-        data_config: dataloader config.
-
-    Raises:
-        ValueError: on invalid capacity or an unsupported batch_cost_size.
-    """
-    if data_config.batch_size <= 0 or data_config.shuffle_buffer_size <= 0:
-        raise ValueError(
-            "sample-level shuffle requires batch_size > 0 and "
-            f"shuffle_buffer_size > 0, got {data_config.batch_size} and "
-            f"{data_config.shuffle_buffer_size}"
-        )
-    if data_config.batch_cost_size > 0:
-        raise ValueError(
-            "sample-level shuffle always groups by batch_size and does not "
-            "support batch_cost_size"
-        )
+            reader.close()

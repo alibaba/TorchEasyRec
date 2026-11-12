@@ -62,11 +62,11 @@ enum FgMode {
 enum ShuffleMode {
     // shuffle whole batches in each read worker (default behavior)
     BATCH = 1;
-    // sample-level shuffle in a per-rank shared pool with fixed windows,
-    // KafkaDataset training only
+    // sample-level shuffle in a per-rank shared pool with fixed windows.
+    // Training only; supported by Kafka, Parquet, Odps and single-rank Csv.
     SAMPLE_WINDOW = 2;
-    // sample-level shuffle in a per-rank shared rolling pool,
-    // KafkaDataset training only
+    // sample-level shuffle in a per-rank shared rolling pool.
+    // Training only; supported by Kafka, Parquet, Odps and single-rank Csv.
     SAMPLE_ROLLING = 3;
 }
 
@@ -154,7 +154,9 @@ message DataConfig {
     // shuffle mode. For SAMPLE_WINDOW and SAMPLE_ROLLING, raw samples are
     // gathered into a per-rank shared pool of
     // batch_size * shuffle_buffer_size samples, shuffled at sample level,
-    // then grouped into batches. KafkaDataset training only.
+    // then grouped into batches. Training only; every rank has its own
+    // independent pool. Supported by KafkaDataset, ParquetDataset,
+    // OdpsDataset and single-rank CsvDataset.
     optional ShuffleMode shuffle_mode = 21 [default = BATCH];
 
     // maxcompute storage api data compression type, LZ4_FRAME | ZSTD | UNCOMPRESSED

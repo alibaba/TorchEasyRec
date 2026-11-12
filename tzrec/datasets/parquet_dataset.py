@@ -23,8 +23,8 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.sample_shuffle import ReadPlan, ReadTask, make_sample_table_schema
 from tzrec.datasets.utils import (
-    calc_slice_intervals,
     inject_checkpoint_metadata,
     list_input_files,
 )
@@ -241,6 +241,66 @@ class ParquetReader(BaseReader):
         """Table schema."""
         return self._schema
 
+    def create_read_plan(
+        self, rank: int, world_size: int, num_readers: int
+    ) -> ReadPlan:
+        """Build this rank's parquet read plan.
+
+        Each reader is planned as one of this rank's local workers, so the
+        rank-step alignment and tail trimming are exactly the BATCH path's.
+
+        Args:
+            rank: this process's rank.
+            world_size: number of ranks.
+            num_readers: number of reader processes on this rank.
+
+        Returns:
+            a finite read plan.
+
+        Raises:
+            ValueError: when parquet rebalancing is disabled.
+        """
+        if not self._rebalance:
+            raise ValueError(
+                "sample-level shuffle requires parquet rebalance to plan per-rank rows"
+            )
+        from tzrec.datasets.sample_shuffle_readers import read_parquet
+
+        tasks = []
+        planned_rows = 0
+        for reader_id in range(num_readers):
+            intervals = self._worker_intervals(
+                [(self._input_path, sum(self._num_rows))],
+                rank * num_readers + reader_id,
+                num_readers * world_size,
+                world_size,
+            )[0]
+            planned_rows += sum(end - start for start, end in intervals)
+            if not intervals:
+                continue
+            tasks.append(
+                ReadTask(
+                    fn=read_parquet,
+                    kwargs=dict(
+                        input_files=self._input_files,
+                        batch_size=self._batch_size,
+                        parquet_metas=self._parquet_metas,
+                        columns=self._ordered_cols,
+                        intervals=intervals,
+                        source_prefix=self._input_path,
+                        reader_id=reader_id,
+                    ),
+                    reader_id=reader_id,
+                )
+            )
+        return ReadPlan(
+            tasks=tasks,
+            schema=make_sample_table_schema(self._schema),
+            is_finite=True,
+            planned_rows=planned_rows,
+            num_readers=num_readers,
+        )
+
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
@@ -250,15 +310,11 @@ class ParquetReader(BaseReader):
 
         worker_intervals = [(0, sys.maxsize)]
         if self._rebalance:
-            worker_intervals = calc_slice_intervals(
+            worker_intervals = self._worker_intervals(
                 [(self._input_path, sum(self._num_rows))],
                 worker_id,
                 num_workers,
-                self._batch_size,
-                self._equalize_rank_steps,
-                self._min_batch_size,
-                checkpoint_state=self._checkpoint_state,
-                world_size=world_size,
+                world_size,
             )[0]
 
         def _combined_reader() -> Iterator[pa.RecordBatch]:

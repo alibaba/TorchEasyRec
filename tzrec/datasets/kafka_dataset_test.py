@@ -11,7 +11,6 @@
 
 
 import io
-import multiprocessing as mp
 import os
 import signal
 import threading
@@ -41,7 +40,6 @@ from tzrec.datasets.kafka_dataset import (
     _offsets_for_times_batched,
     _parse_kafka_uri,
     resolve_start_offsets,
-    validate_sample_shuffle_config,
 )
 from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, DATA_TIMESTAMP
 from tzrec.features.feature import FgMode, create_features
@@ -216,6 +214,28 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
                 [[partition] for partition in owned],
             )
             gen.close()
+
+    def test_multi_rank_partition_coverage(self):
+        leaders = {0: 1, 1: 0, 2: 1, 3: 0, 4: 1, 5: 0}
+        expected = [[1, 2], [3, 4], [5], [0]]
+        assigned = []
+        for global_reader_id, owned in enumerate(expected):
+            consumers = [mock.Mock() for _ in owned]
+            consumers[0].consume.return_value = [_msg(owned[0], 0, 1)]
+            reader = self._make_reader(
+                consumers, partitions=list(leaders), leaders=leaders
+            )
+            gen = reader._reader(global_reader_id, len(expected))
+            next(gen)
+            actual = [
+                tp.partition
+                for consumer in consumers
+                for tp in consumer.assign.call_args.args[0]
+            ]
+            self.assertEqual(actual, owned)
+            assigned.extend(actual)
+            gen.close()
+        self.assertEqual(sorted(assigned), list(leaders))
 
     def test_insufficient_partitions_raises(self):
         reader = self._make_reader([], partitions=(0, 1))
@@ -426,29 +446,43 @@ class KafkaReaderDecodedMessageLogTest(unittest.TestCase):
     def test_counter_resets_per_reader_iteration(self):
         consumer = mock.Mock()
         consumer.consume.return_value = [_msg(0, 0, 1)]
-        reader = self._make_reader(consumer, kafka_log_every_n_messages=100)
-        for _ in range(2):
-            gen = reader._reader(0, 1)
-            self.addCleanup(gen.close)
-            next(gen)
-            self.assertEqual(reader._decoded_message_count, 1)
-            self.assertEqual(reader._decoded_partition_counts, {"topic:0": 1})
-            gen.close()
+        reader = self._make_reader(consumer, kafka_log_every_n_messages=2)
+        with mock.patch("tzrec.datasets.kafka_dataset.logger") as mock_logger:
+            for _ in range(2):
+                gen = reader._reader(0, 1)
+                self.addCleanup(gen.close)
+                next(gen)
+                next(gen)
+                gen.close()
+            self.assertEqual(
+                _decoded_logs(mock_logger),
+                [
+                    "KafkaReader[rank-0|worker-0] decoded_messages=2 "
+                    "partitions={'topic:0': 2}",
+                    "KafkaReader[rank-0|worker-0] decoded_messages=2 "
+                    "partitions={'topic:0': 2}",
+                ],
+            )
 
     def test_rebalance_preserves_counters(self):
         consumer = mock.Mock()
         consumer.consume.return_value = [_msg(0, 0, 1)]
-        reader = self._make_reader(consumer, kafka_log_every_n_messages=100)
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        next(gen)
-        on_assign = consumer.subscribe.call_args.kwargs["on_assign"]
-        on_assign(consumer, [TopicPartition("topic", 0)])
-        self.assertEqual(reader._decoded_message_count, 1)
-        self.assertEqual(reader._decoded_partition_counts, {"topic:0": 1})
-        next(gen)
-        self.assertEqual(reader._decoded_message_count, 2)
-        self.assertEqual(reader._decoded_partition_counts, {"topic:0": 2})
+        reader = self._make_reader(consumer, kafka_log_every_n_messages=2)
+        with mock.patch("tzrec.datasets.kafka_dataset.logger") as mock_logger:
+            gen = reader._reader(0, 1)
+            self.addCleanup(gen.close)
+            next(gen)
+            on_assign = consumer.subscribe.call_args.kwargs["on_assign"]
+            on_assign(consumer, [TopicPartition("topic", 0)])
+            self.assertEqual(_decoded_logs(mock_logger), [])
+            next(gen)
+            self.assertEqual(
+                _decoded_logs(mock_logger),
+                [
+                    "KafkaReader[rank-0|worker-0] decoded_messages=2 "
+                    "partitions={'topic:0': 2}"
+                ],
+            )
 
 
 class OffsetsForTimesBatchedTest(unittest.TestCase):
@@ -763,11 +797,18 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         self.assertEqual(dataset._reader._shuffle, expected_shuffle)
         self.assertEqual(dataset._reader._shuffle_buffer_size, 64)
         self.assertEqual(
-            dataset._reader._kafka_partition_round_robin, bool(round_robin)
+            dataset._reader._round_robin_partition_order,
+            [0, 1] if round_robin else None,
         )
         self.assertEqual(
             dataset._reader._log_every_n_messages, log_every_n_messages or 0
         )
+        # Kafka is the source that declares event time to the pool
+        with mock.patch.object(
+            KafkaReader, "_resolve_start_offsets_for_run", return_value={0: 0}
+        ):
+            plan = dataset._reader.create_read_plan(0, 1, 2)
+        self.assertIn(DATA_TIMESTAMP, plan.schema.names)
 
 
 class KafkaDatasetTest(unittest.TestCase):
@@ -1285,239 +1326,6 @@ def check_row_correspondence(tc, batch, partition=0, offset_start=0, rows_per_ms
         tc.assertAlmostEqual(row[DATA_TIMESTAMP], i + 0.5)
 
 
-class SamplePoolTest(unittest.TestCase):
-    def _pool(self, capacity, batch_size, mode, seed=0):
-        rng = np.random.default_rng(seed)
-        return kafka_dataset.SamplePool(capacity, batch_size, mode, rng=rng)
-
-    @parameterized.expand(
-        [
-            (0, 16, data_pb2.SAMPLE_WINDOW),
-            (16, 0, data_pb2.SAMPLE_WINDOW),
-            (16, 16, 999),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_invalid_config(self, capacity, batch_size, mode):
-        with self.assertRaises(ValueError):
-            kafka_dataset.SamplePool(capacity, batch_size, mode)
-
-    @parameterized.expand(
-        [
-            (data_pb2.SAMPLE_WINDOW,),
-            (data_pb2.SAMPLE_ROLLING,),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_no_emit_until_full(self, mode):
-        pool = self._pool(128, 16, mode)
-        # empty pool
-        self.assertIsNone(pool.emit())
-        # fewer rows than one batch: retained, nothing emitted
-        pool.add(make_batch(8))
-        self.assertIsNone(pool.emit())
-        self.assertEqual(pool.total_rows, 8)
-        # still short of capacity
-        pool.add(make_batch(64, start_id=8))
-        self.assertIsNone(pool.emit())
-        # fill past capacity: emit one full batch
-        pool.add(make_batch(64, start_id=72))
-        out = pool.emit()
-        self.assertIsNotNone(out)
-        self.assertEqual(out.num_rows, 16)
-
-    def test_capacity_one_batch(self):
-        batch_size = 8
-        pool = self._pool(batch_size, batch_size, data_pb2.SAMPLE_ROLLING)
-        pool.add(make_batch(batch_size))
-        out = pool.emit()
-        self.assertIsNotNone(out)
-        self.assertEqual(out.num_rows, batch_size)
-
-    def test_window_emits_all_full_batches_without_new_data(self):
-        pool = self._pool(96, 16, data_pb2.SAMPLE_WINDOW)
-        pool.add(make_batch(100))
-        seen = []
-        while True:
-            out = pool.emit()
-            if out is None:
-                break
-            seen.append(out)
-        self.assertEqual(sum(b.num_rows for b in seen), 96)  # 6 full batches
-        self.assertEqual(pool.total_rows, 4)  # leftover retained
-
-    def test_window_arrivals_not_mixed_into_frozen_window(self):
-        pool = self._pool(64, 16, data_pb2.SAMPLE_WINDOW)
-        pool.add(make_batch(64, start_id=0))
-        first = pool.emit()
-        self.assertIsNotNone(first)
-        first_ids = set(first.column("id").to_pylist())
-        # arrivals during the frozen phase
-        pool.add(make_batch(32, start_id=1000))
-        rest = []
-        while True:
-            out = pool.emit()
-            if out is None:
-                break
-            rest.append(out)
-        frozen_ids = set(first_ids)
-        for b in rest:
-            frozen_ids.update(b.column("id").to_pylist())
-        self.assertTrue(all(i < 64 for i in frozen_ids))
-        # the 32 new rows wait for the next full window
-        self.assertEqual(pool.total_rows, 32)
-        self.assertIsNone(pool.emit())
-        pool.add(make_batch(32, start_id=2000))
-        out = pool.emit()
-        self.assertIsNotNone(out)
-        self.assertTrue(all(i >= 1000 for i in out.column("id").to_pylist()))
-
-    def test_rolling_extract_then_refill(self):
-        # deterministic rng: the first batch is a fixed subset
-        pool = self._pool(32, 16, data_pb2.SAMPLE_ROLLING, seed=7)
-        pool.add(make_batch(32, start_id=0))
-        first = pool.emit()
-        self.assertIsNotNone(first)
-        first_ids = set(first.column("id").to_pylist())
-        self.assertEqual(len(first_ids), 16)
-        self.assertEqual(pool.total_rows, 16)
-        # no emit before the refill reaches capacity
-        self.assertIsNone(pool.emit())
-        pool.add(make_batch(16, start_id=32))
-        second = pool.emit()
-        self.assertIsNotNone(second)
-        second_ids = set(second.column("id").to_pylist())
-        # the second batch mixes old and new samples and repeats nothing
-        self.assertEqual(len(second_ids & first_ids), 0)
-        self.assertTrue(any(i < 32 for i in second_ids))
-        self.assertTrue(any(i >= 32 for i in second_ids))
-        self.assertEqual(pool.total_rows, 16)
-
-    def test_row_correspondence_and_conservation(self):
-        for mode in (data_pb2.SAMPLE_WINDOW, data_pb2.SAMPLE_ROLLING):
-            pool = self._pool(96, 16, mode)
-            total_in = 0
-            for i in range(6):
-                pool.add(
-                    make_batch(
-                        32, start_id=32 * i, partition=i % 3, offset_start=100 * (i % 3)
-                    )
-                )
-                total_in += 32
-            emitted = []
-            while True:
-                out = pool.emit()
-                if out is None:
-                    break
-                emitted.append(out)
-            for batch in emitted:
-                # per-row correspondence is per source partition
-                for part in range(3):
-                    cols = batch.filter(
-                        pa.compute.equal(
-                            batch.column(CKPT_SOURCE_ID), pa.scalar(f"topic:{part}")
-                        )
-                    )
-                    check_row_correspondence(
-                        self, cols, partition=part, offset_start=100 * part
-                    )
-            rows_out = sum(b.num_rows for b in emitted)
-            self.assertEqual(rows_out + pool.total_rows, total_in)
-            self.assertEqual(pool.rows_in, total_in)
-            self.assertEqual(pool.rows_out, rows_out)
-
-    def test_msg_split_and_batch_spanning_offsets(self):
-        pool = self._pool(40, 16, data_pb2.SAMPLE_WINDOW)
-        # one message of 40 rows (all at offset 7) spans multiple batches
-        pool.add(make_batch(40, rows_per_msg=40, offset_start=7))
-        offsets_seen = set()
-        while True:
-            out = pool.emit()
-            if out is None:
-                break
-            offsets_seen.update(out.column(CKPT_ROW_IDX).to_pylist())
-        # 40 rows -> 2 full batches, 8 retained; all carry offset 7
-        self.assertEqual(offsets_seen, {7})
-        self.assertEqual(pool.total_rows, 8)
-
-    def test_window_boundary_compaction_bounds_memory(self):
-        # reviewer scenario: capacity 32, batch 8, arrivals of 16 rows while
-        # a window is frozen; the next window is full right when the previous
-        # one ends, so add()-time compaction never fires
-        pool = self._pool(32, 8, data_pb2.SAMPLE_WINDOW)
-        next_id = 0
-        for _ in range(25):
-            pool.add(make_batch(16, start_id=next_id))
-            next_id += 16
-            pool.add(make_batch(16, start_id=next_id))
-            next_id += 16
-            # freeze + drain the window, with arrivals mid-drain
-            for i in range(10):
-                out = pool.emit()
-                if out is None:
-                    break
-                if i == 1:
-                    pool.add(make_batch(16, start_id=next_id))
-                    next_id += 16
-        self.assertGreater(pool.num_compactions, 0)
-        self.assertLessEqual(len(pool._chunks), 10)
-        self.assertEqual(pool.rows_in, next_id)
-        self.assertEqual(pool.rows_in - pool.rows_out, pool.total_rows)
-
-    def test_output_batches_survive_compaction(self):
-        pool = self._pool(32, 8, data_pb2.SAMPLE_ROLLING)
-        next_id = 0
-        produced = []
-        for _ in range(40):
-            pool.add(make_batch(16, start_id=next_id))
-            next_id += 16
-            while True:
-                out = pool.emit()
-                if out is None:
-                    break
-                produced.append(out)
-        self.assertGreater(pool.num_compactions, 0)
-        # batches emitted before a compaction stay valid and row-correct
-        seen = set()
-        for b in produced:
-            check_row_correspondence(self, b)
-            seen.update(b.column("id").to_pylist())
-        self.assertEqual(len(seen), len(produced) * 8)
-
-    def test_null_and_nested_columns(self):
-        pool = self._pool(32, 16, data_pb2.SAMPLE_WINDOW)
-        ids = np.arange(32, dtype=np.int64)
-        rb = pa.RecordBatch.from_arrays(
-            [
-                pa.array(ids),
-                pa.array([None if i % 3 == 0 else f"v{i}" for i in ids]),
-                pa.array(
-                    [None if i % 4 == 0 else [int(i)] * (i % 3) for i in ids],
-                    type=pa.list_(pa.int64()),
-                ),
-                pa.array(["topic:0"] * 32),
-                pa.array(ids // 16),
-                pa.array(ids.astype(np.float64)),
-            ],
-            names=[
-                "id",
-                "str_f",
-                "list_f",
-                CKPT_SOURCE_ID,
-                CKPT_ROW_IDX,
-                DATA_TIMESTAMP,
-            ],
-        )
-        pool.add(rb)
-        out = pool.emit()
-        self.assertIsNotNone(out)
-        for row in out.to_pylist():
-            i = row["id"]
-            self.assertEqual(row["str_f"], None if i % 3 == 0 else f"v{i}")
-            self.assertEqual(row["list_f"], None if i % 4 == 0 else [i] * (i % 3))
-            self.assertEqual(row[CKPT_ROW_IDX], i // 16)
-
-
 class CheckpointInfoTest(unittest.TestCase):
     """checkpoint_info of a sample-shuffled batch reflects its actual content."""
 
@@ -1595,11 +1403,15 @@ class FakeKafkaConsumer:
       fake.rebalance_after_msgs (re-assign this reader's partitions after
       serving this many messages, replaying from the start offsets),
       fake.grow_to_partitions (on the first rebalance, also assign a
-      partition created after startup, which must fail loudly).
+      partition created after startup, which must fail loudly),
+      fake.id_mod (when > 0, reduce payload ids modulo this value so a
+      training fixture feeds valid embedding bucket indices; partition and
+      offset checkpoint metadata stay unchanged).
 
     Partition p is served to reader r iff p % num_readers == r. The message
     at (p, o) carries rows_per_msg rows with globally unique ids
-    p * 10**9 + o * rows_per_msg + i and label = id % 2.
+    p * 10**9 + o * rows_per_msg + i (or those ids modulo fake.id_mod) and
+    label = id % 2.
     """
 
     def __init__(self, config, reader_id=0, num_readers=1):
@@ -1608,6 +1420,7 @@ class FakeKafkaConsumer:
         self._total_msgs = int(config.get("fake.total_msgs", "1000000"))
         self._ts_offset = int(config.get("fake.ts_offset", "7"))
         self._low_watermark = int(config.get("fake.low_watermark", "0"))
+        self._id_mod = int(config.get("fake.id_mod", "0"))
         self._reader_id = reader_id
         self._num_readers = num_readers
         self._rebalance_after = int(config.get("fake.rebalance_after_msgs", "0"))
@@ -1690,6 +1503,8 @@ class FakeKafkaConsumer:
                 continue
             rpm = self._rows_per_msg
             ids = np.arange(rpm, dtype=np.int64) + p * _FAKE_ID_BASE + o * rpm
+            if self._id_mod > 0:
+                ids = ids % self._id_mod
             rb = pa.RecordBatch.from_arrays(
                 [pa.array(ids), pa.array(ids % 2)], names=["id", "label"]
             )
@@ -1710,7 +1525,10 @@ class FakeKafkaConsumer:
         return SimpleNamespace(
             topics={
                 topic: SimpleNamespace(
-                    partitions={p: None for p in range(self._num_partitions)},
+                    partitions={
+                        p: SimpleNamespace(leader=p % 2)
+                        for p in range(self._num_partitions)
+                    },
                     error=None,
                 )
             }
@@ -1718,6 +1536,28 @@ class FakeKafkaConsumer:
 
     def close(self):
         pass
+
+
+class FakeKafkaConsumerTest(unittest.TestCase):
+    def test_id_mod_bounds_ids_without_hiding_metadata(self):
+        consumer = FakeKafkaConsumer(
+            {"fake.num_partitions": 1, "fake.rows_per_msg": 3, "fake.id_mod": 5},
+            reader_id=0,
+            num_readers=1,
+        )
+        consumer.assign([TopicPartition("topic", 0, 0)])
+        msgs = consumer.consume(2)
+        schema = pa.schema([pa.field("id", pa.int64()), pa.field("label", pa.int64())])
+        ids = []
+        for m in msgs:
+            ids.extend(
+                pa.ipc.read_record_batch(m.value(), schema).column("id").to_pylist()
+            )
+        self.assertTrue(ids)
+        self.assertTrue(all(0 <= i < 5 for i in ids))
+        # checkpoint metadata still comes from the message partition/offset
+        self.assertEqual(msgs[0].partition(), 0)
+        self.assertEqual(msgs[0].offset(), 0)
 
 
 def _fake_uri(**params):
@@ -1755,48 +1595,6 @@ def _features():
 
 def _ids_of(batch):
     return batch.to_dict()["id.values"].tolist()
-
-
-class ValidateSampleShuffleConfigTest(unittest.TestCase):
-    @parameterized.expand(
-        [
-            param("zero_batch", batch_size=0),
-            param("zero_buffer", shuffle_buffer_size=0),
-            param("batch_cost", batch_cost_size=1024),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_invalid_configs(self, _name, **overrides):
-        cfg = _data_config(**overrides)
-        with self.assertRaises(ValueError):
-            validate_sample_shuffle_config(cfg)
-
-    def test_auto_commit_passthrough(self):
-        _, params, _ = _parse_kafka_uri(_fake_uri())
-        self.assertEqual(params["enable.auto.commit"], "false")
-        _, params, _ = _parse_kafka_uri(
-            "kafka://fake:9092/topic?group.id=g&enable.auto.commit=true"
-        )
-        self.assertEqual(params["enable.auto.commit"], "true")
-
-    def test_enabled_only_for_train_shuffle_sample_mode(self):
-        from tzrec.datasets.dataset import sample_shuffle_enabled
-
-        self.assertTrue(sample_shuffle_enabled(_data_config(), Mode.TRAIN))
-        self.assertFalse(sample_shuffle_enabled(_data_config(), Mode.EVAL))
-        self.assertFalse(sample_shuffle_enabled(_data_config(), Mode.PREDICT))
-        self.assertFalse(
-            sample_shuffle_enabled(_data_config(shuffle=False), Mode.TRAIN)
-        )
-        self.assertFalse(
-            sample_shuffle_enabled(
-                _data_config(shuffle_mode=data_pb2.ShuffleMode.BATCH), Mode.TRAIN
-            )
-        )
-        # a legacy config that never mentions the new field stays BATCH
-        legacy = data_pb2.DataConfig()
-        self.assertEqual(legacy.shuffle_mode, data_pb2.ShuffleMode.BATCH)
-        self.assertFalse(sample_shuffle_enabled(legacy, Mode.TRAIN))
 
 
 class ResolveStartOffsetsTest(unittest.TestCase):
@@ -1870,9 +1668,9 @@ class ResolveStartOffsetsTest(unittest.TestCase):
 
 
 class ReaderDispatchTest(unittest.TestCase):
-    """KafkaReader.to_batches selects the BATCH or SAMPLE path."""
+    """KafkaReader.to_batches uses the per-worker BATCH path."""
 
-    def _reader(self):
+    def _reader(self, **kwargs):
         return kafka_dataset.KafkaReader(
             _fake_uri(),
             batch_size=8,
@@ -1882,43 +1680,38 @@ class ReaderDispatchTest(unittest.TestCase):
                 pa.field("id", pa.int64()),
                 pa.field("label", pa.int64()),
             ],
+            **kwargs,
         )
 
-    def _payload(self, reader):
-        # payloads must match the dispatch schema exactly; a mismatch reads
-        # garbage columns instead of raising
-        ids = np.arange(2, dtype=np.int64)
-        rb = pa.RecordBatch.from_arrays(
-            [
-                pa.array(ids),
-                pa.array(ids % 2),
-                pa.array(["topic:0"] * 2),
-                pa.array(ids // 16),
-                pa.array(ids.astype(np.float64)),
-            ],
-            schema=reader._sample_table_schema,
-        )
-        return rb.serialize().to_pybytes()
+    @parameterized.expand(
+        [("subscribe", False), ("round_robin", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_read_plan_uses_global_reader_ids(self, _name, round_robin):
+        with mock.patch.object(
+            kafka_dataset, "_default_consumer_factory", FakeKafkaConsumer
+        ):
+            reader = self._reader(
+                kafka_partition_round_robin=round_robin,
+                kafka_log_every_n_messages=7,
+            )
+            reader.load_state_dict({"topic:0": 12})
+            plan = reader.create_read_plan(1, 2, 2)
+        self.assertEqual(plan.num_readers, 2)
+        self.assertEqual([t.reader_id for t in plan.tasks], [0, 1])
+        # consumers of every rank share one global group
+        self.assertEqual([t.kwargs["reader_id"] for t in plan.tasks], [2, 3])
+        self.assertEqual([t.kwargs["num_readers"] for t in plan.tasks], [4, 4])
+        for task in plan.tasks:
+            self.assertEqual(task.kwargs["kafka_log_every_n_messages"], 7)
+            self.assertEqual(
+                task.kwargs["round_robin_partition_order"],
+                [0, 1] if round_robin else None,
+            )
+            self.assertEqual(task.kwargs["start_offsets"][0], 13)
+        self.assertFalse(plan.is_finite)
 
-    def test_sample_pickup_and_metadata_columns(self):
-        ctx = mp.get_context("spawn")
-        shared = ctx.Queue()
-        reader = self._reader()
-        reader._configure_sample_shuffle(shared, ctx.Event(), ctx.Event())
-
-        def _must_not_read(*_args, **_kwargs):
-            raise AssertionError("sample path must not read Kafka in the worker")
-
-        reader._reader = _must_not_read
-        reader._arrow_reader_iter = _must_not_read
-        shared.put(self._payload(reader))
-        input_data = next(reader.to_batches(0, 2, 1))
-        self.assertEqual(input_data["id"].to_pylist(), [0, 1])
-        self.assertEqual(input_data["label"].to_pylist(), [0, 1])
-        self.assertEqual(input_data[CKPT_SOURCE_ID].to_pylist(), ["topic:0"] * 2)
-        self.assertIn(DATA_TIMESTAMP, input_data)
-
-    def test_batch_path_still_uses_worker_reader_and_batch_shuffle(self):
+    def test_batch_path_uses_worker_reader_and_batch_shuffle(self):
         reader = self._reader()
         calls = []
 
@@ -1932,204 +1725,148 @@ class ReaderDispatchTest(unittest.TestCase):
         # a single full batch flows through the batch-shuffle buffer
         self.assertEqual(sum(len(b["id"]) for b in batches), 8)
 
-    def test_fatal_event_raises(self):
-        ctx = mp.get_context("spawn")
-        fatal = ctx.Event()
-        reader = self._reader()
-        reader._configure_sample_shuffle(ctx.Queue(), ctx.Event(), fatal)
-        fatal.set()
-        it = reader.to_batches(0, 1, 1)
-        with self.assertRaisesRegex(RuntimeError, "coordinator exited unexpectedly"):
-            next(it)
 
-    def test_stop_event_ends_the_pass(self):
-        ctx = mp.get_context("spawn")
-        shared = ctx.Queue()
-        stop = ctx.Event()
-        reader = self._reader()
-        reader._configure_sample_shuffle(shared, stop, ctx.Event())
-        it = reader.to_batches(0, 1, 1)
-        stop.set()
-        with self.assertRaises(StopIteration):
-            next(it)
+class SampleKafkaReadTaskTest(unittest.TestCase):
+    """The generic Kafka read task honors round-robin and message logging."""
 
+    def _task(self, consumers, partition_order=None, log_every=0):
+        from tzrec.datasets.sample_shuffle_readers import read_kafka
 
-class CoordinatorTest(unittest.TestCase):
-    """In-process coordinator with a stubbed reader set."""
-
-    def _coordinator(
-        self,
-        dispatch_maxsize=0,
-        num_readers=0,
-        input_maxsize=0,
-        consumer_factory=None,
-    ):
-        ctx = mp.get_context("spawn")
-        schema = pa.schema(
-            [
-                pa.field("id", pa.int64()),
-                pa.field(CKPT_SOURCE_ID, pa.string()),
-                pa.field(CKPT_ROW_IDX, pa.int64()),
-                pa.field(DATA_TIMESTAMP, pa.float64()),
-            ]
-        )
-        return kafka_dataset._Coordinator(
-            input_path=_fake_uri(),
-            num_readers=num_readers,
-            start_offsets={0: 0, 1: 0},
-            input_q=ctx.Queue(maxsize=input_maxsize),
-            stop_event=ctx.Event(),
-            shared_dispatch_queue=ctx.Queue(maxsize=dispatch_maxsize),
-            mode=data_pb2.ShuffleMode.SAMPLE_ROLLING,
-            capacity_rows=16,
-            batch_size=8,
-            input_table_schema=schema,
-            reader_schema=pa.schema([pa.field("id", pa.int64())]),
-            # FakeConsumer payloads carry [id, label]; schema-less decode must
-            # match exactly or pyarrow misreads the buffer
-            full_schema=pa.schema(
-                [pa.field("id", pa.int64()), pa.field("label", pa.int64())]
-            ),
+        stop = threading.Event()
+        schema = pa.schema([pa.field("x", pa.int64())])
+        gen = read_kafka(
+            stop_event=stop,
+            input_path="kafka://broker:9092/topic?group.id=g1",
+            reader_id=1,
+            num_readers=2,
+            start_offsets={0: 5, 1: 5, 2: 5, 3: 5},
+            reader_schema=schema,
+            full_schema=schema,
             has_embedded_schema=False,
-            trainer_pid=os.getpid(),
-            consumer_factory=consumer_factory,
+            batch_size=8,
+            consumer_factory=mock.Mock(side_effect=consumers),
+            round_robin_partition_order=partition_order,
+            kafka_log_every_n_messages=log_every,
         )
+        self.addCleanup(gen.close)
+        return gen, stop
 
-    def _feed(self, coord, n_rows):
-        # the payload must match the coordinator's input table schema exactly
-        ids = np.arange(n_rows, dtype=np.int64)
-        rb = pa.RecordBatch.from_arrays(
-            [
-                pa.array(ids),
-                pa.array(["topic:0"] * n_rows),
-                pa.array(ids // 16),
-                pa.array(ids.astype(np.float64)),
-            ],
-            names=["id", CKPT_SOURCE_ID, CKPT_ROW_IDX, DATA_TIMESTAMP],
+    @parameterized.expand(
+        [("subscribe", False), ("round_robin", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_mixed_messages_and_two_log_intervals(self, _name, round_robin):
+        first = _msg(1, 5, 1, rows=2)
+        error = _msg(3, 5, 0, error="boom")
+        second = _msg(3, 6, 2)
+        empty = _msg(1, 6, 0, rows=0)
+        last = _msg(3, 7, 3)
+        consumers = [mock.Mock() for _ in range(2 if round_robin else 1)]
+        if round_robin:
+            consumers[0].consume.side_effect = [[first], [empty]]
+            consumers[1].consume.side_effect = [[error], [second], [last]]
+        else:
+            consumers[0].consume.side_effect = [[first], [error, second], [empty, last]]
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0"}),
+            mock.patch.object(kafka_dataset, "logger") as mock_logger,
+        ):
+            gen, _ = self._task(
+                consumers, [0, 1, 2, 3] if round_robin else None, log_every=2
+            )
+            batches = [next(gen) for _ in range(3)]
+            gen.close()
+            self.assertEqual(
+                _decoded_logs(mock_logger),
+                [
+                    "KafkaReader[rank-0|worker-1] decoded_messages=2 "
+                    "partitions={'topic:1': 1, 'topic:3': 1}",
+                    "KafkaReader[rank-0|worker-1] decoded_messages=4 "
+                    "partitions={'topic:1': 2, 'topic:3': 2}",
+                ],
+            )
+        self.assertEqual(
+            [b.column("x").to_pylist() for b in batches], [[1, 1], [2], [3]]
         )
-        coord._input_q.put(rb.serialize().to_pybytes())
+        for consumer in consumers:
+            consumer.close.assert_called_once()
+        if round_robin:
+            for consumer, partition in zip(consumers, (1, 3)):
+                consumer.subscribe.assert_not_called()
+                tp = consumer.assign.call_args.args[0][0]
+                self.assertEqual((tp.partition, tp.offset), (partition, 5))
+                self.assertTrue(
+                    all(
+                        c == mock.call(1, timeout=1.0)
+                        for c in consumer.consume.call_args_list
+                    )
+                )
+        else:
+            consumers[0].subscribe.assert_called_once()
 
-    def test_pending_sent_once_when_capacity_frees(self):
-        coord = self._coordinator(dispatch_maxsize=1)
-        self._feed(coord, 64)
-        coord._service_input(1.0)
-        # one slot: the first batch fills it, the second is stashed as pending
-        self.assertEqual(coord._emit_and_dispatch(), 1)
-        first = coord._shared_dispatch_queue.get(timeout=1.0)
-        rb = pa.ipc.read_record_batch(first, coord._input_table_schema)
-        self.assertEqual(rb.num_rows, 8)
-        pending = coord._pending_dispatch
-        self.assertIsNotNone(pending)
-        self.assertNotEqual(first, pending)
-        # freeing the slot sends the stashed payload exactly once; the next
-        # batch becomes the new pending one
-        self.assertEqual(coord._emit_and_dispatch(), 1)
-        self.assertEqual(coord._shared_dispatch_queue.get(timeout=1.0), pending)
-        self.assertNotEqual(coord._pending_dispatch, pending)
-        for _ in range(5):
-            self.assertEqual(coord._emit_and_dispatch(), 1)
-            coord._shared_dispatch_queue.get(timeout=1.0)
-        self.assertIsNone(coord._pending_dispatch)
-        self.assertEqual(coord._pool.total_rows, 8)
-        self.assertEqual(coord._emit_and_dispatch(), 0)
-        coord._shared_dispatch_queue.close()
-        coord._shared_dispatch_queue.join_thread()
+    @parameterized.expand(
+        [("subscribe", None), ("round_robin", [0, 1])],
+        name_func=parameterized_name_func,
+    )
+    def test_logging_disabled(self, _name, partition_order):
+        consumer = mock.Mock()
+        consumer.consume.return_value = [_msg(1, 5, 1)]
+        with mock.patch.object(kafka_dataset, "logger") as mock_logger:
+            gen, _ = self._task([consumer], partition_order)
+            next(gen)
+            gen.close()
+            self.assertEqual(_decoded_logs(mock_logger), [])
 
-    def test_pool_full_gates_input(self):
-        coord = self._coordinator(dispatch_maxsize=1)
-        self.addCleanup(coord._input_q.close)
-        self.addCleanup(coord._input_q.cancel_join_thread)
-        for _ in range(5):
-            self._feed(coord, 32)
-        t = threading.Thread(target=coord.run, daemon=True)
-        t.start()
-        try:
-            time.sleep(1.0)
-            # pool never exceeds capacity + one in-flight table; the
-            # undigested input stays on the bounded queue (backpressure)
-            self.assertLessEqual(coord._pool.total_rows, 16 + 32)
-            self.assertFalse(coord._input_q.empty())
-        finally:
-            coord._stop_event.set()
-            t.join(timeout=10.0)
-        self.assertFalse(t.is_alive())
+    @parameterized.expand(
+        [("subscribe", None), ("round_robin", [0, 1])],
+        name_func=parameterized_name_func,
+    )
+    def test_decode_failure_does_not_count(self, _name, partition_order):
+        consumer = mock.Mock()
+        message = _msg(1, 5, 1)
+        message.value.return_value = b"not-arrow"
+        consumer.consume.return_value = [message]
+        with mock.patch.object(kafka_dataset, "logger") as mock_logger:
+            gen, _ = self._task([consumer], partition_order, log_every=1)
+            with self.assertRaises(pa.ArrowInvalid):
+                next(gen)
+            self.assertEqual(_decoded_logs(mock_logger), [])
+        consumer.close.assert_called_once()
 
-    def test_shutdown_reaps_all_readers_within_budget(self):
-        coord = self._coordinator(
-            num_readers=6, input_maxsize=1, consumer_factory=FakeKafkaConsumer
-        )
-        coord._start_readers()
-        self.assertTrue(all(p.is_alive() for p in coord._readers))
-        # let the readers fill the bounded input queue and block on it
-        time.sleep(2.0)
-        t0 = time.monotonic()
-        coord._shutdown_readers()
-        elapsed = time.monotonic() - t0
-        self.assertTrue(all(not p.is_alive() for p in coord._readers))
-        self.assertLess(elapsed, 12.0)
+    @parameterized.expand(
+        [("stop", False), ("orphan", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_idle_round_robin_exits(self, _name, orphan):
+        consumer = mock.Mock()
+        gen, stop = self._task([consumer], [0, 1])
 
-    def test_stop_event_exits_with_blocked_output(self):
-        coord = self._coordinator(dispatch_maxsize=1)
-        self._feed(coord, 64)
-        coord._service_input(1.0)
-        coord._emit_and_dispatch()
-        # dispatch queue is full and a payload is stashed as pending
-        self.assertIsNotNone(coord._pending_dispatch)
-        t = threading.Thread(target=coord.run, daemon=True)
-        t.start()
-        time.sleep(0.3)
-        assert t.is_alive()
-        coord._stop_event.set()
-        t.join(timeout=10.0)
-        self.assertFalse(t.is_alive())
+        def consume(*args, **kwargs):
+            stop.set()
+            return []
 
-    def test_shutdown_budget_does_not_scale_with_reader_count(self):
-        clock = [0.0]
+        consumer.consume.side_effect = consume
+        with (
+            mock.patch.object(kafka_dataset.os, "getppid", side_effect=[100, 101])
+            if orphan
+            else nullcontext()
+        ):
+            with self.assertRaises(StopIteration):
+                next(gen)
+        if orphan:
+            consumer.consume.assert_not_called()
+        else:
+            consumer.consume.assert_called_once_with(1, timeout=1.0)
+        consumer.close.assert_called_once()
 
-        class _SlowReader:
-            def __init__(self):
-                self.terminated = False
-                self.alive = True
-
-            def join(self, timeout=None):
-                # never exits by itself; consume whatever budget it is given
-                clock[0] += timeout or 0.0
-
-            def is_alive(self):
-                return self.alive
-
-            def terminate(self):
-                self.terminated = True
-
-        for n in (1, 6):
-            clock[0] = 0.0
-            coord = self._coordinator()
-            coord._readers = [_SlowReader() for _ in range(n)]
-            with mock.patch.object(kafka_dataset.time, "monotonic", lambda: clock[0]):
-                coord._shutdown_readers()
-            # one shared 6s graceful + 2s forced budget, regardless of n
-            self.assertAlmostEqual(clock[0], 8.0, places=6)
-            self.assertTrue(all(r.terminated for r in coord._readers))
-
-    def test_idle_does_not_spin(self):
-        coord = self._coordinator()
-        calls = []
-        orig = coord._service_input
-
-        def spy(timeout):
-            calls.append(timeout)
-            return orig(timeout)
-
-        coord._service_input = spy
-        t = threading.Thread(target=coord.run, daemon=True)
-        t.start()
-        time.sleep(1.0)
-        coord._stop_event.set()
-        t.join(timeout=10.0)
-        self.assertFalse(t.is_alive())
-        # ~10 wakeups/s tick; a zero-timeout spin would produce thousands
-        self.assertLess(len(calls), 50)
-        self.assertTrue(all(0 < x <= 0.11 for x in calls))
+    @parameterized.expand(
+        [("empty", []), ("one", [0])],
+        name_func=parameterized_name_func,
+    )
+    def test_insufficient_partitions(self, _name, partitions):
+        gen, _ = self._task([], partitions)
+        with self.assertRaisesRegex(ValueError, "fewer than the 2"):
+            next(gen)
 
 
 class SampleShuffleEndToEndTest(unittest.TestCase):
@@ -2173,7 +1910,7 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
             signal.setitimer(signal.ITIMER_REAL, 0)
             try:
                 try:
-                    dataloader.dataset.stop_loading()
+                    dataloader.close()
                 finally:
                     if dataloader.num_workers > 0:
                         it._shutdown_workers()
@@ -2186,17 +1923,55 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("rolling", data_pb2.ShuffleMode.SAMPLE_ROLLING, 2, 2, 3, 4),
-            ("window", data_pb2.ShuffleMode.SAMPLE_WINDOW, 2, 2, 3, 4),
-            ("no_workers", data_pb2.ShuffleMode.SAMPLE_ROLLING, 0, 1, 4, 2),
+            ("rolling", data_pb2.ShuffleMode.SAMPLE_ROLLING, 2, 2, 3, 4, False),
+            ("window", data_pb2.ShuffleMode.SAMPLE_WINDOW, 2, 2, 3, 4, False),
+            (
+                "rolling_round_robin",
+                data_pb2.ShuffleMode.SAMPLE_ROLLING,
+                2,
+                4,
+                3,
+                4,
+                True,
+            ),
+            (
+                "window_round_robin",
+                data_pb2.ShuffleMode.SAMPLE_WINDOW,
+                2,
+                4,
+                3,
+                4,
+                True,
+            ),
+            ("no_workers", data_pb2.ShuffleMode.SAMPLE_ROLLING, 0, 1, 4, 2, False),
+            (
+                "no_workers_round_robin",
+                data_pb2.ShuffleMode.SAMPLE_WINDOW,
+                0,
+                2,
+                4,
+                2,
+                True,
+            ),
         ],
         name_func=parameterized_name_func,
     )
     def test_batches_flow(
-        self, _name, mode, num_workers, num_partitions, rows_per_msg, n_batches
+        self,
+        _name,
+        mode,
+        num_workers,
+        num_partitions,
+        rows_per_msg,
+        n_batches,
+        round_robin,
     ):
         batches = self._run_round(
-            dict(shuffle_mode=mode, num_workers=num_workers),
+            dict(
+                shuffle_mode=mode,
+                num_workers=num_workers,
+                kafka_partition_round_robin=round_robin,
+            ),
             dict(num_partitions=num_partitions, rows_per_msg=rows_per_msg),
             n_batches=n_batches,
         )
@@ -2243,7 +2018,7 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
         ) as it:
             next(it)  # flowing before the rebalance
             with self.assertRaisesRegex(
-                RuntimeError, "coordinator exited unexpectedly"
+                RuntimeError, "reader 0 failed|coordinator exited unexpectedly"
             ):
                 while True:
                     next(it)
@@ -2307,107 +2082,14 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
             it._shutdown_workers()
 
 
-class HandleLifecycleTest(unittest.TestCase):
-    """SampleShuffleHandle lifecycle without real processes."""
-
-    def _handle(self):
-        ctx = mp.get_context("spawn")
-        h = kafka_dataset.SampleShuffleHandle.__new__(kafka_dataset.SampleShuffleHandle)
-        h.stop_event = ctx.Event()
-        h.fatal_event = ctx.Event()
-        h._proc = None
-        h._atexit_cleanup = None
-        return h
-
-    def test_stop_is_clean(self):
-        h = self._handle()
-        proc = mock.Mock()
-        proc.is_alive.return_value = False
-        proc.join.side_effect = lambda timeout: self.assertTrue(h.stop_event.is_set())
-        h._proc = proc
-        h.stop()
-        proc.join.assert_called_once_with(timeout=15.0)
-        proc.terminate.assert_not_called()
-        self.assertFalse(h.fatal_event.is_set())
-
-    def _prepared_dataset(self):
-        # the reader captures the module default at construction and hands it
-        # explicitly to the spawned coordinator
-        patcher = mock.patch.object(
-            kafka_dataset, "_default_consumer_factory", FakeKafkaConsumer
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        cfg = _data_config(num_workers=1)
-        ds = KafkaDataset(
-            data_config=cfg,
-            features=_features(),
-            input_path=_fake_uri(num_partitions=1),
-            mode=Mode.TRAIN,
-        )
-        self.addCleanup(ds.stop_loading)
-        return ds
-
-    def test_prepare_keeps_reader_and_delays_input_q(self):
-        ds = self._prepared_dataset()
-        reader_before = ds._reader
-        ds.prepare_for_loading(None)
-        # the reader object is kept and configured in place
-        self.assertIs(ds._reader, reader_before)
-        self.assertIsNotNone(reader_before._sample_queue)
-        handle = ds._sample_shuffle
-        # the reader -> coordinator queue is not created during prepare
-        self.assertIsNone(handle.input_q)
-        with mock.patch.object(
-            kafka_dataset, "resolve_start_offsets", side_effect=AssertionError
-        ):
-            ds.start_loading()
-            input_q = handle.input_q
-            proc = handle._proc
-            self.assertIsNotNone(input_q)
-            ds.start_loading()
-            self.assertIs(handle.input_q, input_q)
-            self.assertIs(handle._proc, proc)
-
-    def test_start_failure_cleans_input_q(self):
-        ds = self._prepared_dataset()
-        ds.prepare_for_loading(None)
-        handle = ds._sample_shuffle
-        with mock.patch.object(
-            handle._ctx, "Process", side_effect=RuntimeError("boom")
-        ):
-            with self.assertRaises(RuntimeError):
-                ds.start_loading()
-        self.assertIsNone(handle.input_q)
-        # stopping a never-started handle is a no-op
-        ds.stop_loading()
-
-    def test_stop_without_start_is_noop(self):
-        self._handle().stop()
-
-
 class ReaderConfigTest(unittest.TestCase):
-    """The reader entry's default factory builds a real consumer as-is."""
+    """The default factory builds a real consumer with the URI config as-is."""
 
     def test_real_consumer_gets_uri_config_verbatim(self):
-        ctx = mp.get_context("spawn")
-        stop = ctx.Event()
-        stop.set()  # never enter the consume loop
-        # confluent_kafka.Consumer raises KafkaException on unknown config
-        # keys at construction; nothing may be added beyond the URI config
-        kafka_dataset._reader_process_main(
-            input_path="kafka://localhost:9092/topic?group.id=g",
-            reader_id=0,
-            num_readers=1,
-            coordinator_pid=os.getpid(),
-            start_offsets={0: 0},
-            input_q=ctx.Queue(),
-            stop_event=stop,
-            reader_schema=pa.schema([pa.field("id", pa.int64())]),
-            full_schema=pa.schema([pa.field("id", pa.int64())]),
-            has_embedded_schema=False,
-            batch_size=8,
-        )
+        with mock.patch.object(kafka_dataset, "Consumer") as m_consumer:
+            config = _parse_kafka_uri(_fake_uri(num_partitions=1))[1]
+            kafka_dataset._default_consumer_factory(config, reader_id=0, num_readers=1)
+        m_consumer.assert_called_once_with(config)
 
 
 if __name__ == "__main__":

@@ -22,10 +22,18 @@ from parameterized import parameterized
 from pyarrow import csv
 from torch.utils.data import DataLoader
 
+from tzrec.constant import Mode
 from tzrec.datasets.csv_dataset import CsvDataset, CsvWriter
+from tzrec.datasets.dataset import create_dataloader
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
-from tzrec.utils.test_util import make_test_dir
+from tzrec.tests.utils import (
+    drain_sample,
+    raw_c_features,
+    sample_data_config,
+    stop_sample,
+)
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
 class CsvDatasetTest(unittest.TestCase):
@@ -269,6 +277,110 @@ class CsvWriterTest(unittest.TestCase):
         table = csv.read_csv(os.path.join(self.test_dir, "part-0.csv"))
         self.assertEqual(table.num_rows, 5)
         self.assertEqual(table.column("int_a").to_pylist(), [1, 2, 3, 4, 5])
+
+
+class CsvSampleShuffleTest(unittest.TestCase):
+    """Sample-level shuffle on the single-rank CSV path."""
+
+    def _write_csv(self, test_dir, num_rows, num_files=2):
+        rows_per_file = num_rows // num_files
+        for f in range(num_files):
+            path = os.path.join(test_dir, f"part-{f}.csv")
+            with open(path, "w") as fh:
+                fh.write("raw_c,label\n")
+                for i in range(f * rows_per_file, (f + 1) * rows_per_file):
+                    fh.write(f"{float(i)},{i % 2}\n")
+
+    @parameterized.expand(
+        [
+            ("rolling_workers", data_pb2.SAMPLE_ROLLING, 2),
+            ("window_workers", data_pb2.SAMPLE_WINDOW, 2),
+            ("rolling_no_workers", data_pb2.SAMPLE_ROLLING, 0),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sample_shuffle_epochs(self, _name, mode, num_workers):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._write_csv(test_dir, 100)
+            dataloader = create_dataloader(
+                sample_data_config(
+                    data_pb2.DatasetType.CsvDataset, mode, num_workers, with_header=True
+                ),
+                raw_c_features(),
+                f"{test_dir}/*.csv",
+                mode=Mode.TRAIN,
+            )
+            iterator = None
+            try:
+                for _ in range(2):
+                    iterator = dataloader.get_iterator()
+                    sizes, values, _ = drain_sample(iterator)
+                    self.assertEqual(sum(sizes), 100)
+                    self.assertEqual(sorted(sizes), [4] + [8] * 12)
+                    self.assertEqual(sorted(values), list(range(100)))
+            finally:
+                stop_sample(dataloader, iterator)
+
+    def test_sample_shuffle_uses_actual_worker_count(self):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._write_csv(test_dir, 100, num_files=1)
+            # 1 file caps the dataloader at one worker; the plan follows it
+            dataloader = create_dataloader(
+                sample_data_config(
+                    data_pb2.DatasetType.CsvDataset,
+                    data_pb2.SAMPLE_ROLLING,
+                    4,
+                    with_header=True,
+                ),
+                raw_c_features(),
+                f"{test_dir}/*.csv",
+                mode=Mode.TRAIN,
+            )
+            self.assertEqual(dataloader.num_workers, 1)
+            self.assertEqual(dataloader.dataset._sample_shuffle._num_consumers, 1)
+            iterator = None
+            try:
+                iterator = dataloader.get_iterator()
+                sizes, values, _ = drain_sample(iterator)
+                self.assertEqual(sum(sizes), 100)
+                self.assertEqual(sorted(values), list(range(100)))
+            finally:
+                stop_sample(dataloader, iterator)
+
+    def test_sample_shuffle_rejects_multi_rank(self):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._write_csv(test_dir, 20)
+            dataset = CsvDataset(
+                sample_data_config(
+                    data_pb2.DatasetType.CsvDataset,
+                    data_pb2.SAMPLE_ROLLING,
+                    1,
+                    with_header=True,
+                ),
+                raw_c_features(),
+                f"{test_dir}/*.csv",
+                mode=Mode.TRAIN,
+            )
+            with self.assertRaisesRegex(ValueError, "single rank"):
+                dataset._reader.create_read_plan(0, 2, 1)
+
+    def test_sample_shuffle_rejects_batch_cost_size(self):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._write_csv(test_dir, 20)
+            with self.assertRaisesRegex(ValueError, "batch_cost_size"):
+                create_dataloader(
+                    sample_data_config(
+                        data_pb2.DatasetType.CsvDataset,
+                        data_pb2.SAMPLE_ROLLING,
+                        1,
+                        with_header=True,
+                        sample_cost_field="raw_c",
+                        batch_cost_size=1024,
+                    ),
+                    raw_c_features(),
+                    f"{test_dir}/*.csv",
+                    mode=Mode.TRAIN,
+                )
 
 
 if __name__ == "__main__":

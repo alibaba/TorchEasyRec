@@ -173,17 +173,10 @@ class DatasetTest(unittest.TestCase):
         del utils.STATS_DICT
         utils.STATS_DICT = []
 
-    def test_sample_shuffle_rejected_for_non_kafka(self):
-        data_config = data_pb2.DataConfig(
-            batch_size=4,
-            dataset_type=data_pb2.DatasetType.CsvDataset,
-            label_fields=["label"],
-            shuffle=True,
-            shuffle_mode=data_pb2.ShuffleMode.SAMPLE_ROLLING,
-            shuffle_buffer_size=2,
-        )
-        with self.assertRaisesRegex(ValueError, "only supports KafkaDataset"):
-            create_dataloader(data_config, [], "", mode=Mode.TRAIN)
+    def test_sample_shuffle_requires_reader_support(self):
+        reader = _TestReader("", 4)
+        with self.assertRaisesRegex(NotImplementedError, "_TestReader"):
+            reader.create_read_plan(0, 1, 1)
 
     def test_sample_shuffle_requires_shuffle_true(self):
         data_config = data_pb2.DataConfig(
