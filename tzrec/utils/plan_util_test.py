@@ -71,7 +71,7 @@ class PlanUtilTest(unittest.TestCase):
             sharders=get_default_sharders(),
         )
 
-        dp_proposer = DynamicProgrammingProposer()
+        dp_proposer = DynamicProgrammingProposer(hbm_bins_per_device=100)
         dp_proposer.load(search_space)
         best_dp_perf = float("inf")
         best_dp_proposal = None
@@ -242,6 +242,28 @@ class PlanUtilTest(unittest.TestCase):
             _total(unpooled) - _total(shared),
             (sum(pooling_factors) - len(pooling_factors)) * 16 * 8 * 4,
         )
+
+    @parameterized.expand(
+        [("default", None, 800), ("override", "1600", 1600)],
+        name_func=parameterized_name_func,
+    )
+    def test_planner_hbm_bins_default_and_override(self, _, value, expected):
+        environ = dict(os.environ)
+        environ.pop("TZREC_DP_HBM_BINS_PER_DEVICE", None)
+        if value is not None:
+            environ["TZREC_DP_HBM_BINS_PER_DEVICE"] = value
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(plan_util, "get_local_size", return_value=1),
+            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
+            mock.patch.object(
+                plan_util,
+                "DynamicProgrammingProposer",
+                wraps=DynamicProgrammingProposer,
+            ) as proposer,
+        ):
+            create_planner(torch.device("cpu"), batch_size=8, model=nn.Module())
+        self.assertEqual(proposer.call_args.kwargs["hbm_bins_per_device"], expected)
 
     def _planner_with_saved_dp_plan(self, test_dir, constraint):
         """A planner over one table whose saved plan pinned it data_parallel.
@@ -644,6 +666,76 @@ def _dp_proposals(search_space, topology):
 
 class DynamicProgrammingProposerTest(unittest.TestCase):
     """2D DP across HBM × DDR picks per-table mode under joint budgets."""
+
+    @parameterized.expand(
+        [
+            ("single_host_nonbinding", 4, 100, 100, 1),
+            ("single_host_binding", 4, 100, 250, 100),
+            ("multiple_hosts_nonbinding", 2, 100, 100, 100),
+            ("zero_ddr", 4, 0, 0, 1),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_ddr_axis_collapses_only_when_single_host_nonbinding(
+        self, _, local_world_size, ddr_per_device, high_ddr, expected_bins
+    ):
+        topology = _make_topology(4, 1000, ddr_per_device, local_world_size)
+        opts = [
+            _FakeShardingOption(name, hbm=100, ddr=ddr, perf=perf)
+            for name in ["table_a", "table_b"]
+            for ddr, perf in [(0, 10.0), (high_ddr, 1.0)]
+        ]
+        proposer = DynamicProgrammingProposer()
+        proposer.load(opts)
+        with mock.patch.object(
+            plan_util, "_sparse_dp_proposor_numpy", wraps=_sparse_dp_proposor_numpy
+        ) as search:
+            proposer.feedback(True, storage_constraint=topology)
+        self.assertEqual(search.call_args.args[1:], (3200, expected_bins))
+        proposals = []
+        while (proposal := proposer.propose()) is not None:
+            self.assertLessEqual(
+                sum(o.total_storage.ddr for o in proposal), 4 * ddr_per_device
+            )
+            proposals.append(proposal)
+            proposer.feedback(True, storage_constraint=topology)
+        self.assertTrue(proposals)
+        expected_perf = 11.0 if high_ddr == 250 else 2.0
+        self.assertEqual(
+            min(sum(o.total_perf for o in p) for p in proposals), expected_perf
+        )
+
+    def test_ddr_bound_excludes_pruned_options(self):
+        opts = [
+            _FakeShardingOption(name, hbm=hbm, ddr=ddr, perf=perf)
+            for name in ["table_a", "table_b"]
+            for hbm, ddr, perf in [(100, 50, 10.0), (1001, 350, 1.0), (100, 401, 1.0)]
+        ]
+        proposer = DynamicProgrammingProposer()
+        proposer.load(opts)
+        topology = _make_topology(4, 1000, 100)
+        with mock.patch.object(
+            plan_util, "_sparse_dp_proposor_numpy", wraps=_sparse_dp_proposor_numpy
+        ) as search:
+            proposer.feedback(True, storage_constraint=topology)
+        self.assertEqual(search.call_args.args[2], 1)
+        proposal = proposer.propose()
+        self.assertIsNotNone(proposal)
+        self.assertEqual(sum(o.total_storage.ddr for o in proposal), 100)
+        self.assertEqual(sum(o.total_perf for o in proposal), 20.0)
+
+    def test_default_hbm_bins_preserve_feasible_lower_memory_prefix(self):
+        opts = [
+            _FakeShardingOption("table_a", hbm=100, ddr=0, perf=10.0),
+            _FakeShardingOption("table_a", hbm=109, ddr=0, perf=1.0),
+            _FakeShardingOption("table_b", hbm=895, ddr=0, perf=1.0),
+        ]
+        proposer = DynamicProgrammingProposer()
+        proposer.load(opts)
+        proposer.feedback(True, storage_constraint=_make_topology(1, 1000, 1000))
+        proposal = proposer.propose()
+        self.assertIsNotNone(proposal)
+        self.assertEqual(sum(o.total_storage.hbm for o in proposal), 995)
 
     def test_caching_preferred_when_ddr_is_generous(self):
         # Three options for one table:

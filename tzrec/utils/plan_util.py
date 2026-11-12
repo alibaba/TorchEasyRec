@@ -225,7 +225,7 @@ def create_planner(
         proposer=[
             DynamicProgrammingProposer(
                 hbm_bins_per_device=int(
-                    os.environ.get("TZREC_DP_HBM_BINS_PER_DEVICE", "100")
+                    os.environ.get("TZREC_DP_HBM_BINS_PER_DEVICE", "800")
                 ),
                 ddr_bins_per_device=int(
                     os.environ.get("TZREC_DP_DDR_BINS_PER_DEVICE", "25")
@@ -438,7 +438,7 @@ class DynamicProgrammingProposer(Proposer):
 
     def __init__(
         self,
-        hbm_bins_per_device: int = 100,
+        hbm_bins_per_device: int = 800,
         ddr_bins_per_device: int = 25,
     ) -> None:
         self._inited: bool = False
@@ -545,7 +545,9 @@ class DynamicProgrammingProposer(Proposer):
 
         # Per-table option arrays in bin-units, with infeasible options pruned.
         table_opts: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        max_total_ddr = 0
         for sharding_options in self._sharding_options_by_fqn.values():
+            max_table_ddr = 0
             hbm_list: List[float] = []
             ddr_list: List[float] = []
             perf_list: List[float] = []
@@ -562,6 +564,9 @@ class DynamicProgrammingProposer(Proposer):
                     continue
                 if ddr_total > 0 and max_shard_ddr > max_machine_ddr:
                     continue
+                max_table_ddr = max(
+                    max_table_ddr, sharding_option.total_storage.ddr or 0
+                )
                 hbm_list.append(
                     (sharding_option.total_storage.hbm or 0) / hbm_bin_size
                     if hbm_total > 0
@@ -574,6 +579,7 @@ class DynamicProgrammingProposer(Proposer):
                 )
                 perf_list.append(sharding_option.total_perf)
                 opt_id_list.append(opt_id)
+            max_total_ddr += max_table_ddr
             table_opts.append(
                 (
                     np.asarray(hbm_list, dtype=np.float32),
@@ -582,6 +588,14 @@ class DynamicProgrammingProposer(Proposer):
                     np.asarray(opt_id_list, dtype=np.int32),
                 )
             )
+
+        if per_host >= num_devices and max_total_ddr <= ddr_total:
+            # NOTE: All remaining combinations fit in the single host's DDR pool.
+            table_opts = [
+                (hbm, ddr / ddr_bins, perf, opt_ids)
+                for hbm, ddr, perf, opt_ids in table_opts
+            ]
+            ddr_bins = 1
 
         self._proposal_list = _sparse_dp_proposor_numpy(table_opts, hbm_bins, ddr_bins)
         if self._proposal_list:
