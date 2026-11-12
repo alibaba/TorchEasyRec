@@ -22,6 +22,10 @@ checkpoint: saves write RocksDB tables through ``DynamicEmbDump`` into the
 checkpoint's ``dynamicemb/`` files like every other dynamicemb table, and a
 restore always imports them into a fresh working DB.
 
+Startup leaves existing working directories untouched. Closing a runtime
+removes its own working directory; leftovers from abrupt termination require
+manual cleanup.
+
 Planning-time capacities come from ``resource_util``: homogeneous scalar
 budgets per rank, with the sharing scope set by ``shared_across_nodes``. This
 module keeps the shared backend reservation, charged whenever RocksDB is
@@ -29,7 +33,6 @@ configured, and the runtime lifecycle.
 """
 
 import dataclasses
-import glob
 import hashlib
 import os
 import shutil
@@ -216,12 +219,6 @@ class RocksDBRuntime:
         self._rank = int(os.environ.get("RANK", 0))
         run_id = hashlib.sha1(os.path.realpath(model_dir).encode()).hexdigest()[:12]
         self.rank_dir = os.path.join(config.root_dir, run_id, f"rank_{self._rank}")
-        if mode == "train":
-            # Only a complete checkpoint is ever resumed, so a working DB left
-            # by an earlier attempt of this rank is stale.
-            for stale in glob.glob(os.path.join(self.rank_dir, "train-*")):
-                logger.info(f"removing stale RocksDB working directory {stale}")
-                shutil.rmtree(stale, ignore_errors=True)
         self.session: Any = None
         self.groups: List[Any] = []
 

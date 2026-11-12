@@ -118,15 +118,28 @@ class RocksDBRuntimeTest(unittest.TestCase):
         self.assertIsNone(rt.session)
         self.assertFalse(os.path.exists(work))
 
-    def test_train_removes_stale_working_dbs(self):
+    def test_train_preserves_other_working_dbs(self):
+        from tzrec_ext.rocksdb import RocksDBSession
+
         rt = rocksdb_util.RocksDBRuntime(
             self.train_config.rocksdb_config, "model", "eval"
         )
-        stale = [os.path.join(rt.rank_dir, d) for d in ("train-1-2", "eval-1-2")]
-        for d in stale:
-            os.makedirs(d)
-        rocksdb_util.RocksDBRuntime(self.train_config.rocksdb_config, "model", "train")
-        self.assertEqual(os.listdir(rt.rank_dir), ["eval-1-2"])
+        existing = ["eval-1-2", "train-1-2"]
+        for name in existing:
+            os.makedirs(os.path.join(rt.rank_dir, name))
+        rt = rocksdb_util.RocksDBRuntime(
+            self.train_config.rocksdb_config, "model", "train"
+        )
+        try:
+            self.assertEqual(sorted(os.listdir(rt.rank_dir)), existing)
+            rt.session = RocksDBSession(_backend_config(), rt._new_work_dir())
+            self.assertTrue(rt.session.get_or_create_namespace_ids(["t"]))
+            work = rt.session.work_dir
+            self.assertTrue(os.path.isdir(work))
+        finally:
+            rt.close()
+        self.assertFalse(os.path.exists(work))
+        self.assertEqual(sorted(os.listdir(rt.rank_dir)), existing)
 
 
 class SharedStorageTest(unittest.TestCase):
