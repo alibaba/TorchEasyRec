@@ -363,13 +363,14 @@ class PromptAssembler(nn.Module):
 class MultiTargetLayout:
     """Training-only SID branches that share each row's packed prompt prefix.
 
-    Tokens keep the assembler's packed order. Every prefix and every target is
-    one attention segment; a target's keys are its row's prefix followed by its
-    own tokens, so causal attention aligned to the last key isolates targets.
+    Tokens keep the assembler's packed order. Every target is one attention
+    segment whose keys are its row's prefix followed by its own tokens, so
+    causal attention aligned to the last key isolates targets. A row's first
+    segment also holds its prefix queries, so only later targets copy keys.
 
     Args:
         position_ids: packed positions, restarting after the prefix per target.
-        cu_seqlens_q: int32 query boundaries of the prefix and target segments.
+        cu_seqlens_q: int32 query boundaries of the segments.
         cu_seqlens_k: int32 key boundaries of the same segments.
         key_indices: packed token behind every segment key.
         max_seqlen: upper bound of any segment's query or key length.
@@ -412,30 +413,32 @@ def build_multi_target_layout(
     row_lengths = torch.diff(cu_seqlens)
     prefix_lengths = row_lengths - response_lengths
     target_counts = response_lengths // num_levels
-    segment_counts = target_counts + 1
+    # the first target shares its row's prefix segment
+    segment_counts = target_counts.clamp(min=1)
     # one host read sizes every repeat below
-    num_targets, num_keys, max_seqlen = torch.stack(
+    num_targets, num_segments, num_keys, max_seqlen = torch.stack(
         (
             target_counts.sum(),
+            segment_counts.sum(),
             (prefix_lengths * segment_counts + response_lengths).sum(),
             row_lengths.max(),
         )
     ).tolist()
     row_ids = torch.arange(row_lengths.numel(), device=device)
 
-    num_segments = row_ids.numel() + num_targets
     segment_ids = torch.arange(num_segments, device=device)
     segment_rows = torch.repeat_interleave(
         row_ids, segment_counts, output_size=num_segments
     )
-    # 0 for a row's prefix, i for its i-th target
+    # i for a row's i-th target; segment 0 also holds the prefix
     segment_ranks = (
         segment_ids - (segment_counts.cumsum(0) - segment_counts)[segment_rows]
     )
-    is_target = segment_ranks > 0
     segment_prefix_lengths = prefix_lengths[segment_rows]
-    query_lengths = torch.where(is_target, num_levels, segment_prefix_lengths)
-    key_lengths = segment_prefix_lengths + num_levels * is_target
+    key_lengths = segment_prefix_lengths + num_levels * (
+        target_counts[segment_rows] > 0
+    )
+    query_lengths = torch.where(segment_ranks > 0, num_levels, key_lengths)
     cu_seqlens_q = nn.functional.pad(query_lengths.cumsum(0), (1, 0))
     cu_seqlens_k = nn.functional.pad(key_lengths.cumsum(0), (1, 0))
 
@@ -447,9 +450,14 @@ def build_multi_target_layout(
         torch.arange(num_tokens, device=device)
         - (cu_seqlens_q[:-1] + query_lengths - key_lengths)[token_segments]
     )
-    token_targets = torch.where(is_target, segment_ids - segment_rows - 1, -1)[
-        token_segments
-    ]
+    segment_targets = (target_counts.cumsum(0) - target_counts)[
+        segment_rows
+    ] + segment_ranks
+    token_targets = torch.where(
+        position_ids < segment_prefix_lengths[token_segments],
+        -1,
+        segment_targets[token_segments],
+    )
 
     key_segments = torch.repeat_interleave(
         segment_ids, key_lengths, output_size=num_keys
@@ -461,16 +469,21 @@ def build_multi_target_layout(
         cu_seqlens[key_rows]
         + key_offsets
         + (key_offsets >= prefix_lengths[key_rows])
-        * (segment_ranks[key_segments] - 1)
+        * segment_ranks[key_segments]
         * num_levels
     )
 
     target_rows = torch.repeat_interleave(
         row_ids, target_counts, output_size=num_targets
     )
-    target_segments = torch.arange(num_targets, device=device) + target_rows + 1
-    label_indices = cu_seqlens_q[target_segments, None] + torch.arange(
-        num_levels, device=device
+    # rows without targets still own a prefix segment
+    target_segments = (
+        torch.arange(num_targets, device=device)
+        + (target_counts == 0).cumsum(0)[target_rows]
+    )
+    # a target's tokens close its segment
+    label_indices = cu_seqlens_q[target_segments + 1, None] - torch.arange(
+        num_levels, 0, -1, device=device
     )
     score_indices = label_indices - 1
     score_indices[:, 0] = cu_seqlens[target_rows] + prefix_lengths[target_rows] - 1

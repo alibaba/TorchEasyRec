@@ -435,13 +435,12 @@ class MultiTargetLayoutTest(unittest.TestCase):
             layout.score_indices.tolist(), [[1, 2, 3], [1, 5, 6], [11, 12, 13]]
         )
         self.assertEqual(layout.target_weights.tolist(), [0.5, 0.5, 1.0])
-        self.assertEqual(layout.cu_seqlens_q.tolist(), [0, 2, 5, 8, 12, 15, 18])
-        self.assertEqual(layout.cu_seqlens_k.tolist(), [0, 2, 7, 12, 16, 23, 26])
+        # a row's first target shares its prefix segment; later ones copy keys
+        self.assertEqual(layout.cu_seqlens_q.tolist(), [0, 5, 8, 15, 18])
+        self.assertEqual(layout.cu_seqlens_k.tolist(), [0, 5, 10, 17, 20])
         self.assertEqual(
             layout.key_indices.tolist(),
-            [0, 1, 0, 1, 2, 3, 4, 0, 1, 5, 6, 7]
-            + [8, 9, 10, 11, 8, 9, 10, 11, 12, 13, 14]
-            + [15, 16, 17],
+            [0, 1, 2, 3, 4, 0, 1, 5, 6, 7] + list(range(8, 15)) + [15, 16, 17],
         )
         # the FA2 segments, causal from the last key, must give exactly this:
         # same row, causal, and the key is prompt or in the query's target
