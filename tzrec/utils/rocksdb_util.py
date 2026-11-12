@@ -197,7 +197,7 @@ def rocksdb_modules(model: nn.Module) -> List[Any]:
 
 
 class RocksDBRuntime:
-    """RocksDB state of one train/eval/export/predict process on this rank.
+    """RocksDB state for train, eval, export or predict_checkpoint on this rank.
 
     Owns the working DB session, opened once the sharding plan is known
     (:meth:`bind`), and the fused RocksDB groups of the built model
@@ -208,7 +208,7 @@ class RocksDBRuntime:
     Args:
         config (RocksDBConfig): the job's RocksDB config.
         model_dir (str): the job's model_dir; it names the run's directory.
-        mode (str): "train", "eval", "export" or "predict".
+        mode (str): "train", "eval", "export" or "predict_checkpoint".
     """
 
     def __init__(
@@ -223,6 +223,7 @@ class RocksDBRuntime:
         self.groups: List[Any] = []
 
     def _new_work_dir(self) -> str:
+        """Build a working DB path without creating the directory."""
         return os.path.join(
             self.rank_dir, f"{self.mode}-{int(time.time() * 1000)}-{os.getpid()}"
         )

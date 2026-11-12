@@ -718,9 +718,8 @@ def _train_and_evaluate(
                     if delta_embedding_dumper is not None:
                         dump_decision = delta_embedding_dumper.maybe_dump(i_step)
                 except StopIteration:
-                    # The call that ran out of data may still have trained
-                    # the last queued batch; run maintenance with nothing
-                    # in flight before the pass's saves.
+                    # Input exhaustion is reported after the pipeline drains.
+                    # Run maintenance before the pass-end saves.
                     runtime.maintain(global_step=i_step)
                     # pass completed: later saves should record positions
                     # within the next pass, on top of the completed-pass count.
