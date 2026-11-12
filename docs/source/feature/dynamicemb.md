@@ -44,8 +44,6 @@ feature_configs {
   - `1`：满显存值预算
   - `(0, 1)` 之间的值：非缓存候选保留请求比例。
 
-自动搜索时，令 `floor = required_cache_rows / shard_rows`，HYBRID 的部分显存比例从 `min(floor, 0.1)` 开始，CACHING 从 `max(floor, 0.1)` 开始。HYBRID 的 Host 分区可以直接承接访问，工作集下限不作为其 HBM 分区硬限制；CACHING 必须覆盖该下限，需要整个分片时使用全 HBM 方案。
-
 - **score_strategy**: Id驱逐策略，默认为 STEP，目前支持 TIMESTAMP | STEP | LFU | NO_EVICTION
 
   - TIMESTAMP: 每个Id根据最近更新的时间戳，驱逐时间戳最小的Id
