@@ -859,7 +859,12 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
     """End-to-end exercise of the dynamicemb planner integration."""
 
     def _enumerate(
-        self, with_plain_table=False, rows=4096, factor=None, optimizer=None
+        self,
+        with_plain_table=False,
+        rows=4096,
+        factor=None,
+        optimizer=None,
+        world_size=2,
     ):
         from tzrec.utils.plan_util import get_default_sharders as dynamicemb_sharders
 
@@ -869,7 +874,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             name="table_de",
             feature_names=["feat_de"],
         )
-        with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": str(world_size)}):
             constraint = build_dynamicemb_constraints(
                 feature_pb2.DynamicEmbedding(max_capacity=rows), table
             )
@@ -889,7 +894,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             model.sparse.ebc.embedding_bags["table_de"].weight._optimizer_classes = [
                 optimizer
             ]
-        topology = Topology(world_size=2, compute_device="cuda")
+        topology = Topology(world_size=world_size, compute_device="cuda")
         enumerator = EmbeddingEnumerator(
             topology=topology,
             batch_size=128,
@@ -897,11 +902,14 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         )
         return enumerator.enumerate(model, dynamicemb_sharders()), topology
 
-    def test_normalized_shards_and_converted_budgets(self):
+    @parameterized.expand([(2,), (4,)], name_func=parameterized_name_func)
+    def test_normalized_shards_and_converted_budgets(self, world_size):
         from torchrec.distributed.planner import planners
 
-        options, topology = self._enumerate(rows=8001, factor=3.2)
-        # Both partial modes start at the 2048-row working set per 4096-row shard.
+        options, topology = self._enumerate(
+            rows=world_size * 4000 + 1, factor=3.2, world_size=world_size
+        )
+        # Local batch 128 requires 2048 rows, without another rank division.
         self.assertEqual(
             min(
                 o.cache_params.load_factor
@@ -912,7 +920,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         )
         noncache = [o for o in options if not o.dynamicemb_options.caching]
         for opt, requested in ((noncache[0], 0), (noncache[1], 0.5), (noncache[-1], 1)):
-            self.assertEqual(opt.tensor.shape[0], 8192)
+            self.assertEqual(opt.tensor.shape[0], world_size * 4096)
             for rank, shard in enumerate(opt.shards):
                 self.assertEqual(shard.size[0], 4096)
                 if requested == 1:
@@ -1109,6 +1117,7 @@ class DynamicEmbPlannerTest(unittest.TestCase):
             ("half", 3.2, [0.5, 0.6, 0.7, 0.8, 0.9], 2),
             ("above_half", 4.8, [0.75, 0.8, 0.9], 1),
             ("full", 6.4, [], 0),
+            ("overfull", 12.8, [], 0),
         ],
         name_func=parameterized_name_func,
     )

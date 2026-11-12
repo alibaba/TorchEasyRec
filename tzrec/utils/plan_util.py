@@ -1085,6 +1085,7 @@ def _emit_dynamicemb_variants(
             * unique_id_factor
             * base_option.batch_size
         )
+        required = min(rows, required)
         builtin_floor = rocksdb_floor = max(required, 1) / rows
 
     params = base_option.cache_params
