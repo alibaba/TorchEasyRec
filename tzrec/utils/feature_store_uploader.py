@@ -745,6 +745,10 @@ class FeatureStoreDeltaUploader:
         rank then barriers so non-primary ranks open the already-published view
         without control-plane races. A rank-zero startup failure still joins the
         barrier before re-raising so every rank issues the same collective order.
+        The worker thread is started before ``_started``/``_worker`` are
+        committed, so a failed thread start leaves no advertised worker and
+        releases the opened SDK handle instead of leaking it with nobody to
+        drain the queue.
         """
         with self._condition:
             if self._started:
@@ -775,13 +779,20 @@ class FeatureStoreDeltaUploader:
             except BaseException:
                 self._close_writer(suppress_errors=True)
                 raise
-            self._started = True
-            self._worker = threading.Thread(
+            # Committed under the condition lock so close()/submit() cannot
+            # observe a half-started uploader.
+            worker = threading.Thread(
                 target=self._run,
                 name="tzrec-feature-store-delta-uploader",
                 daemon=True,
             )
-            self._worker.start()
+            try:
+                worker.start()
+            except BaseException:
+                self._close_writer(suppress_errors=True)
+                raise
+            self._worker = worker
+            self._started = True
         logger.info(
             "FeatureStore delta uploader started: project=%s feature_view=%s "
             "version=%s rank=%s",

@@ -209,6 +209,14 @@ export NCCL_P2P_LEVEL=PHB
 export STORAGE_RESERVE_PERCENT=0.5
 ```
 
+主机内存（DDR）的规划预算由 `HOST_MEMORY_RESERVE_PERCENT` 控制，默认值为 `0`，不额外扣除预留比例。`STORAGE_RESERVE_PERCENT` 控制的是 HBM 侧预留，不能调整 DDR 预算。
+
+未设置此变量且没有容器内存限制时，DDR 预算保持原来的物理内存均分行为。需要为数据读取、特征处理和 pinned memory 等开销预留规划余量时，可显式配置，例如预留 15%：
+
+```bash
+export HOST_MEMORY_RESERVE_PERCENT=0.15
+```
+
 (embedding-sharding-constraints)=
 
 ### Embedding分片约束
@@ -271,7 +279,5 @@ python -m tzrec.tools.add_pooling_factor_to_config \
     --output_path pipeline_measured.config \
     --num_batches 100
 ```
-
-- 表的划分从配置的`feature_groups`解析（与模型构建一致，含ZCH表），不构建模型；遵循标准`feature_groups`语义的自定义模型无需导入模型类即可使用。ZCH表的去重计数基于原始Id，不代表碰撞后的行工作集
 
 注: 数据分布变化后请重新测量；测量值不保证覆盖未来的数据

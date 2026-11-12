@@ -301,7 +301,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         return self._input_fields
 
     def get_worker_info(self) -> Tuple[int, int, int]:
-        """Get global dataloader worker id, worker number and world size."""
+        """Get worker id, worker count and world size within the reader scope."""
         worker_info = get_worker_info()
         if worker_info is None:
             worker_id = 0
@@ -310,7 +310,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
 
-        if dist.is_initialized():
+        # NOTE: Export warm-up is local even while the training group is live.
+        if dist.is_initialized() and int(os.environ.get("WORLD_SIZE", 1)) > 1:
             rank = dist.get_rank()
             world_size = dist.get_world_size()
         else:
