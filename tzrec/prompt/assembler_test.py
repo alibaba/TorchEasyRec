@@ -416,6 +416,7 @@ class MultiTargetLayoutTest(unittest.TestCase):
             torch.tensor([0, 8, 15, 18], dtype=torch.int32),
             torch.tensor([6, 3, 0]),
             num_levels=3,
+            num_tokens=18,
         )
         self.assertEqual(
             layout.position_ids.tolist(),

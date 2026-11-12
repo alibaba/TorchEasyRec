@@ -209,6 +209,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
             infos[CU_SEQLENS],
             infos[RESPONSE_LENGTHS],
             self._prompt.sid_space.num_levels,
+            embeds.shape[0],
         )
         if self._attn_kernel == "flash_attention_2":
             attention, attention_mask = _SHARED_PREFIX_ATTENTION, None

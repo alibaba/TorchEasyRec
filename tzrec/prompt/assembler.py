@@ -391,7 +391,10 @@ class MultiTargetLayout:
 
 
 def build_multi_target_layout(
-    cu_seqlens: torch.Tensor, response_lengths: torch.Tensor, num_levels: int
+    cu_seqlens: torch.Tensor,
+    response_lengths: torch.Tensor,
+    num_levels: int,
+    num_tokens: int,
 ) -> MultiTargetLayout:
     """Split each packed row into its shared prefix and independent SID targets.
 
@@ -399,6 +402,7 @@ def build_multi_target_layout(
         cu_seqlens: packed row boundaries from the assembler.
         response_lengths: supervised SID token count of each row.
         num_levels: codebook levels per target SID.
+        num_tokens: packed token count, equal to ``cu_seqlens[-1]``.
 
     Returns:
         Positions, attention segments and scoring indices over packed tokens.
@@ -410,32 +414,14 @@ def build_multi_target_layout(
     target_counts = response_lengths // num_levels
     segment_counts = target_counts + 1
     # one host read sizes every repeat below
-    num_tokens, num_targets, num_keys, max_seqlen = torch.stack(
+    num_targets, num_keys, max_seqlen = torch.stack(
         (
-            cu_seqlens[-1],
             target_counts.sum(),
             (prefix_lengths * segment_counts + response_lengths).sum(),
             row_lengths.max(),
         )
     ).tolist()
     row_ids = torch.arange(row_lengths.numel(), device=device)
-
-    token_rows = torch.repeat_interleave(row_ids, row_lengths, output_size=num_tokens)
-    token_offsets = torch.arange(num_tokens, device=device) - cu_seqlens[token_rows]
-    token_prefix_lengths = prefix_lengths[token_rows]
-    response_offsets = token_offsets - token_prefix_lengths
-    in_prefix = response_offsets < 0
-    position_ids = torch.where(
-        in_prefix,
-        token_offsets,
-        token_prefix_lengths + response_offsets.remainder(num_levels),
-    )
-    token_targets = torch.where(
-        in_prefix,
-        -1,
-        (target_counts.cumsum(0) - target_counts)[token_rows]
-        + response_offsets.div(num_levels, rounding_mode="floor"),
-    )
 
     num_segments = row_ids.numel() + num_targets
     segment_ids = torch.arange(num_segments, device=device)
@@ -446,11 +432,25 @@ def build_multi_target_layout(
     segment_ranks = (
         segment_ids - (segment_counts.cumsum(0) - segment_counts)[segment_rows]
     )
+    is_target = segment_ranks > 0
     segment_prefix_lengths = prefix_lengths[segment_rows]
-    query_lengths = torch.where(segment_ranks > 0, num_levels, segment_prefix_lengths)
-    key_lengths = segment_prefix_lengths + num_levels * (segment_ranks > 0)
+    query_lengths = torch.where(is_target, num_levels, segment_prefix_lengths)
+    key_lengths = segment_prefix_lengths + num_levels * is_target
     cu_seqlens_q = nn.functional.pad(query_lengths.cumsum(0), (1, 0))
     cu_seqlens_k = nn.functional.pad(key_lengths.cumsum(0), (1, 0))
+
+    token_segments = torch.repeat_interleave(
+        segment_ids, query_lengths, output_size=num_tokens
+    )
+    # a query's position counts the keys before it in its segment
+    position_ids = (
+        torch.arange(num_tokens, device=device)
+        - (cu_seqlens_q[:-1] + query_lengths - key_lengths)[token_segments]
+    )
+    token_targets = torch.where(is_target, segment_ids - segment_rows - 1, -1)[
+        token_segments
+    ]
+
     key_segments = torch.repeat_interleave(
         segment_ids, key_lengths, output_size=num_keys
     )
