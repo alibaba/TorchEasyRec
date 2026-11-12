@@ -22,11 +22,12 @@ from parameterized import param, parameterized
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import get_default_sharders
+from torchrec.distributed.planner.estimator.types import HardwarePerfConfig
 from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
 from torchrec.distributed.planner.proposers import GridSearchProposer
-from torchrec.distributed.planner.types import PlannerError, Topology
+from torchrec.distributed.planner.types import PlannerError, SharderData, Topology
 from torchrec.distributed.test_utils.test_model import TestSparseNN
-from torchrec.distributed.types import CacheParams, ShardingType
+from torchrec.distributed.types import CacheParams, ShardingType, StorageUsageType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 from tzrec.protos import feature_pb2
@@ -823,7 +824,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         from torchrec.distributed.planner import planners
 
         options, topology = self._enumerate(rows=8001, factor=3.2)
-        # 2048 distinct rows per shard: the first cache must cover half of 4096.
+        # Both partial modes start at the 2048-row working set per 4096-row shard.
         self.assertEqual(
             min(
                 o.cache_params.load_factor
@@ -833,7 +834,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             0.5,
         )
         noncache = [o for o in options if not o.dynamicemb_options.caching]
-        for opt, requested in ((noncache[0], 0), (noncache[1], 0.1), (noncache[-1], 1)):
+        for opt, requested in ((noncache[0], 0), (noncache[1], 0.5), (noncache[-1], 1)):
             self.assertEqual(opt.tensor.shape[0], 8192)
             for rank, shard in enumerate(opt.shards):
                 self.assertEqual(shard.size[0], 4096)
@@ -1003,30 +1004,51 @@ class DynamicEmbPlannerTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("unmeasured", None, 0.1, 0.1, 3),
-            ("measured_zero", 0, 0.1, 0.1, 3),
-            ("small_working_set", 0.1, 64 / 4096, 0.1, 3),
-            ("half", 3.2, 0.1, 0.5, 2),
-            ("above_half", 4.8, 0.1, 0.75, 1),
-            ("full", 6.4, 0.1, None, 0),
+            ("unmeasured", None, [*np.geomspace(0.1, 0.5, 5), 0.6, 0.7, 0.8, 0.9], 3),
+            (
+                "measured_zero",
+                0,
+                [1 / 4096, *np.geomspace(1 / 4096, 0.5, 5)[2:], 0.6, 0.7, 0.8, 0.9],
+                3,
+            ),
+            (
+                "below_one_percent",
+                0.001,
+                [1 / 4096, *np.geomspace(1 / 4096, 0.5, 5)[2:], 0.6, 0.7, 0.8, 0.9],
+                3,
+            ),
+            (
+                "small_working_set",
+                0.1,
+                [*np.geomspace(64 / 4096, 0.5, 5), 0.6, 0.7, 0.8, 0.9],
+                3,
+            ),
+            (
+                "above_default",
+                1.92,
+                [*np.geomspace(1229 / 4096, 0.5, 5), 0.6, 0.7, 0.8, 0.9],
+                2,
+            ),
+            ("half", 3.2, [0.5, 0.6, 0.7, 0.8, 0.9], 2),
+            ("above_half", 4.8, [0.75, 0.8, 0.9], 1),
+            ("full", 6.4, [], 0),
         ],
         name_func=parameterized_name_func,
     )
-    def test_auto_grid(self, _, factor, hybrid_floor, cache_floor, ncache):
+    def test_auto_grid(self, _, factor, partial_ratios, ncache):
         opts = self._options(factor)
         noncache = [o for o in opts if not o.dynamicemb_options.caching]
         cache = [o for o in opts if o.dynamicemb_options.caching]
         full_bytes = 4096 * 4
-        grid = [0, *np.geomspace(hybrid_floor, 0.5, 5), 0.6, 0.7, 0.8, 0.9, 1]
         self.assertEqual(
             [o.dynamicemb_storage.local_hbm_for_values for o in noncache],
-            [int(r * full_bytes) for r in grid],
+            [int(r * full_bytes) for r in [0, *partial_ratios, 1]],
         )
         self.assertEqual(len(cache), ncache)
         if cache:
             self.assertEqual(
                 cache[0].dynamicemb_storage.local_hbm_for_values,
-                int(cache_floor * full_bytes),
+                int(partial_ratios[0] * full_bytes),
             )
 
     @parameterized.expand(
@@ -1137,17 +1159,20 @@ class DynamicEmbPlannerTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("zero", 0, False, 4096, False, 0),
-            ("full", 1, False, 4096, False, 1),
-            ("hybrid", 0.1, False, 4096, False, 0.11 + 0.01 * 1024 / (1024 + 3696)),
-            ("cache", 0.1, True, 4096, False, 0.28 + 0.01 * 0.25),
-            ("measured_cache", 0.1, True, 4096, True, 0.6),
+            ("zero", 0, False, None, 0),
+            ("full", 1, False, None, 1),
+            ("hybrid", 0.1, False, None, 0.11 + 0.01 * 1024 / (1024 + 3696)),
+            ("cache", 0.1, True, None, 0.28 + 0.01 * 0.25),
+            ("measured_cache", 0.1, True, 2.4, 0.6),
+            ("miss_rate_above_one", 0.1, True, -1.0, 0),
+            ("miss_rate_below_zero", 0.1, True, 8.0, 1),
         ],
         name_func=parameterized_name_func,
     )
-    def test_performance_uses_allocated_share_only(
-        self, _, ratio, caching, rows, measured, expected
+    def test_performance_bandwidth_preserves_allocated_share(
+        self, _, ratio, caching, stats_scale, expected_weight
     ):
+        rows = 4096
         opt = next(
             o
             for o in self._options(ratio=ratio, rows=rows)
@@ -1155,22 +1180,44 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         )
         original = opt.cache_params
         allocated = opt.cache_load_factor
-        if measured:
+        if stats_scale is not None:
             original.stats = mock.Mock()
-            original.stats.expected_miss_rate.return_value = 0.4
-        with mock.patch.object(
-            dynamicemb_util,
-            "_orig_build_shard_perf_contexts",
-            side_effect=lambda *args: opt.cache_params.load_factor,
-        ):
-            hit_rate = dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
-                None, [[rows, 1]], opt, None, None, None
+            original.stats.expected_miss_rate.side_effect = lambda share: (
+                1 - stats_scale * share
             )
-        if measured:
-            original.stats.expected_miss_rate.assert_called_once_with(0.25)
-        self.assertAlmostEqual(hit_rate, expected)
+        topology = Topology(
+            world_size=1, compute_device="cuda", hbm_mem_bw=1000, hbm_to_ddr_mem_bw=20
+        )
+        config = HardwarePerfConfig()
+        fused_key = ("cuda", EmbeddingComputeKernel.FUSED.value)
+        config.kernel_device_bandwidths = {fused_key: 37.0}
+        sharder_data = SharderData(
+            fused_params={},
+            qcomm_dtype_sizes={},
+            storage_usage_type=StorageUsageType.DEFAULT,
+        )
+        contexts = dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
+            config, [[rows, 1]], opt, topology, {}, sharder_data
+        )
+        self.assertEqual(len(contexts), 1)
+        self.assertAlmostEqual(contexts[0].device_bw, 2 + 98 * expected_weight)
+        self.assertEqual(contexts[0].caching_ratio, allocated)
+        self.assertEqual(contexts[0].hbm_to_ddr_mem_bw, 20)
+        self.assertEqual(
+            dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
+                config, [], opt, topology, {}, sharder_data
+            ),
+            [],
+        )
         self.assertIs(opt.cache_params, original)
         self.assertEqual(opt.cache_load_factor, allocated)
+        self.assertEqual(config.kernel_device_bandwidths, {fused_key: 37.0})
+        opt.dynamicemb_options = None
+        opt.compute_kernel = EmbeddingComputeKernel.FUSED.value
+        contexts = dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
+            config, [[rows, 1]], opt, topology, {}, sharder_data
+        )
+        self.assertEqual(contexts[0].device_bw, 37.0)
 
 
 if __name__ == "__main__":
