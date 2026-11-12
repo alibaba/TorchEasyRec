@@ -17,6 +17,7 @@ import sys
 import unittest
 from collections import OrderedDict
 from typing import Dict
+from unittest import mock
 from unittest.mock import patch
 
 import torch
@@ -554,6 +555,40 @@ class EmbeddingGroupTest(unittest.TestCase):
         initializer_args = const.dynamicemb_options.initializer_args
         self.assertEqual(str(initializer_args.mode), "DynamicEmbInitializerMode.NORMAL")
         self.assertAlmostEqual(initializer_args.std_dev, 1.0 / (4**0.5), places=6)
+
+    @parameterized.expand(
+        [("pooled", False), ("sequence", True)],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipUnless(dynamicemb_util.has_dynamicemb, "dynamicemb is not installed.")
+    @mark_ci_scope("gpu")
+    def test_dynamicemb_capacity_is_normalized_before_tensor_creation(
+        self, _name, sequence
+    ) -> None:
+        cfg = feature_pb2.IdFeature(
+            feature_name="cat_a",
+            embedding_name="aligned",
+            embedding_dim=4,
+            num_buckets=100,
+        )
+        cfg.dynamicemb.max_capacity = 100003
+        features = create_features([feature_pb2.FeatureConfig(id_feature=cfg)])
+        group_cfg = model_pb2.FeatureGroupConfig(
+            group_name="group",
+            feature_names=["cat_a"],
+            group_type=(
+                model_pb2.FeatureGroupType.SEQUENCE
+                if sequence
+                else model_pb2.FeatureGroupType.DEEP
+            ),
+        )
+        factory = SequenceEmbeddingGroupImpl if sequence else EmbeddingGroupImpl
+        with mock.patch.dict("os.environ", {"WORLD_SIZE": "4"}):
+            group = factory(features, [group_cfg], device=torch.device("meta"))
+        collection = group.ec_dict["4"] if sequence else group.ebc
+        self.assertEqual(next(collection.parameters()).shape, (100352, 4))
+        constraint = next(iter(group.parameter_constraints().values()))
+        self.assertEqual(constraint.dynamicemb_options.max_capacity, 25088)
 
     def test_build_embedding_bag_configs_wide_resizes_and_renames(self) -> None:
         features = _create_test_features()

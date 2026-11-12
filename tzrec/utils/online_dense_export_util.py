@@ -380,18 +380,32 @@ class OnlineDenseExportManager:
                 daemon=True,
             )
             self._worker.start()
-            self._finalizer = weakref.finalize(
-                self,
-                type(self)._drain_worker,
-                self._worker,
-                self._cond,
-                self._drain_event,
-                self._close_timeout,
-            )
-            logger.info(
-                "ONLINE_DENSE_EXPORT enabled; dense versions will be exported under %s",
-                self._export_root,
-            )
+            try:
+                self._finalizer = weakref.finalize(
+                    self,
+                    type(self)._drain_worker,
+                    self._worker,
+                    self._cond,
+                    self._drain_event,
+                    self._close_timeout,
+                )
+                logger.info(
+                    "ONLINE_DENSE_EXPORT enabled; dense versions will be "
+                    "exported under %s",
+                    self._export_root,
+                )
+            except BaseException:
+                # The worker is already live and no caller-side guard can clean
+                # up a constructor that fails after starting it: drain it here
+                # or it leaks as an unattended publisher.
+                try:
+                    self.close()
+                except Exception:
+                    logger.exception(
+                        "Failed to drain the online dense export worker "
+                        "after a startup error"
+                    )
+                raise
 
     @property
     def enabled(self) -> bool:
@@ -405,11 +419,10 @@ class OnlineDenseExportManager:
         the export-side model has user-side twin modules the training process
         never builds, and INPUT_TILE is read at model construction and
         batch-parse time. WORLD_SIZE gives the warm-up dataloader the same
-        single-rank view the full export runs under: the Parquet and ODPS
-        readers run startup collectives (file-metadata all-gather, scan
-        session broadcast) on the default process group when WORLD_SIZE > 1,
-        and this rank-zero-only build has no peer to join, which would
-        deadlock the collective. The training model and its dataloader
+        single-rank view the full export runs under. Dataset readers exchange
+        file, partition, or session metadata on the Gloo group when
+        WORLD_SIZE > 1. This rank-zero-only build must skip those collectives
+        because no other rank participates. The training model and its dataloader
         workers are already constructed by the time this runs, so the window
         cannot affect them.
 

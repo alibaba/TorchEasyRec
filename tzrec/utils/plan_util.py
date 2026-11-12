@@ -11,13 +11,13 @@
 
 import copy
 import json
+import math
 import os
 from collections import OrderedDict
 from queue import Queue
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
-import psutil
 import torch
 from torch import distributed as dist
 from torch import nn
@@ -85,8 +85,8 @@ from torchrec.modules.embedding_modules import (
 )
 
 from tzrec.protos import feature_pb2
-from tzrec.utils import env_util
-from tzrec.utils.dynamicemb_util import has_dynamicemb
+from tzrec.utils import env_util, resource_util
+from tzrec.utils.dynamicemb_util import DynamicEmbTableStorage, has_dynamicemb
 from tzrec.utils.logging_util import logger
 
 
@@ -97,7 +97,13 @@ def create_planner(
     global_constraints_cfg: Optional[feature_pb2.ParameterConstraints] = None,
     model: Optional[nn.Module] = None,
 ) -> EmbeddingShardingPlanner:
-    """Create EmbeddingShardingPlanner."""
+    """Create an embedding sharding planner.
+
+    Builds the hardware topology and storage reservation, resolves
+    per-table and global constraints, applies applicable sharding
+    constraints from a saved checkpoint plan, and configures the
+    enumerator and proposers.
+    """
     if global_constraints_cfg is not None and (
         global_constraints_cfg.HasField("pooling_factor")
         or global_constraints_cfg.HasField("unique_id_factor")
@@ -115,8 +121,11 @@ def create_planner(
     if torch.cuda.is_available():
         topo_kwargs["hbm_cap"] = torch.cuda.get_device_properties(device).total_memory
 
-    ddr_cap_per_rank = int(float(psutil.virtual_memory().total) / local_world_size)
-    topo_kwargs["ddr_cap"] = ddr_cap_per_rank
+    host_reserve_percent = float(os.environ.get("HOST_MEMORY_RESERVE_PERCENT", 0.0))
+    topo_kwargs["ddr_cap"] = resource_util.host_memory_capacity_per_rank(
+        local_world_size=local_world_size,
+        reserve_percent=host_reserve_percent,
+    )
     if "INTRA_NODE_BANDWIDTH" in os.environ:
         topo_kwargs["intra_host_bw"] = float(os.environ["INTRA_NODE_BANDWIDTH"])
     if "CROSS_NODE_BANDWIDTH" in os.environ:
@@ -625,7 +634,6 @@ def _extract_constraints_for_param(
         if hasattr(constraints[name], "dynamicemb_options"):
             # pyre-ignore [16]
             dynamicemb_options = constraints[name].dynamicemb_options
-
     return (
         input_lengths,
         col_wise_shard_dim,
@@ -762,6 +770,8 @@ class EmbeddingStorageEstimator(ShardEstimator):
             dynamicemb_options = None
             if use_dynamicemb:
                 dynamicemb_options = sharding_option.dynamicemb_options
+            elif not caching_ratio:
+                caching_ratio = UVM_CACHING_RATIO
 
             shard_storages = calculate_shard_storages(
                 sharder_data=sharder_data,
@@ -775,7 +785,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 local_world_size=self._topology.local_world_size,
                 input_lengths=sharding_option.input_lengths,
                 num_poolings=num_poolings,
-                caching_ratio=caching_ratio if caching_ratio else UVM_CACHING_RATIO,
+                caching_ratio=caching_ratio,
                 is_pooled=sharding_option.is_pooled,
                 input_data_type_size=input_data_type_size,
                 output_data_type_size=output_data_type_size,
@@ -787,6 +797,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 kv_cache_load_factor=kv_cache_load_factor,
                 use_virtual_table=use_virtual_table,
                 dynamicemb_options=dynamicemb_options,
+                dynamicemb_storage=getattr(sharding_option, "dynamicemb_storage", None),
             )
             for shard, storage in zip(sharding_option.shards, shard_storages):
                 shard.storage = storage
@@ -816,6 +827,7 @@ def calculate_shard_storages(
     kv_cache_load_factor: float = KV_CACHING_RATIO,
     use_virtual_table: bool = False,
     dynamicemb_options=None,
+    dynamicemb_storage: Optional[DynamicEmbTableStorage] = None,
 ) -> List[Storage]:
     """Calculates estimated storage sizes.
 
@@ -849,13 +861,17 @@ def calculate_shard_storages(
             cache.
         kv_cache_load_factor (float): ratio of kv caching.
         use_virtual_table (bool): use virtual table or not.
-        dynamicemb_options (DynamicEmbTableOptions): dynamice embedding options
+        dynamicemb_options (DynamicEmbTableOptions): dynamic embedding options.
+        dynamicemb_storage (DynamicEmbTableStorage): per-shard capacities and
+            table storage costs of the DynamicEmb candidate.
+
     Returns:
         List[Storage]: storage object for each device in topology.
     """
     if dynamicemb_options is not None:
         from tzrec.utils.dynamicemb_util import dynamicemb_calculate_shard_storages
 
+        assert dynamicemb_storage is not None
         return dynamicemb_calculate_shard_storages(
             sharder_data=sharder_data,
             sharding_type=sharding_type,
@@ -868,7 +884,6 @@ def calculate_shard_storages(
             local_world_size=local_world_size,
             input_lengths=input_lengths,
             num_poolings=num_poolings,
-            caching_ratio=caching_ratio,
             is_pooled=is_pooled,
             input_data_type_size=input_data_type_size,
             output_data_type_size=output_data_type_size,
@@ -877,6 +892,7 @@ def calculate_shard_storages(
             is_inference=is_inference,
             multipass_prefetch_max_pass=multipass_prefetch_max_pass,
             dynamicemb_options=dynamicemb_options,
+            dynamicemb_storage=dynamicemb_storage,
         )
     else:
         return tzrec_calculate_shard_storages(
@@ -905,36 +921,135 @@ def calculate_shard_storages(
         )
 
 
+_DYNAMICEMB_WORKING_SET_MULTIPLIER = 5
+
+
+def _dynamicemb_partial_ratios(low: float) -> List[float]:
+    """Sample five geometric points up to 0.5, then fixed tenths up to 0.9."""
+    if low >= 1.0:
+        return []
+    ratios = {low, *(r for r in (0.5, 0.6, 0.7, 0.8, 0.9) if r >= low)}
+    if low < 0.5:
+        ratios.update(float(r) for r in np.geomspace(low, 0.5, 5)[1:-1])
+    return sorted(ratios)
+
+
 def _emit_dynamicemb_variants(
-    base_option: ShardingOption,
+    base_option: ShardingOption, unique_id_factor: Optional[float]
 ) -> List[ShardingOption]:
-    """Expand a dynamicemb ShardingOption into HYBRID + CACHING variants.
+    """Expand a DynamicEmb sharding option into caching and non-caching candidates.
 
-    Sweeps both placement modes (``caching=False`` and ``caching=True``) and,
-    when ``base_option.cache_params`` is unset, ten cache_load_factor values
-    (0.1, 0.2, ..., 1.0). The downstream 2D DP proposer picks per table the
-    best (mode, ratio) that fits both HBM and host topology budgets.
+    Without an explicit load factor, search the zero and full value budgets
+    and both partial-budget modes. A configured unique-id factor sets the
+    same working-set floor for both modes; zero requests at least one row.
+    Without that factor, partial grids start at 0.1. The grids use up to
+    five geometric points through 0.5, then fixed
+    tenths up to 0.9. An explicit partial ratio requests both modes at that
+    budget. A cache must cover the working set; a cache covering the entire
+    shard is represented by the full non-caching endpoint.
 
-    ``base_option.dynamicemb_options`` must already be attached by the
-    caller; each returned ShardingOption owns a freshly deep-copied
-    ``dynamicemb_options`` instance so per-option ``caching`` mutations do
-    not bleed across variants.
+    In automatic search, keep the first budget for each set of rounded tier
+    capacities within a mode. Zero, partial and full budgets remain distinct:
+    equal row estimates do not imply the same layout after native fusion.
+    Within a mode the HBM value rows follow from the resident rows -- equal
+    for HYBRID, plus the fixed overflow area for CACHING -- so the key tracks
+    only the resident and backing rows. The DP proposer uses the candidates'
+    HBM and host costs to select a plan.
+
+    The caller supplies base_option.dynamicemb_options. Each emitted option
+    owns a deep copy of its table options and reports the allocated share as
+    its load factor; its storage estimate retains the byte budget for runtime.
     """
-    if base_option.cache_params is None:
-        load_factors = [(i + 1) / 10 for i in range(10)]
-        stats = None
+    tensor = base_option.tensor
+    template = copy.copy(base_option)
+    template.dynamicemb_options = copy.copy(base_option.dynamicemb_options)
+    options = template.dynamicemb_options
+    rows = base_option.shards[0].size[0]
+    if any(shard.size[0] != options.max_capacity for shard in base_option.shards):
+        raise ValueError("DynamicEmb shard rows must match the per-rank max_capacity")
+    if unique_id_factor is None:
+        required = math.ceil(base_option.batch_size * sum(base_option.input_lengths))
+        floor = 0.1
     else:
-        load_factors = [base_option.cache_params.load_factor]
-        stats = base_option.cache_params.stats
-    variants: List[ShardingOption] = []
-    for caching_mode in (False, True):
-        for load_factor in load_factors:
-            opt = copy.deepcopy(base_option)
-            opt.cache_params = CacheParams(load_factor=load_factor, stats=stats)
-            # deepcopy(base_option) already produced a fresh dynamicemb_options.
-            opt.dynamicemb_options.caching = caching_mode  # pyre-ignore [16]
-            variants.append(opt)
-    return variants
+        if not math.isfinite(unique_id_factor) or unique_id_factor < 0:
+            raise ValueError(
+                f"{base_option.name}: unique_id_factor must be finite and non-negative"
+            )
+        required = math.ceil(
+            _DYNAMICEMB_WORKING_SET_MULTIPLIER
+            * unique_id_factor
+            * base_option.batch_size
+        )
+        floor = max(required, 1) / rows
+
+    params = base_option.cache_params
+    if params is None:
+        requests = [(False, 0.0)]
+        partial_ratios = _dynamicemb_partial_ratios(floor)
+        requests.extend((False, r) for r in partial_ratios)
+        requests.extend((True, r) for r in partial_ratios)
+        requests.append((False, 1.0))
+    else:
+        ratio = float(params.load_factor)
+        requests = [(False, ratio)]
+        if 0 < ratio < 1:
+            requests.append((True, ratio))
+
+    candidates = []
+    seen = set()
+    for caching, requested in requests:
+        options.caching = caching
+        ratio = requested
+        dynamicemb_storage = DynamicEmbTableStorage.from_options(
+            tensor, options, ratio=ratio
+        )
+        if ratio > 0 and dynamicemb_storage.local_hbm_for_values == 0:
+            if options.caching:
+                continue
+            ratio = 0.0
+        elif (
+            options.caching
+            and dynamicemb_storage.resident_rows >= dynamicemb_storage.backing_rows
+        ):
+            if params is None:
+                continue  # Automatic search already includes the full endpoint.
+            options.caching = False
+            ratio = 1.0
+        if ratio != requested:
+            dynamicemb_storage = DynamicEmbTableStorage.from_options(
+                tensor, options, ratio=ratio
+            )
+        if options.caching and dynamicemb_storage.resident_rows < required:
+            continue
+        if params is None:
+            endpoint = ratio if ratio in (0, 1) else None
+            key = (
+                options.caching,
+                endpoint,
+                dynamicemb_storage.backing_rows,
+                dynamicemb_storage.resident_rows,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+
+        if options.caching:
+            allocated = (
+                dynamicemb_storage.resident_rows / dynamicemb_storage.backing_rows
+            )
+        elif 0 < ratio < 1:
+            allocated = dynamicemb_storage.resident_rows / (
+                dynamicemb_storage.resident_rows + dynamicemb_storage.backing_rows
+            )
+        else:
+            allocated = ratio
+        option = copy.deepcopy(template)
+        option.cache_params = CacheParams(
+            load_factor=allocated, stats=params.stats if params else None
+        )
+        option.dynamicemb_storage = dynamicemb_storage
+        candidates.append(option)
+    return candidates
 
 
 class EmbeddingEnumerator(_EmbeddingEnumerator):
@@ -1062,6 +1177,13 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                     use_dynamicemb,
                     dynamicemb_options,
                 ) = _extract_constraints_for_param(_constraints, key)
+                # the union measurement rides on the resolved constraint;
+                # absence stays None, distinct from a measured zero
+                unique_id_factor = (
+                    getattr(_constraints[key], "unique_id_factor", None)
+                    if _constraints and _constraints.get(key)
+                    else None
+                )
 
                 # skip for other device groups
                 if device_group and device_group != self._compute_device:
@@ -1130,7 +1252,9 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             # pyre-ignore [16]
                             sharding_option.dynamicemb_options = dynamicemb_options
                             sharding_options_per_table.extend(
-                                _emit_dynamicemb_variants(sharding_option)
+                                _emit_dynamicemb_variants(
+                                    sharding_option, unique_id_factor
+                                )
                             )
                         else:
                             sharding_options_per_table.append(sharding_option)
