@@ -1203,6 +1203,12 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(contexts[0].device_bw, 2 + 98 * expected_weight)
         self.assertEqual(contexts[0].caching_ratio, allocated)
         self.assertEqual(contexts[0].hbm_to_ddr_mem_bw, 20)
+        self.assertEqual(
+            dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
+                config, [], opt, topology, {}, sharder_data
+            ),
+            [],
+        )
         self.assertIs(opt.cache_params, original)
         self.assertEqual(opt.cache_load_factor, allocated)
         self.assertEqual(config.kernel_device_bandwidths, {fused_key: 37.0})

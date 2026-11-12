@@ -297,9 +297,12 @@ def _dynamicemb_effective_bandwidth(
     calibration values, not measured cache hit rates.
 
     CACHING statistics override the fitted weight with one minus the expected
-    miss rate. Otherwise the full endpoint uses HBM bandwidth and the zero
-    non-caching endpoint uses the host link. The existing /10 calibration
-    applies to all cases. Bandwidth units follow the topology.
+    miss rate, clamped to [0, 1]. Otherwise the full endpoint uses HBM
+    bandwidth and the zero non-caching endpoint uses the host link. The
+    weight jump from partial HYBRID to full budget models the HBM-only
+    transition; the runtime takes that path only when the entire fused group
+    fits, so this remains a per-table approximation. All cases scale the
+    weighted bandwidth by 0.1. Bandwidth units follow the topology.
 
     Args:
         sharding_option: Candidate carrying DynamicEmb options and cache stats.
@@ -837,7 +840,7 @@ if has_dynamicemb:
     ):
         """Estimate performance from allocated residency without changing the budget."""
         dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
-        if dynamicemb_options is not None and shard_sizes:
+        if dynamicemb_options is not None:
             config = copy.copy(config)
             config.kernel_device_bandwidths = {
                 **config.kernel_device_bandwidths,
