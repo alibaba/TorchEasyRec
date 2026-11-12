@@ -9,9 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
 import unittest
+from unittest import mock
 
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -61,6 +61,7 @@ def _config(train_input_path, with_model=True):
     cfg = pipeline_pb2.EasyRecConfig()
     cfg.train_input_path = train_input_path
     cfg.data_config.batch_size = 4
+    cfg.data_config.num_workers = 0
     cfg.data_config.dataset_type = data_pb2.DatasetType.ParquetDataset
     cfg.data_config.fg_mode = data_pb2.FgMode.FG_NONE
     cfg.data_config.label_fields.append("label")
@@ -183,6 +184,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         cfg = pipeline_pb2.EasyRecConfig()
         cfg.train_input_path = os.path.join(test_dir, "*.parquet")
         cfg.data_config.batch_size = 4
+        cfg.data_config.num_workers = 0
         cfg.data_config.drop_remainder = True
         cfg.data_config.min_batch_size = 4
         cfg.data_config.dataset_type = data_pb2.DatasetType.ParquetDataset
@@ -337,39 +339,47 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         )
 
     def test_invalid_tool_arguments_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "batch_size"):
+            AddPoolingFactorToConfig("in.config", "out.config", 5, batch_size=0)
+        with self.assertRaises(ValueError):
+            AddPoolingFactorToConfig(
+                "in.config", "out.config", 5, dataset_type="Unknown"
+            )
         with self.assertRaisesRegex(ValueError, "num_batches"):
             AddPoolingFactorToConfig("in.config", "out.config", 0)
         with self.assertRaisesRegex(ValueError, "output_path"):
             AddPoolingFactorToConfig("dir/pipeline.config", "dir/pipeline.config", 5)
 
     @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
-    def test_run_measures_and_writes_a_loadable_config(self, edit):
+    def test_run_measures_and_writes_a_loadable_config(self, override):
         test_dir = make_test_dir()
         _write_parquet(test_dir)
         in_path = os.path.join(test_dir, "pipeline.config")
         out_path = os.path.join(test_dir, "measured.config")
-        cfg = _config("unused.parquet" if edit else os.path.join(test_dir, "*.parquet"))
+        cfg = _config(
+            "odps://project/tables/original"
+            if override
+            else os.path.join(test_dir, "*.parquet")
+        )
+        if override:
+            cfg.data_config.dataset_type = data_pb2.OdpsDataset
+        cfg.model_dir = "original_model"
+        constraints = cfg.feature_configs[0].id_feature.embedding_constraints
+        constraints.sharding_types.append("row_wise")
+        constraints.pooling_factor = 17
+        constraints.unique_id_factor = 18
         config_util.save_message(cfg, in_path)
         before = config_util.load_pipeline_config(in_path)
-        edits = (
-            {
-                "data_config.batch_size": 8,
-                "train_input_path": os.path.join(test_dir, "*.parquet"),
-                "feature_configs[0].id_feature.embedding_dim": 16,
-            }
-            if edit
-            else None
-        )
         AddPoolingFactorToConfig(
             in_path,
             out_path,
-            num_batches=1 if edit else 10,
-            edit_config_json=json.dumps(edits) if edit else None,
+            num_batches=1 if override else 10,
+            dataset_type="ParquetDataset" if override else None,
+            input_path=os.path.join(test_dir, "*.parquet") if override else None,
+            batch_size=8 if override else None,
         ).run()
         out = config_util.load_pipeline_config(out_path)
         self.assertEqual(config_util.load_pipeline_config(in_path), before)
-        if edits:
-            config_util.edit_config(before, edits)
         self.assertEqual(out.train_input_path, before.train_input_path)
         # measured factors for a normal and a shared feature, and for the
         # two features of similarly named tables
@@ -379,35 +389,75 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             out.feature_configs[3].id_feature.embedding_constraints.unique_id_factor,
-            0.375 if edit else 1.5,
+            0.375 if override else 1.5,
         )
         self.assertEqual(
             out.feature_configs[7].id_feature.embedding_constraints.unique_id_factor,
-            0.25 if edit else 1.0,
+            0.25 if override else 1.0,
         )
         self.assertEqual(
             out.feature_configs[8].id_feature.embedding_constraints.unique_id_factor,
-            0.25 if edit else 1.0,
+            0.25 if override else 1.0,
         )
         # nothing else about the configuration changed
         for field in ("model_config", "data_config"):
             self.assertEqual(str(getattr(out, field)), str(getattr(before, field)))
 
-        def _clear_constraints(feature_config):
+        def _clear_factors(feature_config):
             oneof = feature_config.WhichOneof("feature")
             f = getattr(feature_config, oneof) if oneof is not None else None
             if f is None:
                 return
             if f.DESCRIPTOR.fields_by_name.get("embedding_constraints"):
-                f.ClearField("embedding_constraints")
+                f.embedding_constraints.ClearField("pooling_factor")
+                f.embedding_constraints.ClearField("unique_id_factor")
+                if not f.embedding_constraints.ListFields():
+                    f.ClearField("embedding_constraints")
             if f.DESCRIPTOR.fields_by_name.get("features"):
                 for sub in f.features:
-                    _clear_constraints(sub)
+                    _clear_factors(sub)
 
         for got, was in zip(out.feature_configs, before.feature_configs):
-            _clear_constraints(got)
-            _clear_constraints(was)
-            self.assertEqual(str(got), str(was))
+            _clear_factors(got)
+            _clear_factors(was)
+        self.assertEqual(out, before)
+
+    @parameterized.expand(
+        [
+            (
+                "dataset",
+                {"dataset_type": "OdpsDataset"},
+                data_pb2.OdpsDataset,
+                "original",
+                4,
+            ),
+            (
+                "path",
+                {"input_path": "odps://project/tables/sample"},
+                data_pb2.ParquetDataset,
+                "odps://project/tables/sample",
+                4,
+            ),
+            ("batch", {"batch_size": 8}, data_pb2.ParquetDataset, "original", 8),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_measurement_overrides_are_independent(
+        self, _, overrides, dataset, path, batch
+    ):
+        cfg = _config("original")
+        before = cfg.SerializePartialToString()
+        tool = AddPoolingFactorToConfig("in.config", "out.config", 1, **overrides)
+        with mock.patch(
+            "tzrec.tools.add_pooling_factor_to_config.create_dataloader",
+            return_value=[],
+        ) as create_dataloader:
+            tool.measure(cfg, [], [])
+        data_config, _, input_path = create_dataloader.call_args.args
+        self.assertEqual(data_config.dataset_type, dataset)
+        self.assertEqual(data_config.batch_size, batch)
+        self.assertEqual(input_path, path)
+        self.assertEqual(cfg.SerializePartialToString(), before)
 
     @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
     @mark_ci_scope("gpu")
@@ -425,6 +475,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         cfg = pipeline_pb2.EasyRecConfig()
         cfg.train_input_path = os.path.join(test_dir, "*.parquet")
         cfg.data_config.batch_size = 4
+        cfg.data_config.num_workers = 0
         cfg.data_config.dataset_type = data_pb2.DatasetType.ParquetDataset
         cfg.data_config.fg_mode = data_pb2.FgMode.FG_NONE
         cfg.data_config.label_fields.append("label")
