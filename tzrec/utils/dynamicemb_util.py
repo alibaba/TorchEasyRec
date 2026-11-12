@@ -23,10 +23,7 @@ from torchrec.distributed.planner import (
     planners,
     shard_estimators,
 )
-from torchrec.distributed.planner.estimator.types import (
-    HardwarePerfConfig,
-    ShardPerfContext,
-)
+from torchrec.distributed.planner.estimator.types import ShardPerfContext
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     SharderData,
@@ -315,41 +312,61 @@ def _validate_eval_initializer_for_tombstones(
         )
 
 
-def _dynamicemb_effective_cache_ratio(
-    cache_load_factor: Optional[float],
-    caching: bool,
-    stats: Optional[Any] = None,
+def _dynamicemb_effective_bandwidth(
+    sharding_option: ShardingOption,
+    topology: Topology,
 ) -> float:
-    """Effective HBM-hit ratio for the dynamicemb perf model.
+    """Estimate DynamicEmb bandwidth without changing its allocated cache share.
 
-    The bandwidth model uses ``(x_eff*hbm_bw + (1-x_eff)*hbm_to_ddr_bw) / 10``.
-    The candidate's load factor ``x`` is its allocated HBM share; ``x_eff`` is
-    the bandwidth weight fitted from an A10 sweep (power-law access, alpha=1.05):
+    The bandwidth weight is fitted from an A10 sweep (power-law access,
+    alpha=1.05): partial CACHING uses a 0.28 base (3.3x slower than HBM-only),
+    partial HYBRID a 0.11 base (6.8x slower). The 0.01 * ratio term breaks
+    ties between otherwise similar partial placements. These weights are
+    calibration values, not measured cache hit rates.
 
-      * Partial CACHING: 3.3x slower than HBM-only -> base 0.28.
-      * Partial HYBRID: 6.8x slower than HBM-only -> base 0.11.
+    CACHING statistics override the fitted weight with one minus the expected
+    miss rate, clamped to [0, 1]. Otherwise the full endpoint uses HBM
+    bandwidth and the zero non-caching endpoint uses the host link. The
+    weight jump from partial HYBRID to full budget models the HBM-only
+    transition; the runtime takes that path only when the entire fused group
+    fits, so this remains a per-table approximation. All cases scale the
+    weighted bandwidth by 0.1. Bandwidth units follow the topology.
 
-    Within each partial mode, measured performance was roughly flat. The
-    ``0.01 * x`` term lets the DP break ties. The roughly 8x jump in ``x_eff``
-    from HYBRID at x=0.9 to the full endpoint at x=1 is intentional: it
-    models the switch to the HBM-only kernel. The runtime makes that switch
-    when the entire fused group fits, not when a single member is fully funded.
-    The zero-budget non-caching endpoint is scored as host access (x_eff=0).
+    RocksDB-backed candidates use SSD bandwidth for the backing link in this
+    approximation; the topology's host-link bandwidth remains unchanged.
 
-    For CACHING candidates with measured stats, ``1 - stats.expected_miss_rate(x)``
-    overrides the fitted value, clamped to [0, 1].
+    Args:
+        sharding_option: Candidate carrying DynamicEmb options and cache stats.
+        topology: Hardware bandwidths used by the performance estimator.
+
+    Returns:
+        Effective bandwidth for the candidate's shard contexts.
     """
-    x = float(cache_load_factor) if cache_load_factor is not None else 0.0
+    options = sharding_option.dynamicemb_options
+    params = sharding_option.cache_params
+    ratio = sharding_option.cache_load_factor
+    stats = params.stats if params is not None else None
+    x = float(ratio) if ratio is not None else 0.0
     x = max(0.0, min(1.0, x))
-    if caching and stats is not None:
-        miss_rate = float(stats.expected_miss_rate(x))
-        return max(0.0, min(1.0, 1.0 - miss_rate))
-    if x >= 1.0:
-        return 1.0
-    if not caching and cache_load_factor == 0.0:
-        return 0.0
-    base = _DYNAMICEMB_CACHING_X_EFF_BASE if caching else _DYNAMICEMB_HYBRID_X_EFF_BASE
-    return base + _DYNAMICEMB_X_EFF_TIEBREAK * x
+    if options.caching and stats is not None:
+        weight = max(0.0, min(1.0, 1.0 - float(stats.expected_miss_rate(x))))
+    elif x >= 1.0:
+        weight = 1.0
+    elif not options.caching and ratio == 0.0:
+        weight = 0.0
+    else:
+        base = (
+            _DYNAMICEMB_CACHING_X_EFF_BASE
+            if options.caching
+            else _DYNAMICEMB_HYBRID_X_EFF_BASE
+        )
+        weight = base + _DYNAMICEMB_X_EFF_TIEBREAK * x
+    backing_bw = (
+        topology.ssd_mem_bw
+        if rocksdb_util.is_rocksdb_options(options)
+        else topology.hbm_to_ddr_mem_bw
+    )
+    return (weight * topology.hbm_mem_bw + (1 - weight) * backing_bw) / 10
 
 
 def _log_dynamicemb_table_plan(
@@ -841,37 +858,6 @@ if has_dynamicemb:
     # pyre-ignore [9]
     planners.to_sharding_plan = _to_sharding_plan
 
-    _orig_hw_perf_config_get_device_bw = HardwarePerfConfig.get_device_bw
-
-    def _customized_kernel_aware_get_device_bw(
-        self,  # pyre-ignore [2]
-        compute_device: str,
-        compute_kernel: str,
-        hbm_mem_bw: float,
-        ddr_mem_bw: float,
-        ssd_mem_bw: float,
-        hbm_to_ddr_mem_bw: float,
-        caching_ratio: Optional[float] = None,
-        prefetch_pipeline: bool = False,
-    ) -> Optional[float]:
-        if compute_kernel == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value:
-            cr = caching_ratio if caching_ratio is not None else 0.0
-            return (cr * hbm_mem_bw + (1 - cr) * hbm_to_ddr_mem_bw) / 10
-        return _orig_hw_perf_config_get_device_bw(
-            self,
-            compute_device,
-            compute_kernel,
-            hbm_mem_bw,
-            ddr_mem_bw,
-            ssd_mem_bw,
-            hbm_to_ddr_mem_bw,
-            caching_ratio,
-            prefetch_pipeline,
-        )
-
-    # pyre-ignore [9]
-    HardwarePerfConfig.get_device_bw = _customized_kernel_aware_get_device_bw
-
     _orig_build_shard_perf_contexts = (
         ShardPerfContext.build_shard_perf_contexts.__func__
     )
@@ -886,44 +872,27 @@ if has_dynamicemb:
         *args,  # pyre-ignore [2]
         **kwargs,  # pyre-ignore [2]
     ):
-        """Estimate performance from allocated residency without changing the budget.
-
-        A table stored in RocksDB misses to disk, not to host memory: its
-        estimate sees the topology's SSD bandwidth as the host link.
-        """
+        """Estimate performance from allocated residency without changing the budget."""
         dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
-        if rocksdb_util.is_rocksdb_options(dynamicemb_options):
-            topology = copy.copy(topology)
-            topology._hbm_to_ddr_mem_bw = topology.ssd_mem_bw
-        original_cache_params = sharding_option.cache_params
-        if dynamicemb_options is not None and shard_sizes:
-            x_eff = _dynamicemb_effective_cache_ratio(
-                sharding_option.cache_load_factor,
-                caching=bool(dynamicemb_options.caching),
-                stats=original_cache_params.stats if original_cache_params else None,
-            )
-            sharding_option.cache_params = (
-                dataclasses.replace(original_cache_params, load_factor=x_eff)
-                if original_cache_params is not None
-                else CacheParams(load_factor=x_eff)
-            )
-        # try/finally so an estimator exception cannot leak the boosted
-        # cache_params clone into the storage estimator's view of the
-        # same ShardingOption.
-        try:
-            result = _orig_build_shard_perf_contexts(
-                cls,
-                config,
-                shard_sizes,
-                sharding_option,
-                topology,
-                constraints,
-                *args,
-                **kwargs,
-            )
-        finally:
-            sharding_option.cache_params = original_cache_params
-        return result
+        if dynamicemb_options is not None:
+            config = copy.copy(config)
+            config.kernel_device_bandwidths = {
+                **config.kernel_device_bandwidths,
+                (
+                    topology.compute_device.lower(),
+                    sharding_option.compute_kernel.lower(),
+                ): _dynamicemb_effective_bandwidth(sharding_option, topology),
+            }
+        return _orig_build_shard_perf_contexts(
+            cls,
+            config,
+            shard_sizes,
+            sharding_option,
+            topology,
+            constraints,
+            *args,
+            **kwargs,
+        )
 
     # pyre-ignore [9]
     ShardPerfContext.build_shard_perf_contexts = classmethod(
