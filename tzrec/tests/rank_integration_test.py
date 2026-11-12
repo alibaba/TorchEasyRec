@@ -12,20 +12,30 @@
 import glob
 import json
 import os
+import shlex
 import shutil
+import sys
 import unittest
+import uuid
+from types import SimpleNamespace
+from typing import Optional
 
 import numpy as np
+import pyarrow as pa
 import torch
+from odps.apis.storage_api import SessionStatus
+from parameterized import parameterized
 from pyarrow import dataset as ds
 
 from tzrec.acc import trt_utils
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import create_dataloader
+from tzrec.datasets.utils import calc_remaining_intervals, calc_slice_intervals
 from tzrec.main import _create_features
 from tzrec.optim.optimizer import has_fbgemm_ftrl
+from tzrec.protos import data_pb2
 from tzrec.tests import utils
-from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
+from tzrec.utils import checkpoint_util, config_util, dynamicemb_util, misc_util
 from tzrec.utils.test_util import (
     cutlass_hstu_unavailable,
     dfs_are_close,
@@ -33,6 +43,7 @@ from tzrec.utils.test_util import (
     is_ci_nightly,
     make_test_dir,
     mark_ci_scope,
+    parameterized_name_func,
     torch_fx_tool_unavailable,
 )
 
@@ -1354,6 +1365,386 @@ class RankIntegrationTest(unittest.TestCase):
                 additional_export_config='{"cand_seq_pk": "cand_seq"}',
             )
         self.assertTrue(self.success)
+
+
+def _append_odps_trace(trace_path, **event):
+    event.update(pid=os.getpid(), rank=int(os.environ["RANK"]))
+    payload = (json.dumps(event, sort_keys=True) + "\n").encode()
+    fd = os.open(trace_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+
+
+class _FakeOdpsArrowReader:
+    def __init__(self, table, read_req, trace_path):
+        self._table = table
+        self._read_req = read_req
+        self._trace_path = trace_path
+        self._offset = 0
+
+    def read(self):
+        if self._offset >= self._read_req.row_count:
+            return None
+        start = self._read_req.row_index + self._offset
+        n = min(
+            self._read_req.max_batch_rows,
+            self._read_req.row_count - self._offset,
+        )
+        batch = self._table.slice(start, n).to_batches(max_chunksize=n)[0]
+        _append_odps_trace(
+            self._trace_path,
+            kind="read",
+            session_id=self._read_req.session_id,
+            row_index=start,
+            row_count=n,
+        )
+        self._offset += n
+        return batch
+
+
+class _FakeOdpsStorageApiClient:
+    def __init__(self, trace_path):
+        self._trace_path = trace_path
+        self.table = SimpleNamespace(
+            full_table_name="fake.train",
+            schema=SimpleNamespace(
+                simple_columns=[
+                    SimpleNamespace(name="id", type="STRING"),
+                    SimpleNamespace(name="label", type="BIGINT"),
+                ]
+            ),
+        )
+        ids = np.arange(_SAMPLE_SHUFFLE_TOTAL_ROWS)
+        self._table = pa.Table.from_arrays(
+            [pa.array(ids.astype(str)), pa.array(ids % 2)], names=["id", "label"]
+        )
+
+    def create_read_session(self, scan_req):
+        return SimpleNamespace(session_id=uuid.uuid4().hex)
+
+    def get_read_session(self, sess_req):
+        return SimpleNamespace(
+            session_status=SessionStatus.NORMAL,
+            record_count=self._table.num_rows,
+        )
+
+    def read_rows_arrow(self, read_req):
+        return _FakeOdpsArrowReader(self._table, read_req, self._trace_path)
+
+
+_SAMPLE_SHUFFLE_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
+_SAMPLE_SHUFFLE_TRAIN_EVAL = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "train_eval.py")
+)
+_SAMPLE_SHUFFLE_BATCH_SIZE = 128
+_SAMPLE_SHUFFLE_TOTAL_ROWS = 4000
+_SAMPLE_SHUFFLE_FAKE_KAFKA_BODY = (
+    "import runpy\n"
+    "from unittest.mock import patch\n"
+    "\n"
+    "from tzrec.datasets import kafka_dataset\n"
+    "from tzrec.datasets.kafka_dataset_test import FakeKafkaConsumer\n"
+    "\n"
+    "if __name__ == '__main__':\n"
+    "    with patch.object(\n"
+    "        kafka_dataset, '_default_consumer_factory', FakeKafkaConsumer\n"
+    "    ):\n"
+    "        runpy.run_module('tzrec.train_eval', run_name='__main__')\n"
+)
+# Top-level patches also apply when spawn loads the generated coordinator entry.
+_SAMPLE_SHUFFLE_FAKE_ODPS_BODY = (
+    "import runpy\n"
+    "from unittest.mock import patch\n"
+    "\n"
+    "from tzrec import main as tzrec_main\n"
+    "from tzrec.datasets import odps_dataset\n"
+    "from tzrec.tests.rank_integration_test import (\n"
+    "    _FakeOdpsStorageApiClient, _append_odps_trace\n"
+    ")\n"
+    "\n"
+    "_TRACE_PATH = {trace_path!r}\n"
+    "patch.object(\n"
+    "    odps_dataset, '_create_odps_account', lambda: (None, 'fake')\n"
+    ").start()\n"
+    "patch.object(\n"
+    "    odps_dataset, '_create_storage_client',\n"
+    "    lambda *args, **kwargs: (None, _FakeOdpsStorageApiClient(_TRACE_PATH)),\n"
+    ").start()\n"
+    "_original_log_train = tzrec_main._log_train\n"
+    "\n"
+    "def _log_train_with_trace(step, *args, **kwargs):\n"
+    "    _append_odps_trace(_TRACE_PATH, kind='step', step=step)\n"
+    "    return _original_log_train(step, *args, **kwargs)\n"
+    "\n"
+    "tzrec_main._log_train = _log_train_with_trace\n"
+    "if __name__ == '__main__':\n"
+    "    runpy.run_module('tzrec.train_eval', run_name='__main__')\n"
+)
+
+
+def _sample_shuffle_build_config(
+    test_dir: str, num_steps: int, train_input_path: str, source: str
+) -> str:
+    config = config_util.load_pipeline_config(
+        os.path.join(_SAMPLE_SHUFFLE_CONFIG_DIR, "sample_shuffle_mock.config")
+    )
+    if source == "kafka":
+        config.data_config.dataset_type = data_pb2.DatasetType.KafkaDataset
+        config.data_config.input_fields.extend(
+            [
+                data_pb2.Field(input_name="id", input_type=data_pb2.FieldType.INT64),
+                data_pb2.Field(input_name="label", input_type=data_pb2.FieldType.INT64),
+            ]
+        )
+    elif source == "odps":
+        config.data_config.dataset_type = data_pb2.DatasetType.OdpsDataset
+    config.train_input_path = train_input_path
+    config.model_dir = os.path.join(test_dir, "model")
+    config.train_config.num_steps = num_steps
+    path = os.path.join(test_dir, f"pipeline_{num_steps}.config")
+    config_util.save_message(config, path)
+    return path
+
+
+def _sample_shuffle_run_torchrun(
+    config_path: str, entry_script: str, log_path: str, extra: str = ""
+):
+    torchrun = os.path.join(os.path.dirname(sys.executable), "torchrun")
+    cmd = shlex.join(
+        [
+            torchrun,
+            *shlex.split(utils._standalone()),
+            "--nnodes=1",
+            f"--nproc-per-node={utils._get_nproc_per_node()}",
+            "--log_dir",
+            os.path.join(os.path.dirname(log_path), "log_train_eval"),
+            "-r",
+            "3",
+            "-t",
+            "3",
+            entry_script,
+            "--pipeline_config_path",
+            config_path,
+            *shlex.split(extra),
+        ]
+    )
+    return misc_util.run_cmd(f"PYTHONPATH=. {cmd}", log_path, timeout=utils._t(600))
+
+
+def _sample_shuffle_read_state(ckpt_dir: str):
+    with open(os.path.join(ckpt_dir, "dataloader_state.json")) as f:
+        return json.load(f)
+
+
+@unittest.skipIf(*gpu_unavailable)
+@mark_ci_scope("h20", "gpu")
+class SampleShuffleIntegrationTest(unittest.TestCase):
+    """Distributed RANK sample shuffle: train, save, resume for one source."""
+
+    def setUp(self):
+        self.success = False
+        self.test_dir = make_test_dir()
+
+    def tearDown(self):
+        # keep the directory on failure so the torchrun log survives
+        if self.success:
+            shutil.rmtree(self.test_dir, True)
+
+    def _entry(self, source: str) -> str:
+        if source == "odps":
+            self._odps_trace_path = os.path.abspath(
+                os.path.join(self.test_dir, "odps_trace.jsonl")
+            )
+            path = os.path.join(self.test_dir, "train_with_fake_odps.py")
+            with open(path, "w") as f:
+                f.write(
+                    _SAMPLE_SHUFFLE_FAKE_ODPS_BODY.format(
+                        trace_path=self._odps_trace_path
+                    )
+                )
+            return path
+        if source != "kafka":
+            return _SAMPLE_SHUFFLE_TRAIN_EVAL
+        path = os.path.join(self.test_dir, "train_with_fake_kafka.py")
+        with open(path, "w") as f:
+            f.write(_SAMPLE_SHUFFLE_FAKE_KAFKA_BODY)
+        return path
+
+    def _train_input_path(self, source: str) -> str:
+        if source == "kafka":
+            return (
+                "kafka://fake:9092/topic?group.id=tzrec_sample_it"
+                "&auto.offset.reset=earliest"
+                "&fake.num_partitions=4&fake.rows_per_msg=3"
+                # the fixture feeds legal embedding bucket indices while the
+                # message partition/offset still carry checkpoint metadata
+                "&fake.id_mod=100003"
+            )
+        if source == "odps":
+            return "odps://fake/tables/train"
+        if hasattr(self, "_parquet_glob"):
+            return self._parquet_glob
+        t = pa.Table.from_arrays(
+            [
+                pa.array([float(i) for i in range(_SAMPLE_SHUFFLE_TOTAL_ROWS)]),
+                pa.array([i % 2 for i in range(_SAMPLE_SHUFFLE_TOTAL_ROWS)]),
+                pa.array([str(i) for i in range(_SAMPLE_SHUFFLE_TOTAL_ROWS)]),
+            ],
+            names=["raw_c", "label", "id"],
+        )
+        data_dir = os.path.join(self.test_dir, "train_data")
+        ds.write_dataset(
+            t,
+            data_dir,
+            format="parquet",
+            max_rows_per_file=500,
+            max_rows_per_group=100,
+        )
+        self._parquet_glob = os.path.join(data_dir, "*.parquet")
+        return self._parquet_glob
+
+    def _remaining_batches(self, state, train_input_path: str) -> int:
+        """This rank's remaining batches in the pass described by ``state``."""
+        intervals = calc_slice_intervals(
+            [(train_input_path, _SAMPLE_SHUFFLE_TOTAL_ROWS)],
+            0,
+            utils._get_nproc_per_node(),
+            _SAMPLE_SHUFFLE_BATCH_SIZE,
+            True,
+            0,
+            checkpoint_state=state,
+        )[0]
+        rows = sum(end - start for start, end in intervals)
+        return (rows + _SAMPLE_SHUFFLE_BATCH_SIZE - 1) // _SAMPLE_SHUFFLE_BATCH_SIZE
+
+    def _assert_resumed_positions(self, before, after, total_rows: int) -> None:
+        """Every newly read range must start inside a remaining checkpoint range."""
+        prefixes = {k.rsplit(":", 1)[0] for k in before if ":" in k}
+        # the restored state keeps its old keys and merges the new positions
+        new_keys = [k for k in after if k not in before and ":" in k]
+        matched = 0
+        for prefix in prefixes:
+            prefix_state = {
+                k: v for k, v in before.items() if k.rsplit(":", 1)[0] == prefix
+            }
+            remaining = calc_remaining_intervals(prefix_state, prefix, total_rows)
+            for key in new_keys:
+                key_prefix, _, key_start = key.rpartition(":")
+                if key_prefix != prefix:
+                    continue
+                start = int(key_start)
+                self.assertTrue(
+                    any(s <= start < e for s, e in remaining),
+                    f"resumed read at {key} is outside {remaining}",
+                )
+                matched += 1
+        self.assertGreater(matched, 0)
+
+    def _assert_odps_trace(self, state, final_step: int) -> None:
+        with open(self._odps_trace_path) as f:
+            events = [json.loads(line) for line in f]
+        ranks = set(range(utils._get_nproc_per_node()))
+        steps = [event for event in events if event["kind"] == "step"]
+        self.assertEqual({event["rank"] for event in steps}, ranks)
+        for rank in ranks:
+            max_step = max(event["step"] for event in steps if event["rank"] == rank)
+            self.assertEqual(max_step, final_step)
+
+        reads = [event for event in events if event["kind"] == "read"]
+        self.assertEqual({event["rank"] for event in reads}, ranks)
+        trainer_pids = {event["pid"] for event in steps}
+        for rank in ranks:
+            rank_reads = [event for event in reads if event["rank"] == rank]
+            self.assertGreater(sum(event["row_count"] for event in rank_reads), 0)
+            self.assertTrue(
+                {event["pid"] for event in rank_reads}.isdisjoint(trainer_pids)
+            )
+        session_ids = {
+            key.rsplit(":", 1)[0].rsplit("#", 1)[1] for key in state if ":" in key
+        }
+        self.assertTrue(session_ids)
+        self.assertEqual({event["session_id"] for event in reads}, session_ids)
+
+    @parameterized.expand(
+        [("kafka",), ("parquet",), ("odps",)], name_func=parameterized_name_func
+    )
+    def test_train_save_resume(self, source):
+        total_rows: Optional[int] = (
+            None if source == "kafka" else _SAMPLE_SHUFFLE_TOTAL_ROWS
+        )
+        entry = self._entry(source)
+        train_input_path = self._train_input_path(source)
+        log_path = os.path.join(self.test_dir, "log_train_eval.txt")
+
+        config = _sample_shuffle_build_config(
+            self.test_dir, 20, train_input_path, source
+        )
+        ok = _sample_shuffle_run_torchrun(config, entry, log_path)
+        self.assertTrue(ok, "initial training run failed; see log_train_eval.txt")
+        ckpt10 = os.path.join(self.test_dir, "model", "model.ckpt-10")
+        ckpt19 = os.path.join(self.test_dir, "model", "model.ckpt-19")
+        for ckpt in (ckpt10, ckpt19):
+            self.assertTrue(os.path.exists(os.path.join(ckpt, "_SUCCESS")), ckpt)
+        state10 = _sample_shuffle_read_state(ckpt10)
+        state19 = _sample_shuffle_read_state(ckpt19)
+        keys = {k for k in state19 if ":" in k}
+        self.assertTrue(keys, state19)
+        if source == "odps":
+            self._assert_odps_trace(state19, final_step=19)
+            os.unlink(self._odps_trace_path)
+        epochs10 = state10.get(checkpoint_util.EPOCHS_COMPLETED, 0)
+        epochs19 = state19.get(checkpoint_util.EPOCHS_COMPLETED, 0)
+        self.assertGreaterEqual(epochs19, epochs10)
+        if epochs19 == epochs10:
+            # positions are per pass; a new pass legitimately restarts at 0
+            for key in keys:
+                self.assertIn(key, state10)
+                self.assertGreaterEqual(state19[key], state10[key])
+
+        # choose a resume budget from the actual remaining plan: leave at
+        # least one batch so the pass does not end, whatever the rank count
+        if total_rows is not None:
+            plan_path = train_input_path
+            if source == "odps":
+                prefixes = {key.rsplit(":", 1)[0] for key in keys}
+                self.assertEqual(len(prefixes), 1)
+                plan_path = prefixes.pop()
+            remaining_batches = self._remaining_batches(state19, plan_path)
+            extra_steps = max(1, remaining_batches - 1)
+        else:
+            remaining_batches = None
+            extra_steps = 5
+        resume_steps = 20 + extra_steps
+        final_step = 19 + extra_steps
+        config = _sample_shuffle_build_config(
+            self.test_dir, resume_steps, train_input_path, source
+        )
+        ok = _sample_shuffle_run_torchrun(
+            config, entry, log_path, extra="--continue_train"
+        )
+        self.assertTrue(ok, "resume training run failed; see log_train_eval.txt")
+        ckpt_final = os.path.join(self.test_dir, "model", f"model.ckpt-{final_step}")
+        self.assertTrue(os.path.exists(os.path.join(ckpt_final, "_SUCCESS")))
+        resumed_state = _sample_shuffle_read_state(ckpt_final)
+        epochs_resumed = resumed_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
+        self.assertGreaterEqual(epochs_resumed, epochs19)
+        if total_rows is not None:
+            if remaining_batches == 0:
+                # the checkpoint ended the pass exactly; the resume can only
+                # start a fresh full pass
+                self.assertGreater(epochs_resumed, epochs19)
+            else:
+                self.assertEqual(epochs_resumed, epochs19)
+                self._assert_resumed_positions(state19, resumed_state, total_rows)
+        elif epochs_resumed == epochs19:
+            for key in keys:
+                self.assertIn(key, resumed_state)
+                self.assertGreaterEqual(resumed_state[key], state19[key])
+        if source == "odps":
+            self._assert_odps_trace(resumed_state, final_step)
+        self.success = True
 
 
 if __name__ == "__main__":

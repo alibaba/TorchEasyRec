@@ -14,7 +14,7 @@ import math
 import os
 import random
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -39,9 +39,9 @@ from tzrec.features.lookup_feature import LookupFeature
 from tzrec.features.match_feature import MatchFeature
 from tzrec.features.raw_feature import RawFeature
 from tzrec.features.tokenize_feature import TokenizeFeature
-from tzrec.protos import data_pb2
+from tzrec.protos import data_pb2, feature_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import config_util, env_util, misc_util
+from tzrec.utils import checkpoint_util, config_util, env_util, misc_util
 
 _TIMEOUT_SCALE = float(os.environ.get("TZREC_TEST_TIMEOUT_SCALE", "1.0"))
 
@@ -1534,3 +1534,58 @@ def test_tdm_cluster_train_eval(
     return misc_util.run_cmd(
         cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=_t(600)
     )
+
+
+def raw_c_features() -> List[BaseFeature]:
+    """Features over the ``raw_c`` numeric column sample tests create."""
+    return create_features(
+        [
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="raw_c")
+            )
+        ]
+    )
+
+
+def sample_data_config(
+    dataset_type: Any, mode: Any, num_workers: int, **overrides: Any
+) -> data_pb2.DataConfig:
+    """Sample-shuffle dataloader config with per-source overrides applied."""
+    cfg = data_pb2.DataConfig(
+        batch_size=8,
+        dataset_type=dataset_type,
+        fg_mode=data_pb2.FgMode.FG_NONE,
+        label_fields=["label"],
+        shuffle=True,
+        shuffle_mode=mode,
+        shuffle_buffer_size=2,
+        num_workers=num_workers,
+    )
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def drain_sample(iterator: Any) -> Tuple[List[int], List[int], Dict[str, int]]:
+    """Read a pass from ``iterator``; return sizes, raw_c values and state."""
+    sizes = []
+    values = []
+    state = {}
+    for batch in iterator:
+        sizes.append(len(batch.labels["label"]))
+        values.extend(int(v) for v in batch.to_dict()["raw_c.values"])
+        checkpoint_util.update_dataloder_state(state, batch.checkpoint_info)
+    return sizes, values, state
+
+
+def stop_sample(dataloader: Any, iterator: Optional[Any]) -> None:
+    """Stop the sample service and close the persistent dataloader workers.
+
+    Workers are closed even when stopping the service raises; ``iterator``
+    may be None when the iterator could not be created.
+    """
+    try:
+        dataloader.close()
+    finally:
+        if dataloader.num_workers > 0 and iterator is not None:
+            iterator._shutdown_workers()

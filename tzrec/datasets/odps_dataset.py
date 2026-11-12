@@ -45,8 +45,8 @@ from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.sample_shuffle import ReadPlan, ReadTask, make_sample_table_schema
 from tzrec.datasets.utils import (
-    calc_slice_intervals,
     inject_checkpoint_metadata,
     remove_nullable,
 )
@@ -205,6 +205,22 @@ def _parse_table_path(
     if "." in table_name:
         table_name, schema = table_name.split(".")[1], table_name.split(".")[0]
     return str_list[2], table_name, table_partitions, schema
+
+
+def _create_storage_client(
+    input_path: str,
+    account: BaseAccount,
+    endpoint: str,
+    quota_name: str,
+    o: Optional[ODPS] = None,
+) -> Tuple[ODPS, StorageApiArrowClient]:
+    """Create a table's ODPS client, optionally reusing a project client."""
+    project, table_name, _, schema = _parse_table_path(input_path)
+    if o is None:
+        o = ODPS(account=account, project=project, endpoint=endpoint, schema=schema)
+    return o, StorageApiArrowClient(
+        odps=o, table=o.get_table(table_name), quota_name=quota_name
+    )
 
 
 def _storage_debug_info(client: StorageApiArrowClient, **req_fields: Any) -> str:
@@ -374,7 +390,9 @@ def _refresh_sessions_daemon(sess_id_to_cli: Dict[str, StorageApiArrowClient]) -
     start_time = time.time()
     while True:
         if time.time() - start_time > ODPS_READ_SESSION_REFRESH_INTERVAL:
-            for session_id, client in sess_id_to_cli.items():
+            # sessions restored from a checkpoint are registered after the
+            # daemon starts; iterate a snapshot so that stays safe
+            for session_id, client in list(sess_id_to_cli.items()):
                 try:
                     client.get_read_session(SessionRequest(session_id, refresh=True))
                     logger.info(f"refresh session: {session_id}")
@@ -475,6 +493,7 @@ class OdpsReader(BaseReader):
         self._is_orderby_partition = is_orderby_partition
         self._init_session_threads = init_session_threads
         self._quota_name = quota_name
+        self._compression_name = compression
         self._compression = _get_compression_type(compression)
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
 
@@ -483,6 +502,8 @@ class OdpsReader(BaseReader):
         self._table_to_cli = {}
         self._input_to_sess = {}
         self._sess_row_counts: Dict[str, int] = {}
+        # sessions kept alive by the rank-0 refresh daemon
+        self._sess_id_to_cli: Dict[str, StorageApiArrowClient] = {}
         self._init_client()
 
         fields = []
@@ -509,28 +530,104 @@ class OdpsReader(BaseReader):
         """Table schema."""
         return self._schema
 
+    def _sources(self) -> List[Tuple[str, int, str, SessionRequest, str]]:
+        """Sessions in read order: (prefix, rows, input_path, request, name)."""
+        sources = []
+        for input_path in self._input_path.split(","):
+            _, table_name, partitions, _ = _parse_table_path(input_path)
+            for sess_idx, sess_req in enumerate(self._input_to_sess[input_path]):
+                name = table_name
+                if self._is_orderby_partition and partitions is not None:
+                    name = f"{table_name}/{partitions[sess_idx]}"
+                sources.append(
+                    (
+                        f"{input_path}#{sess_idx}#{sess_req.session_id}",
+                        self._sess_row_counts[sess_req.session_id],
+                        input_path,
+                        sess_req,
+                        name,
+                    )
+                )
+        return sources
+
+    def create_read_plan(
+        self, rank: int, world_size: int, num_readers: int
+    ) -> ReadPlan:
+        """Build this rank's ODPS read plan.
+
+        Each reader is planned as one of this rank's local workers, so the
+        rank-step alignment and tail trimming are exactly the BATCH path's.
+        Only session ids travel to the reader processes; each reader process
+        creates its own storage client.
+
+        Args:
+            rank: this process's rank.
+            world_size: number of ranks.
+            num_readers: number of reader processes on this rank.
+
+        Returns:
+            a finite read plan.
+        """
+        sources = self._sources()
+
+        from tzrec.datasets.sample_shuffle_readers import read_odps
+
+        tasks = []
+        planned_rows = 0
+        for reader_id in range(num_readers):
+            plan = self._worker_intervals(
+                [(prefix, rows) for prefix, rows, _, _, _ in sources],
+                rank * num_readers + reader_id,
+                num_readers * world_size,
+                world_size,
+            )
+            for (prefix, _, input_path, sess_req, _), intervals in zip(sources, plan):
+                planned_rows += sum(end - start for start, end in intervals)
+                if not intervals:
+                    continue
+                tasks.append(
+                    ReadTask(
+                        fn=read_odps,
+                        kwargs=dict(
+                            input_path=input_path,
+                            quota_name=self._quota_name,
+                            session_id=sess_req.session_id,
+                            intervals=intervals,
+                            source_prefix=prefix,
+                            batch_size=self._batch_size,
+                            compression=self._compression_name,
+                        ),
+                        reader_id=reader_id,
+                    )
+                )
+        return ReadPlan(
+            tasks=tasks,
+            schema=make_sample_table_schema(self._schema),
+            is_finite=True,
+            planned_rows=planned_rows,
+            num_readers=num_readers,
+        )
+
     def _init_client(self) -> None:
         """Init storage api client."""
         for input_path in self._input_path.split(","):
-            project, table_name, _, schema = _parse_table_path(input_path)
-            if project not in self._proj_to_o:
-                self._proj_to_o[project] = ODPS(
-                    account=self._account,
-                    project=project,
-                    endpoint=self._odps_endpoint,
-                    schema=schema,
-                )
-            if table_name not in self._table_to_cli:
-                o = self._proj_to_o[project]
-                self._table_to_cli[table_name] = StorageApiArrowClient(
-                    odps=o, table=o.get_table(table_name), quota_name=self._quota_name
-                )
+            project, table_name, _, _ = _parse_table_path(input_path)
+            if table_name in self._table_to_cli:
+                continue
+            o, client = _create_storage_client(
+                input_path,
+                self._account,
+                self._odps_endpoint,
+                self._quota_name,
+                o=self._proj_to_o.get(project),
+            )
+            self._proj_to_o[project] = o
+            self._table_to_cli[table_name] = client
 
     def _init_session(self) -> None:
         """Init table scan session."""
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
-        sess_id_to_cli = {}
         for input_path in self._input_path.split(","):
             _, table_name, partitions, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]
@@ -561,12 +658,12 @@ class OdpsReader(BaseReader):
             ]
             self._sess_row_counts.update(sessions)
             if rank == 0:
-                sess_id_to_cli.update((x, client) for x, _ in sessions)
+                self._sess_id_to_cli.update((x, client) for x, _ in sessions)
         # refresh session
         if rank == 0:
             t = threading.Thread(
                 target=_refresh_sessions_daemon,
-                args=(sess_id_to_cli,),
+                args=(self._sess_id_to_cli,),
                 daemon=True,
             )
             t.start()
@@ -638,6 +735,9 @@ class OdpsReader(BaseReader):
                         )
                     sess_reqs[sess_idx] = sess_req
                     self._sess_row_counts[session_id] = resp.record_count
+                    # keep a restored session alive for the whole run, like a
+                    # freshly created one
+                    self._sess_id_to_cli[session_id] = client
                 except ODPSError as e:
                     raise RuntimeError(
                         f"Cannot resume from checkpoint: ODPS session {session_id} "
@@ -660,41 +760,21 @@ class OdpsReader(BaseReader):
         self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
-        # (source_id_prefix, record_count, client, session, name) in read order
-        sources = []
-        for input_path in self._input_path.split(","):
-            _, table_name, partitions, _ = _parse_table_path(input_path)
-            client = self._table_to_cli[table_name]
-            for sess_idx, sess_req in enumerate(self._input_to_sess[input_path]):
-                name = table_name
-                if self._is_orderby_partition and partitions is not None:
-                    name = f"{table_name}/{partitions[sess_idx]}"
-                sources.append(
-                    (
-                        f"{input_path}#{sess_idx}#{sess_req.session_id}",
-                        self._sess_row_counts[sess_req.session_id],
-                        client,
-                        sess_req,
-                        name,
-                    )
-                )
-        plan = calc_slice_intervals(
-            [(prefix, record_count) for prefix, record_count, _, _, _ in sources],
+        sessions = self._sources()
+        plan = self._worker_intervals(
+            [(prefix, rows) for prefix, rows, _, _, _ in sessions],
             worker_id,
             num_workers,
-            self._batch_size,
-            self._equalize_rank_steps,
-            self._min_batch_size,
-            checkpoint_state=self._checkpoint_state,
-            world_size=world_size,
+            world_size,
         )
 
         def _combined_reader() -> Iterator[pa.RecordBatch]:
-            for i, ((prefix, _, client, sess_req, name), intervals) in enumerate(
-                zip(sources, plan)
+            for i, ((prefix, _, input_path, sess_req, name), intervals) in enumerate(
+                zip(sessions, plan)
             ):
+                client = self._table_to_cli[_parse_table_path(input_path)[1]]
                 if worker_id == 0 and any(start < end for start, end in intervals):
-                    logger.info(f"Reading {name} ({i + 1}/{len(sources)})")
+                    logger.info(f"Reading {name} ({i + 1}/{len(sessions)})")
                 for start, end in intervals:
                     if start >= end:
                         continue

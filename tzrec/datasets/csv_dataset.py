@@ -22,6 +22,7 @@ from pyarrow import csv
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.sample_shuffle import ReadPlan, ReadTask
 from tzrec.datasets.utils import (
     FIELD_TYPE_TO_PA,
     get_input_fields_proto,
@@ -30,6 +31,21 @@ from tzrec.datasets.utils import (
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
+
+
+def _make_csv_file_format(
+    column_names: Optional[List[str]],
+    delimiter: str,
+    column_types: Optional[Dict[str, pa.DataType]],
+) -> ds.CsvFileFormat:
+    """Build the CSV scanner format shared by the BATCH and sample paths."""
+    return ds.CsvFileFormat(
+        parse_options=pa.csv.ParseOptions(delimiter=delimiter),
+        convert_options=pa.csv.ConvertOptions(column_types=column_types),
+        read_options=csv.ReadOptions(
+            column_names=column_names, block_size=64 * 1024 * 1024
+        ),
+    )
 
 
 class CsvDataset(BaseDataset):
@@ -123,13 +139,10 @@ class CsvReader(BaseReader):
             batch_cost_size=batch_cost_size,
             **kwargs,
         )
-        self._csv_fmt = ds.CsvFileFormat(
-            parse_options=pa.csv.ParseOptions(delimiter=delimiter),
-            convert_options=pa.csv.ConvertOptions(column_types=column_types),
-            read_options=csv.ReadOptions(
-                column_names=column_names, block_size=64 * 1024 * 1024
-            ),
-        )
+        self._csv_fmt = _make_csv_file_format(column_names, delimiter, column_types)
+        self._column_names = column_names
+        self._delimiter = delimiter
+        self._column_types = column_types
         self._input_files = list_input_files(
             self._input_path, dist_util.get_dataset_process_group()
         )
@@ -153,6 +166,62 @@ class CsvReader(BaseReader):
     def schema(self) -> pa.Schema:
         """Table schema."""
         return self._schema
+
+    def create_read_plan(
+        self, rank: int, world_size: int, num_readers: int
+    ) -> ReadPlan:
+        """Build the single-rank CSV read plan.
+
+        Files are assigned to the actual reader slots with a stride, like
+        the BATCH path. Their row count is unknown before reading, so the
+        coordinator drains the pool after EOF instead of enforcing a quota.
+
+        Args:
+            rank: this process's rank; must be 0.
+            world_size: number of ranks; CSV only supports one.
+            num_readers: number of reader processes on this rank.
+
+        Returns:
+            a finite read plan without a planned row count.
+
+        Raises:
+            ValueError: when more than one rank is used.
+        """
+        if world_size != 1 or rank != 0:
+            raise ValueError(
+                "sample-level shuffle supports CsvDataset only on a single "
+                f"rank, got rank {rank} of {world_size}"
+            )
+        from tzrec.datasets.sample_shuffle_readers import read_csv
+
+        tasks = []
+        for reader_id in range(num_readers):
+            input_files = self._input_files[reader_id::num_readers]
+            if not input_files:
+                continue
+            tasks.append(
+                ReadTask(
+                    fn=read_csv,
+                    kwargs=dict(
+                        input_files=input_files,
+                        batch_size=self._batch_size,
+                        columns=self._ordered_cols,
+                        column_names=self._column_names,
+                        delimiter=self._delimiter,
+                        column_types=self._column_types,
+                    ),
+                    reader_id=reader_id,
+                )
+            )
+        return ReadPlan(
+            tasks=tasks,
+            # CSV has no checkpoint metadata: the row order of a file set is
+            # not stable enough to resume from, matching the BATCH path
+            schema=self._schema,
+            is_finite=True,
+            planned_rows=None,
+            num_readers=num_readers,
+        )
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None

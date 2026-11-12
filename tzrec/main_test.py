@@ -459,6 +459,192 @@ class MainTest(unittest.TestCase):
                     delta_embedding_dumper=mock.Mock() if has_dumper else None,
                 )
 
+    def test_train_loop_resume_with_empty_first_pass(self) -> None:
+        """An end-of-data resume trains the next full pass.
+
+        The empty remainder of the resumed pass yields no batch for the
+        optimizer-init peek, so the peek falls through to the next pass:
+        the empty pass is accounted like the loop's StopIteration handler
+        and the restore still runs with the optimizer.
+        """
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.return_value = False
+        exporter = mock.Mock()
+        exporter.enabled = False
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        optimizer = mock.Mock()
+        optimizer.params = {}
+        optimizer.param_groups = []
+        train_dataloader = mock.Mock()
+        batches = [
+            SimpleNamespace(checkpoint_info=None, data_timestamp=1.0),
+            SimpleNamespace(checkpoint_info=None, data_timestamp=2.0),
+        ]
+        train_dataloader.get_iterator.side_effect = [iter([]), iter(batches)]
+        pipeline = mock.Mock()
+        pipeline.progress.side_effect = lambda it: (
+            {"loss": torch.tensor(1.0)},
+            {},
+            next(it),
+        )
+        dataloader_state = {checkpoint_util.EPOCHS_COMPLETED: 1, "src:0": 7}
+        train_config = _train_config(num_steps=1, log_step_count_steps=10)
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            _train_and_evaluate(
+                model=model,
+                optimizer=optimizer,
+                train_dataloader=train_dataloader,
+                eval_dataloader=None,
+                lr_scheduler=[],
+                model_dir="unused",
+                train_config=train_config,
+                eval_config=EvalConfig(),
+                runtime=ShardedModelRuntime(ckpt_manager, None),
+                ckpt_path="model.ckpt-10",
+                restore_from_model_dir=True,
+                dataloader_state=dataloader_state,
+            )
+        # the peek consumed the empty pass and took its batch from the next
+        self.assertEqual(train_dataloader.get_iterator.call_count, 2)
+        self.assertIs(ckpt_manager.restore.call_args.args[2], optimizer)
+        # the empty pass completed the resumed one; its positions are gone
+        self.assertEqual(dataloader_state, {checkpoint_util.EPOCHS_COMPLETED: 2})
+
+    def test_train_loop_empty_data_fails_the_restore_loudly(self) -> None:
+        """A training dataset without any row cannot init the optimizer.
+
+        Both the empty remainder and the next full pass yield nothing, so
+        the restore fails with a clear error instead of hanging the loop.
+        """
+        ckpt_manager = mock.Mock()
+        exporter = mock.Mock()
+        exporter.enabled = False
+        model = mock.Mock()
+        optimizer = mock.Mock()
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.side_effect = [iter([]), iter([])]
+        pipeline = mock.Mock()
+        train_config = _train_config(num_steps=1, log_step_count_steps=10)
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "training data is empty"):
+                _train_and_evaluate(
+                    model=model,
+                    optimizer=optimizer,
+                    train_dataloader=train_dataloader,
+                    eval_dataloader=None,
+                    lr_scheduler=[],
+                    model_dir="unused",
+                    train_config=train_config,
+                    eval_config=EvalConfig(),
+                    runtime=ShardedModelRuntime(ckpt_manager, None),
+                    ckpt_path="model.ckpt-10",
+                    restore_from_model_dir=True,
+                    dataloader_state={checkpoint_util.EPOCHS_COMPLETED: 1},
+                )
+        ckpt_manager.restore.assert_not_called()
+
+    def test_train_loop_empty_resume_trains_exactly_the_leftover_epochs(self) -> None:
+        """An end-of-data resume under an epoch budget trains the exact rest.
+
+        The empty remainder consumed by the peek accounts the resumed pass
+        and burns its epoch iteration, so a job with one epoch of budget
+        left trains exactly one full pass, not two.
+        """
+        ckpt_manager = mock.Mock()
+        ckpt_manager.maybe_save.return_value = False
+        exporter = mock.Mock()
+        exporter.enabled = False
+        model = mock.Mock()
+        model.module.model.compute_train_metric.return_value = {}
+        optimizer = mock.Mock()
+        optimizer.params = {}
+        optimizer.param_groups = []
+        train_dataloader = mock.Mock()
+        batches = [
+            SimpleNamespace(checkpoint_info=None, data_timestamp=float(i))
+            for i in range(3)
+        ]
+        train_dataloader.get_iterator.side_effect = [iter([]), iter(batches)]
+        pipeline = mock.Mock()
+        pipeline.progress.side_effect = lambda it: (
+            {"loss": torch.tensor(1.0)},
+            {},
+            next(it),
+        )
+        dataloader_state = {checkpoint_util.EPOCHS_COMPLETED: 1, "src:0": 7}
+        train_config = _train_config(num_steps=0, num_epochs=3, log_step_count_steps=10)
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            _train_and_evaluate(
+                model=model,
+                optimizer=optimizer,
+                train_dataloader=train_dataloader,
+                eval_dataloader=None,
+                lr_scheduler=[],
+                model_dir="unused",
+                train_config=train_config,
+                eval_config=EvalConfig(),
+                runtime=ShardedModelRuntime(ckpt_manager, None),
+                ckpt_path="model.ckpt-10",
+                restore_from_model_dir=True,
+                dataloader_state=dataloader_state,
+            )
+        # the peek's iterator plus the one full pass; no extra epoch ran
+        self.assertEqual(train_dataloader.get_iterator.call_count, 2)
+        self.assertEqual(pipeline.progress.call_count, 5)
+        self.assertIs(ckpt_manager.restore.call_args.args[2], optimizer)
+        self.assertEqual(dataloader_state, {checkpoint_util.EPOCHS_COMPLETED: 3})
+
+    def test_train_loop_empty_resume_at_budget_saves_nothing(self) -> None:
+        """The empty remainder completes the last epoch: nothing left to do.
+
+        Like the entry's restored-counter early return, the run exits
+        before the restore, so the source checkpoint is not rewritten.
+        """
+        ckpt_manager = mock.Mock()
+        exporter = mock.Mock()
+        exporter.enabled = False
+        model = mock.Mock()
+        optimizer = mock.Mock()
+        train_dataloader = mock.Mock()
+        train_dataloader.get_iterator.return_value = iter([])
+        pipeline = mock.Mock()
+        train_config = _train_config(num_steps=0, num_epochs=2, log_step_count_steps=10)
+        with (
+            mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
+            mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
+            mock.patch("tzrec.main.OnlineDenseExportManager", return_value=exporter),
+        ):
+            _train_and_evaluate(
+                model=model,
+                optimizer=optimizer,
+                train_dataloader=train_dataloader,
+                eval_dataloader=None,
+                lr_scheduler=[],
+                model_dir="unused",
+                train_config=train_config,
+                eval_config=EvalConfig(),
+                runtime=ShardedModelRuntime(ckpt_manager, None),
+                ckpt_path="model.ckpt-10",
+                restore_from_model_dir=True,
+                dataloader_state={checkpoint_util.EPOCHS_COMPLETED: 1},
+            )
+        self.assertEqual(train_dataloader.get_iterator.call_count, 1)
+        ckpt_manager.restore.assert_not_called()
+        ckpt_manager.maybe_save.assert_not_called()
+
     def test_train_loop_pairs_dense_export_with_delta_dump(self) -> None:
         """The dump decision drives the export; the poll and final publish follow.
 

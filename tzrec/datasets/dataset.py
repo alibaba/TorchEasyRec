@@ -23,6 +23,11 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from tzrec.constant import Mode
 from tzrec.datasets.data_parser import DataParser
+from tzrec.datasets.sample_shuffle import (
+    ReadPlan,
+    SampleShuffleHandle,
+    sample_shuffle_enabled,
+)
 from tzrec.datasets.sampler import BaseSampler, TDMSampler
 from tzrec.datasets.utils import (
     C_NEG_SAMPLE_MASK,
@@ -35,6 +40,7 @@ from tzrec.datasets.utils import (
     Batch,
     RecordBatchTensor,
     build_sampler_input,
+    calc_slice_intervals,
     combine_negs_to_candidate_sequence,
     expand_tdm_sample,
     remove_nullable,
@@ -225,6 +231,9 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._sampler_inited = False
 
         self._reader = None
+        # attached by create_dataloader when the sample-shuffle path serves
+        # this dataset; forked workers inherit it, the trainer owns its life
+        self._sample_shuffle: Optional[SampleShuffleHandle] = None
 
     def launch_sampler_cluster(
         self,
@@ -333,6 +342,12 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         if self._sampler is not None and not self._sampler_inited:
             self._sampler.init()
             self._sampler_inited = True
+        if self._sample_shuffle is not None:
+            worker_info = get_worker_info()
+            consumer_id = 0 if worker_info is None else worker_info.id
+            for input_data in self._sample_shuffle.batches(consumer_id):
+                yield self._build_batch(input_data)
+            return
         worker_id, num_workers, world_size = self.get_worker_info()
         for input_data in self._reader.to_batches(worker_id, num_workers, world_size):
             yield self._build_batch(input_data)
@@ -602,6 +617,60 @@ class BaseReader(metaclass=_reader_meta_cls):
         """Table schema."""
         raise NotImplementedError
 
+    def _worker_intervals(
+        self,
+        sources: List[Tuple[str, int]],
+        worker_id: int,
+        num_workers: int,
+        world_size: Optional[int],
+    ) -> List[List[Tuple[int, int]]]:
+        """Plan one worker's row intervals per source; shared by BATCH and RANK.
+
+        Args:
+            sources: (source_id_prefix, total_rows) in read order.
+            worker_id: slice id.
+            num_workers: slice number.
+            world_size: number of ranks the slices are grouped into.
+
+        Returns:
+            for every source, in the order of ``sources``, the (start, end)
+            intervals of this slice.
+        """
+        return calc_slice_intervals(
+            sources,
+            worker_id,
+            num_workers,
+            self._batch_size,
+            self._equalize_rank_steps,
+            self._min_batch_size,
+            checkpoint_state=self._checkpoint_state,
+            world_size=world_size,
+        )
+
+    def create_read_plan(
+        self, rank: int, world_size: int, num_readers: int
+    ) -> ReadPlan:
+        """Build this rank's sample-level shuffle read plan.
+
+        ``planned_rows`` must already reflect rank-step alignment and tail
+        trimming; the coordinator allocates exactly those rows.
+
+        Args:
+            rank: this process's rank.
+            world_size: number of ranks.
+            num_readers: number of reader processes on this rank.
+
+        Returns:
+            the rank-local read plan.
+
+        Raises:
+            NotImplementedError: when the reader does not support sample-level
+                shuffle.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support sample-level shuffle"
+        )
+
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
@@ -831,6 +900,16 @@ def create_dataloader(
         dataloader (dataloader): a DataLoader.
     """
     dataset_name = data_pb2.DatasetType.Name(data_config.dataset_type)
+    if (
+        mode == Mode.TRAIN
+        and not data_config.shuffle
+        and data_config.shuffle_mode
+        in (data_pb2.ShuffleMode.SAMPLE_WINDOW, data_pb2.ShuffleMode.SAMPLE_ROLLING)
+    ):
+        raise ValueError(
+            "shuffle_mode=SAMPLE_WINDOW/SAMPLE_ROLLING requires shuffle=true; "
+            "otherwise no shuffle happens at all"
+        )
     # pyre-ignore [16]
     dataset_cls = BaseDataset.create_class(dataset_name)
     dataset = dataset_cls(
@@ -842,8 +921,6 @@ def create_dataloader(
         debug_level=debug_level,
         compiled_prompt=compiled_prompt,
     )
-    if checkpoint_state:
-        dataset.load_state_dict(dict(checkpoint_state))
 
     kwargs = {}
     if data_config.num_workers < 1:
@@ -871,6 +948,22 @@ def create_dataloader(
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = data_config.prefetch_factor
 
+    # Restore the resume state and build the sample-shuffle service before
+    # forking, using the actual worker count.
+    if checkpoint_state:
+        dataset.load_state_dict(dict(checkpoint_state))
+    sample_shuffle = None
+    if sample_shuffle_enabled(data_config, mode):
+        rank, world_size = (
+            (dist.get_rank(), dist.get_world_size())
+            if dist.is_initialized()
+            else (0, 1)
+        )
+        sample_shuffle = SampleShuffleHandle(
+            dataset._reader, data_config, num_workers, rank, world_size
+        )
+        dataset._sample_shuffle = sample_shuffle
+
     if mode == Mode.TRAIN:
         # When in train_and_eval mode, use 2x worker in gl cluster
         # for train_dataloader and eval_dataloader
@@ -894,10 +987,20 @@ def create_dataloader(
         in_order=data_config.in_order,
         **kwargs,
     )
-    # For PyTorch versions 2.6 and above, we initialize the data iterator before
-    # beginning the training process to avoid potential CUDA-related issues following
-    # model saving.
-    first_iterator = iter(dataloader)
+    try:
+        # For PyTorch versions 2.6 and above, we initialize the data iterator
+        # before beginning the training process to avoid potential CUDA-related
+        # issues following model saving.
+        first_iterator = iter(dataloader)
+        # start the service after the eager iter() forked the workers, so
+        # consumers and reader processes never share state with them
+        if sample_shuffle is not None:
+            sample_shuffle.start()
+    except Exception:
+        # a half-started service must not outlive the failed dataloader
+        if sample_shuffle is not None:
+            sample_shuffle.stop()
+        raise
 
     def get_iterator() -> Iterator[Batch]:
         # return the eager iterator first (keeps its prefetch), then fresh ones
@@ -907,5 +1010,11 @@ def create_dataloader(
             return it
         return iter(dataloader)
 
+    def close() -> None:
+        """Stop the sample-shuffle service; a no-op for paths without one."""
+        if sample_shuffle is not None:
+            sample_shuffle.stop()
+
     dataloader.get_iterator = get_iterator  # pyre-ignore[16]
+    dataloader.close = close  # pyre-ignore[16]
     return dataloader

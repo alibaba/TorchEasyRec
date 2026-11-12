@@ -15,7 +15,7 @@ import json
 import os
 import socket
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime, timezone
 from queue import Queue
 from threading import Event, Thread
@@ -494,7 +494,9 @@ def _train_and_evaluate(
             )
         return
     epoch_iter = (
-        range(epochs_completed, train_config.num_epochs)
+        # an iterator, so the optimizer-init peek can consume an iteration
+        # that an empty resumed pass already accounted
+        iter(range(epochs_completed, train_config.num_epochs))
         if use_epoch
         else itertools.count(0, 0)
     )
@@ -646,29 +648,46 @@ def _train_and_evaluate(
                     if restore_from_model_dir and not ignore_restore_lr_scheduler
                     else None
                 )
-                if ignore_restore_optimizer:
-                    ckpt_manager.restore(
-                        ckpt_path,
-                        model,
-                        None,
-                        train_config.fine_tune_ckpt_param_map,
-                        dense_ema=dense_ema,
-                        lr_schedulers=restore_schedulers,
-                    )
-                else:
+                if not ignore_restore_optimizer:
                     # optimizer state is lazy, so peek one batch to init it
-                    # before restore.
-                    peek_batch = next(train_iterator)
+                    # before restore. A resume at the end of the data serves
+                    # an empty first pass; the peek then falls through to the
+                    # next pass, accounting the empty remainder like the
+                    # loop's StopIteration handler.
+                    peek_batch = next(train_iterator, None)
+                    if peek_batch is None:
+                        epochs_completed += 1
+                        dataloader_state.clear()
+                        dataloader_state[checkpoint_util.EPOCHS_COMPLETED] = (
+                            epochs_completed
+                        )
+                        if use_epoch and epochs_completed >= train_config.num_epochs:
+                            if is_local_rank_zero:
+                                logger.warning(
+                                    f"{epochs_completed} epochs already "
+                                    "completed in the restored checkpoint, "
+                                    "no epochs left to train."
+                                )
+                            return
+                        # the accounted pass consumed this epoch iteration
+                        next(epoch_iter, None)
+                        train_iterator = train_dataloader.get_iterator()
+                        peek_batch = next(train_iterator, None)
+                    if peek_batch is None:
+                        raise RuntimeError(
+                            "cannot initialize the optimizer state for the "
+                            "restore: the training data is empty"
+                        )
                     pipeline.progress(iter([peek_batch]))
                     train_iterator = itertools.chain([peek_batch], train_iterator)
-                    ckpt_manager.restore(
-                        ckpt_path,
-                        model,
-                        optimizer,
-                        train_config.fine_tune_ckpt_param_map,
-                        dense_ema=dense_ema,
-                        lr_schedulers=restore_schedulers,
-                    )
+                ckpt_manager.restore(
+                    ckpt_path,
+                    model,
+                    None if ignore_restore_optimizer else optimizer,
+                    train_config.fine_tune_ckpt_param_map,
+                    dense_ema=dense_ema,
+                    lr_schedulers=restore_schedulers,
+                )
                 if not restore_from_model_dir:
                     # a fine-tune checkpoint's train metric describes the source
                     # model, not the model this job is training.
@@ -970,196 +989,203 @@ def train_and_evaluate(
             compiled_prompt=compiled_prompt,
             checkpoint_state=dataloader_state,
         )
-        eval_dataloader = None
-        if pipeline_config.eval_input_path:
-            # pyre-ignore [16]
-            gl_cluster = train_dataloader.dataset.get_sampler_cluster()
-            eval_dataloader = create_dataloader(
-                data_config,
+        with ExitStack() as stack:
+            # any exit stops the sample-shuffle service: initialization
+            # failure, a finished or early-stopped run, or an exception
+            stack.callback(train_dataloader.close)  # pyre-ignore[16]
+
+            eval_dataloader = None
+            if pipeline_config.eval_input_path:
+                # pyre-ignore [16]
+                gl_cluster = train_dataloader.dataset.get_sampler_cluster()
+                eval_dataloader = create_dataloader(
+                    data_config,
+                    features,
+                    pipeline_config.eval_input_path,
+                    mode=Mode.EVAL,
+                    compiled_prompt=compiled_prompt,
+                    gl_cluster=gl_cluster,
+                )
+
+            sampler_type = _get_sampler_type(data_config)
+
+            # Build model
+            model = _create_model(
+                pipeline_config.model_config,
                 features,
-                pipeline_config.eval_input_path,
-                mode=Mode.EVAL,
+                list(data_config.label_fields),
+                sample_weights=list(data_config.sample_weight_fields),
+                sampler_type=sampler_type,
                 compiled_prompt=compiled_prompt,
-                gl_cluster=gl_cluster,
+            )
+            # Cold start only; a resumed or fine-tuned run gets its weights from DCP.
+            if ckpt_path is None:
+                model.init_from_pretrained()
+            model = TrainWrapper(
+                model, device=device, mixed_precision=train_config.mixed_precision
             )
 
-        sampler_type = _get_sampler_type(data_config)
+            sparse_optim_cls, sparse_optim_kwargs = (
+                optimizer_builder.create_sparse_optimizer(train_config.sparse_optimizer)
+            )
+            trainable_params, frozen_params = model.model.sparse_parameters()
+            apply_optimizer_in_backward(
+                sparse_optim_cls, trainable_params, sparse_optim_kwargs
+            )
+            if len(frozen_params) > 0:
+                # SGD and lr=0 for using fused kernel and freezing params
+                apply_optimizer_in_backward(SGD, frozen_params, {"lr": 0.0})
 
-        # Build model
-        model = _create_model(
-            pipeline_config.model_config,
-            features,
-            list(data_config.label_fields),
-            sample_weights=list(data_config.sample_weight_fields),
-            sampler_type=sampler_type,
-            compiled_prompt=compiled_prompt,
-        )
-        # Cold start only; a resumed or fine-tuned run gets its weights from DCP.
-        if ckpt_path is None:
-            model.init_from_pretrained()
-        model = TrainWrapper(
-            model, device=device, mixed_precision=train_config.mixed_precision
-        )
-
-        sparse_optim_cls, sparse_optim_kwargs = (
-            optimizer_builder.create_sparse_optimizer(train_config.sparse_optimizer)
-        )
-        trainable_params, frozen_params = model.model.sparse_parameters()
-        apply_optimizer_in_backward(
-            sparse_optim_cls, trainable_params, sparse_optim_kwargs
-        )
-        if len(frozen_params) > 0:
-            # SGD and lr=0 for using fused kernel and freezing params
-            apply_optimizer_in_backward(SGD, frozen_params, {"lr": 0.0})
-
-        model = runtime.shard(
-            model,
-            device=device,
-            # pyre-ignore [16]
-            batch_size=train_dataloader.dataset.sampled_batch_size,
-            checkpoint_path=ckpt_path,
-        )
-        delta_embedding_dumper = None
-        if enable_delta_embedding_dump:
-            delta_embedding_dumper = DeltaEmbeddingDumper(
+            model = runtime.shard(
                 model,
-                train_config.delta_embedding_dump_config,
-                pipeline_config.model_dir,
-                device,
+                device=device,
+                # pyre-ignore [16]
+                batch_size=train_dataloader.dataset.sampled_batch_size,
+                checkpoint_path=ckpt_path,
             )
-
-        dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
-            train_config.dense_optimizer
-        )
-        part_optim_cls, part_optim_kwargs, part_optim_regex_patterns = (
-            optimizer_builder.create_part_optimizer(train_config.dense_optimizer)
-        )
-        dense_params = dict(in_backward_optimizer_filter(model.named_parameters()))
-        remaining_params, part_optim_params = (
-            optimizer_builder.group_param_by_regex_pattern(
-                dense_params,
-                part_optim_regex_patterns,
-            )
-        )
-        dense_ema = None
-        if train_config.dense_optimizer.HasField("ema"):
-            dense_ema = DenseEMA(
-                dense_params,
-                train_config.dense_optimizer.ema.decay,
-            )
-        dense_optimizer = KeyedOptimizerWrapper(
-            remaining_params,
-            lambda params: dense_optim_cls(params, **dense_optim_kwargs),
-        )
-        # it is necessary to know the index that can match the parameter part_optimizer
-        # for lr scheduler use
-        part_optimizers, part_optim_indices = optimizer_builder.build_part_optimizers(
-            part_optim_cls, part_optim_kwargs, part_optim_params
-        )
-        grad_scaler = None
-        if train_config.HasField("grad_scaler"):
-            grad_scaler = GradScaler(
-                device=device.type,
-                **config_util.config_to_kwargs(train_config.grad_scaler),
-            )
-        combined_optimizer = CombinedOptimizer(
-            [model.fused_optimizer, dense_optimizer, *part_optimizers]
-        )
-        # Apply gradient clipping for dense parameters if configured
-        if train_config.HasField("grad_clipping"):
-            gc_config = train_config.grad_clipping
-            valid_clipping_types = set(GradientClipping.__members__.keys())
-            clipping_type_str = gc_config.clipping_type.upper()
-            if clipping_type_str not in valid_clipping_types:
-                raise ValueError(
-                    f"Invalid clipping_type '{gc_config.clipping_type}'. Valid "
-                    f"values are: {', '.join(t.lower() for t in valid_clipping_types)}"
+            delta_embedding_dumper = None
+            if enable_delta_embedding_dump:
+                delta_embedding_dumper = DeltaEmbeddingDumper(
+                    model,
+                    train_config.delta_embedding_dump_config,
+                    pipeline_config.model_dir,
+                    device,
                 )
-            clipping_type = GradientClipping[clipping_type_str]
-            if clipping_type != GradientClipping.NONE:
-                combined_optimizer = GradientClippingOptimizer(
-                    optimizer=combined_optimizer,
-                    clipping=clipping_type,
-                    max_gradient=gc_config.max_gradient,
-                    norm_type=gc_config.norm_type,
-                    enable_global_grad_clip=gc_config.enable_global_grad_clip,
+
+            dense_optim_cls, dense_optim_kwargs = (
+                optimizer_builder.create_dense_optimizer(train_config.dense_optimizer)
+            )
+            part_optim_cls, part_optim_kwargs, part_optim_regex_patterns = (
+                optimizer_builder.create_part_optimizer(train_config.dense_optimizer)
+            )
+            dense_params = dict(in_backward_optimizer_filter(model.named_parameters()))
+            remaining_params, part_optim_params = (
+                optimizer_builder.group_param_by_regex_pattern(
+                    dense_params,
+                    part_optim_regex_patterns,
                 )
-        if dense_ema is not None:
-            combined_optimizer = EMAOptimizer(combined_optimizer, dense_ema)
-        optimizer = TZRecOptimizer(
-            combined_optimizer,
-            grad_scaler=grad_scaler,
-            gradient_accumulation_steps=train_config.gradient_accumulation_steps,
-        )
-        sparse_lr = optimizer_builder.create_scheduler(
-            model.fused_optimizer, train_config.sparse_optimizer
-        )
-        dense_lr = optimizer_builder.create_scheduler(
-            dense_optimizer, train_config.dense_optimizer
-        )
-        part_lrs = optimizer_builder.create_part_optim_schedulers(
-            part_optimizers, train_config.dense_optimizer, part_optim_indices
-        )
-
-        # use barrier to sync all workers, prevent rank zero save_message and create
-        # model_dir first, other slow rank find model_dir already exists and
-        # do continue train improperly.
-        dist.barrier()
-
-        if is_rank_zero:
-            config_util.save_message(
-                pipeline_config,
-                os.path.join(pipeline_config.model_dir, "pipeline.config"),
             )
-            with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:
-                f.write(tzrec_version + "\n")
-
-        try:
-            if delta_embedding_dumper is not None:
-                delta_embedding_dumper.start()
-            # when slice batch by sample cost, data on all workers may not be balanced
-            check_all_workers_data_status = data_config.HasField("batch_cost_size")
-            _train_and_evaluate(
-                model,
-                optimizer,
-                train_dataloader,
-                eval_dataloader,
-                [sparse_lr, dense_lr, *part_lrs],
-                pipeline_config.model_dir,
-                train_config=train_config,
-                eval_config=pipeline_config.eval_config,
-                runtime=runtime,
-                skip_steps=skip_steps,
-                ckpt_path=ckpt_path,
-                check_all_workers_data_status=check_all_workers_data_status,
-                ignore_restore_optimizer=ignore_restore_optimizer,
-                ignore_restore_lr_scheduler=ignore_restore_lr_scheduler,
-                restore_from_model_dir=restore_from_model_dir,
-                dataloader_state=dataloader_state,
-                delta_embedding_dumper=delta_embedding_dumper,
-                pipeline_config_path=os.path.join(
-                    pipeline_config.model_dir, "pipeline.config"
-                ),
-                dense_ema=dense_ema,
-                export_config=pipeline_config.export_config,
+            dense_ema = None
+            if train_config.dense_optimizer.HasField("ema"):
+                dense_ema = DenseEMA(
+                    dense_params,
+                    train_config.dense_optimizer.ema.decay,
+                )
+            dense_optimizer = KeyedOptimizerWrapper(
+                remaining_params,
+                lambda params: dense_optim_cls(params, **dense_optim_kwargs),
             )
-            # Drain background uploads after a normal return: full training
-            # already drained inside the loop before its final publish (this
-            # close is then idempotent), and a no-work return still needs its
-            # started uploader drained.
-            if delta_embedding_dumper is not None:
-                delta_embedding_dumper.close()
-        except BaseException:
-            # A training failure tears down the whole job (torchrun kills every
-            # rank): request a non-draining abort so the uploader drops its
-            # pending in-memory deltas instead of uploading doomed state; the
-            # restarted run re-dumps from the latest checkpoint.
-            if delta_embedding_dumper is not None:
-                try:
-                    delta_embedding_dumper.close(raise_on_error=False, drain=False)
-                except Exception:
-                    logger.exception("Failed to request delta uploader abort")
-            raise
+            # it is necessary to know the index that can match the parameter
+            # part_optimizer for lr scheduler use
+            part_optimizers, part_optim_indices = (
+                optimizer_builder.build_part_optimizers(
+                    part_optim_cls, part_optim_kwargs, part_optim_params
+                )
+            )
+            grad_scaler = None
+            if train_config.HasField("grad_scaler"):
+                grad_scaler = GradScaler(
+                    device=device.type,
+                    **config_util.config_to_kwargs(train_config.grad_scaler),
+                )
+            combined_optimizer = CombinedOptimizer(
+                [model.fused_optimizer, dense_optimizer, *part_optimizers]
+            )
+            # Apply gradient clipping for dense parameters if configured
+            if train_config.HasField("grad_clipping"):
+                gc_config = train_config.grad_clipping
+                valid_clipping_types = set(GradientClipping.__members__.keys())
+                clipping_type_str = gc_config.clipping_type.upper()
+                if clipping_type_str not in valid_clipping_types:
+                    valid = ", ".join(t.lower() for t in valid_clipping_types)
+                    raise ValueError(
+                        f"Invalid clipping_type '{gc_config.clipping_type}'. "
+                        f"Valid values are: {valid}"
+                    )
+                clipping_type = GradientClipping[clipping_type_str]
+                if clipping_type != GradientClipping.NONE:
+                    combined_optimizer = GradientClippingOptimizer(
+                        optimizer=combined_optimizer,
+                        clipping=clipping_type,
+                        max_gradient=gc_config.max_gradient,
+                        norm_type=gc_config.norm_type,
+                        enable_global_grad_clip=gc_config.enable_global_grad_clip,
+                    )
+            if dense_ema is not None:
+                combined_optimizer = EMAOptimizer(combined_optimizer, dense_ema)
+            optimizer = TZRecOptimizer(
+                combined_optimizer,
+                grad_scaler=grad_scaler,
+                gradient_accumulation_steps=train_config.gradient_accumulation_steps,
+            )
+            sparse_lr = optimizer_builder.create_scheduler(
+                model.fused_optimizer, train_config.sparse_optimizer
+            )
+            dense_lr = optimizer_builder.create_scheduler(
+                dense_optimizer, train_config.dense_optimizer
+            )
+            part_lrs = optimizer_builder.create_part_optim_schedulers(
+                part_optimizers, train_config.dense_optimizer, part_optim_indices
+            )
+            # use barrier to sync all workers, prevent rank zero save_message and create
+            # model_dir first, other slow rank find model_dir already exists and
+            # do continue train improperly.
+            dist.barrier()
+
+            if is_rank_zero:
+                config_util.save_message(
+                    pipeline_config,
+                    os.path.join(pipeline_config.model_dir, "pipeline.config"),
+                )
+                with open(os.path.join(pipeline_config.model_dir, "version"), "w") as f:
+                    f.write(tzrec_version + "\n")
+            try:
+                if delta_embedding_dumper is not None:
+                    delta_embedding_dumper.start()
+                # when slice batch by sample cost, data on all workers may
+                # not be balanced
+                check_all_workers_data_status = data_config.HasField("batch_cost_size")
+                _train_and_evaluate(
+                    model,
+                    optimizer,
+                    train_dataloader,
+                    eval_dataloader,
+                    [sparse_lr, dense_lr, *part_lrs],
+                    pipeline_config.model_dir,
+                    train_config=train_config,
+                    eval_config=pipeline_config.eval_config,
+                    runtime=runtime,
+                    skip_steps=skip_steps,
+                    ckpt_path=ckpt_path,
+                    check_all_workers_data_status=check_all_workers_data_status,
+                    ignore_restore_optimizer=ignore_restore_optimizer,
+                    ignore_restore_lr_scheduler=ignore_restore_lr_scheduler,
+                    restore_from_model_dir=restore_from_model_dir,
+                    dataloader_state=dataloader_state,
+                    delta_embedding_dumper=delta_embedding_dumper,
+                    pipeline_config_path=os.path.join(
+                        pipeline_config.model_dir, "pipeline.config"
+                    ),
+                    dense_ema=dense_ema,
+                    export_config=pipeline_config.export_config,
+                )
+                # Drain background uploads after a normal return: full training
+                # already drained inside the loop before its final publish (this
+                # close is then idempotent), and a no-work return still needs its
+                # started uploader drained.
+                if delta_embedding_dumper is not None:
+                    delta_embedding_dumper.close()
+            except BaseException:
+                # A training failure tears down the whole job (torchrun kills every
+                # rank): request a non-draining abort so the uploader drops its
+                # pending in-memory deltas instead of uploading doomed state; the
+                # restarted run re-dumps from the latest checkpoint.
+                if delta_embedding_dumper is not None:
+                    try:
+                        delta_embedding_dumper.close(raise_on_error=False, drain=False)
+                    except Exception:
+                        logger.exception("Failed to request delta uploader abort")
+                raise
 
     if is_local_rank_zero:
         logger.info("Train and Evaluate Finished.")
