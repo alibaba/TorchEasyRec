@@ -424,19 +424,61 @@ def _sparse_dp_proposor_numpy(
 
 
 class DynamicProgrammingProposer(Proposer):
-    r"""Proposes sharding plans in 3D (HBM × DDR × SSD) dynamic programming.
+    r"""Proposes sharding plans using 3D (HBM, DDR, SSD) dynamic programming.
 
-        The problem of the Embedding Sharding Plan can be framed as follows:
-    Given :math:`M` tables and their corresponding :math:`N` Sharding Options,
-    we need to select one sharding option for each table such that the total
-    performance is minimized, while keeping the HBM constraint :math:`K_h`,
-    the host DDR constraint :math:`K_d` and the SSD constraint :math:`K_s`
-    in check. Shared backend resources are already reserved in the topology.
+    The problem of the Embedding Sharding Plan can be framed as follows: given
+    :math:`M` tables and their corresponding :math:`N` Sharding Options, select
+    one option for each table such that the total performance cost is minimized,
+    while keeping the HBM constraint :math:`K_h`, host DDR constraint
+    :math:`K_d` and SSD constraint :math:`K_s` in check. Shared backend resources
+    are already reserved in the topology before these capacities are computed.
 
-    Each DP state is a reachable (hbm, ddr, ssd) cell. Performance determines
-    the winner within each cell; one proposal is emitted per HBM bin.
-    The SSD axis uses per-device bins when candidate costs can exceed the
-    capacity and otherwise collapses to one bin.
+    Given matrices :math:`A^h`, :math:`A^d`, :math:`A^s` and :math:`B` of
+    dimensions :math:`(M, N)`, let :math:`a^h_{i,j}`, :math:`a^d_{i,j}` and
+    :math:`a^s_{i,j}` be the per-option HBM, DDR and SSD storage costs, and
+    :math:`b_{i,j}` the performance cost. We aim to find a set of column indices
+    :math:`\{j_0, j_1, \ldots, j_{M-1}\}` such that:
+
+    1. :math:`\sum_{i=0}^{M-1} a^h_{i,j_i} \leq K_h`.
+    2. :math:`\sum_{i=0}^{M-1} a^d_{i,j_i} \leq K_d`.
+    3. :math:`\sum_{i=0}^{M-1} a^s_{i,j_i} \leq K_s`.
+    4. :math:`\sum_{i=0}^{M-1} b_{i,j_i}` is minimized.
+
+    This problem can be tackled using 3D dynamic programming. First, discretize
+    :math:`K_h`, :math:`K_d` and :math:`K_s` into bins, and denote the
+    discretization functions as :math:`f_h`, :math:`f_d` and :math:`f_s`.
+
+    Define :math:`dp[i][f_h(k_h)][f_d(k_d)][f_s(k_s)]` as the minimum performance
+    cost retained for a resource cell after considering the first :math:`i`
+    tables. Here :math:`k_h`, :math:`k_d` and :math:`k_s` are the accumulated
+    HBM, DDR and SSD costs. Initialize :math:`dp[0][0][0][0]=0`; other states
+    are unreachable until a transition reaches them.
+
+    The conceptual state transition for table :math:`i` is:
+
+    .. math::
+
+        dp[i+1][f_h(k_h)][f_d(k_d)][f_s(k_s)] = \min_{j=0}^{N-1} \left(
+            dp[i][f_h(k_h-a^h_{i,j})][f_d(k_d-a^d_{i,j})]
+            [f_s(k_s-a^s_{i,j})] + b_{i,j} \right)
+
+    The sparse implementation carries actual resource totals with each retained
+    state, adds a candidate's costs, and rejects totals above capacity before
+    binning. Exact equality to capacity is feasible and maps to the last bin.
+    Only the lowest-cost state in each destination cell is retained. SSD bins
+    scale per device; when every eligible combination fits the SSD budget, its
+    axis collapses to one bin while the actual SSD costs are still tracked.
+
+    Since :math:`K_h`, :math:`K_d` and :math:`K_s` are aggregate capacities,
+    satisfying these inequalities does not guarantee that the allocation fits
+    on individual cards or hosts. Keep the final DP states for proposal
+    selection: for each HBM bin, emit the lowest-cost plan across all DDR and
+    SSD bins, in decreasing HBM order. The partitioner checks each emitted
+    proposal against the per-device and per-host constraints.
+
+    Binning and retaining one proposal per HBM bin are search heuristics, not a
+    proof of global optimality: a discarded plan can have different placement
+    feasibility even if it has a higher performance cost in the same HBM bin.
 
     Args:
         hbm_bins_per_device (int): per-device HBM bins for DP precision.
