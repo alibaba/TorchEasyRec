@@ -21,15 +21,10 @@ measured feature of a copy of the config:
                     count, partial batches included. The planner keeps one
                     entry per feature of a table, for input, output and
                     communication estimates.
-  unique_id_factor  largest number of distinct ids one sample looks up in a
-                    table through all the features that share it: the
-                    per-sample union, measured jointly over every member
-                    feature, never the max of independently measured
-                    features. The table's conservative cache working-set
-                    estimate is batch_size * the factor. The same table-level
-                    value is written on each member feature; a feature
-                    feeding several physical tables keeps the maximum of
-                    their measured factors.
+  unique_id_factor  maximum across global batches of the table's joint distinct
+                    ID count divided by the actual batch sample count. All
+                    samples and sharing features participate in the union.
+                    Each member receives the same table-level factor.
 
 Both values are measured in one pass. A feature missing from the sampled
 batches is left unchanged. A shared table's union is only measured when
@@ -46,13 +41,14 @@ post-collision embedding-row working set.
 
 Usage: python -m tzrec.tools.add_pooling_factor_to_config
     --pipeline_config_path pipeline.config --output_path pipeline_measured.config
-    [--num_batches 100]
+    --global_batch_size 4096 [--num_batches 100]
 """
 
 import argparse
+import copy
 import math
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -77,12 +73,21 @@ class AddPoolingFactorToConfig(object):
         pipeline_config_path (str): pipeline config path; its train input is
             read and its model config decides the physical tables.
         output_path (str): path to write the filled config to.
-        num_batches (int): number of batches to sample.
+        num_batches (int): number of global batches to sample.
+        global_batch_size (int): target local batch size times world size;
+            None uses the config batch size for programmatic callers.
     """
 
     def __init__(
-        self, pipeline_config_path: str, output_path: str, num_batches: int
+        self,
+        pipeline_config_path: str,
+        output_path: str,
+        num_batches: int,
+        global_batch_size: Optional[int] = None,
     ) -> None:
+        if global_batch_size is not None and global_batch_size < 1:
+            raise ValueError("global_batch_size must be positive when supplied")
+        self._global_batch_size = global_batch_size
         if num_batches < 1:
             raise ValueError(f"num_batches must be at least 1, got {num_batches}")
         if os.path.realpath(output_path) == os.path.realpath(pipeline_config_path):
@@ -204,9 +209,13 @@ class AddPoolingFactorToConfig(object):
             feature name -> (pooling_factor, unique_id_factor); the second is
             0.0 for features whose tables were never looked up.
         """
-        dataloader = create_dataloader(cfg.data_config, features, cfg.train_input_path)
+        data_config = copy.deepcopy(cfg.data_config)
+        data_config.batch_size = self._global_batch_size or data_config.batch_size
+        data_config.drop_remainder = False
+        data_config.min_batch_size = 0
+        dataloader = create_dataloader(data_config, features, cfg.train_input_path)
         raw_ids: Dict[str, int] = {}
-        table_max: Dict[str, int] = {}
+        table_max: Dict[str, float] = {}
         samples = 0
         got = 0
         for batch in dataloader:
@@ -219,10 +228,12 @@ class AddPoolingFactorToConfig(object):
                         jt.values().detach().cpu().numpy(),
                         jt.lengths().detach().cpu().numpy(),
                     )
+            batch_samples = 0
             if getattr(batch, "labels", None):
-                samples += int(next(iter(batch.labels.values())).shape[0])
+                batch_samples = int(next(iter(batch.labels.values())).shape[0])
             elif per_feature:
-                samples += int(next(iter(per_feature.values()))[1].shape[0])
+                batch_samples = int(next(iter(per_feature.values()))[1].shape[0])
+            samples += batch_samples
             for key, (values, _) in per_feature.items():
                 raw_ids[key] = raw_ids.get(key, 0) + values.size
             for table, names in tables:
@@ -230,10 +241,15 @@ class AddPoolingFactorToConfig(object):
                 if any(name not in per_feature for name in names):
                     continue
                 feats = [per_feature[name] for name in names]
-                if len({lengths.shape[0] for _, lengths in feats}) > 1:
+                if not batch_samples or any(
+                    lengths.shape[0] != batch_samples for _, lengths in feats
+                ):
                     # not sample-aligned, e.g. a tiled user view
                     continue
-                union = _max_distinct_union(feats)
+                union = (
+                    np.unique(np.concatenate([values for values, _ in feats])).size
+                    / batch_samples
+                )
                 table_max[table] = (
                     union if table not in table_max else max(table_max[table], union)
                 )
@@ -294,45 +310,19 @@ class AddPoolingFactorToConfig(object):
         return filled
 
 
-def _max_distinct_union(feats: List[Tuple[np.ndarray, np.ndarray]]) -> int:
-    """Largest per-sample number of distinct ids across the given features.
-
-    The ids of all features are concatenated with the index of their sample
-    and lexsorted by (sample, id); a position starts a new distinct run when
-    either index changes, and the runs are counted per sample. Cost and memory
-    scale with the number of ids, not with the longest sample, and every int64
-    id value is safe.
-
-    Args:
-        feats (List[Tuple[np.ndarray, np.ndarray]]): (ids, lengths per sample)
-            of every feature of one table.
-
-    Returns:
-        the maximum distinct count over the samples.
-    """
-    num_samples = int(feats[0][1].shape[0])
-    ids = np.concatenate([values for values, _ in feats])
-    if ids.size == 0:
-        return 0
-    rows = np.concatenate(
-        [np.repeat(np.arange(num_samples), lengths) for _, lengths in feats]
-    )
-    order = np.lexsort((ids, rows))
-    ids, rows = ids[order], rows[order]
-    starts = np.ones(ids.size, dtype=bool)
-    starts[1:] = (rows[1:] != rows[:-1]) | (ids[1:] != ids[:-1])
-    return int(np.bincount(rows[starts], minlength=num_samples).max())
-
-
 def main() -> None:
     """Command-line entry point."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--pipeline_config_path", required=True)
     parser.add_argument("--output_path", required=True)
+    parser.add_argument("--global_batch_size", type=int, required=True)
     parser.add_argument("--num_batches", type=int, default=100)
     args = parser.parse_args()
     tool = AddPoolingFactorToConfig(
-        args.pipeline_config_path, args.output_path, args.num_batches
+        args.pipeline_config_path,
+        args.output_path,
+        args.num_batches,
+        args.global_batch_size,
     )
     tool.run()
 

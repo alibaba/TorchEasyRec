@@ -14,12 +14,13 @@ import unittest
 
 import pyarrow as pa
 import pyarrow.dataset as ds
+from parameterized import parameterized
 
 from tzrec.protos import data_pb2, model_pb2, pipeline_pb2
 from tzrec.tools.add_pooling_factor_to_config import AddPoolingFactorToConfig
 from tzrec.utils import config_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.test_util import make_test_dir, mark_ci_scope
+from tzrec.utils.test_util import make_test_dir, mark_ci_scope, parameterized_name_func
 
 
 def _write_parquet(test_dir, num_rows=10):
@@ -143,28 +144,33 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         )
         # raw average per sample, partial batches counted: 10 rows in
         # batches of 4 give 10 samples, so multi_b is 30/10, not 30/12
-        self.assertEqual(factors["id_a"], (1.0, 1.0))
-        self.assertEqual(factors["multi_b"], (3.0, 3.0))
+        self.assertEqual(factors["id_a"], (1.0, 0.5))
+        self.assertEqual(factors["multi_b"], (3.0, 1.5))
         # a feature with ids in half the samples clamps to 1
-        self.assertEqual(factors["sparse_c"], (1.0, 1.0))
-        # the union of the sharing features' ids, per sample: the overlap
-        # of shared_a and shared_b gives 3, not the 4 of two features
-        self.assertEqual(factors["shared_a"], (2.0, 3.0))
-        self.assertEqual(factors["shared_b"], (2.0, 3.0))
+        self.assertEqual(factors["sparse_c"], (1.0, 0.5))
+        # The tail batch has three joint IDs across two samples.
+        self.assertEqual(factors["shared_a"], (2.0, 1.5))
+        self.assertEqual(factors["shared_b"], (2.0, 1.5))
         # disjoint ids of two features union to their sum
-        self.assertEqual(factors["dis_a"], (2.0, 4.0))
-        self.assertEqual(factors["dis_b"], (2.0, 4.0))
+        self.assertEqual(factors["dis_a"], (2.0, 2.0))
+        self.assertEqual(factors["dis_b"], (2.0, 2.0))
         # a feature in two physical tables keeps the larger table's value
-        self.assertEqual(factors["t1"], (3.0, 3.0))
-        self.assertEqual(factors["t2"], (2.0, 3.0))
+        self.assertEqual(factors["t1"], (3.0, 1.5))
+        self.assertEqual(factors["t2"], (2.0, 1.5))
 
-    def test_pooling_factor_is_the_average_over_samples(self):
+    @parameterized.expand(
+        [("tail_maximum", False, 0.125), ("first_batch_maximum", True, 1.125)],
+        name_func=parameterized_name_func,
+    )
+    def test_global_batches_and_pooling_average(self, _, reverse, first_factor):
         # eight samples bring one id and two bring nine, so the average is
         # 26/10 = 2.6: neither the per-batch maximum (9) nor a division by
         # padded batch counts (26/12) may replace it
         test_dir = make_test_dir()
         num_rows = 10
         ids = ["7"] * 8 + ["1\x032\x033\x034\x035\x036\x037\x038\x039"] * 2
+        if reverse:
+            ids.reverse()
         t = pa.Table.from_arrays(
             [
                 pa.array(ids),
@@ -176,6 +182,8 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         cfg = pipeline_pb2.EasyRecConfig()
         cfg.train_input_path = os.path.join(test_dir, "*.parquet")
         cfg.data_config.batch_size = 4
+        cfg.data_config.drop_remainder = True
+        cfg.data_config.min_batch_size = 4
         cfg.data_config.dataset_type = data_pb2.DatasetType.ParquetDataset
         cfg.data_config.fg_mode = data_pb2.FgMode.FG_NONE
         cfg.data_config.label_fields.append("label")
@@ -189,7 +197,25 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         factors = AddPoolingFactorToConfig(
             "in.config", "out.config", num_batches=10
         ).measure(cfg, features, [("ebc.id_a_emb", ["id_a"])])
-        self.assertEqual(factors["id_a"][0], 2.6)
+        self.assertEqual(factors["id_a"], (2.6, 2.25 if reverse else 4.5))
+        self.assertEqual(cfg.data_config.batch_size, 4)
+        tool = AddPoolingFactorToConfig(
+            "in.config", "out.config", 1, global_batch_size=8
+        )
+        self.assertEqual(
+            tool.measure(cfg, features, [("t", ["id_a"])])["id_a"],
+            (3.0 if reverse else 1.0, first_factor),
+        )
+        self.assertEqual(cfg.data_config.batch_size, 4)
+        self.assertTrue(cfg.data_config.drop_remainder)
+        self.assertEqual(cfg.data_config.min_batch_size, 4)
+        tool = AddPoolingFactorToConfig(
+            "in.config", "out.config", 2, global_batch_size=8
+        )
+        self.assertEqual(
+            tool.measure(cfg, features, [("t", ["id_a"])])["id_a"],
+            (2.6, 1.125 if reverse else 4.5),
+        )
 
     def test_incomplete_shared_table_has_no_unique_id_estimate(self):
         # a missing member is not an empty one: its table keeps no union
@@ -212,8 +238,8 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
             [("ebc.sparse_union", ["id_a", "sparse_c"])],
         )
         # id_a holds 7 in every sample, sparse_c adds 5 in the even ones
-        self.assertEqual(factors["id_a"], (1.0, 2.0))
-        self.assertEqual(factors["sparse_c"], (1.0, 2.0))
+        self.assertEqual(factors["id_a"], (1.0, 1.0))
+        self.assertEqual(factors["sparse_c"], (1.0, 1.0))
 
     def test_table_feature_mapping_preserves_sharing_and_separation(self):
         cfg = _config("unused.parquet")
@@ -313,6 +339,8 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         )
 
     def test_invalid_tool_arguments_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "global_batch_size"):
+            AddPoolingFactorToConfig("in.config", "out.config", 5, global_batch_size=0)
         with self.assertRaisesRegex(ValueError, "num_batches"):
             AddPoolingFactorToConfig("in.config", "out.config", 0)
         with self.assertRaisesRegex(ValueError, "output_path"):
@@ -335,15 +363,15 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             out.feature_configs[3].id_feature.embedding_constraints.unique_id_factor,
-            3.0,
+            1.5,
         )
         self.assertEqual(
             out.feature_configs[7].id_feature.embedding_constraints.unique_id_factor,
-            2.0,
+            1.0,
         )
         self.assertEqual(
             out.feature_configs[8].id_feature.embedding_constraints.unique_id_factor,
-            2.0,
+            1.0,
         )
         # nothing else about the configuration changed
         for field in ("model_config", "data_config"):
@@ -395,7 +423,7 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
             "in.config", "out.config", num_batches=10
         ).measure(cfg, features, [("ebc.id_a_emb", ["id_a"])])
         # raw positions include the duplicate 7; the union does not
-        self.assertEqual(factors["id_a"], (3.0, 2.0))
+        self.assertEqual(factors["id_a"], (3.0, 1.0))
 
 
 if __name__ == "__main__":

@@ -254,7 +254,7 @@ train_config {
 每个特征可以在`embedding_constraints`中配置两个从训练数据测量的参数来使得EmbeddingPlanner根据数据分布更合理地进行规划：
 
 - `pooling_factor`：一个样本通过该特征查这张表的平均原始Id位置数（含重复），最小为1。规划器用它估算每步查表量、输入输出张量大小和通信量
-- `unique_id_factor`：单个样本通过共用这张表的所有特征查表的去重Id数的最大值（注意与`pooling_factor`不同，它不是平均值，而是最重的一个样本的去重数）。`batch_size * unique_id_factor`是这张表保守的cache工作集估计（例如dynamicemb GPU cache需要容纳它）
+- `unique_id_factor`：每个 global batch 内，共用物理 embedding 表的所有特征、所有样本的 ID 联合去重数除以该批实际样本数，再取多个 batch 的最大值。共享表只统计一次，同一个结果写入各成员特征。尾批使用实际样本数归一化。
 
 ```
 feature_configs {
@@ -262,10 +262,10 @@ feature_configs {
         feature_name: "tag"
         embedding_dim: 8
         embedding_constraints {
-            # 平均每个样本36.3个原始Id；最重的一个样本41个去重Id
-            # batch_size=1024时，该表单个batch的去重工作集估计为1024*41=41984
+            # 平均每样本36.3个原始Id；global batch联合去重后每样本因子为4.1
+            # local batch_size=1024时，每分片工作集估计为1024*4.1
             pooling_factor: 36.3
-            unique_id_factor: 41
+            unique_id_factor: 4.1
         }
     }
 }
@@ -277,7 +277,12 @@ feature_configs {
 python -m tzrec.tools.add_pooling_factor_to_config \
     --pipeline_config_path pipeline.config \
     --output_path pipeline_measured.config \
+    --global_batch_size 4096 \
     --num_batches 100
 ```
+
+统计可在单进程执行，`global_batch_size = local_batch_size × world_size`，`num_batches` 表示采样多少个 global batch。未读满的尾批按实际样本数计算；输出配置保留原来的训练 batch size。
+
+planner 接收 local batch size，按 `min(shard_rows, ceil(5 × unique_id_factor × local_batch_size))` 估算 CACHING 工作集下限，不再除以 world size。5 倍系数是独立安全余量。该估算假设 ID 均匀分片，分布倾斜仍可能造成误差。
 
 注: 数据分布变化后请重新测量；测量值不保证覆盖未来的数据
