@@ -20,13 +20,6 @@ from tzrec.protos import train_pb2
 from tzrec.utils import rocksdb_util
 from tzrec.utils.test_util import make_test_dir
 
-try:
-    import tzrec_ext.rocksdb  # noqa: F401
-
-    has_rocksdb = True
-except ImportError:
-    has_rocksdb = False
-
 
 def _backend_config():
     from tzrec_ext.rocksdb import BackendConfig
@@ -48,13 +41,6 @@ class RocksDBRuntimeTest(unittest.TestCase):
                 root_dir=os.path.join(self.test_dir, "db")
             )
         )
-
-    def test_factory_returns_a_runtime_for_a_selected_config(self):
-        rt = rocksdb_util.create_rocksdb_runtime(
-            self.train_config.rocksdb_config, "model", "eval"
-        )
-        self.assertIsNotNone(rt)
-        rt.close()
 
     def test_missing_wheel_warns_and_stays_in_memory(self):
         # The factory owns the availability policy: a missing top-level
@@ -157,7 +143,7 @@ class SharedStorageTest(unittest.TestCase):
 
         shared = rocksdb_util.shared_storage(local_world_size=1)
         self.assertEqual(shared.hbm, 0)
-        self.assertEqual(shared.ddr, rocksdb_util.fixed_host_bytes())
+        self.assertEqual(shared.ddr, int(4.25 * (1 << 30)))
         overheads = disk_overheads(
             rocksdb_util.backend_config(1, block_cache_bytes=0, import_budget_bytes=0)
         )

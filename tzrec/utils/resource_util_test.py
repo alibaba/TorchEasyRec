@@ -141,7 +141,7 @@ class SSDCapacityTest(unittest.TestCase):
             )
 
     def test_zero_remaining_quota(self):
-        # Free space below the reserve leaves zero; memory-only remains.
+        # Free space below the reserve leaves zero capacity.
         root = os.path.realpath(make_test_dir())
         with self._statvfs_patch(10 * GIB):
             self.assertEqual(

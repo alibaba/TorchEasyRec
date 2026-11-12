@@ -61,16 +61,6 @@ SST_FACTOR = 1.1
 SSD_RESERVE_BYTES = 16 << 30
 
 
-def fixed_host_bytes() -> int:
-    """Host memory reserved per rank whenever RocksDB planning is enabled."""
-    return (
-        WRITE_BUFFER_BYTES
-        + STAGING_BUFFER_BYTES
-        + BLOCK_CACHE_DATA_BYTES
-        + _HOST_OVERHEAD_BYTES
-    )
-
-
 def backend_config(
     local_world_size: int,
     *,
@@ -176,7 +166,10 @@ def shared_storage(local_world_size: int) -> Any:
     )
     return Storage(
         hbm=0,
-        ddr=fixed_host_bytes(),
+        ddr=WRITE_BUFFER_BYTES
+        + STAGING_BUFFER_BYTES
+        + BLOCK_CACHE_DATA_BYTES
+        + _HOST_OVERHEAD_BYTES,
         ssd=overheads["compaction_headroom"] + overheads["other_files"],
     )
 
@@ -297,16 +290,14 @@ class RocksDBRuntime:
             storage.bind_cache(m.cache)
             self.groups.append(m)
 
-    def evict(self) -> int:
-        """Evict every RocksDB table above its capacity; returns the rows.
+    def evict(self) -> None:
+        """Evict every RocksDB table above its capacity.
 
         Call only with no lookup in flight (a completed update, or the end of
         a pass).
         """
-        evicted = 0
         for m in self.groups:
-            evicted += sum(m.tables.evict_to_capacity().values())
-        return evicted
+            m.tables.evict_to_capacity()
 
     def reset_for_import(self, model: nn.Module) -> None:
         """Start RocksDB tables from a fresh empty DB before ``DynamicEmbLoad``.

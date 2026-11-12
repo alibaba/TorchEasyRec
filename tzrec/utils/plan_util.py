@@ -239,7 +239,7 @@ def create_planner(
             else None,
         )
 
-    enumerator: Any = EmbeddingEnumerator(
+    enumerator = EmbeddingEnumerator(
         topology=topology,
         batch_size=batch_size,
         fqn_constraints=fqn_constraints,
@@ -249,7 +249,7 @@ def create_planner(
     hbm_bins = int(os.environ.get("TZREC_DP_HBM_BINS_PER_DEVICE", "100"))
     ddr_bins = int(os.environ.get("TZREC_DP_DDR_BINS_PER_DEVICE", "25"))
     ssd_bins = int(os.environ.get("TZREC_DP_SSD_BINS_PER_DEVICE", "20"))
-    callbacks: Any = None
+    callbacks = None
     if allow_rocksdb:
         callbacks = [
             partial(
@@ -258,7 +258,7 @@ def create_planner(
                 local_world_size=local_world_size,
             )
         ]
-    dp_proposer: Any = DynamicProgrammingProposer(
+    dp_proposer = DynamicProgrammingProposer(
         hbm_bins_per_device=hbm_bins,
         ddr_bins_per_device=ddr_bins,
         ssd_bins_per_device=ssd_bins,
@@ -268,8 +268,6 @@ def create_planner(
         batch_size=batch_size,
         enumerator=enumerator,
         storage_reservation=storage_reservation,
-        # With RocksDB candidates the DP is the only proposer: Uniform's
-        # data-parallel proposals are not SSD-aware.
         proposer=[dp_proposer] if allow_rocksdb else [dp_proposer, UniformProposer()],
         callbacks=callbacks,
         debug=True,
@@ -412,8 +410,7 @@ def _sparse_dp_proposor_numpy(
     if dp_perf.size == 0:
         return []
 
-    chosen_cell_i = _argmin_per_group(group_keys=dp_hbm_i, perf_keys=dp_perf)
-    chosen_cell_i = sorted(chosen_cell_i, key=lambda i: -int(dp_hbm_i[i]))
+    chosen_cell_i = _argmin_per_group(group_keys=dp_hbm_i, perf_keys=dp_perf)[::-1]
 
     proposals: List[List[int]] = []
     for last_cell_i in chosen_cell_i:
@@ -1145,9 +1142,8 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
             fqns to provided ParameterConstraints.
         global_constraints (Optional[ParameterConstraints]): all parameters provided
             ParameterConstraints.
-        allow_rocksdb (bool): whether RocksDB planning is enabled; then
-            dynamicemb tables get built-in CACHING and eligible RocksDB
-            CACHING_PS candidates together, and no built-in HYBRID.
+        allow_rocksdb (bool): whether to add eligible RocksDB candidates
+            alongside built-in DynamicEmb placements.
     """
 
     def __init__(

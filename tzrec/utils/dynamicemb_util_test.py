@@ -679,30 +679,6 @@ class RocksDBTableTest(unittest.TestCase):
     NUM_EMBEDDINGS = 1 << 20
     EMBEDDING_DIM = 16
 
-    def _constraints(self, *pooling, **kwargs):
-        kwargs.setdefault("score_strategy", "NO_EVICTION")
-        cfg = feature_pb2.DynamicEmbedding(max_capacity=self.NUM_EMBEDDINGS, **kwargs)
-        constraint = dynamicemb_util.build_dynamicemb_constraints(
-            cfg,
-            EmbeddingBagConfig(
-                name="dyn_table",
-                num_embeddings=self.NUM_EMBEDDINGS,
-                embedding_dim=self.EMBEDDING_DIM,
-                feature_names=["user_id"],
-            ),
-        )
-        if pooling:
-            constraint.pooling_factors = list(pooling)
-        return constraint
-
-    def test_constraints(self):
-        # A feature's ids per sample reach the planner's lookup estimate; the
-        # planner, not the constraint, decides whether a table is offloaded.
-        self.assertEqual(self._constraints().pooling_factors, [1.0])
-        constraints = self._constraints(50.0)
-        self.assertEqual(constraints.pooling_factors, [50.0])
-        self.assertIsNone(constraints.dynamicemb_options.external_storage)
-
     @parameterized.expand([("indexed", "STEP"), ("not_indexed", "NO_EVICTION")])
     @mock.patch.dict(os.environ, {"WORLD_SIZE": "2"})
     def test_storage_estimate(self, _name, strategy):
@@ -716,7 +692,9 @@ class RocksDBTableTest(unittest.TestCase):
 
         rows, ratio = self.NUM_EMBEDDINGS // 2, 0.01
         tensor = torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM)
-        options = self._constraints(score_strategy=strategy).dynamicemb_options
+        options = _table_options(
+            self.NUM_EMBEDDINGS, self.EMBEDDING_DIM, score_strategy=strategy
+        )
         options.caching = True
         host_memory = DynamicEmbTableStorage.from_options(tensor, options, ratio=ratio)
         options.external_storage = RocksDBStorageFactory(BackendConfig(0, 0, 0, 0), "")

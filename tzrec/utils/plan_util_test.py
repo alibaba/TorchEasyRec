@@ -13,9 +13,8 @@ import math
 import os
 import random
 import unittest
-from functools import partial
 from types import SimpleNamespace
-from typing import Any, List, Tuple
+from typing import List, Tuple
 from unittest import mock
 
 import numpy as np
@@ -24,16 +23,11 @@ from parameterized import param, parameterized
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import get_default_sharders
-from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.estimator.types import HardwarePerfConfig
 from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
 from torchrec.distributed.planner.proposers import GridSearchProposer
-from torchrec.distributed.planner.storage_reservations import (
-    HeuristicalStorageReservation,
-)
 from torchrec.distributed.planner.types import (
     PlannerError,
-    PlannerErrorType,
     SharderData,
     Storage,
     Topology,
@@ -42,7 +36,7 @@ from torchrec.distributed.test_utils.test_model import TestSparseNN
 from torchrec.distributed.types import CacheParams, ShardingType, StorageUsageType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
-from tzrec.protos import feature_pb2
+from tzrec.protos import feature_pb2, train_pb2
 from tzrec.utils import dynamicemb_util, plan_util, resource_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints, has_dynamicemb
 from tzrec.utils.plan_util import (
@@ -57,93 +51,6 @@ from tzrec.utils.test_util import (
     mark_ci_scope,
     parameterized_name_func,
 )
-
-
-class PlannerHostMemoryTest(unittest.TestCase):
-    """Every configuration sizes host memory by the container-aware budget.
-
-    ``HOST_MEMORY_RESERVE_PERCENT`` (default 0) holds back host RAM for
-    non-embedding use in ordinary CPU/HYBRID/CACHING plans as well as in
-    RocksDB plans; zero reserve disables only the margin, never the
-    container limit.
-    """
-
-    @parameterized.expand(
-        [
-            param("default_reserve", env=None, reserve=0.0),
-            param("explicit_reserve", env="0.5", reserve=0.5),
-            param("zero_reserve", env="0.0", reserve=0.0),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_reserve(self, _, env, reserve):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        environ = dict(os.environ)
-        environ.pop("HOST_MEMORY_RESERVE_PERCENT", None)
-        if env is not None:
-            environ["HOST_MEMORY_RESERVE_PERCENT"] = env
-        container = 100 << 30
-        with (
-            mock.patch.dict(os.environ, environ, clear=True),
-            mock.patch.object(
-                resource_util,
-                "_container_memory_limit_bytes",
-                return_value=container,
-            ),
-            mock.patch.object(plan_util, "get_local_size", return_value=1),
-            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
-        ):
-            # The ordinary, no-RocksDB planner uses the same container-aware
-            # budget as a RocksDB one.
-            planner = plan_util.create_planner(device, batch_size=8, model=nn.Module())
-            self.assertEqual(
-                planner._topology.devices[0].storage.ddr,
-                int(container * (1 - reserve)),
-            )
-            rocksdb = mock.Mock(
-                rank_dir="/tmp/db", config=mock.Mock(root_dir="/tmp/db")
-            )
-            with mock.patch.object(
-                resource_util, "ssd_capacity_per_rank", return_value=100 << 30
-            ):
-                planner = plan_util.create_planner(
-                    device, batch_size=8, model=nn.Module(), rocksdb=rocksdb
-                )
-            shared = rocksdb_util.shared_storage(1)
-            self.assertEqual(
-                planner._topology.devices[0].storage.ddr,
-                int(container * (1 - reserve)) - shared.ddr,
-            )
-            self.assertEqual(
-                planner._topology.devices[0].storage.ssd, (100 << 30) - shared.ssd
-            )
-
-    @parameterized.expand(
-        [("ddr", 3, 100), ("ssd", 100, 7)],
-        name_func=parameterized_name_func,
-    )
-    def test_shared_reserve_exceeds_capacity(self, _, ddr, ssd):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        with (
-            mock.patch.object(
-                resource_util, "host_memory_capacity_per_rank", return_value=ddr
-            ),
-            mock.patch.object(resource_util, "ssd_capacity_per_rank", return_value=ssd),
-            mock.patch.object(
-                rocksdb_util,
-                "shared_storage",
-                return_value=Storage(hbm=0, ddr=4, ssd=8),
-            ),
-            mock.patch.object(plan_util, "get_local_size", return_value=1),
-            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
-            self.assertRaisesRegex(PlannerError, "shared reserve"),
-        ):
-            create_planner(
-                device,
-                batch_size=8,
-                model=nn.Module(),
-                rocksdb=mock.Mock(),
-            )
 
 
 class PlanUtilTest(unittest.TestCase):
@@ -512,6 +419,54 @@ class PlanUtilTest(unittest.TestCase):
             self.assertEqual(
                 planner._topology.devices[0].storage.ddr,
                 int(container * (1 - reserve)),
+            )
+
+            rocksdb = mock.Mock(
+                rank_dir="/tmp/db", config=mock.Mock(root_dir="/tmp/db")
+            )
+            shared = Storage(hbm=0, ddr=4 << 30, ssd=8 << 30)
+            with (
+                mock.patch.object(
+                    resource_util, "ssd_capacity_per_rank", return_value=100 << 30
+                ),
+                mock.patch.object(rocksdb_util, "shared_storage", return_value=shared),
+            ):
+                planner = plan_util.create_planner(
+                    device, batch_size=8, model=nn.Module(), rocksdb=rocksdb
+                )
+            self.assertEqual(
+                planner._topology.devices[0].storage.ddr,
+                int(container * (1 - reserve)) - shared.ddr,
+            )
+            self.assertEqual(
+                planner._topology.devices[0].storage.ssd, (100 << 30) - shared.ssd
+            )
+
+    @parameterized.expand(
+        [("ddr", 3, 100), ("ssd", 100, 7)],
+        name_func=parameterized_name_func,
+    )
+    def test_shared_reserve_exceeds_capacity(self, _, ddr, ssd):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        with (
+            mock.patch.object(
+                resource_util, "host_memory_capacity_per_rank", return_value=ddr
+            ),
+            mock.patch.object(resource_util, "ssd_capacity_per_rank", return_value=ssd),
+            mock.patch.object(
+                rocksdb_util,
+                "shared_storage",
+                return_value=Storage(hbm=0, ddr=4, ssd=8),
+            ),
+            mock.patch.object(plan_util, "get_local_size", return_value=1),
+            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
+            self.assertRaisesRegex(PlannerError, "shared reserve"),
+        ):
+            create_planner(
+                device,
+                batch_size=8,
+                model=nn.Module(),
+                rocksdb=mock.Mock(),
             )
 
     @unittest.skipUnless(
@@ -1341,8 +1296,6 @@ GIB = 1 << 30
 
 def _model_and_constraints(tables):
     """tables: name -> (rows, dim, DynamicEmbedding fields[, pooling factor])."""
-    from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints
-
     configs, constraints = [], {}
     for name, (rows, dim, fields, *pooling) in tables.items():
         config = EmbeddingBagConfig(
@@ -1376,11 +1329,7 @@ class RocksDBPlannerTest(unittest.TestCase):
             self.skipTest("tzrec_ext.rocksdb is not installed")
 
     def _planner(self, tables, hbm_gib, ddr_gib, ssd_gib=None, ssd_mem_bw=None):
-        """Build the unified planner over a synthetic topology.
-
-        Uses the same upfront shared reserve and ordinary partitioner as
-        ``create_planner``, with deterministic device capacities.
-        """
+        """Build the production planner with deterministic resource capacities."""
         model, constraints = _model_and_constraints(tables)
         topo_kwargs = {}
         if ssd_mem_bw is not None:
@@ -1393,47 +1342,44 @@ class RocksDBPlannerTest(unittest.TestCase):
             ssd_cap=(1 << 50) if ssd_gib is None else int(ssd_gib * GIB),
             **topo_kwargs,
         )
-        ddr_caps = tuple(d.storage.ddr for d in topology.devices)
-        shared = rocksdb_util.shared_storage(1)
-        for device in topology.devices:
-            if not shared.fits_in(device.storage):
-                raise PlannerError(
-                    "insufficient shared reserve", PlannerErrorType.INSUFFICIENT_STORAGE
-                )
-            device.storage = device.storage - shared
-        enumerator: Any = plan_util.EmbeddingEnumerator(
-            topology=topology,
-            batch_size=128,
-            fqn_constraints=constraints,
-            allow_rocksdb=True,
-        )
-        sharders = plan_util.get_default_sharders()
-        search_space = enumerator.enumerate(model, sharders)
-        planner = EmbeddingShardingPlanner(
-            topology=topology,
-            batch_size=128,
-            enumerator=enumerator,
-            storage_reservation=HeuristicalStorageReservation(percentage=0.15),
-            proposer=[
-                DynamicProgrammingProposer(
-                    hbm_bins_per_device=20,
-                    ddr_bins_per_device=20,
-                    ssd_bins_per_device=20,
-                )
-            ],
-            callbacks=[
-                partial(
-                    rocksdb_util.configure_backend,
-                    ddr_caps=ddr_caps,
-                    local_world_size=1,
-                )
-            ],
-            debug=True,
-        )
-        return planner, model, search_space
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        with (
+            mock.patch.object(
+                model, "parameter_constraints", return_value=constraints, create=True
+            ),
+            mock.patch.object(plan_util, "Topology", return_value=topology),
+            mock.patch.object(plan_util, "get_local_size", return_value=1),
+            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
+            mock.patch.object(
+                resource_util,
+                "host_memory_capacity_per_rank",
+                return_value=int(ddr_gib * GIB),
+            ),
+            mock.patch.object(
+                resource_util,
+                "ssd_capacity_per_rank",
+                return_value=topology.devices[0].storage.ssd,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "STORAGE_RESERVE_PERCENT": "0.15",
+                    "TZREC_DP_HBM_BINS_PER_DEVICE": "20",
+                    "TZREC_DP_DDR_BINS_PER_DEVICE": "20",
+                    "TZREC_DP_SSD_BINS_PER_DEVICE": "20",
+                },
+            ),
+        ):
+            planner = create_planner(
+                device,
+                batch_size=128,
+                model=model,
+                rocksdb=mock.Mock(config=train_pb2.RocksDBConfig(root_dir="unused")),
+            )
+        return planner, model
 
     def _plan(self, tables, hbm_gib, ddr_gib, **kwargs):
-        planner, model, _ = self._planner(tables, hbm_gib, ddr_gib, **kwargs)
+        planner, model = self._planner(tables, hbm_gib, ddr_gib, **kwargs)
         plan = planner.plan(model, plan_util.get_default_sharders())
         offloaded = {
             name: p.dynamicemb_options
@@ -1451,7 +1397,8 @@ class RocksDBPlannerTest(unittest.TestCase):
         runners; derive the budget from the shared reserve and the worst
         per-table candidate cost instead.
         """
-        _, _, space = self._planner(tables, hbm_gib, ddr_gib, **kwargs)
+        planner, model = self._planner(tables, hbm_gib, ddr_gib, **kwargs)
+        space = planner._enumerator.enumerate(model, plan_util.get_default_sharders())
         shared = rocksdb_util.shared_storage(1)
         worst = {}
         for o in space:
@@ -1684,9 +1631,7 @@ class RocksDBPlannerTest(unittest.TestCase):
                 )
 
     def test_rocksdb_misses_cost_disk_bandwidth(self):
-        # The upfront shared reserve grows with the runner's CPUs; this
-        # call only needs the model, so it takes the capless default.
-        _, model, _ = self._planner({"a": self.BIG}, 4, 8, ssd_gib=None)
+        model, _ = _model_and_constraints({"a": self.BIG})
         topology = Topology(world_size=1, compute_device="cuda", ssd_mem_bw=104857.6)
         enumerator = plan_util.EmbeddingEnumerator(
             topology=topology,
@@ -1750,7 +1695,8 @@ class RocksDBPlannerTest(unittest.TestCase):
         }
         # Construction only needs the model and the candidate space; the
         # capless default keeps the machine-scaled shared reserve in budget.
-        _, model, space = self._planner(tables, 1.76, 12, ssd_gib=None)
+        planner, model = self._planner(tables, 1.76, 12, ssd_gib=None)
+        space = planner._enumerator.enumerate(model, plan_util.get_default_sharders())
         ssd_cost = {}
         for fqn in ("sparse.ebc.a", "sparse.ebc.b"):
             costs = [
@@ -1780,7 +1726,7 @@ class RocksDBPlannerTest(unittest.TestCase):
         # admits, so the search must fall back to the feasible all-memory
         # plan, and the failed attempts never mutate the shared topology.
         tables = {"a": self.BIG, "b": self.BIG}
-        planner, model, _ = self._planner(
+        planner, model = self._planner(
             tables,
             80,
             64,

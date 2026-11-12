@@ -158,10 +158,9 @@ message DeltaEmbeddingDumpConfig {
     optional uint32 sparse_dump_interval_minutes = 10;
 }
 
-// Lets the planner offload dynamicemb tables to RocksDB when GPU and host
-// memory cannot hold them all. Each rank keeps one working database under
-// root_dir for all of its offloaded tables; cache sizes, buffers and threads
-// are planned. A table with cache_load_factor stays in memory.
+// Adds RocksDB-backed dynamicemb candidates to embedding planning. Each rank
+// shares one working database under root_dir across its offloaded tables.
+// A table with an explicit cache_load_factor stays in memory.
 message RocksDBConfig {
     // storage root of the working databases on a local disk or an NFS-like
     // filesystem (NVMe, ESSD, Extreme NAS), never an OSS mount. Each rank
