@@ -41,11 +41,12 @@ post-collision embedding-row working set.
 
 Usage: python -m tzrec.tools.add_pooling_factor_to_config
     --pipeline_config_path pipeline.config --output_path pipeline_measured.config
-    --global_batch_size 4096 [--num_batches 100]
+    --edit_config_json '{"data_config.batch_size":4096}' [--num_batches 100]
 """
 
 import argparse
 import copy
+import json
 import math
 import os
 from typing import Dict, List, Optional, Tuple
@@ -74,8 +75,8 @@ class AddPoolingFactorToConfig(object):
             read and its model config decides the physical tables.
         output_path (str): path to write the filled config to.
         num_batches (int): number of global batches to sample.
-        global_batch_size (int): target local batch size times world size;
-            None uses the config batch size for programmatic callers.
+        edit_config_json (str, optional): JSON overrides applied before measurement
+            and saved in the output config.
     """
 
     def __init__(
@@ -83,11 +84,9 @@ class AddPoolingFactorToConfig(object):
         pipeline_config_path: str,
         output_path: str,
         num_batches: int,
-        global_batch_size: Optional[int] = None,
+        edit_config_json: Optional[str] = None,
     ) -> None:
-        if global_batch_size is not None and global_batch_size < 1:
-            raise ValueError("global_batch_size must be positive when supplied")
-        self._global_batch_size = global_batch_size
+        self._edit_config_json = edit_config_json
         if num_batches < 1:
             raise ValueError(f"num_batches must be at least 1, got {num_batches}")
         if os.path.realpath(output_path) == os.path.realpath(pipeline_config_path):
@@ -102,6 +101,8 @@ class AddPoolingFactorToConfig(object):
     def run(self) -> None:
         """Measure the train input and write the filled config."""
         cfg = config_util.load_pipeline_config(self._pipeline_config_path)
+        if self._edit_config_json:
+            config_util.edit_config(cfg, json.loads(self._edit_config_json))
         features = _create_features(list(cfg.feature_configs), cfg.data_config)
         tables = self.get_embedding_table_features(cfg, features)
         factors = self.measure(cfg, features, tables)
@@ -210,7 +211,6 @@ class AddPoolingFactorToConfig(object):
             0.0 for features whose tables were never looked up.
         """
         data_config = copy.deepcopy(cfg.data_config)
-        data_config.batch_size = self._global_batch_size or data_config.batch_size
         data_config.drop_remainder = False
         data_config.min_batch_size = 0
         dataloader = create_dataloader(data_config, features, cfg.train_input_path)
@@ -315,14 +315,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pipeline_config_path", required=True)
     parser.add_argument("--output_path", required=True)
-    parser.add_argument("--global_batch_size", type=int, required=True)
+    parser.add_argument("--edit_config_json", type=str, default=None)
     parser.add_argument("--num_batches", type=int, default=100)
     args = parser.parse_args()
     tool = AddPoolingFactorToConfig(
         args.pipeline_config_path,
         args.output_path,
         args.num_batches,
-        args.global_batch_size,
+        args.edit_config_json,
     )
     tool.run()
 

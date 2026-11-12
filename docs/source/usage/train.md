@@ -277,10 +277,10 @@ feature_configs {
 python -m tzrec.tools.add_pooling_factor_to_config \
     --pipeline_config_path pipeline.config \
     --output_path pipeline_measured.config \
-    --global_batch_size 4096 \
+    --edit_config_json '{"data_config.batch_size":4096}' \
     --num_batches 100
 ```
 
-统计用单进程执行，`global_batch_size = local_batch_size × world_size`，`num_batches` 表示采样多少个 global batch。
+统计用单进程执行，建议通过 `--edit_config_json` 将 `data_config.batch_size` 设置为目标训练的 global batch size，即 `local_batch_size × world_size`。`num_batches` 表示采样多少个 global batch。`--edit_config_json` 也支持覆盖其他配置项，覆盖后的配置会写入输出文件。
 
 注: 数据分布变化后请重新测量；测量值不保证覆盖未来的数据

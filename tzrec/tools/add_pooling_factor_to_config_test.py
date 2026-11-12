@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import unittest
 
@@ -199,19 +200,16 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         ).measure(cfg, features, [("ebc.id_a_emb", ["id_a"])])
         self.assertEqual(factors["id_a"], (2.6, 2.25 if reverse else 4.5))
         self.assertEqual(cfg.data_config.batch_size, 4)
-        tool = AddPoolingFactorToConfig(
-            "in.config", "out.config", 1, global_batch_size=8
-        )
+        cfg.data_config.batch_size = 8
+        tool = AddPoolingFactorToConfig("in.config", "out.config", 1)
         self.assertEqual(
             tool.measure(cfg, features, [("t", ["id_a"])])["id_a"],
             (3.0 if reverse else 1.0, first_factor),
         )
-        self.assertEqual(cfg.data_config.batch_size, 4)
+        self.assertEqual(cfg.data_config.batch_size, 8)
         self.assertTrue(cfg.data_config.drop_remainder)
         self.assertEqual(cfg.data_config.min_batch_size, 4)
-        tool = AddPoolingFactorToConfig(
-            "in.config", "out.config", 2, global_batch_size=8
-        )
+        tool = AddPoolingFactorToConfig("in.config", "out.config", 2)
         self.assertEqual(
             tool.measure(cfg, features, [("t", ["id_a"])])["id_a"],
             (2.6, 1.125 if reverse else 4.5),
@@ -339,22 +337,40 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         )
 
     def test_invalid_tool_arguments_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "global_batch_size"):
-            AddPoolingFactorToConfig("in.config", "out.config", 5, global_batch_size=0)
         with self.assertRaisesRegex(ValueError, "num_batches"):
             AddPoolingFactorToConfig("in.config", "out.config", 0)
         with self.assertRaisesRegex(ValueError, "output_path"):
             AddPoolingFactorToConfig("dir/pipeline.config", "dir/pipeline.config", 5)
 
-    def test_run_measures_and_writes_a_loadable_config(self):
+    @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
+    def test_run_measures_and_writes_a_loadable_config(self, edit):
         test_dir = make_test_dir()
         _write_parquet(test_dir)
         in_path = os.path.join(test_dir, "pipeline.config")
         out_path = os.path.join(test_dir, "measured.config")
-        config_util.save_message(_config(os.path.join(test_dir, "*.parquet")), in_path)
+        cfg = _config("unused.parquet" if edit else os.path.join(test_dir, "*.parquet"))
+        config_util.save_message(cfg, in_path)
         before = config_util.load_pipeline_config(in_path)
-        AddPoolingFactorToConfig(in_path, out_path, num_batches=10).run()
+        edits = (
+            {
+                "data_config.batch_size": 8,
+                "train_input_path": os.path.join(test_dir, "*.parquet"),
+                "feature_configs[0].id_feature.embedding_dim": 16,
+            }
+            if edit
+            else None
+        )
+        AddPoolingFactorToConfig(
+            in_path,
+            out_path,
+            num_batches=1 if edit else 10,
+            edit_config_json=json.dumps(edits) if edit else None,
+        ).run()
         out = config_util.load_pipeline_config(out_path)
+        self.assertEqual(config_util.load_pipeline_config(in_path), before)
+        if edits:
+            config_util.edit_config(before, edits)
+        self.assertEqual(out.train_input_path, before.train_input_path)
         # measured factors for a normal and a shared feature, and for the
         # two features of similarly named tables
         self.assertEqual(
@@ -363,15 +379,15 @@ class AddPoolingFactorToConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             out.feature_configs[3].id_feature.embedding_constraints.unique_id_factor,
-            1.5,
+            0.375 if edit else 1.5,
         )
         self.assertEqual(
             out.feature_configs[7].id_feature.embedding_constraints.unique_id_factor,
-            1.0,
+            0.25 if edit else 1.0,
         )
         self.assertEqual(
             out.feature_configs[8].id_feature.embedding_constraints.unique_id_factor,
-            1.0,
+            0.25 if edit else 1.0,
         )
         # nothing else about the configuration changed
         for field in ("model_config", "data_config"):
