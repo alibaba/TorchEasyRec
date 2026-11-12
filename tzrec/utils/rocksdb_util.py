@@ -114,7 +114,7 @@ def configure_backend(
     metadata_bytes_per_rank = [0] * len(ddr_caps)
     import_available_per_rank = list(ddr_caps)
     for option in selected:
-        is_rocksdb = is_rocksdb_options(option.dynamicemb_options)
+        is_rocksdb = is_rocksdb_options(getattr(option, "dynamicemb_options", None))
         if is_rocksdb:
             rocksdb_options.append(option)
         for shard in option.shards:

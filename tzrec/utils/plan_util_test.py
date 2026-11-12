@@ -1295,7 +1295,7 @@ GIB = 1 << 30
 
 
 def _model_and_constraints(tables):
-    """tables: name -> (rows, dim, DynamicEmbedding fields[, pooling factor])."""
+    """Map names to (rows, dim, DynamicEmbedding fields[, pooling]); None is static."""
     configs, constraints = [], {}
     for name, (rows, dim, fields, *pooling) in tables.items():
         config = EmbeddingBagConfig(
@@ -1305,6 +1305,8 @@ def _model_and_constraints(tables):
             feature_names=[f"f_{name}"],
         )
         configs.append(config)
+        if fields is None:
+            continue
         constraint = build_dynamicemb_constraints(
             feature_pb2.DynamicEmbedding(max_capacity=rows, **fields), config
         )
@@ -1385,7 +1387,7 @@ class RocksDBPlannerTest(unittest.TestCase):
             name: p.dynamicemb_options
             for m in plan.plan.values()
             for name, p in m.items()
-            if rocksdb_util.is_rocksdb_options(p.dynamicemb_options)
+            if rocksdb_util.is_rocksdb_options(getattr(p, "dynamicemb_options", None))
         }
         return plan, offloaded, planner
 
@@ -1496,6 +1498,26 @@ class RocksDBPlannerTest(unittest.TestCase):
         self.assertEqual(
             planner._topology.devices[0].storage.ddr,
             64 * GIB - rocksdb_util.shared_storage(1).ddr,
+        )
+
+    @parameterized.expand(
+        [("memory", 80, 64, False), ("offload", 4, 4.75, True)],
+        name_func=parameterized_name_func,
+    )
+    def test_mixed_static_dynamic_tables(self, _, hbm, ddr, offload):
+        tables = {
+            "dynamic_a": self.BIG,
+            "dynamic_b": self.BIG,
+            "static": (1024, 64, None),
+        }
+        plan, offloaded, _ = self._plan_with_ssd_room(tables, hbm, ddr)
+        self.assertEqual(set(plan.plan["sparse.ebc"]), set(tables))
+        self.assertNotEqual(
+            plan.plan["sparse.ebc"]["static"].compute_kernel,
+            EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
+        )
+        self.assertEqual(
+            set(offloaded), {"dynamic_a", "dynamic_b"} if offload else set()
         )
 
     def test_faster_mixed_choice_beats_the_fitting_memory_plan(self):
@@ -1743,7 +1765,7 @@ class RocksDBPlannerTest(unittest.TestCase):
             name: p.dynamicemb_options
             for m in plan.plan.values()
             for name, p in m.items()
-            if rocksdb_util.is_rocksdb_options(p.dynamicemb_options)
+            if rocksdb_util.is_rocksdb_options(getattr(p, "dynamicemb_options", None))
         }
         self.assertEqual(offloaded, {}, "the SSD plan must be infeasible")
         self.assertEqual(
