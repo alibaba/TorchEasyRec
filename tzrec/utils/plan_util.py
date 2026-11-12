@@ -941,7 +941,8 @@ def _emit_dynamicemb_variants(
 
     Without an explicit load factor, search the zero and full value budgets
     and both partial-budget modes. A configured unique-id factor sets the
-    same working-set floor for both modes; zero requests at least one row.
+    working-set floor for CACHING; zero requests at least one row.
+    HYBRID starts at min(floor, 0.1), CACHING at max(floor, 0.1).
     Without that factor, partial grids start at 0.1. The grids use up to
     five geometric points through 0.5, then fixed
     tenths up to 0.9. An explicit partial ratio requests both modes at that
@@ -980,14 +981,14 @@ def _emit_dynamicemb_variants(
             * unique_id_factor
             * base_option.batch_size
         )
+        required = min(rows, required)
         floor = max(required, 1) / rows
 
     params = base_option.cache_params
     if params is None:
         requests = [(False, 0.0)]
-        partial_ratios = _dynamicemb_partial_ratios(floor)
-        requests.extend((False, r) for r in partial_ratios)
-        requests.extend((True, r) for r in partial_ratios)
+        requests.extend((False, r) for r in _dynamicemb_partial_ratios(min(floor, 0.1)))
+        requests.extend((True, r) for r in _dynamicemb_partial_ratios(max(floor, 0.1)))
         requests.append((False, 1.0))
     else:
         ratio = float(params.load_factor)
