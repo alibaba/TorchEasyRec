@@ -285,6 +285,6 @@ python -m tzrec.tools.add_pooling_factor_to_config \
 
 统计用单进程执行，建议将 `--batch_size` 设置为目标训练的 global batch size，即 `local_batch_size × world_size`。`num_batches` 表示采样多少个 global batch。
 
-`--dataset_type`、`--input_path` 和 `--batch_size` 仅覆盖本次统计的数据集类型、输入路径和 batch size，未传时沿用原配置。`--dataset_type` 使用名称，例如 `OdpsDataset`、`ParquetDataset`。输出配置只更新 `pooling_factor` 和 `unique_id_factor`，保留原来的训练数据源、batch size 及其他配置。
+`--dataset_type`、`--input_path` 和 `--batch_size` 仅覆盖本次统计的数据集类型、输入路径和 batch size，未传时沿用原配置。输出配置只会更新 `pooling_factor` 和 `unique_id_factor`，原来的训练数据源、batch size 及其他配置会被保留。
 
 注: 数据分布变化后请重新测量；测量值不保证覆盖未来的数据
