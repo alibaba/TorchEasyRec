@@ -281,8 +281,6 @@ python -m tzrec.tools.add_pooling_factor_to_config \
     --num_batches 100
 ```
 
-统计可在单进程执行，`global_batch_size = local_batch_size × world_size`，`num_batches` 表示采样多少个 global batch。未读满的尾批按实际样本数计算；输出配置保留原来的训练 batch size。
-
-planner 接收 local batch size，按 `min(shard_rows, ceil(5 × unique_id_factor × local_batch_size))` 估算 CACHING 工作集下限，不再除以 world size。5 倍系数是独立安全余量。该估算假设 ID 均匀分片，分布倾斜仍可能造成误差。
+统计用单进程执行，`global_batch_size = local_batch_size × world_size`，`num_batches` 表示采样多少个 global batch。
 
 注: 数据分布变化后请重新测量；测量值不保证覆盖未来的数据
