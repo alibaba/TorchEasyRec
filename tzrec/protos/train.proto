@@ -166,8 +166,9 @@ message RocksDBConfig {
     // filesystem (NVMe, ESSD, Extreme NAS), never an OSS mount. Each rank
     // uses <root_dir>/<model_dir id>/rank_<rank>/<mode>-<time>-<pid>.
     required string root_dir = 1;
-    // bytes this job may occupy on the storage behind root_dir, for all of
-    // its ranks that share it. Unset: only the observed free space limits it.
+    // Planning-time SSD capacity cap in bytes for all ranks sharing the volume
+    // behind root_dir. Observed free space also limits planning; unset uses
+    // free space alone. This is not an enforced runtime disk quota.
     optional uint64 ssd_budget_bytes = 2;
     // Whether all nodes share one storage volume behind root_dir.
     // false: each node has its own volume, shared by that node's ranks.
@@ -233,7 +234,9 @@ message TrainConfig {
     optional DeltaEmbeddingDumpConfig delta_embedding_dump_config = 24;
     // profiler schedule and collection options, used when is_profiling=true
     optional ProfilerConfig profiler_config = 25;
-    // allows offloading dynamicemb tables to RocksDB.
+    // Allows offloading dynamicemb tables to RocksDB. With the backend available,
+    // enabling this reserves shared resources even if no table is offloaded.
+    // Planning fails if the shared reserve exceeds the available capacity.
     optional RocksDBConfig rocksdb_config = 26;
     // TBD: qcomm config
 }
