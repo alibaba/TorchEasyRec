@@ -160,8 +160,12 @@ def create_planner(
         shared = rocksdb_util.shared_storage(local_world_size)
         for device_storage in topology.devices:
             if not shared.fits_in(device_storage.storage):
+                available = device_storage.storage
                 raise PlannerError(
-                    "insufficient capacity for the configured RocksDB shared reserve",
+                    "insufficient capacity for the configured RocksDB shared reserve: "
+                    f"DDR available={available.ddr} bytes, "
+                    f"required={shared.ddr} bytes; "
+                    f"SSD available={available.ssd} bytes, required={shared.ssd} bytes",
                     PlannerErrorType.INSUFFICIENT_STORAGE,
                 )
             device_storage.storage = device_storage.storage - shared

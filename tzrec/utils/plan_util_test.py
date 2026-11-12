@@ -460,7 +460,7 @@ class PlanUtilTest(unittest.TestCase):
             ),
             mock.patch.object(plan_util, "get_local_size", return_value=1),
             mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
-            self.assertRaisesRegex(PlannerError, "shared reserve"),
+            self.assertRaisesRegex(PlannerError, "shared reserve") as raised,
         ):
             create_planner(
                 device,
@@ -468,6 +468,12 @@ class PlanUtilTest(unittest.TestCase):
                 model=nn.Module(),
                 rocksdb=mock.Mock(),
             )
+        self.assertIn(
+            f"DDR available={ddr} bytes, required=4 bytes", str(raised.exception)
+        )
+        self.assertIn(
+            f"SSD available={ssd} bytes, required=8 bytes", str(raised.exception)
+        )
 
     @unittest.skipUnless(
         torch.cuda.is_available(), "CUDA is required for create_planner."
