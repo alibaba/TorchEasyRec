@@ -229,14 +229,12 @@ export TZREC_MILP_TIME_LIMIT_SECONDS=60.0
 export TZREC_MILP_RELATIVE_GAP=0.001
 ```
 
-- `TZREC_MILP_TIME_LIMIT_SECONDS`：求解器时间预算（秒），默认 `60.0`，必须为正有限数。直接构造 `MILPPlanner` 时可设置 `time_limit` 参数。
-- `TZREC_MILP_RELATIVE_GAP`：预计性能成本的相对最优性容差，默认 0.001（0.1%），不是实测训练速度误差。
+- `TZREC_MILP_TIME_LIMIT_SECONDS`：求解器时间预算（秒），默认 `60.0`，必须为正有限数。
+- `TZREC_MILP_RELATIVE_GAP`：预计性能成本的相对最优性容差，默认 0.001（0.1%）。
 
-支持动态表的 `row_wise` 和静态表的 `data_parallel`、`row_wise`、`table_wise`、`column_wise`、`table_row_wise`、`table_column_wise`，保留后两种分片及依赖表的同 host 放置约束。暂不支持 `grid_shard`；使用该分片方式时请保持 `TZREC_PLANNER=dp`。
+支持动态表的 `row_wise` 和静态表的 `data_parallel`、`row_wise`、`table_wise`、`column_wise`、`table_row_wise`、`table_column_wise`，保留后两种分片及依赖表的同 host 放置约束。暂不支持 `grid_shard`。
 
-MILP 的求解器超时默认 60 秒，不包含候选枚举、建模与结果校验，求解器退出也可能略超预算。达到最优性容差会提前结束；超时已有可行方案时，校验各 rank 的 HBM 和各 node 的 DDR 容量后使用该方案，并通过警告日志报告实际 gap，此时未必达到配置的容差。
-
-超时且没有可行方案会报错，不代表容量必然不足；可以设置 `TZREC_PLANNER=dp` 尝试 DP。求解器确认无可行方案时，应检查容量与分片约束。MILP 不会自动切回 DP。
+MILP 的求解器超时默认 60 秒，不包含候选枚举、建模与结果校验，求解器退出也可能略超预算。
 
 (embedding-sharding-constraints)=
 
