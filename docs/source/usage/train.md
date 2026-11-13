@@ -217,6 +217,21 @@ export STORAGE_RESERVE_PERCENT=0.5
 export HOST_MEMORY_RESERVE_PERCENT=0.15
 ```
 
+### MILP 分片规划
+
+默认仍使用 DP 规划。设置 `TZREC_PLANNER=milp` 可启用 MILP，同时选择每张表的分片候选和各 shard 的 rank，约束各 rank 的 HBM、DDR、SSD 用量，并优化最慢 rank 的预计耗时。MILP 不使用 DP 的资源分桶配置。
+
+```bash
+export TZREC_PLANNER=milp
+export TZREC_MILP_RELATIVE_GAP=0.001
+```
+
+- `TZREC_MILP_RELATIVE_GAP`：预计性能成本的相对最优性容差，默认 0.001（0.1%），不是实测训练速度误差。
+
+支持动态表的 `row_wise` 和静态表的 `data_parallel`、`row_wise`、`table_wise`、`column_wise`、`table_row_wise`、`table_column_wise`，保留后两种分片及依赖表的同 host 放置约束。暂不支持 `grid_shard`；使用该分片方式时请保持 `TZREC_PLANNER=dp`。
+
+MILP 不设置求解时间上限，求解至满足最优性容差或确认无可行方案。求解器确认无可行方案时，应检查容量与分片约束；求解器异常会报错，不会自动切回 DP。
+
 (embedding-sharding-constraints)=
 
 ### Embedding分片约束

@@ -46,6 +46,7 @@ from torchrec.distributed.planner.enumerators import (
 from torchrec.distributed.planner.enumerators import (
     EmbeddingEnumerator as _EmbeddingEnumerator,
 )
+from torchrec.distributed.planner.planners import EmbeddingPlannerBase
 from torchrec.distributed.planner.proposers import UniformProposer
 from torchrec.distributed.planner.shard_estimators import (
     EmbeddingPerfEstimator,
@@ -96,13 +97,13 @@ def create_planner(
     ckpt_plan_path: Optional[str] = None,
     global_constraints_cfg: Optional[feature_pb2.ParameterConstraints] = None,
     model: Optional[nn.Module] = None,
-) -> EmbeddingShardingPlanner:
+) -> EmbeddingPlannerBase:
     """Create an embedding sharding planner.
 
     Builds the hardware topology and storage reservation, resolves
     per-table and global constraints, applies applicable sharding
     constraints from a saved checkpoint plan, and configures the
-    enumerator and proposers.
+    enumerator and the selected planning algorithm.
     """
     if global_constraints_cfg is not None and (
         global_constraints_cfg.HasField("pooling_factor")
@@ -210,16 +211,31 @@ def create_planner(
             else None,
         )
 
+    enumerator = EmbeddingEnumerator(
+        topology=topology,
+        batch_size=batch_size,
+        fqn_constraints=fqn_constraints,
+        global_constraints=global_constraints,
+    )
+    planner_type = os.environ.get("TZREC_PLANNER", "dp")
+    if planner_type == "milp":
+        from tzrec.utils.milp_planner import MILPPlanner
+
+        return MILPPlanner(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            relative_gap=float(os.environ.get("TZREC_MILP_RELATIVE_GAP", "0.001")),
+        )
+    if planner_type != "dp":
+        raise ValueError(f"Unknown TZREC_PLANNER={planner_type!r}; expected dp or milp")
+
     # build planner
     planner = EmbeddingShardingPlanner(
         topology=topology,
         batch_size=batch_size,
-        enumerator=EmbeddingEnumerator(
-            topology=topology,
-            batch_size=batch_size,
-            fqn_constraints=fqn_constraints,
-            global_constraints=global_constraints,
-        ),
+        enumerator=enumerator,
         storage_reservation=storage_reservation,
         # DP bin counts are env-tunable; defaults match the proposer signature.
         proposer=[

@@ -51,6 +51,90 @@ class PlanUtilTest(unittest.TestCase):
     def setUp(self):
         self.maxDiff = None
 
+    @parameterized.expand(
+        [("single_host", 2), ("two_hosts", 4)],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipUnless(
+        has_dynamicemb and torch.cuda.is_available(), "CUDA and dynamicemb are required"
+    )
+    @mark_ci_scope("gpu")
+    def test_milp_plans_mixed_dynamic_and_static_tables(self, name, world_size):
+        from torchrec.distributed.planner.types import ParameterConstraints
+
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=1024,
+                embedding_dim=256,
+                name=table,
+                feature_names=[f"f_{table}"],
+            )
+            for table in ("dynamic", "static_tw", "static_cw")
+        ]
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": str(world_size)}):
+            dynamic_constraint = build_dynamicemb_constraints(
+                feature_pb2.DynamicEmbedding(max_capacity=1024), tables[0]
+            )
+        constraints = {
+            "sparse.ebc.dynamic": dynamic_constraint,
+            "sparse.ebc.static_tw": ParameterConstraints(
+                sharding_types=["table_wise"], compute_kernels=["fused"]
+            ),
+            "sparse.ebc.static_cw": ParameterConstraints(
+                sharding_types=["column_wise"],
+                compute_kernels=["fused"],
+                min_partition=128,
+            ),
+        }
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        with (
+            mock.patch.dict(os.environ, {"TZREC_PLANNER": "milp"}),
+            mock.patch.object(
+                model, "parameter_constraints", return_value=constraints, create=True
+            ),
+            mock.patch.object(plan_util, "get_local_size", return_value=2),
+            mock.patch.object(
+                plan_util.dist, "get_world_size", return_value=world_size
+            ),
+            mock.patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(total_memory=1 << 30),
+            ),
+            mock.patch.object(
+                resource_util, "host_memory_capacity_per_rank", return_value=1 << 30
+            ),
+        ):
+            planner = create_planner(torch.device("cuda"), batch_size=16, model=model)
+        for _ in range(2):
+            plan = planner.plan(model, plan_util.get_default_sharders())
+            table_plans = plan.plan["sparse.ebc"]
+            self.assertEqual(set(table_plans), {t.name for t in tables})
+            self.assertEqual(table_plans["dynamic"].ranks, list(range(world_size)))
+            self.assertEqual(
+                table_plans["dynamic"].dynamicemb_options.max_capacity,
+                tables[0].num_embeddings // world_size,
+            )
+            self.assertEqual(table_plans["static_tw"].sharding_type, "table_wise")
+            self.assertEqual(len(table_plans["static_cw"].ranks), 2)
+            self.assertTrue(
+                all(
+                    0 <= rank < world_size
+                    for table in table_plans.values()
+                    for rank in table.ranks
+                )
+            )
+            used = [0] * world_size
+            for option in planner.get_selected_options():
+                if option.name == "dynamic":
+                    self.assertEqual(
+                        table_plans["dynamic"].dynamicemb_options.local_hbm_for_values,
+                        option.dynamicemb_storage.local_hbm_for_values,
+                    )
+                for shard in option.shards:
+                    used[shard.rank] += shard.storage.hbm
+            self.assertTrue(all(hbm <= (1 << 30) * 0.85 for hbm in used))
+
     def test_dp_proposer(self) -> None:
         topology = Topology(world_size=2, compute_device="cuda")
         enumerator = EmbeddingEnumerator(topology=topology, batch_size=8196)
