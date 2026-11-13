@@ -32,8 +32,8 @@ from torchrec.distributed.planner.types import (
     Topology,
 )
 
-from tzrec.utils import milp_planner
-from tzrec.utils.milp_planner import MILPPlanner, _solve_placement
+from tzrec.utils.planner import planners
+from tzrec.utils.planner.planners import MILPPlanner, _solve_milp_placement
 from tzrec.utils.test_util import parameterized_name_func
 
 
@@ -91,9 +91,9 @@ class MILPPlannerTest(unittest.TestCase):
     def test_hbm_capacity_per_rank(self):
         space = [_option(str(i), "table_wise", [[6, 0]]) for i in range(3)]
         with self.assertRaises(PlannerError) as cm:
-            _solve_placement(space, _topology(), 0)
+            _solve_milp_placement(space, _topology(), 0)
         self.assertEqual(cm.exception.error_type, PlannerErrorType.STRICT_CONSTRAINTS)
-        plan = _solve_placement(
+        plan = _solve_milp_placement(
             [_option("rw", "row_wise", [[4, 0], [4, 0]])] + space[:2], _topology(), 0
         )
         self.assertEqual([s.rank for s in plan[0].shards], [0, 1])
@@ -111,7 +111,7 @@ class MILPPlannerTest(unittest.TestCase):
         topology = _topology(world=4, local=2)
         space = [_option("a", "table_wise", [[1, ddr]])]
         if fits:
-            plan = _solve_placement(space, topology, 0)
+            plan = _solve_milp_placement(space, topology, 0)
             shard = plan[0].shards[0]
             self.assertGreater(
                 shard.storage.ddr, topology.devices[shard.rank].storage.ddr
@@ -125,7 +125,7 @@ class MILPPlannerTest(unittest.TestCase):
             )
         else:
             with self.assertRaises(PlannerError) as cm:
-                _solve_placement(space, topology, 0)
+                _solve_milp_placement(space, topology, 0)
             self.assertEqual(
                 cm.exception.error_type, PlannerErrorType.STRICT_CONSTRAINTS
             )
@@ -141,7 +141,7 @@ class MILPPlannerTest(unittest.TestCase):
         )
         space = [_option("rw", "row_wise", [[1, 11], [1, 11], [1, 0], [1, 0]])]
         with self.assertRaises(PlannerError) as cm:
-            _solve_placement(space, topology, 0)
+            _solve_milp_placement(space, topology, 0)
         self.assertEqual(cm.exception.error_type, PlannerErrorType.STRICT_CONSTRAINTS)
 
     @parameterized.expand(
@@ -160,12 +160,12 @@ class MILPPlannerTest(unittest.TestCase):
         topology = _topology(world=4)
         if dependency and size == 6:
             with self.assertRaises(PlannerError) as cm:
-                _solve_placement(space, topology, 0)
+                _solve_milp_placement(space, topology, 0)
             self.assertEqual(
                 cm.exception.error_type, PlannerErrorType.STRICT_CONSTRAINTS
             )
         else:
-            plan = _solve_placement(space, topology, 0)
+            plan = _solve_milp_placement(space, topology, 0)
             hosts = [{s.rank // 2 for s in o.shards} for o in plan]
             self.assertTrue(all(len(h) == 1 for h in hosts))
             if dependency:
@@ -183,9 +183,9 @@ class MILPPlannerTest(unittest.TestCase):
         space = [_option("cw", "column_wise", [[2, 0]] * 2, kernel=kernel)]
         if kernel == "key_value":
             with self.assertRaises(PlannerError):
-                _solve_placement(space, topology, 0)
+                _solve_milp_placement(space, topology, 0)
         else:
-            plan = _solve_placement(space, topology, 0)
+            plan = _solve_milp_placement(space, topology, 0)
             self.assertEqual([s.rank for s in plan[0].shards], [0, 0])
 
     @parameterized.expand([(0,), (1,), (2,)], name_func=parameterized_name_func)
@@ -230,7 +230,7 @@ class MILPPlannerTest(unittest.TestCase):
                         perfs[rank] += shard.perf.total
                 if np.all(used[:, 0] <= 14) and used[:, 1].sum() <= 28:
                     best = min(best, max(perfs))
-        plan = _solve_placement(
+        plan = _solve_milp_placement(
             [o for group in groups for o in group], _topology(capacity=14), 0
         )
         self.assertEqual(len({o.fqn for o in plan}), 4)
@@ -250,18 +250,18 @@ class MILPPlannerTest(unittest.TestCase):
     def test_timeout_without_solution_is_not_infeasibility(self):
         space = [_option("a", "table_wise", [[1, 0]])]
         with mock.patch.object(
-            milp_planner,
+            planners,
             "milp",
             return_value=SimpleNamespace(status=1, x=None),
         ):
             with self.assertRaisesRegex(
                 PlannerError, "does not prove insufficient"
             ) as cm:
-                _solve_placement(space, _topology(), 0)
+                _solve_milp_placement(space, _topology(), 0)
         self.assertEqual(cm.exception.error_type, PlannerErrorType.OTHER)
 
     def test_timeout_uses_feasible_incumbent(self):
-        solve = milp_planner.milp
+        solve = planners.milp
 
         def timed_out(*args, **kwargs):
             result = solve(*args, **kwargs)
@@ -278,7 +278,7 @@ class MILPPlannerTest(unittest.TestCase):
             time_limit=12.5,
             stats=[],
         )
-        with mock.patch.object(milp_planner, "milp", side_effect=timed_out):
+        with mock.patch.object(planners, "milp", side_effect=timed_out):
             with self.assertLogs("tzrec", level="WARNING") as logs:
                 plan = planner.plan(nn.Module(), [])
         self.assertEqual(set(plan.plan["ebc"]["a"].ranks), {0, 1})
@@ -300,7 +300,9 @@ class MILPPlannerTest(unittest.TestCase):
 
     def test_grid_shard_is_not_silently_ignored(self):
         with self.assertRaisesRegex(NotImplementedError, "grid_shard"):
-            _solve_placement([_option("a", "grid_shard", [[1, 0]] * 2)], _topology(), 0)
+            _solve_milp_placement(
+                [_option("a", "grid_shard", [[1, 0]] * 2)], _topology(), 0
+            )
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import coo_matrix
 from torch import nn
-from torchrec.distributed.planner import planners
+from torchrec.distributed.planner import planners as torchrec_planners
 from torchrec.distributed.planner.planners import (
     EmbeddingPlannerBase,
     validate_compute_kernels,
@@ -42,7 +42,7 @@ from torchrec.distributed.types import ModuleSharder, ShardingPlan, ShardingType
 from tzrec.utils.logging_util import logger
 
 
-class _PlacementModel:
+class MILPPlacementModel:
     """Select table options and place shards under rank HBM and node DDR constraints.
 
     Each option's index is its binary selection variable. Shard-to-rank mappings
@@ -363,7 +363,7 @@ class _PlacementModel:
         return plan
 
 
-def _solve_placement(
+def _solve_milp_placement(
     options: List[ShardingOption],
     topology: Topology,
     relative_gap: float,
@@ -371,7 +371,7 @@ def _solve_placement(
 ) -> List[ShardingOption]:
     """Build the joint placement model, solve it and return a validated plan."""
     started = time.perf_counter()
-    model = _PlacementModel(options, topology)
+    model = MILPPlacementModel(options, topology)
     result = milp(
         c=model.objective,
         integrality=model.integrality,
@@ -486,7 +486,7 @@ class MILPPlanner(EmbeddingPlannerBase):
         self._search_space = self._enumerator.enumerate(module, sharders)
         if not self._search_space:
             return ShardingPlan({})
-        selected = _solve_placement(
+        selected = _solve_milp_placement(
             self._search_space,
             capacity,
             self._relative_gap,
@@ -494,7 +494,7 @@ class MILPPlanner(EmbeddingPlannerBase):
         )
         for callback in self._callbacks:
             selected = callback(selected)
-        plan = planners.to_sharding_plan(selected, self._topology)
+        plan = torchrec_planners.to_sharding_plan(selected, self._topology)
         validate_modules_inclusion_in_sharding_plan(plan, module, sharders)
         validate_rank_assignment(plan, self._topology)
         validate_compute_kernels(selected)
