@@ -178,9 +178,6 @@ def create_planner(
             relative_gap=float(os.environ.get("TZREC_MILP_RELATIVE_GAP", "0.001")),
             time_limit=float(os.environ.get("TZREC_MILP_TIME_LIMIT_SECONDS", "60.0")),
         )
-    if planner_type != "dp":
-        raise ValueError(f"Unknown TZREC_PLANNER={planner_type!r}; expected dp or milp")
-
     # build planner
     planner = EmbeddingShardingPlanner(
         topology=topology,
