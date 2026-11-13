@@ -20,6 +20,7 @@ forward has no ``logits_to_keep``, or which returns a legacy tuple cache, is
 not supported; Qwen2.5/Qwen3 are what CI covers.
 """
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
@@ -36,12 +37,42 @@ from tzrec.prompt.assembler import (
     INPUT_IDS,
     MAX_SEQLEN,
     RESPONSE_LENGTHS,
-    MultiTargetLayout,
-    build_multi_target_layout,
 )
 from tzrec.prompt.types import CompiledPrompt, SlotSeg
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+
+
+@dataclass
+class _MultiTargetLayout:
+    """Training-only SID branches that share each row's packed prompt prefix.
+
+    Tokens keep the assembler's packed order. Every target is one attention
+    segment whose keys are its row's prefix followed by its own tokens, so
+    causal attention aligned to the last key isolates targets. A row's first
+    segment also holds its prefix queries, so only later targets copy keys.
+
+    Args:
+        position_ids: packed positions, restarting after the prefix per target.
+        cu_seqlens_q: int32 query boundaries of the segments.
+        cu_seqlens_k: int32 key boundaries of the same segments.
+        kv_indices: packed token behind every segment key/value.
+        max_seqlen: upper bound of any segment's query or key length.
+        label_indices: packed indices of target tokens, shaped (targets, levels).
+        score_indices: packed indices whose logits predict those labels.
+        target_weights: inverse target count of each target's row.
+        token_targets: target index of every packed token, -1 in a prefix.
+    """
+
+    position_ids: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    kv_indices: torch.Tensor
+    max_seqlen: int
+    label_indices: torch.Tensor
+    score_indices: torch.Tensor
+    target_weights: torch.Tensor
+    token_targets: torch.Tensor
 
 
 def _shared_prefix_attention(
@@ -53,7 +84,7 @@ def _shared_prefix_attention(
     scaling: Optional[float] = None,
     dropout: float = 0.0,
     *,
-    multi_target_layout: MultiTargetLayout,
+    multi_target_layout: _MultiTargetLayout,
     **kwargs: Any,
 ) -> Tuple[torch.Tensor, None]:
     """Run one FA2 varlen call over the prefix and target segments.
@@ -205,10 +236,9 @@ class GenRecCausalLMModel(BaseGenRecModel):
             Per-target logits and labels, and each target's row weight.
         """
         infos = batch.additional_infos
-        layout = build_multi_target_layout(
+        layout = self._build_multi_target_layout(
             infos[CU_SEQLENS],
             infos[RESPONSE_LENGTHS],
-            self._prompt.sid_space.num_levels,
             embeds.shape[0],
         )
         if self._attn_kernel == "flash_attention_2":
@@ -249,6 +279,115 @@ class GenRecCausalLMModel(BaseGenRecModel):
             "labels": infos[INPUT_IDS][layout.label_indices],
             "target_weights": layout.target_weights,
         }
+
+    def _build_multi_target_layout(
+        self,
+        cu_seqlens: torch.Tensor,
+        response_lengths: torch.Tensor,
+        num_tokens: int,
+    ) -> _MultiTargetLayout:
+        """Split each packed row into its shared prefix and independent SID targets.
+
+        Args:
+            cu_seqlens: packed row boundaries from the assembler.
+            response_lengths: supervised SID token count of each row.
+            num_tokens: packed token count, equal to ``cu_seqlens[-1]``.
+
+        Returns:
+            Positions, attention segments and scoring indices over packed tokens.
+        """
+        num_levels = self._prompt.sid_space.num_levels
+        device = cu_seqlens.device
+        cu_seqlens = cu_seqlens.to(torch.int64)
+        row_lengths = torch.diff(cu_seqlens)
+        prefix_lengths = row_lengths - response_lengths
+        target_counts = response_lengths // num_levels
+        # the first target shares its row's prefix segment
+        segment_counts = target_counts.clamp(min=1)
+        # one host read sizes every repeat below
+        num_targets, num_segments, num_keys, max_seqlen = torch.stack(
+            (
+                target_counts.sum(),
+                segment_counts.sum(),
+                (prefix_lengths * segment_counts + response_lengths).sum(),
+                row_lengths.max(),
+            )
+        ).tolist()
+        row_ids = torch.arange(row_lengths.numel(), device=device)
+
+        segment_ids = torch.arange(num_segments, device=device)
+        segment_rows = torch.repeat_interleave(
+            row_ids, segment_counts, output_size=num_segments
+        )
+        # i for a row's i-th target; segment 0 also holds the prefix
+        segment_ranks = (
+            segment_ids - (segment_counts.cumsum(0) - segment_counts)[segment_rows]
+        )
+        segment_prefix_lengths = prefix_lengths[segment_rows]
+        key_lengths = segment_prefix_lengths + num_levels * (
+            target_counts[segment_rows] > 0
+        )
+        query_lengths = torch.where(segment_ranks > 0, num_levels, key_lengths)
+        cu_seqlens_q = torch.nn.functional.pad(query_lengths.cumsum(0), (1, 0))
+        cu_seqlens_k = torch.nn.functional.pad(key_lengths.cumsum(0), (1, 0))
+
+        token_segments = torch.repeat_interleave(
+            segment_ids, query_lengths, output_size=num_tokens
+        )
+        # a query's position counts the keys before it in its segment
+        position_ids = (
+            torch.arange(num_tokens, device=device)
+            - (cu_seqlens_q[:-1] + query_lengths - key_lengths)[token_segments]
+        )
+        segment_targets = (target_counts.cumsum(0) - target_counts)[
+            segment_rows
+        ] + segment_ranks
+        token_targets = torch.where(
+            position_ids < segment_prefix_lengths[token_segments],
+            -1,
+            segment_targets[token_segments],
+        )
+
+        key_segments = torch.repeat_interleave(
+            segment_ids, key_lengths, output_size=num_keys
+        )
+        key_offsets = torch.arange(num_keys, device=device) - cu_seqlens_k[key_segments]
+        key_rows = segment_rows[key_segments]
+        # past the prefix, a target's own keys skip the row's earlier targets
+        kv_indices = (
+            cu_seqlens[key_rows]
+            + key_offsets
+            + (key_offsets >= prefix_lengths[key_rows])
+            * segment_ranks[key_segments]
+            * num_levels
+        )
+
+        target_rows = torch.repeat_interleave(
+            row_ids, target_counts, output_size=num_targets
+        )
+        # rows without targets still own a prefix segment
+        target_segments = (
+            torch.arange(num_targets, device=device)
+            + (target_counts == 0).cumsum(0)[target_rows]
+        )
+        # a target's tokens close its segment
+        label_indices = cu_seqlens_q[target_segments + 1, None] - torch.arange(
+            num_levels, 0, -1, device=device
+        )
+        score_indices = label_indices - 1
+        score_indices[:, 0] = cu_seqlens[target_rows] + prefix_lengths[target_rows] - 1
+
+        return _MultiTargetLayout(
+            position_ids=position_ids,
+            cu_seqlens_q=cu_seqlens_q.to(torch.int32),
+            cu_seqlens_k=cu_seqlens_k.to(torch.int32),
+            kv_indices=kv_indices,
+            max_seqlen=max_seqlen,
+            label_indices=label_indices,
+            score_indices=score_indices,
+            target_weights=target_counts[target_rows].float().reciprocal(),
+            token_targets=token_targets,
+        )
 
     def _forward(
         self, embeds: torch.Tensor, batch: Batch

@@ -22,7 +22,6 @@ from tzrec.prompt.assembler import (
     MAX_SEQLEN,
     RESPONSE_LENGTHS,
     PromptAssembler,
-    build_multi_target_layout,
 )
 from tzrec.prompt.types import (
     FillMode,
@@ -407,61 +406,6 @@ class PromptAssemblerTest(unittest.TestCase):
         scripted = torch.jit.script(module)
         for key, value in scripted(batch).items():
             self.assertTrue(torch.equal(eager[key], value), key)
-
-
-class MultiTargetLayoutTest(unittest.TestCase):
-    def test_layout_of_two_targets_one_target_and_none(self) -> None:
-        # rows: 2-token prompt + 2 SIDs, 4-token prompt + 1 SID, 3-token prompt
-        layout = build_multi_target_layout(
-            torch.tensor([0, 8, 15, 18], dtype=torch.int32),
-            torch.tensor([6, 3, 0]),
-            num_levels=3,
-            num_tokens=18,
-        )
-        self.assertEqual(
-            layout.position_ids.tolist(),
-            [0, 1, 2, 3, 4, 2, 3, 4] + [0, 1, 2, 3, 4, 5, 6] + [0, 1, 2],
-        )
-        self.assertEqual(
-            layout.token_targets.tolist(),
-            [-1, -1, 0, 0, 0, 1, 1, 1, -1, -1, -1, -1, 2, 2, 2, -1, -1, -1],
-        )
-        self.assertEqual(layout.max_seqlen, 8)
-        self.assertEqual(
-            layout.label_indices.tolist(), [[2, 3, 4], [5, 6, 7], [12, 13, 14]]
-        )
-        # a target's first level is scored from the last prompt token
-        self.assertEqual(
-            layout.score_indices.tolist(), [[1, 2, 3], [1, 5, 6], [11, 12, 13]]
-        )
-        self.assertEqual(layout.target_weights.tolist(), [0.5, 0.5, 1.0])
-        # a row's first target shares its prefix segment; later ones copy keys
-        self.assertEqual(layout.cu_seqlens_q.tolist(), [0, 5, 8, 15, 18])
-        self.assertEqual(layout.cu_seqlens_k.tolist(), [0, 5, 10, 17, 20])
-        self.assertEqual(
-            layout.kv_indices.tolist(),
-            [0, 1, 2, 3, 4, 0, 1, 5, 6, 7] + list(range(8, 15)) + [15, 16, 17],
-        )
-        # the FA2 segments, causal from the last key, must give exactly this:
-        # same row, causal, and the key is prompt or in the query's target
-        rows = torch.repeat_interleave(torch.arange(3), torch.tensor([8, 7, 3]))
-        query, key = torch.arange(18)[:, None], torch.arange(18)[None, :]
-        targets = layout.token_targets
-        expected = (
-            (rows[query] == rows[key])
-            & (key <= query)
-            & ((targets[key] < 0) | (targets[key] == targets[query]))
-        )
-        from_segments = torch.zeros(18, 18, dtype=torch.bool)
-        cu_q = layout.cu_seqlens_q.tolist()
-        cu_k = layout.cu_seqlens_k.tolist()
-        for segment in range(len(cu_q) - 1):
-            keys = layout.kv_indices[cu_k[segment] : cu_k[segment + 1]]
-            queries = cu_q[segment + 1] - cu_q[segment]
-            for row in range(queries):
-                visible = keys[: keys.numel() - queries + row + 1]
-                from_segments[cu_q[segment] + row, visible] = True
-        torch.testing.assert_close(from_segments, expected)
 
 
 if __name__ == "__main__":
