@@ -21,6 +21,7 @@ from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 from tzrec.utils.planner.enumerators import EmbeddingEnumerator
+from tzrec.utils.planner.shard_estimators import calculate_shard_storages
 from tzrec.utils.test_util import parameterized_name_func
 
 
@@ -48,10 +49,7 @@ class EmbeddingStorageEstimatorTest(unittest.TestCase):
         # one entry per input feature survives enumeration; the estimation
         # path then prices a shared pooled bag one output row per input,
         # while an unpooled collection keeps every position
-        from torchrec.distributed.planner.shard_estimators import (
-            calculate_shard_storages,
-            get_num_poolings,
-        )
+        from torchrec.distributed.planner.shard_estimators import get_num_poolings
         from torchrec.distributed.planner.types import ParameterConstraints
 
         topology = Topology(world_size=1, compute_device="cpu")

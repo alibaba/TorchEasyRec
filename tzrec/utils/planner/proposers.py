@@ -20,8 +20,6 @@ from torchrec.distributed.planner.types import (
     Topology,
 )
 
-_INF = float("inf")
-
 
 def _argmin_per_group(group_keys: np.ndarray, perf_keys: np.ndarray) -> np.ndarray:
     """Index of the min-``perf_keys`` entry per distinct ``group_keys`` value.

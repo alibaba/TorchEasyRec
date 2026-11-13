@@ -22,7 +22,7 @@ from torchrec.distributed.planner.enumerators import (
     ShardEstimator,
 )
 from torchrec.distributed.planner.shard_estimators import (
-    calculate_shard_storages as tzrec_calculate_shard_storages,
+    calculate_shard_storages as _torchrec_calculate_shard_storages,
 )
 from torchrec.distributed.planner.shard_estimators import get_num_poolings
 from torchrec.distributed.planner.types import (
@@ -286,7 +286,7 @@ def calculate_shard_storages(
             dynamicemb_storage=dynamicemb_storage,
         )
     else:
-        return tzrec_calculate_shard_storages(
+        return _torchrec_calculate_shard_storages(
             sharder_data=sharder_data,
             sharding_type=sharding_type,
             tensor=tensor,

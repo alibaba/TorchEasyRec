@@ -17,6 +17,7 @@ from unittest import mock
 import numpy as np
 import torch
 from parameterized import parameterized
+from scipy.optimize import LinearConstraint
 from torch import nn
 from torchrec.distributed.planner.enumerators import get_partition_by_type
 from torchrec.distributed.planner.storage_reservations import (
@@ -52,8 +53,8 @@ def _option(name, kind, costs, perfs=None, dependency=None, kernel="fused"):
         compute_kernel=kernel,
         shards=[
             Shard(
-                size=[8, 16],
-                offset=[i * 8, 0],
+                size=[16, 16] if kind == "data_parallel" else [8, 16],
+                offset=[0, 0] if kind == "data_parallel" else [i * 8, 0],
                 storage=Storage(*cost),
                 perf=Perf(perfs[i] if perfs else 1, 0, 0, 0),
             )
@@ -91,13 +92,19 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
         self.assertEqual(len(plan.plan["ebc"]), 1)
         self.assertEqual(planner.get_selected_options()[0].total_storage.hbm, 4)
 
-    def test_hbm_capacity_per_rank(self):
+    @parameterized.expand(
+        [("row_wise", "fused"), ("data_parallel", "dense")],
+        name_func=parameterized_name_func,
+    )
+    def test_hbm_capacity_per_rank(self, kind, kernel):
         space = [_option(str(i), "table_wise", [[6, 0]]) for i in range(3)]
         with self.assertRaises(PlannerError) as cm:
             _solve_milp_placement(space, _topology(), 0)
         self.assertEqual(cm.exception.error_type, PlannerErrorType.STRICT_CONSTRAINTS)
         plan = _solve_milp_placement(
-            [_option("rw", "row_wise", [[4, 0], [4, 0]])] + space[:2], _topology(), 0
+            [_option("uniform", kind, [[4, 0], [4, 0]], kernel=kernel)] + space[:2],
+            _topology(),
+            0,
         )
         self.assertEqual([s.rank for s in plan[0].shards], [0, 1])
         self.assertEqual({o.shards[0].rank for o in plan[1:]}, {0, 1})
@@ -196,6 +203,8 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
         rng = np.random.default_rng(seed)
         groups = []
         for i in range(4):
+            replica_cost = rng.integers(1, 5, 2).tolist()
+            replica_perf = int(rng.integers(1, 6))
             groups.append(
                 [
                     _option(
@@ -210,6 +219,13 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
                         rng.integers(3, 9, (1, 2)).tolist(),
                         rng.integers(2, 10, 1).tolist(),
                     ),
+                    _option(
+                        str(i),
+                        "data_parallel",
+                        [replica_cost] * 2,
+                        [replica_perf] * 2,
+                        kernel="dense",
+                    ),
                 ]
             )
         best = float("inf")
@@ -222,7 +238,7 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
                 for option in choices:
                     ranks = (
                         [0, 1]
-                        if option.sharding_type == "row_wise"
+                        if option.sharding_type in ("row_wise", "data_parallel")
                         else [next(positions)]
                     )
                     for rank, shard in zip(ranks, option.shards):
@@ -288,18 +304,55 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
         self.assertIn("12.5s solver limit", " ".join(logs.output))
         self.assertIn("gap=0.02", " ".join(logs.output))
 
-    @parameterized.expand([(0.0,), (float("nan"),)], name_func=parameterized_name_func)
-    def test_invalid_time_limit(self, time_limit):
-        with self.assertRaisesRegex(
-            ValueError, "time_limit must be positive and finite"
-        ):
+    @parameterized.expand(
+        [
+            ("time_limit", 0.0),
+            ("time_limit", float("nan")),
+            ("relative_gap", -0.001),
+            ("relative_gap", float("nan")),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_invalid_solver_settings(self, setting, value):
+        with self.assertRaisesRegex(ValueError, f"{setting} must be"):
             MILPEmbeddingShardingPlanner(
                 topology=_topology(),
                 batch_size=16,
                 enumerator=mock.Mock(),
                 storage_reservation=FixedPercentageStorageReservation(0),
-                time_limit=time_limit,
+                **{setting: value},
             )
+
+    @parameterized.expand(
+        [("hbm", 0, "rank"), ("ddr", 1, "node")],
+        name_func=parameterized_name_func,
+    )
+    def test_rejects_timeout_plan_over_byte_capacity(self, name, axis, scope):
+        capacity = 1 << 30
+        cost = [0, 0]
+        cost[axis] = capacity + 1
+        space = [_option("a", "table_wise", [cost])]
+        solve = planners.milp
+
+        def rounded_timeout(*args, **kwargs):
+            constraints = kwargs["constraints"]
+            # Model solver feasibility tolerance without assuming variable indices.
+            kwargs["constraints"] = LinearConstraint(
+                constraints.A, constraints.lb, constraints.ub + 1e-6
+            )
+            result = solve(*args, **kwargs)
+            self.assertEqual(result.status, 0)
+            result.status = 1
+            return result
+
+        with mock.patch.object(planners, "milp", side_effect=rounded_timeout):
+            with self.assertRaisesRegex(
+                PlannerError, f"exact byte capacity on {scope} 0"
+            ) as cm:
+                _solve_milp_placement(
+                    space, _topology(world=1, local=1, capacity=capacity), 0
+                )
+        self.assertEqual(cm.exception.error_type, PlannerErrorType.PARTITION)
 
     def test_grid_shard_is_not_silently_ignored(self):
         with self.assertRaisesRegex(NotImplementedError, "grid_shard"):
