@@ -83,8 +83,8 @@ def _shared_prefix_attention(
     query, key = query.to(value.dtype), key.to(value.dtype)
     output = flash_attn_varlen_func(
         query[0].transpose(0, 1),
-        key[0].transpose(0, 1).index_select(0, layout.key_indices),
-        value[0].transpose(0, 1).index_select(0, layout.key_indices),
+        key[0].transpose(0, 1).index_select(0, layout.kv_indices),
+        value[0].transpose(0, 1).index_select(0, layout.kv_indices),
         cu_seqlens_q=layout.cu_seqlens_q,
         cu_seqlens_k=layout.cu_seqlens_k,
         max_seqlen_q=layout.max_seqlen,
@@ -496,12 +496,21 @@ def _fx_wrapped_forward(
     Returns:
         Logits and labels, plus per-target row weights for a SID-only
         response.
+
+    Raises:
+        ValueError: no valid SID targets remain after masking incomplete responses.
     """
     if not model._sid_only_response:
         logits, labels = model._forward(embeds, batch)
         return {"logits": logits, "labels": labels}
+    num_levels = model._prompt.sid_space.num_levels
     lengths = batch.additional_infos[RESPONSE_LENGTHS]
-    if int(lengths.max()) > model._prompt.sid_space.num_levels:
+    lengths = lengths.masked_fill(lengths % num_levels != 0, 0)
+    batch.additional_infos[RESPONSE_LENGTHS] = lengths
+    max_length = int(lengths.max())
+    if max_length == 0:
+        raise ValueError("No valid SID targets remain in this batch.")
+    if max_length > num_levels:
         return model._multi_target_predictions(embeds, batch)
     logits, labels = model._forward(embeds, batch)
     return {

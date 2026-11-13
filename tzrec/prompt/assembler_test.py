@@ -439,7 +439,7 @@ class MultiTargetLayoutTest(unittest.TestCase):
         self.assertEqual(layout.cu_seqlens_q.tolist(), [0, 5, 8, 15, 18])
         self.assertEqual(layout.cu_seqlens_k.tolist(), [0, 5, 10, 17, 20])
         self.assertEqual(
-            layout.key_indices.tolist(),
+            layout.kv_indices.tolist(),
             [0, 1, 2, 3, 4, 0, 1, 5, 6, 7] + list(range(8, 15)) + [15, 16, 17],
         )
         # the FA2 segments, causal from the last key, must give exactly this:
@@ -456,7 +456,7 @@ class MultiTargetLayoutTest(unittest.TestCase):
         cu_q = layout.cu_seqlens_q.tolist()
         cu_k = layout.cu_seqlens_k.tolist()
         for segment in range(len(cu_q) - 1):
-            keys = layout.key_indices[cu_k[segment] : cu_k[segment + 1]]
+            keys = layout.kv_indices[cu_k[segment] : cu_k[segment + 1]]
             queries = cu_q[segment + 1] - cu_q[segment]
             for row in range(queries):
                 visible = keys[: keys.numel() - queries + row + 1]

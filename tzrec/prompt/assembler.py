@@ -372,7 +372,7 @@ class MultiTargetLayout:
         position_ids: packed positions, restarting after the prefix per target.
         cu_seqlens_q: int32 query boundaries of the segments.
         cu_seqlens_k: int32 key boundaries of the same segments.
-        key_indices: packed token behind every segment key.
+        kv_indices: packed token behind every segment key/value.
         max_seqlen: upper bound of any segment's query or key length.
         label_indices: packed indices of target tokens, shaped (targets, levels).
         score_indices: packed indices whose logits predict those labels.
@@ -383,7 +383,7 @@ class MultiTargetLayout:
     position_ids: torch.Tensor
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
-    key_indices: torch.Tensor
+    kv_indices: torch.Tensor
     max_seqlen: int
     label_indices: torch.Tensor
     score_indices: torch.Tensor
@@ -465,7 +465,7 @@ def build_multi_target_layout(
     key_offsets = torch.arange(num_keys, device=device) - cu_seqlens_k[key_segments]
     key_rows = segment_rows[key_segments]
     # past the prefix, a target's own keys skip the row's earlier targets
-    key_indices = (
+    kv_indices = (
         cu_seqlens[key_rows]
         + key_offsets
         + (key_offsets >= prefix_lengths[key_rows])
@@ -492,7 +492,7 @@ def build_multi_target_layout(
         position_ids=position_ids,
         cu_seqlens_q=cu_seqlens_q.to(torch.int32),
         cu_seqlens_k=cu_seqlens_k.to(torch.int32),
-        key_indices=key_indices,
+        kv_indices=kv_indices,
         max_seqlen=max_seqlen,
         label_indices=label_indices,
         score_indices=score_indices,

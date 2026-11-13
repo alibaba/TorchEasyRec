@@ -372,6 +372,14 @@ class LayoutInvarianceTest(unittest.TestCase):
         )
         return model.to(device).eval(), compiled_prompt
 
+    def test_all_incomplete_responses_are_rejected(self) -> None:
+        model, compiled = self._eval_model(
+            "qwen2", "sdpa", torch.device("cpu"), GenRecModelConfig.FP32
+        )
+        batch = _packed_batch(compiled, [GENREC_HIST_CODES], [GENREC_ANSWER_CODES[:2]])
+        with self.assertRaisesRegex(ValueError, "No valid SID targets remain"):
+            model.predict(batch)
+
     def _assert_rows_match_solo_runs(
         self,
         model_type: str,
@@ -384,32 +392,35 @@ class LayoutInvarianceTest(unittest.TestCase):
             model_type, attn_kernel, device, lm_parameter_dtype
         )
         hist_rows, answer_rows = _TWO_ROWS
+        hist_rows = hist_rows + [hist_rows[0]]
+        answer_rows = answer_rows + [GENREC_ANSWER_CODES[:2]]
         packed_batch = _packed_batch(compiled_prompt, hist_rows, answer_rows).to(device)
 
         packed = model.predict(packed_batch)
+        self.assertEqual(packed["target_weights"].tolist(), [1.0, 1.0, 0.0])
         with torch.no_grad():
             solos = [
                 model.predict(
                     _packed_batch(compiled_prompt, [hist], [answer]).to(device)
                 )
-                for hist, answer in zip(hist_rows, answer_rows)
+                for hist, answer in zip(hist_rows[:2], answer_rows[:2])
             ]
             changed = model.predict(
                 _packed_batch(
                     compiled_prompt,
-                    [_REWRITTENGENREC_HIST_CODES, hist_rows[1]],
+                    [_REWRITTENGENREC_HIST_CODES] + hist_rows[1:],
                     answer_rows,
                 ).to(device)
             )
 
         torch.testing.assert_close(
-            packed["logits"],
+            packed["logits"][:2],
             torch.cat([result["logits"] for result in solos]),
             atol=1e-2,
             rtol=1e-2,
         )
         torch.testing.assert_close(
-            packed["labels"], torch.cat([result["labels"] for result in solos])
+            packed["labels"][:2], torch.cat([result["labels"] for result in solos])
         )
         torch.testing.assert_close(
             packed["logits"][1], changed["logits"][1], atol=0, rtol=0
@@ -417,6 +428,15 @@ class LayoutInvarianceTest(unittest.TestCase):
 
         loss = model.loss(packed, packed_batch)["ce_loss"]
         self.assertTrue(bool(torch.isfinite(loss)))
+        torch.testing.assert_close(
+            loss,
+            ForCausalLMLoss(
+                packed["logits"],
+                labels=packed["labels"],
+                vocab_size=model.lm.config.vocab_size,
+                ignore_index=model._ignore_index,
+            ),
+        )
         loss.backward()
         grad = model.lm.get_input_embeddings().weight.grad
         self.assertIsNotNone(grad)
@@ -530,7 +550,9 @@ class LayoutInvarianceTest(unittest.TestCase):
 
         def grouped(first_row_answer):
             return _packed_batch(
-                compiled_prompt, hist_rows, [first_row_answer, GENREC_ANSWER_CODES]
+                compiled_prompt,
+                [hist_rows[0]] + hist_rows,
+                [GENREC_ANSWER_CODES + [2], first_row_answer, GENREC_ANSWER_CODES],
             ).to(device)
 
         batch = grouped(GENREC_ANSWER_CODES + _OTHERGENREC_ANSWER_CODES)
