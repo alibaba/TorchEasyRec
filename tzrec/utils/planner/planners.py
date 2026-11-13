@@ -42,7 +42,7 @@ from torchrec.distributed.types import ModuleSharder, ShardingPlan, ShardingType
 from tzrec.utils.logging_util import logger
 
 
-class MILPPlacementModel:
+class _MILPPlacementModel:
     """Select table options and place shards under rank HBM and node DDR constraints.
 
     Each option's index is its binary selection variable. Shard-to-rank mappings
@@ -371,7 +371,7 @@ def _solve_milp_placement(
 ) -> List[ShardingOption]:
     """Build the joint placement model, solve it and return a validated plan."""
     started = time.perf_counter()
-    model = MILPPlacementModel(options, topology)
+    model = _MILPPlacementModel(options, topology)
     result = milp(
         c=model.objective,
         integrality=model.integrality,
