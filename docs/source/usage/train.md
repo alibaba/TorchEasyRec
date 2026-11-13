@@ -223,7 +223,7 @@ export HOST_MEMORY_RESERVE_PERCENT=0.15
 
 DDR 和 SSD 预算在同一 node 的 rank 之间共享，允许单个 rank 超过均分额度，但该 node 的总用量不能超过对应预算，也不能借用其他 node 的额度。
 
-启用 `train_config.rocksdb_config` 的 RocksDB 后端后，自动使用 MILP，即使 `TZREC_PLANNER=dp` 也不使用 DP。共享资源预留后，内存与 RocksDB 候选一起参与选择和放置；普通配置继续保持默认 DP。跨 node 共享磁盘时，按 `shared_across_nodes` 的配置先分配各 node 的 SSD 额度，再执行 node 内的容量约束。
+启用 `train_config.rocksdb_config` 的 RocksDB 后端后，自动使用 MILP。
 
 ```bash
 export TZREC_PLANNER=milp
