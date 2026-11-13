@@ -33,7 +33,10 @@ from torchrec.distributed.planner.types import (
 )
 
 from tzrec.utils.planner import planners
-from tzrec.utils.planner.planners import MILPPlanner, _solve_milp_placement
+from tzrec.utils.planner.planners import (
+    MILPEmbeddingShardingPlanner,
+    _solve_milp_placement,
+)
 from tzrec.utils.test_util import parameterized_name_func
 
 
@@ -71,13 +74,13 @@ def _topology(world=2, local=2, capacity=10):
     )
 
 
-class MILPPlannerTest(unittest.TestCase):
+class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
     def test_plan_respects_storage_reservation(self):
         options = [
             _option("a", "table_wise", [[9, 0]], [1]),
             _option("a", "table_wise", [[4, 0]], [3]),
         ]
-        planner = MILPPlanner(
+        planner = MILPEmbeddingShardingPlanner(
             topology=_topology(),
             batch_size=16,
             enumerator=mock.Mock(enumerate=mock.Mock(return_value=options)),
@@ -270,7 +273,7 @@ class MILPPlannerTest(unittest.TestCase):
             return result
 
         space = [_option("a", "column_wise", [[6, 0]] * 2)]
-        planner = MILPPlanner(
+        planner = MILPEmbeddingShardingPlanner(
             topology=_topology(),
             batch_size=16,
             enumerator=mock.Mock(enumerate=mock.Mock(return_value=space)),
@@ -290,7 +293,7 @@ class MILPPlannerTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "time_limit must be positive and finite"
         ):
-            MILPPlanner(
+            MILPEmbeddingShardingPlanner(
                 topology=_topology(),
                 batch_size=16,
                 enumerator=mock.Mock(),

@@ -410,7 +410,7 @@ def _solve_milp_placement(
     return plan
 
 
-class MILPPlanner(EmbeddingPlannerBase):
+class MILPEmbeddingShardingPlanner(EmbeddingPlannerBase):
     """Jointly select sharding options and rank assignments without resource bins.
 
     Supports row-wise, data-parallel, table-wise, column-wise, table-row-wise

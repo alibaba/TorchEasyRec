@@ -168,9 +168,9 @@ def create_planner(
     )
     planner_type = os.environ.get("TZREC_PLANNER", "dp")
     if planner_type == "milp":
-        from tzrec.utils.planner.planners import MILPPlanner
+        from tzrec.utils.planner.planners import MILPEmbeddingShardingPlanner
 
-        return MILPPlanner(
+        return MILPEmbeddingShardingPlanner(
             topology=topology,
             batch_size=batch_size,
             enumerator=enumerator,
