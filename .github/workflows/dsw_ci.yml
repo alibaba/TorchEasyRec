@@ -48,8 +48,13 @@ jobs:
           CI_ALIKAFKA_BROKERS: ${{ inputs.lane == 'cpu' && secrets.CI_ALIKAFKA_BROKERS || '' }}
           CI_REGION: ${{ inputs.lane == 'cpu' && secrets.CI_REGION || '' }}
         run: |
-          /opt/tzci/current/bin/tzci job run --lane "$TZCI_LANE" \
-            --checkout "$GITHUB_WORKSPACE"
+          test -f tzrec/tests/ci_job.py
+          case "$TZCI_LANE" in
+            cpu) script=ci_test_cpu.sh ;;
+            gpu) script=ci_test.sh ;;
+            ppu) script=ci_test_ppu.sh ;;
+          esac
+          bash "scripts/ci/$script" --container
       - name: Retain test evidence
         if: always() && steps.tests.outputs.report_dir != ''
         uses: actions/upload-artifact@v4

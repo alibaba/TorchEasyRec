@@ -167,6 +167,23 @@ class RecordingResult(unittest.TextTestResult):
 
     def _record(self, test: Any, outcome: str, detail: str = "") -> None:
         """Merge repeated teardown/subtest events with failure precedence."""
+        failure_file = os.environ.get("TZREC_CI_FAILURE_FILE")
+        if failure_file and outcome in (
+            "failure",
+            "error",
+            "unexpected_success",
+            "blocked_by_fixture",
+        ):
+            fd = os.open(failure_file, os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            directory = os.open(Path(failure_file).parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         journal = os.environ.get("TZREC_CI_EVENT_LOG")
         if journal:
             first = not Path(journal).exists()
@@ -366,6 +383,7 @@ def preserve_execution_environment(env: dict[str, str]) -> None:
         "CUDA_VISIBLE_DEVICES",
         "NVIDIA_VISIBLE_DEVICES",
         "TZREC_CI_EVENT_LOG",
+        "TZREC_CI_FAILURE_FILE",
         "TZREC_CI_SESSION_ID",
     ):
         if key in os.environ:

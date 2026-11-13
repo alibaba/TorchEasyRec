@@ -34,12 +34,48 @@ from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 class DispatchTest(unittest.TestCase):
     def setUp(self):
         self.path = Path(make_test_dir("dispatch_"))
-        journal = mock.patch.dict(os.environ, {"TZREC_CI_EVENT_LOG": ""})
+        journal = mock.patch.dict(
+            os.environ, {"TZREC_CI_EVENT_LOG": "", "TZREC_CI_FAILURE_FILE": ""}
+        )
         journal.start()
         self.addCleanup(journal.stop)
 
     def tearDown(self):
         shutil.rmtree(self.path)
+
+    def test_failure_marker_is_durable_before_the_test_journal(self):
+        marker = self.path / "failed"
+        journal = self.path / "events.jsonl"
+
+        class Example(unittest.TestCase):
+            def runTest(self):
+                self.fail("known failure")
+
+        observed = []
+        original_open = open
+
+        def observe_journal(file, *args, **kwargs):
+            if Path(file) == journal:
+                observed.append(marker.is_file())
+            return original_open(file, *args, **kwargs)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "TZREC_CI_FAILURE_FILE": str(marker),
+                    "TZREC_CI_EVENT_LOG": str(journal),
+                },
+            ),
+            mock.patch("builtins.open", side_effect=observe_journal),
+        ):
+            result = unittest.TextTestRunner(
+                stream=io.StringIO(), resultclass=execution.RecordingResult
+            ).run(Example())
+        self.assertFalse(result.wasSuccessful())
+        self.assertTrue(marker.is_file())
+        self.assertEqual(observed, [True])
+        self.assertIn('"outcome": "failure"', journal.read_text())
 
     def test_result_subtests_and_teardown_are_one_failed_case(self):
         class Example(unittest.TestCase):
