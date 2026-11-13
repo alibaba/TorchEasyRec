@@ -88,7 +88,10 @@ class PlanUtilTest(unittest.TestCase):
         }
         model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
         with (
-            mock.patch.dict(os.environ, {"TZREC_PLANNER": "milp"}),
+            mock.patch.dict(
+                os.environ,
+                {"TZREC_PLANNER": "milp", "TZREC_MILP_TIME_LIMIT_SECONDS": "12.5"},
+            ),
             mock.patch.object(
                 model, "parameter_constraints", return_value=constraints, create=True
             ),
