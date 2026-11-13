@@ -42,171 +42,317 @@ from torchrec.distributed.types import ModuleSharder, ShardingPlan, ShardingType
 from tzrec.utils.logging_util import logger
 
 
+class _PlacementModel:
+    """Select table options and place shards under per-rank resource constraints.
+
+    Each option's index is its binary selection variable. Shard-to-rank mappings
+    reference selection, host or shard-placement variables, depending on the
+    sharding type. The objective minimizes the maximum estimated rank cost.
+    """
+
+    def __init__(self, options: List[ShardingOption], topology: Topology) -> None:
+        self._options = options
+        self._topology = topology
+        self._world_size = topology.world_size
+        self._host_size = topology.intra_group_size
+        self._num_hosts, remainder = divmod(self._world_size, self._host_size)
+        if remainder:
+            raise ValueError("MILP requires complete hosts in the topology")
+        supported = {
+            ShardingType.ROW_WISE.value,
+            ShardingType.DATA_PARALLEL.value,
+            ShardingType.TABLE_WISE.value,
+            ShardingType.COLUMN_WISE.value,
+            ShardingType.TABLE_ROW_WISE.value,
+            ShardingType.TABLE_COLUMN_WISE.value,
+        }
+        for option in options:
+            if option.sharding_type not in supported:
+                raise NotImplementedError(
+                    f"MILP does not support {option.sharding_type} for {option.fqn}; "
+                    "use TZREC_PLANNER=dp for this sharding type"
+                )
+
+        self._option_indices_by_table: Dict[str, List[int]] = defaultdict(list)
+        for option_index, option in enumerate(options):
+            self._option_indices_by_table[option.fqn].append(option_index)
+        self._shard_rank_variables: List[List[Dict[int, int]]] = [[] for _ in options]
+        self._dependency_host_variables: Dict[str, List[int]] = {}
+        self._variable_count = len(options)
+        self._row_indices: List[int] = []
+        self._col_indices: List[int] = []
+        self._coefficients: List[float] = []
+        self._constraint_lower: List[float] = []
+        self._constraint_upper: List[float] = []
+
+        self._add_selection_and_placement_constraints()
+        self._max_rank_cost_variable = self._variable_count
+        self._add_rank_cost_constraints()
+
+        variable_count = self._variable_count + 1
+        matrix = coo_matrix(
+            (self._coefficients, (self._row_indices, self._col_indices)),
+            shape=(len(self._constraint_lower), variable_count),
+        ).tocsc()
+        self.constraints = LinearConstraint(
+            matrix, self._constraint_lower, self._constraint_upper
+        )
+        self.objective = np.zeros(variable_count)
+        self.objective[self._max_rank_cost_variable] = 1
+        bounds_upper = np.ones(variable_count)
+        bounds_upper[self._max_rank_cost_variable] = np.inf
+        self.bounds = Bounds(0, bounds_upper)
+        self.integrality = np.ones(variable_count)
+        self.integrality[self._max_rank_cost_variable] = 0
+
+    def _add_binary_variables(self, count: int) -> List[int]:
+        """Allocate indices for binary decision variables."""
+        variables = list(range(self._variable_count, self._variable_count + count))
+        self._variable_count += count
+        return variables
+
+    def _add_constraint(
+        self, terms: List[tuple[int, float]], *, lower: float, upper: float
+    ) -> None:
+        """Append a bounded linear expression to the sparse constraint matrix."""
+        row = len(self._constraint_lower)
+        for col, coefficient in terms:
+            if coefficient:
+                self._row_indices.append(row)
+                self._col_indices.append(col)
+                self._coefficients.append(coefficient)
+        self._constraint_lower.append(lower)
+        self._constraint_upper.append(upper)
+
+    def _add_selection_and_placement_constraints(self) -> None:
+        """Select one option per table and place all and only its selected shards."""
+        for option_indices in self._option_indices_by_table.values():
+            for option_variable in option_indices:
+                option = self._options[option_variable]
+                shard_mappings = self._shard_rank_variables[option_variable]
+                kind = option.sharding_type
+                if kind in (
+                    ShardingType.ROW_WISE.value,
+                    ShardingType.DATA_PARALLEL.value,
+                ):
+                    if len(option.shards) != self._world_size:
+                        raise ValueError(
+                            f"{option.fqn}: uniform shards must match world_size"
+                        )
+                    # Fixed ranks reuse the option's selection variable.
+                    shard_mappings.extend(
+                        {rank: option_variable} for rank in range(self._world_size)
+                    )
+                elif kind in (
+                    ShardingType.TABLE_WISE.value,
+                    ShardingType.COLUMN_WISE.value,
+                ):
+                    for _ in option.shards:
+                        rank_variables = self._add_binary_variables(self._world_size)
+                        # Sum of shard placements equals the option selection.
+                        self._add_constraint(
+                            [(variable, 1) for variable in rank_variables]
+                            + [(option_variable, -1)],
+                            lower=0,
+                            upper=0,
+                        )
+                        shard_mappings.append(dict(enumerate(rank_variables)))
+                    if (
+                        kind == ShardingType.COLUMN_WISE.value
+                        and option.compute_kernel == "key_value"
+                    ):
+                        # Key-value column shards require distinct ranks.
+                        for rank in range(self._world_size):
+                            self._add_constraint(
+                                [(mapping[rank], 1) for mapping in shard_mappings]
+                                + [(option_variable, -1)],
+                                lower=-np.inf,
+                                upper=0,
+                            )
+                else:
+                    host_variables = (
+                        self._add_binary_variables(self._num_hosts)
+                        if self._num_hosts > 1
+                        else [option_variable]
+                    )
+                    if self._num_hosts > 1:
+                        self._add_constraint(
+                            [(variable, 1) for variable in host_variables]
+                            + [(option_variable, -1)],
+                            lower=0,
+                            upper=0,
+                        )
+                        if option.dependency is not None:
+                            if option.dependency not in self._dependency_host_variables:
+                                group_variables = self._add_binary_variables(
+                                    self._num_hosts
+                                )
+                                self._dependency_host_variables[option.dependency] = (
+                                    group_variables
+                                )
+                                self._add_constraint(
+                                    [(variable, 1) for variable in group_variables],
+                                    lower=1,
+                                    upper=1,
+                                )
+                            group_variables = self._dependency_host_variables[
+                                option.dependency
+                            ]
+                            # A selected option must use its dependency group's host.
+                            for host_variable, group_variable in zip(
+                                host_variables, group_variables
+                            ):
+                                self._add_constraint(
+                                    [(host_variable, 1), (group_variable, -1)],
+                                    lower=-np.inf,
+                                    upper=0,
+                                )
+                    if kind == ShardingType.TABLE_ROW_WISE.value:
+                        if len(option.shards) != self._host_size:
+                            raise ValueError(
+                                f"{option.fqn}: table-row-wise shards must fit a host"
+                            )
+                        shard_mappings.extend(
+                            {
+                                host * self._host_size + local_rank: host_variable
+                                for host, host_variable in enumerate(host_variables)
+                            }
+                            for local_rank in range(self._host_size)
+                        )
+                    else:
+                        for _ in option.shards:
+                            rank_variables = self._add_binary_variables(
+                                self._world_size
+                            )
+                            for host, host_variable in enumerate(host_variables):
+                                host_rank_variables = rank_variables[
+                                    host * self._host_size : (host + 1)
+                                    * self._host_size
+                                ]
+                                # Each shard has one rank within the selected host.
+                                self._add_constraint(
+                                    [(variable, 1) for variable in host_rank_variables]
+                                    + [(host_variable, -1)],
+                                    lower=0,
+                                    upper=0,
+                                )
+                            shard_mappings.append(dict(enumerate(rank_variables)))
+            self._add_constraint(
+                [(option_variable, 1) for option_variable in option_indices],
+                lower=1,
+                upper=1,
+            )
+
+    def _add_rank_cost_constraints(self) -> None:
+        """Aggregate existing shard storage and perf estimates by placement.
+
+        Normalize resource costs by capacity and performance by a common scale.
+        This changes neither the byte budgets nor the estimated execution costs;
+        no resource bins or new performance estimates are introduced here.
+        """
+        capacities = [
+            [getattr(device.storage, name) or 0 for name in ("hbm", "ddr", "ssd")]
+            for device in self._topology.devices
+        ]
+        rank_storage_terms: List[List[List[tuple[int, float]]]] = [
+            [[] for _ in range(3)] for _ in range(self._world_size)
+        ]
+        rank_perf_terms: List[List[tuple[int, float]]] = [
+            [] for _ in range(self._world_size)
+        ]
+        perf_scale = max(
+            float(
+                np.median(
+                    [option.total_perf / self._world_size for option in self._options]
+                )
+            ),
+            1e-12,
+        )
+        for option, shard_mappings in zip(self._options, self._shard_rank_variables):
+            for shard, rank_variables in zip(option.shards, shard_mappings):
+                assert shard.storage is not None and shard.perf is not None
+                storage_costs = [
+                    getattr(shard.storage, name) or 0 for name in ("hbm", "ddr", "ssd")
+                ]
+                scaled_perf_cost = shard.perf.total / perf_scale
+                for rank, placement_variable in rank_variables.items():
+                    for resource_index, cost in enumerate(storage_costs):
+                        capacity_fraction = cost / max(
+                            capacities[rank][resource_index], 1
+                        )
+                        rank_storage_terms[rank][resource_index].append(
+                            (placement_variable, capacity_fraction)
+                        )
+                    rank_perf_terms[rank].append((placement_variable, scaled_perf_cost))
+        for rank in range(self._world_size):
+            for resource_index, capacity in enumerate(capacities[rank]):
+                self._add_constraint(
+                    rank_storage_terms[rank][resource_index],
+                    lower=-np.inf,
+                    upper=1 if capacity > 0 else 0,
+                )
+            self._add_constraint(
+                rank_perf_terms[rank] + [(self._max_rank_cost_variable, -1)],
+                lower=-np.inf,
+                upper=0,
+            )
+
+    def decode_plan(self, solution: np.ndarray) -> List[ShardingOption]:
+        """Recover selected options, assign ranks and check exact byte capacities."""
+        binary_solution = solution[: self._max_rank_cost_variable]
+        if not np.allclose(
+            binary_solution, np.rint(binary_solution), atol=1e-5, rtol=0
+        ):
+            raise PlannerError("MILP returned a non-integral placement")
+        plan: List[ShardingOption] = []
+        used_storage = [Storage(hbm=0, ddr=0, ssd=0) for _ in range(self._world_size)]
+        for option_indices in self._option_indices_by_table.values():
+            selected = [index for index in option_indices if solution[index] > 0.5]
+            if len(selected) != 1:
+                raise PlannerError("MILP did not select exactly one option per table")
+            option_index = selected[0]
+            option = copy.deepcopy(self._options[option_index])
+            for shard, rank_variables in zip(
+                option.shards, self._shard_rank_variables[option_index]
+            ):
+                selected_ranks = [
+                    rank
+                    for rank, variable in rank_variables.items()
+                    if solution[variable] > 0.5
+                ]
+                if len(selected_ranks) != 1:
+                    raise PlannerError(
+                        f"MILP did not assign one rank to a shard of {option.fqn}"
+                    )
+                shard.rank = selected_ranks[0]
+                assert shard.storage is not None
+                used_storage[shard.rank] += shard.storage
+            plan.append(option)
+        for rank, (storage, device) in enumerate(
+            zip(used_storage, self._topology.devices)
+        ):
+            if not storage.fits_in(device.storage):
+                raise PlannerError(
+                    f"MILP placement exceeds exact byte capacity on rank {rank}: "
+                    f"required={storage}, available={device.storage}",
+                    PlannerErrorType.PARTITION,
+                )
+        return plan
+
+
 def _solve_placement(
     options: List[ShardingOption],
     topology: Topology,
     relative_gap: float,
 ) -> List[ShardingOption]:
-    """Choose one option per table and its ranks in a single mixed-integer model.
-
-    Binary x variables select options; y variables place movable shards. Uniform
-    shards use x directly. Host selectors couple table-row/column-wise shards and
-    dependent tables. Each rank has separate HBM, DDR and SSD constraints. The
-    continuous objective bounds every rank's summed estimated execution cost.
-    Resource coefficients are normalized by capacity without discretizing bytes.
-    """
+    """Build the joint placement model, solve it and return a validated plan."""
     started = time.perf_counter()
-    world_size = topology.world_size
-    host_size = topology.intra_group_size
-    num_hosts, remainder = divmod(world_size, host_size)
-    if remainder:
-        raise ValueError("MILP requires complete hosts in the topology")
-    supported = {
-        ShardingType.ROW_WISE.value,
-        ShardingType.DATA_PARALLEL.value,
-        ShardingType.TABLE_WISE.value,
-        ShardingType.COLUMN_WISE.value,
-        ShardingType.TABLE_ROW_WISE.value,
-        ShardingType.TABLE_COLUMN_WISE.value,
-    }
-    for option in options:
-        if option.sharding_type not in supported:
-            raise NotImplementedError(
-                f"MILP does not support {option.sharding_type} for {option.fqn}; "
-                "use TZREC_PLANNER=dp for this sharding type"
-            )
-
-    groups: Dict[str, List[int]] = defaultdict(list)
-    for i, option in enumerate(options):
-        groups[option.fqn].append(i)
-    row_indices: List[int] = []
-    col_indices: List[int] = []
-    coefficients: List[float] = []
-    lower: List[float] = []
-    upper: List[float] = []
-    variable_count = len(options)
-
-    def binary_variables(count: int) -> List[int]:
-        """Allocate indices for binary decision variables."""
-        nonlocal variable_count
-        indices = list(range(variable_count, variable_count + count))
-        variable_count += count
-        return indices
-
-    def constraint(
-        terms: List[tuple[int, float]], lo: float = 0, hi: float = 0
-    ) -> None:
-        """Append a sparse linear constraint."""
-        row = len(lower)
-        for col, value in terms:
-            if value:
-                row_indices.append(row)
-                col_indices.append(col)
-                coefficients.append(value)
-        lower.append(lo)
-        upper.append(hi)
-
-    for indices in groups.values():
-        constraint([(i, 1) for i in indices], 1, 1)
-
-    placements: List[List[Dict[int, int]]] = []
-    dependency_hosts: Dict[str, List[int]] = {}
-    for i, option in enumerate(options):
-        shard_placements: List[Dict[int, int]] = []
-        kind = option.sharding_type
-        if kind in (ShardingType.ROW_WISE.value, ShardingType.DATA_PARALLEL.value):
-            if len(option.shards) != world_size:
-                raise ValueError(f"{option.fqn}: uniform shards must match world_size")
-            shard_placements = [{rank: i} for rank in range(world_size)]
-        elif kind in (
-            ShardingType.TABLE_ROW_WISE.value,
-            ShardingType.TABLE_COLUMN_WISE.value,
-        ):
-            hosts = binary_variables(num_hosts) if num_hosts > 1 else [i]
-            if num_hosts > 1:
-                constraint([(h, 1) for h in hosts] + [(i, -1)])
-                if option.dependency is not None:
-                    if option.dependency not in dependency_hosts:
-                        selectors = binary_variables(num_hosts)
-                        dependency_hosts[option.dependency] = selectors
-                        constraint([(h, 1) for h in selectors], 1, 1)
-                    for h, group_h in zip(hosts, dependency_hosts[option.dependency]):
-                        constraint([(h, 1), (group_h, -1)], -np.inf, 0)
-            if kind == ShardingType.TABLE_ROW_WISE.value:
-                if len(option.shards) != host_size:
-                    raise ValueError(
-                        f"{option.fqn}: table-row-wise shards must fit a host"
-                    )
-                shard_placements = [
-                    {host * host_size + local_rank: h for host, h in enumerate(hosts)}
-                    for local_rank in range(host_size)
-                ]
-            else:
-                for _ in option.shards:
-                    ranks = binary_variables(world_size)
-                    for host, h in enumerate(hosts):
-                        members = ranks[host * host_size : (host + 1) * host_size]
-                        constraint([(r, 1) for r in members] + [(h, -1)])
-                    shard_placements.append(dict(enumerate(ranks)))
-        else:
-            for _ in option.shards:
-                ranks = binary_variables(world_size)
-                constraint([(r, 1) for r in ranks] + [(i, -1)])
-                shard_placements.append(dict(enumerate(ranks)))
-            if (
-                kind == ShardingType.COLUMN_WISE.value
-                and option.compute_kernel == "key_value"
-            ):
-                for rank in range(world_size):
-                    constraint(
-                        [(p[rank], 1) for p in shard_placements] + [(i, -1)],
-                        -np.inf,
-                        0,
-                    )
-        placements.append(shard_placements)
-
-    capacities = [
-        [getattr(device.storage, name) or 0 for name in ("hbm", "ddr", "ssd")]
-        for device in topology.devices
-    ]
-    resources: List[List[List[tuple[int, float]]]] = [
-        [[] for _ in range(3)] for _ in range(world_size)
-    ]
-    perfs: List[List[tuple[int, float]]] = [[] for _ in range(world_size)]
-    perf_scale = max(
-        float(np.median([o.total_perf / world_size for o in options])), 1e-12
-    )
-    for option, mappings in zip(options, placements):
-        for shard, mapping in zip(option.shards, mappings):
-            assert shard.storage is not None and shard.perf is not None
-            for rank, variable in mapping.items():
-                for k, name in enumerate(("hbm", "ddr", "ssd")):
-                    cost = getattr(shard.storage, name) or 0
-                    resources[rank][k].append(
-                        (variable, cost / max(capacities[rank][k], 1))
-                    )
-                perfs[rank].append((variable, shard.perf.total / perf_scale))
-
-    target = variable_count
-    for rank in range(world_size):
-        for k in range(3):
-            constraint(resources[rank][k], -np.inf, 1 if capacities[rank][k] > 0 else 0)
-        constraint(perfs[rank] + [(target, -1)], -np.inf, 0)
-    matrix = coo_matrix(
-        (coefficients, (row_indices, col_indices)),
-        shape=(len(lower), variable_count + 1),
-    ).tocsc()
-    objective = np.zeros(variable_count + 1)
-    objective[target] = 1
-    bounds_upper = np.ones(variable_count + 1)
-    bounds_upper[target] = np.inf
-    integrality = np.ones(variable_count + 1)
-    integrality[target] = 0
+    model = _PlacementModel(options, topology)
     result = milp(
-        objective,
-        integrality=integrality,
-        bounds=Bounds(0, bounds_upper),
-        constraints=LinearConstraint(matrix, lower, upper),
+        c=model.objective,
+        integrality=model.integrality,
+        bounds=model.bounds,
+        constraints=model.constraints,
         options={"time_limit": 60.0, "mip_rel_gap": relative_gap},
     )
     if result.status == 2:
@@ -215,46 +361,16 @@ def _solve_placement(
             "HBM, DDR, SSD and sharding constraints",
             PlannerErrorType.STRICT_CONSTRAINTS,
         )
-    if result.status == 1 and result.x is None:
+    solution = result.x
+    if result.status == 1 and solution is None:
         raise PlannerError(
             "MILP reached the 60s solver limit without a feasible placement. "
             "This does not prove insufficient capacity; use TZREC_PLANNER=dp "
             "to try the DP planner."
         )
-    if result.status not in (0, 1) or result.x is None:
+    if result.status not in (0, 1) or solution is None:
         raise PlannerError(f"MILP placement solver failed: {result.message}")
-    if not np.allclose(
-        result.x[:target], np.rint(result.x[:target]), atol=1e-5, rtol=0
-    ):
-        raise PlannerError("MILP returned a non-integral placement")
-
-    plan: List[ShardingOption] = []
-    used = [Storage(hbm=0, ddr=0, ssd=0) for _ in range(world_size)]
-    for indices in groups.values():
-        selected = [i for i in indices if result.x[i] > 0.5]
-        if len(selected) != 1:
-            raise PlannerError("MILP did not select exactly one option per table")
-        i = selected[0]
-        option = copy.deepcopy(options[i])
-        for shard, mapping in zip(option.shards, placements[i]):
-            ranks = [
-                rank for rank, variable in mapping.items() if result.x[variable] > 0.5
-            ]
-            if len(ranks) != 1:
-                raise PlannerError(
-                    f"MILP did not assign one rank to a shard of {option.fqn}"
-                )
-            shard.rank = ranks[0]
-            assert shard.storage is not None
-            used[shard.rank] += shard.storage
-        plan.append(option)
-    for rank, (storage, device) in enumerate(zip(used, topology.devices)):
-        if not storage.fits_in(device.storage):
-            raise PlannerError(
-                f"MILP placement exceeds exact byte capacity on rank {rank}: "
-                f"required={storage}, available={device.storage}",
-                PlannerErrorType.PARTITION,
-            )
+    plan = model.decode_plan(solution)
     elapsed = time.perf_counter() - started
     logger.info(
         f"MILP selected {len(plan)} tables from {len(options)} options in "
