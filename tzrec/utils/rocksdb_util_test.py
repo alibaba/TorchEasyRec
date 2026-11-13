@@ -16,9 +16,11 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from parameterized import parameterized
+
 from tzrec.protos import train_pb2
 from tzrec.utils import rocksdb_util
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
 def _backend_config():
@@ -164,7 +166,15 @@ class SharedStorageTest(unittest.TestCase):
             shared.ssd, overheads["compaction_headroom"] + overheads["other_files"]
         )
 
-    def test_configure_backend_budgets(self):
+    @parameterized.expand(
+        [
+            ("uneven", [3, 7], 35),
+            ("borrowed_rank", [20, 0], 15),
+            ("two_nodes", [20, 0, 1, 1], 15),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_configure_backend_budgets(self, name, builtin_gib, import_quarters):
         try:
             from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
         except ModuleNotFoundError as e:
@@ -188,20 +198,22 @@ class SharedStorageTest(unittest.TestCase):
                 ],
             )
             for name, ddr_bytes in (
-                ("plain", [3 * gib, 7 * gib]),
-                ("sparse.a", [gib // 4, gib // 2]),
-                ("sparse.b", [3 * gib // 4, gib]),
+                ("plain", [value * gib for value in builtin_gib]),
+                ("sparse.a", [gib // 4, gib // 2] * (len(builtin_gib) // 2)),
+                ("sparse.b", [3 * gib // 4, gib] * (len(builtin_gib) // 2)),
             )
         ]
         configured = rocksdb_util.configure_backend(
-            selected, ddr_caps=(16 * gib, 16 * gib), local_world_size=2
+            selected, ddr_caps=(16 * gib,) * len(builtin_gib), local_world_size=2
         )
         self.assertIsNone(configured[0].dynamicemb_options.external_storage)
         for option in configured[1:]:
             factory = option.dynamicemb_options.external_storage
             self.assertEqual(factory.table_namespace, option.fqn)
             self.assertEqual(factory.backend_config.block_cache_bytes, 5 * gib // 2)
-            self.assertEqual(factory.backend_config.import_budget_bytes, 27 * gib // 4)
+            self.assertEqual(
+                factory.backend_config.import_budget_bytes, import_quarters * gib // 4
+            )
 
 
 if __name__ == "__main__":

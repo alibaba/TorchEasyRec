@@ -26,10 +26,11 @@ Startup leaves existing working directories untouched. Closing a runtime
 removes its own working directory; leftovers from abrupt termination require
 manual cleanup.
 
-Planning-time capacities come from ``resource_util``: homogeneous scalar
-budgets per rank, with the sharing scope set by ``shared_across_nodes``. This
-module keeps the shared backend reservation, charged whenever RocksDB is
-configured, and the runtime lifecycle.
+Planning-time capacities come from ``resource_util`` as homogeneous per-rank
+shares. MILP pools DDR and SSD shares within each physical node; the disk
+sharing scope is set by ``shared_across_nodes``. This module keeps the shared
+backend reservation, charged whenever RocksDB is configured, and the runtime
+lifecycle.
 """
 
 import dataclasses
@@ -103,7 +104,8 @@ def configure_backend(
 
     Args:
         selected: Selected options with ranks assigned to their shards.
-        ddr_caps: Per-rank host capacities before the shared RocksDB reserve.
+        ddr_caps: Per-rank host budget shares before the shared RocksDB reserve,
+            pooled per node to compute the import budget.
         local_world_size: Number of ranks sharing one host.
 
     Returns:
@@ -112,7 +114,10 @@ def configure_backend(
     """
     rocksdb_options = []
     metadata_bytes_per_rank = [0] * len(ddr_caps)
-    import_available_per_rank = list(ddr_caps)
+    import_available_per_node = [
+        sum(ddr_caps[start : start + local_world_size])
+        for start in range(0, len(ddr_caps), local_world_size)
+    ]
     for option in selected:
         is_rocksdb = is_rocksdb_options(getattr(option, "dynamicemb_options", None))
         if is_rocksdb:
@@ -123,7 +128,7 @@ def configure_backend(
             if is_rocksdb:
                 metadata_bytes_per_rank[rank] += ddr_bytes
             else:
-                import_available_per_rank[rank] -= ddr_bytes
+                import_available_per_node[rank // local_world_size] -= ddr_bytes
 
     if not rocksdb_options:
         return selected
@@ -131,7 +136,9 @@ def configure_backend(
     block_cache_bytes = BLOCK_CACHE_DATA_BYTES + max(metadata_bytes_per_rank)
     # Import reuses the empty memtable/cache budgets; built-in tables remain resident.
     import_budget_bytes = (
-        min(import_available_per_rank) - STAGING_BUFFER_BYTES - _HOST_OVERHEAD_BYTES
+        min(import_available_per_node) // local_world_size
+        - STAGING_BUFFER_BYTES
+        - _HOST_OVERHEAD_BYTES
     )
     config = backend_config(
         local_world_size=local_world_size,

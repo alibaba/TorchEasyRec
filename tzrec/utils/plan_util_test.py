@@ -11,10 +11,8 @@
 
 import math
 import os
-import random
 import unittest
 from types import SimpleNamespace
-from typing import List, Tuple
 from unittest import mock
 
 import numpy as np
@@ -24,28 +22,23 @@ from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import get_default_sharders
 from torchrec.distributed.planner.estimator.types import HardwarePerfConfig
-from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
-from torchrec.distributed.planner.proposers import GridSearchProposer
 from torchrec.distributed.planner.types import (
     PlannerError,
     SharderData,
-    Storage,
     Topology,
 )
 from torchrec.distributed.test_utils.test_model import TestSparseNN
-from torchrec.distributed.types import CacheParams, ShardingType, StorageUsageType
+from torchrec.distributed.types import ShardingType, StorageUsageType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 from tzrec.protos import feature_pb2, train_pb2
 from tzrec.utils import dynamicemb_util, plan_util, resource_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import build_dynamicemb_constraints, has_dynamicemb
-from tzrec.utils.plan_util import (
-    DynamicProgrammingProposer,
+from tzrec.utils.plan_util import create_planner
+from tzrec.utils.planner.enumerators import (
     EmbeddingEnumerator,
-    _emit_dynamicemb_variants,
-    _sparse_dp_proposor_numpy,
-    create_planner,
 )
+from tzrec.utils.planner.proposers_test import _dp_proposals
 from tzrec.utils.test_util import (
     make_test_dir,
     mark_ci_scope,
@@ -57,66 +50,92 @@ class PlanUtilTest(unittest.TestCase):
     def setUp(self):
         self.maxDiff = None
 
-    def test_dp_proposer(self) -> None:
-        topology = Topology(world_size=2, compute_device="cuda")
-        enumerator = EmbeddingEnumerator(topology=topology, batch_size=8196)
-        partitioner = GreedyPerfPartitioner()
+    @parameterized.expand(
+        [("single_host", 2), ("two_hosts", 4)],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipUnless(
+        has_dynamicemb and torch.cuda.is_available(), "CUDA and dynamicemb are required"
+    )
+    @mark_ci_scope("gpu")
+    def test_milp_plans_mixed_dynamic_and_static_tables(self, name, world_size):
+        from torchrec.distributed.planner.types import ParameterConstraints
 
         tables = [
             EmbeddingBagConfig(
-                num_embeddings=1000**i,
-                embedding_dim=10 * i,
-                name="table_" + str(i),
-                feature_names=["feature_" + str(i)],
+                num_embeddings=1024,
+                embedding_dim=256,
+                name=table,
+                feature_names=[f"f_{table}"],
             )
-            for i in range(1, 4)
+            for table in ("dynamic", "static_tw", "static_cw")
         ]
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": str(world_size)}):
+            dynamic_constraint = build_dynamicemb_constraints(
+                feature_pb2.DynamicEmbedding(max_capacity=1024), tables[0]
+            )
+        constraints = {
+            "sparse.ebc.dynamic": dynamic_constraint,
+            "sparse.ebc.static_tw": ParameterConstraints(
+                sharding_types=["table_wise"], compute_kernels=["fused"]
+            ),
+            "sparse.ebc.static_cw": ParameterConstraints(
+                sharding_types=["column_wise"],
+                compute_kernels=["fused"],
+                min_partition=128,
+            ),
+        }
         model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
-        search_space = enumerator.enumerate(
-            module=model,
-            sharders=get_default_sharders(),
-        )
-
-        dp_proposer = DynamicProgrammingProposer()
-        dp_proposer.load(search_space)
-        best_dp_perf = float("inf")
-        best_dp_proposal = None
-        num_proposals = 0
-        proposal = dp_proposer.propose()
-        while proposal:
-            num_proposals += 1
-            try:
-                partitioner.partition(proposal, topology)
-                cur_perf = sum([x.total_perf for x in proposal])
-                if cur_perf < best_dp_perf:
-                    best_dp_proposal = {x.fqn: x for x in proposal}
-                    best_dp_perf = cur_perf
-            except PlannerError:
-                pass
-            dp_proposer.feedback(partitionable=True, storage_constraint=topology)
-            proposal = dp_proposer.propose()
-        self.assertEqual(num_proposals, 3)
-
-        grid_proposer = GridSearchProposer()
-        grid_proposer.load(search_space)
-        best_grid_perf = float("inf")
-        best_grid_proposal = None
-        proposal = grid_proposer.propose()
-        while proposal:
-            try:
-                partitioner.partition(proposal, topology)
-                cur_perf = sum([x.total_perf for x in proposal])
-                if cur_perf < best_grid_perf:
-                    best_grid_proposal = {x.fqn: x for x in proposal}
-                    best_grid_perf = cur_perf
-            except PlannerError:
-                pass
-            grid_proposer.feedback(partitionable=True)
-            proposal = grid_proposer.propose()
-
-        self.assertAlmostEqual(best_dp_perf, best_grid_perf)
-        for k, v in best_grid_proposal.items():
-            self.assertEqual(str(v), str(best_dp_proposal[k]))
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"TZREC_PLANNER": "milp", "TZREC_MILP_TIME_LIMIT_SECONDS": "12.5"},
+            ),
+            mock.patch.object(
+                model, "parameter_constraints", return_value=constraints, create=True
+            ),
+            mock.patch.object(plan_util, "get_local_size", return_value=2),
+            mock.patch.object(
+                plan_util.dist, "get_world_size", return_value=world_size
+            ),
+            mock.patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(total_memory=1 << 30),
+            ),
+            mock.patch.object(
+                resource_util, "host_memory_capacity_per_rank", return_value=1 << 30
+            ),
+        ):
+            planner = create_planner(torch.device("cuda"), batch_size=16, model=model)
+        for _ in range(2):
+            plan = planner.plan(model, plan_util.get_default_sharders())
+            table_plans = plan.plan["sparse.ebc"]
+            self.assertEqual(set(table_plans), {t.name for t in tables})
+            self.assertEqual(table_plans["dynamic"].ranks, list(range(world_size)))
+            self.assertEqual(
+                table_plans["dynamic"].dynamicemb_options.max_capacity,
+                tables[0].num_embeddings // world_size,
+            )
+            self.assertEqual(table_plans["static_tw"].sharding_type, "table_wise")
+            self.assertEqual(len(table_plans["static_cw"].ranks), 2)
+            self.assertTrue(
+                all(
+                    0 <= rank < world_size
+                    for table in table_plans.values()
+                    for rank in table.ranks
+                )
+            )
+            used = [0] * world_size
+            for option in planner.get_selected_options():
+                if option.name == "dynamic":
+                    self.assertEqual(
+                        table_plans["dynamic"].dynamicemb_options.local_hbm_for_values,
+                        option.dynamicemb_storage.local_hbm_for_values,
+                    )
+                for shard in option.shards:
+                    used[shard.rank] += shard.storage.hbm
+            self.assertTrue(all(hbm <= (1 << 30) * 0.85 for hbm in used))
 
     def test_global_pooling_factor_is_rejected(self) -> None:
         # ids per sample differ per feature, so a global value means nothing;
@@ -131,123 +150,6 @@ class PlanUtilTest(unittest.TestCase):
                 batch_size=32,
                 global_constraints_cfg=global_cfg,
             )
-
-    @parameterized.expand(
-        [
-            param(
-                "single_input",
-                table_name="table_a",
-                feature_names=["feature_a"],
-                pooling_factors=[3.0],
-            ),
-            param(
-                "shared_inputs",
-                table_name="table_shared",
-                feature_names=["feature_a", "feature_b"],
-                pooling_factors=[1.0, 20.0],
-            ),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_pooling_factors_affect_shared_table_storage_estimates(
-        self, name, table_name, feature_names, pooling_factors
-    ) -> None:
-        # one entry per input feature survives enumeration; the estimation
-        # path then prices a shared pooled bag one output row per input,
-        # while an unpooled collection keeps every position
-        from torchrec.distributed.planner.shard_estimators import (
-            calculate_shard_storages,
-            get_num_poolings,
-        )
-        from torchrec.distributed.planner.types import ParameterConstraints
-
-        topology = Topology(world_size=1, compute_device="cpu")
-        tables = [
-            EmbeddingBagConfig(
-                num_embeddings=100,
-                embedding_dim=8,
-                name=table_name,
-                feature_names=feature_names,
-            )
-        ]
-        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
-        constraint = ParameterConstraints(
-            pooling_factors=pooling_factors, feature_names=feature_names
-        )
-        fqn = f"sparse.ebc.{table_name}"
-        enumerator = EmbeddingEnumerator(
-            topology=topology,
-            batch_size=16,
-            fqn_constraints={fqn: constraint},
-        )
-        search_space = enumerator.enumerate(
-            module=model, sharders=get_default_sharders()
-        )
-        self.assertTrue(search_space)
-        for option in search_space:
-            self.assertEqual(option.input_lengths, pooling_factors)
-            self.assertEqual(option.num_inputs, len(feature_names))
-        table_wise = [
-            option
-            for option in search_space
-            if option.sharding_type == ShardingType.TABLE_WISE.value
-        ][0]
-        self.assertEqual(
-            get_num_poolings({fqn: constraint}, table_wise),
-            [1.0] * len(feature_names),
-        )
-        # the estimation the planner runs: batch sizes and poolings straight
-        # off the enumerated option
-        from torchrec.distributed.planner.types import (
-            SharderData,
-            StorageUsageType,
-        )
-
-        sharder_data = SharderData(
-            fused_params={},
-            qcomm_dtype_sizes={},
-            storage_usage_type=StorageUsageType.DEFAULT,
-        )
-        batch_sizes = [table_wise.batch_size] * table_wise.num_inputs
-        kwargs = dict(
-            sharder_data=sharder_data,
-            sharding_type=ShardingType.TABLE_WISE.value,
-            tensor=torch.zeros((100, 8)),
-            compute_device="cpu",
-            compute_kernel=EmbeddingComputeKernel.FUSED.value,
-            shard_sizes=[[100, 8]],
-            batch_sizes=batch_sizes,
-            world_size=1,
-            local_world_size=1,
-            num_poolings=[1.0] * table_wise.num_inputs,
-            caching_ratio=1.0,
-            input_data_type_size=4,
-            output_data_type_size=4,
-        )
-
-        def _total(storages):
-            return storages[0].hbm + storages[0].ddr + storages[0].ssd
-
-        shared = calculate_shard_storages(
-            input_lengths=pooling_factors, is_pooled=True, **kwargs
-        )
-        collapsed = calculate_shard_storages(
-            input_lengths=[sum(pooling_factors)], is_pooled=True, **kwargs
-        )
-        # a pooled bag outputs one row per input: len(features) rows, where a
-        # single summed factor would have collapsed them to one
-        self.assertEqual(
-            _total(shared) - _total(collapsed),
-            (len(pooling_factors) - 1) * 16 * 8 * 4,
-        )
-        # an unpooled collection outputs every position
-        unpooled = calculate_shard_storages(
-            input_lengths=pooling_factors, is_pooled=False, **kwargs
-        )
-        self.assertEqual(
-            _total(unpooled) - _total(shared),
-            (sum(pooling_factors) - len(pooling_factors)) * 16 * 8 * 4,
-        )
 
     def _planner_with_saved_dp_plan(self, test_dir, constraint):
         """A planner over one table whose saved plan pinned it data_parallel.
@@ -311,59 +213,6 @@ class PlanUtilTest(unittest.TestCase):
             os.environ.clear()
             os.environ.update(env)
 
-    def test_global_constraints_apply_behind_statistics_only_entries(self) -> None:
-        # a parameter entry that only carries measured factors keeps the
-        # global sharding and kernel lists applied to its table
-        from torchrec.distributed.planner.types import ParameterConstraints
-
-        topology = Topology(world_size=1, compute_device="cpu")
-        tables = [
-            EmbeddingBagConfig(
-                num_embeddings=100,
-                embedding_dim=8,
-                name="table_a",
-                feature_names=["feature_a"],
-            )
-        ]
-        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
-        global_constraints = ParameterConstraints(
-            sharding_types=["table_wise", "row_wise"]
-        )
-        statistics_only = ParameterConstraints(
-            pooling_factors=[2.0], feature_names=["feature_a"]
-        )
-        enumerator = EmbeddingEnumerator(
-            topology=topology,
-            batch_size=16,
-            fqn_constraints={"sparse.ebc.table_a": statistics_only},
-            global_constraints=global_constraints,
-        )
-        search_space = enumerator.enumerate(
-            module=model, sharders=get_default_sharders()
-        )
-        self.assertTrue(search_space)
-        # the global list restricts the table; data_parallel is gone
-        self.assertNotIn(
-            "data_parallel", {option.sharding_type for option in search_space}
-        )
-        # an entry that restricts sharding itself still outranks the global
-        enumerator = EmbeddingEnumerator(
-            topology=topology,
-            batch_size=16,
-            fqn_constraints={
-                "sparse.ebc.table_a": ParameterConstraints(
-                    sharding_types=["table_wise"]
-                )
-            },
-            global_constraints=global_constraints,
-        )
-        search_space = enumerator.enumerate(
-            module=model, sharders=get_default_sharders()
-        )
-        self.assertEqual(
-            {option.sharding_type for option in search_space}, {"table_wise"}
-        )
-
     @unittest.skipUnless(
         torch.cuda.is_available(), "CUDA is required for create_planner."
     )
@@ -421,60 +270,6 @@ class PlanUtilTest(unittest.TestCase):
                 int(container * (1 - reserve)),
             )
 
-            rocksdb = mock.Mock(
-                rank_dir="/tmp/db", config=mock.Mock(root_dir="/tmp/db")
-            )
-            shared = Storage(hbm=0, ddr=4 << 30, ssd=8 << 30)
-            with (
-                mock.patch.object(
-                    resource_util, "ssd_capacity_per_rank", return_value=100 << 30
-                ),
-                mock.patch.object(rocksdb_util, "shared_storage", return_value=shared),
-            ):
-                planner = plan_util.create_planner(
-                    device, batch_size=8, model=nn.Module(), rocksdb=rocksdb
-                )
-            self.assertEqual(
-                planner._topology.devices[0].storage.ddr,
-                int(container * (1 - reserve)) - shared.ddr,
-            )
-            self.assertEqual(
-                planner._topology.devices[0].storage.ssd, (100 << 30) - shared.ssd
-            )
-
-    @parameterized.expand(
-        [("ddr", 3, 100), ("ssd", 100, 7)],
-        name_func=parameterized_name_func,
-    )
-    def test_shared_reserve_exceeds_capacity(self, _, ddr, ssd):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        with (
-            mock.patch.object(
-                resource_util, "host_memory_capacity_per_rank", return_value=ddr
-            ),
-            mock.patch.object(resource_util, "ssd_capacity_per_rank", return_value=ssd),
-            mock.patch.object(
-                rocksdb_util,
-                "shared_storage",
-                return_value=Storage(hbm=0, ddr=4, ssd=8),
-            ),
-            mock.patch.object(plan_util, "get_local_size", return_value=1),
-            mock.patch.object(plan_util.dist, "get_world_size", return_value=1),
-            self.assertRaisesRegex(PlannerError, "shared reserve") as raised,
-        ):
-            create_planner(
-                device,
-                batch_size=8,
-                model=nn.Module(),
-                rocksdb=mock.Mock(),
-            )
-        self.assertIn(
-            f"DDR available={ddr} bytes, required=4 bytes", str(raised.exception)
-        )
-        self.assertIn(
-            f"SSD available={ssd} bytes, required=8 bytes", str(raised.exception)
-        )
-
     @unittest.skipUnless(
         torch.cuda.is_available(), "CUDA is required for create_planner."
     )
@@ -487,369 +282,6 @@ class PlanUtilTest(unittest.TestCase):
         )
         plan = self._run_with_saved_dp_plan(constraint)
         self.assertEqual(plan.plan["sparse.ebc"]["table_a"].sharding_type, "row_wise")
-
-    def test_dp_proposer_with_prune(self) -> None:
-        topology = Topology(
-            world_size=2,
-            hbm_cap=(1000**3) * 10 * 2 * 4,
-            compute_device="cuda" if torch.cuda.is_available() else "cpu",
-        )
-        enumerator = EmbeddingEnumerator(topology=topology, batch_size=8196)
-        partitioner = GreedyPerfPartitioner()
-
-        tables = [
-            EmbeddingBagConfig(
-                num_embeddings=1000**i,
-                embedding_dim=10 * i,
-                name="table_" + str(i),
-                feature_names=["feature_" + str(i)],
-            )
-            for i in range(1, 4)
-        ]
-        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
-        search_space = enumerator.enumerate(
-            module=model,
-            sharders=get_default_sharders(),
-        )
-
-        dp_proposer = DynamicProgrammingProposer()
-        dp_proposer.load(search_space)
-        best_dp_perf = float("inf")
-        best_dp_proposal = None
-        num_proposals = 0
-        proposal = dp_proposer.propose()
-        while proposal:
-            num_proposals += 1
-            try:
-                partitioner.partition(proposal, topology)
-                cur_perf = sum([x.total_perf for x in proposal])
-                if cur_perf < best_dp_perf:
-                    best_dp_proposal = {x.fqn: x for x in proposal}
-                    best_dp_perf = cur_perf
-            except PlannerError:
-                pass
-            dp_proposer.feedback(partitionable=True, storage_constraint=topology)
-            proposal = dp_proposer.propose()
-        self.assertEqual(
-            best_dp_proposal["sparse.ebc.table_3"].sharding_type,
-            "row_wise" if torch.cuda.is_available() else "table_wise",
-        )
-
-
-class _FakeStorage:
-    def __init__(self, hbm, ddr, ssd=0):
-        self.hbm = hbm
-        self.ddr = ddr
-        self.ssd = ssd
-
-
-class _FakeShard:
-    def __init__(self, hbm, ddr, ssd=0):
-        self.storage = _FakeStorage(hbm, ddr, ssd)
-
-
-class _FakeShardingOption:
-    """Minimal ShardingOption stand-in: only the fields the DP proposer reads."""
-
-    def __init__(self, fqn, hbm, ddr, perf, ssd=0):
-        self.fqn = fqn
-        # Total = single shard for simplicity (single-rank assignment).
-        self.shards = [_FakeShard(hbm, ddr, ssd)]
-        self.total_storage = _FakeStorage(hbm, ddr, ssd)
-        self.total_perf = perf
-
-
-def _make_topology(
-    num_devices,
-    hbm_per_device,
-    ddr_per_device,
-    local_world_size=None,
-    ssd_per_device=0,
-):
-    return SimpleNamespace(
-        devices=[
-            SimpleNamespace(
-                storage=_FakeStorage(
-                    hbm=hbm_per_device, ddr=ddr_per_device, ssd=ssd_per_device
-                )
-            )
-            for _ in range(num_devices)
-        ],
-        local_world_size=local_world_size or num_devices,
-    )
-
-
-def _make_random_table_opts(
-    seed: int,
-    table_count: int = 5,
-    option_count: int = 4,
-    hbm_bins: int = 8,
-    ddr_bins: int = 8,
-    ssd_bins: int = 8,
-) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    """Seeded random per-table option arrays for property testing.
-
-    Per-option bin contributions stay in [0, axis/2) so combined plans can fit
-    several tables without saturating any axis. Some options carry SSD cost
-    so the SSD axis is exercised.
-    """
-    rng = random.Random(seed)
-    table_opts = []
-    for _ in range(table_count):
-        hbm = np.asarray(
-            [rng.uniform(0, hbm_bins / 2) for _ in range(option_count)],
-            dtype=np.float32,
-        )
-        ddr = np.asarray(
-            [rng.uniform(0, ddr_bins / 2) for _ in range(option_count)],
-            dtype=np.float32,
-        )
-        ssd = np.asarray(
-            [
-                rng.uniform(0, ssd_bins / 2) if rng.random() < 0.4 else 0.0
-                for _ in range(option_count)
-            ],
-            dtype=np.float32,
-        )
-        perf = np.asarray(
-            [rng.uniform(1, 100) for _ in range(option_count)], dtype=np.float32
-        )
-        opt_id = np.arange(option_count, dtype=np.int32)
-        table_opts.append((hbm, ddr, ssd, perf, opt_id))
-    return table_opts
-
-
-def _exhaustive_best_proposals(
-    table_opts,
-    hbm_bins,
-    ddr_bins,
-    ssd_bins,
-):
-    """Exhaustive-combination oracle for the binned DP on a tiny input.
-
-    Enumerates every per-table option combination directly -- no second
-    implementation of the sparse DP -- keeps the feasible ones (exact
-    equality to a capacity lands in the last bin), and keeps the best
-    proposal per HBM bin in decreasing-HBM order.
-    """
-    import itertools
-
-    best = {}
-    for combo in itertools.product(*(range(len(t[3])) for t in table_opts)):
-        hbm = ddr = ssd = perf = 0.0
-        for table_i, opt_j in enumerate(combo):
-            _, _, opt_ssd, opt_perf, _ = table_opts[table_i]
-            hbm += float(table_opts[table_i][0][opt_j])
-            ddr += float(table_opts[table_i][1][opt_j])
-            ssd += float(opt_ssd[opt_j])
-            perf += float(opt_perf[opt_j])
-        if hbm > hbm_bins or ddr > ddr_bins or ssd > ssd_bins:
-            continue
-        hbm_i = min(int(hbm), hbm_bins - 1)
-        key = hbm_i
-        if key not in best or perf < best[key][0]:
-            best[key] = (perf, combo)
-    ordered = sorted(best.items(), key=lambda kv: -kv[0])
-    return [list(kv[1][1]) for kv in ordered]
-
-
-def _dp_proposals(search_space, topology):
-    proposer = DynamicProgrammingProposer(
-        hbm_bins_per_device=20, ddr_bins_per_device=20
-    )
-    proposer.load(search_space)
-    # First propose returns the lowest-mem-per-table seed.
-    proposer.propose()
-    proposer.feedback(partitionable=True, storage_constraint=topology)
-    proposals = []
-    proposal = proposer.propose()
-    while proposal:
-        proposals.append(proposal)
-        proposer.feedback(partitionable=True, storage_constraint=topology)
-        proposal = proposer.propose()
-    return proposals
-
-
-class DynamicProgrammingProposerTest(unittest.TestCase):
-    """Binned DP across HBM × DDR (× SSD for RocksDB) picks per-table modes."""
-
-    def test_caching_preferred_when_ddr_is_generous(self):
-        # Three options for one table:
-        #   HYBRID @ x=1.0: hbm = T,   ddr = 0,   perf = high  (HBM-only)
-        #   HYBRID @ x=0.1: hbm = .1T, ddr = .9T, perf = high  (slow)
-        #   CACHING @ x=0.1: hbm = .1T, ddr = T,  perf = low   (fast — modeled hits)
-        opts = [
-            _FakeShardingOption("table_a", hbm=1000, ddr=0, perf=50.0),
-            _FakeShardingOption("table_a", hbm=100, ddr=900, perf=80.0),
-            _FakeShardingOption("table_a", hbm=100, ddr=1000, perf=10.0),
-        ]
-        topology = _make_topology(
-            num_devices=2, hbm_per_device=2000, ddr_per_device=2000
-        )
-        proposals = _dp_proposals(opts, topology)
-        # Best plan must be the CACHING option (perf=10).
-        best = min(proposals, key=lambda p: sum(o.total_perf for o in p))
-        self.assertEqual(best[0].total_perf, 10.0)
-
-    def test_reload_runs_the_dp_again(self):
-        topology = _make_topology(
-            num_devices=1, hbm_per_device=2000, ddr_per_device=2000
-        )
-        proposer = DynamicProgrammingProposer()
-        proposer.load([_FakeShardingOption("table_a", hbm=100, ddr=0, perf=1.0)])
-        proposer.propose()
-        proposer.feedback(partitionable=False, storage_constraint=topology)
-
-        fits = _FakeShardingOption("table_a", hbm=200, ddr=0, perf=2.0)
-        oversized = _FakeShardingOption("table_a", hbm=100, ddr=9000, perf=3.0)
-        proposer.load([oversized, fits])
-        proposer.propose()
-        proposer.feedback(partitionable=False, storage_constraint=topology)
-        self.assertEqual(proposer.propose(), [fits])
-
-    def test_caching_rejected_when_ddr_is_tight(self):
-        # Host budget is only 950 — CACHING (ddr=1000) cannot fit; HYBRID can.
-        opts = [
-            _FakeShardingOption("table_a", hbm=100, ddr=900, perf=80.0),
-            _FakeShardingOption("table_a", hbm=100, ddr=1000, perf=10.0),
-        ]
-        topology = _make_topology(
-            num_devices=1, hbm_per_device=2000, ddr_per_device=950
-        )
-        proposals = _dp_proposals(opts, topology)
-        # Every proposed plan must pick the HYBRID option (perf=80).
-        for p in proposals:
-            self.assertEqual(p[0].total_perf, 80.0)
-
-    def test_high_factor_collapses_modes(self):
-        # At x=1.0 HYBRID == CACHING in HBM and CACHING.ddr = T = HYBRID.hbm.
-        # If we offer just the high-factor options, DP picks one of them.
-        opts = [
-            _FakeShardingOption("table_a", hbm=1000, ddr=0, perf=50.0),  # HYBRID x=1.0
-            _FakeShardingOption(
-                "table_a", hbm=1000, ddr=1000, perf=50.0
-            ),  # CACHING x=1.0
-        ]
-        topology = _make_topology(
-            num_devices=1, hbm_per_device=1100, ddr_per_device=2000
-        )
-        proposals = _dp_proposals(opts, topology)
-        # Either option is fine — they're tied. Just verify the proposer
-        # returned something feasible.
-        self.assertGreater(len(proposals), 0)
-        for p in proposals:
-            self.assertEqual(p[0].total_perf, 50.0)
-
-    def test_two_tables_pick_mixed_modes_under_joint_budget(self):
-        # Two tables, each with HYBRID@1.0 (all-HBM, no DDR) and CACHING@0.1
-        # (small HBM, full-T DDR). Topology HBM=2000 admits exactly one
-        # full HYBRID + one small CACHING shard (1500+100), and host DDR
-        # admits exactly one full-T CACHING backing (1500). Both-HYBRID is
-        # HBM-infeasible (3000>2000), both-CACHING is DDR-infeasible
-        # (3000>2000). Only the mixed plan fits. Exercises the
-        # cross-table DP transition at plan_util.py table_i==1.
-        opts = [
-            _FakeShardingOption("table_a", hbm=1500, ddr=0, perf=50.0),  # HYBRID@1.0
-            _FakeShardingOption("table_a", hbm=100, ddr=1500, perf=40.0),  # CACHING@0.1
-            _FakeShardingOption("table_b", hbm=1500, ddr=0, perf=50.0),  # HYBRID@1.0
-            _FakeShardingOption("table_b", hbm=100, ddr=1500, perf=40.0),  # CACHING@0.1
-        ]
-        topology = _make_topology(
-            num_devices=1, hbm_per_device=2000, ddr_per_device=2000
-        )
-        proposals = _dp_proposals(opts, topology)
-        self.assertGreater(len(proposals), 0)
-        best = min(proposals, key=lambda p: sum(o.total_perf for o in p))
-        styles = sorted(
-            "hybrid" if o.shards[0].storage.ddr == 0 else "caching" for o in best
-        )
-        self.assertEqual(styles, ["caching", "hybrid"])
-
-    @parameterized.expand(
-        [
-            param("no_ssd", ssd_cap=0),
-            param("one_ssd_tight", ssd_cap=10_000),
-            param("nonbinding_axis", ssd_cap=1_000_000),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_ssd_capacity_combinations(self, _, ssd_cap):
-        tables = [
-            _FakeShardingOption("t.a", hbm=100, ddr=1000, perf=10.0, ssd=2000),
-            _FakeShardingOption("t.a", hbm=100, ddr=0, perf=90.0, ssd=0),
-            _FakeShardingOption("t.b", hbm=100, ddr=0, perf=50.0, ssd=0),
-        ]
-        topology = _make_topology(
-            num_devices=1,
-            hbm_per_device=1000,
-            ddr_per_device=1000,
-            ssd_per_device=ssd_cap,
-        )
-        proposals = _dp_proposals(tables, topology)
-        self.assertTrue(proposals)
-        best = min(proposals, key=lambda p: sum(o.total_perf for o in p))
-        self.assertEqual(
-            sum(o.total_storage.ssd for o in best), 0 if ssd_cap == 0 else 2000
-        )
-
-    def test_per_machine_ddr_prune_on_multi_host_topology(self):
-        # 4 GPUs across 2 machines (local_world_size=2). Each machine has
-        # 1000 DDR; total = 2000. An option whose per-shard ddr is 1500
-        # exceeds the 1000 per-machine cap and must be pruned, even
-        # though 1500 < ddr_total. The 900-ddr option fits.
-        topology = _make_topology(
-            num_devices=4,
-            local_world_size=2,
-            hbm_per_device=2000,
-            ddr_per_device=500,
-        )
-        # 1500 > per-machine cap (1000) -> pruned, no proposal.
-        proposals_pruned = _dp_proposals(
-            [_FakeShardingOption("t", hbm=100, ddr=1500, perf=10.0)], topology
-        )
-        self.assertEqual(proposals_pruned, [])
-        # 900 <= per-machine cap (1000) -> survives, proposal emitted.
-        proposals_fit = _dp_proposals(
-            [_FakeShardingOption("t", hbm=100, ddr=900, perf=10.0)], topology
-        )
-        self.assertGreater(len(proposals_fit), 0)
-
-    @parameterized.expand([(seed,) for seed in [0, 1, 7, 42, 1337]])
-    def test_sparse_numpy_matches_exhaustive_reference(self, seed):
-        table_opts = _make_random_table_opts(
-            seed, table_count=4, option_count=3, hbm_bins=8, ddr_bins=8, ssd_bins=8
-        )
-        actual = _sparse_dp_proposor_numpy(
-            table_opts,
-            hbm_bins=8,
-            ddr_bins=8,
-            ssd_bins=8,
-        )
-        expected = _exhaustive_best_proposals(
-            table_opts,
-            hbm_bins=8,
-            ddr_bins=8,
-            ssd_bins=8,
-        )
-        self.assertEqual(
-            {tuple(p) for p in actual},
-            {tuple(p) for p in expected},
-        )
-
-    def test_empty_search_space_returns_empty_proposal(self):
-        proposer = DynamicProgrammingProposer()
-        proposer.load([])
-        # Seed proposal is the per-table first option; with no tables the
-        # list is empty.
-        self.assertEqual(proposer.propose(), [])
-        # Feedback must not raise on an empty proposer (it short-circuits
-        # via `table_count == 0`).
-        topology = _make_topology(
-            num_devices=1, hbm_per_device=1000, ddr_per_device=1000
-        )
-        proposer.feedback(partitionable=True, storage_constraint=topology)
-        # After feedback, no proposals are available.
-        self.assertIsNone(proposer.propose())
 
 
 @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
@@ -1059,236 +491,6 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
                 planners.to_sharding_plan([sharding_option], topology)
 
 
-@unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
-@mark_ci_scope("gpu")
-class DynamicEmbPlannerTest(unittest.TestCase):
-    """Test candidate generation and scoring with meta tensors."""
-
-    def _options(self, factor=None, ratio=None, *, rows=4096, pooling=1):
-        from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
-        from torchrec.distributed.planner.types import Shard, ShardingOption
-
-        base = ShardingOption(
-            name="t",
-            module=("", torch.nn.Module()),
-            partition_by="uniform",
-            compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
-            sharding_type=ShardingType.ROW_WISE.value,
-            batch_size=128,
-            input_lengths=[pooling],
-            tensor=torch.empty((rows, 1), dtype=torch.float32, device="meta"),
-            shards=[Shard(size=[rows, 1], offset=[0, 0])],
-            cache_params=None if ratio is None else CacheParams(load_factor=ratio),
-        )
-        base.dynamicemb_options = DynamicEmbTableOptions(
-            max_capacity=rows,
-            bucket_capacity=16,
-            score_strategy=DynamicEmbScoreStrategy.STEP,
-        )
-        return _emit_dynamicemb_variants(base, factor)
-
-    @parameterized.expand(
-        [
-            ("unmeasured", None, 0.1, 0.1, 3),
-            ("measured_zero", 0, 1 / 4096, 0.1, 3),
-            ("below_one_percent", 0.001, 1 / 4096, 0.1, 3),
-            ("small_working_set", 0.1, 64 / 4096, 0.1, 3),
-            ("above_default", 1.92, 0.1, 1229 / 4096, 2),
-            ("half", 3.2, 0.1, 0.5, 2),
-            ("above_half", 4.8, 0.1, 0.75, 1),
-            ("full", 6.4, 0.1, None, 0),
-            ("overfull", 12.8, 0.1, None, 0),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_auto_grid(self, _, factor, hybrid_start, cache_start, ncache):
-        partial_ratios = [*np.geomspace(hybrid_start, 0.5, 5), 0.6, 0.7, 0.8, 0.9]
-        if hybrid_start == 1 / 4096:
-            del partial_ratios[1]  # Same physical storage as the first point.
-        opts = self._options(factor)
-        noncache = [o for o in opts if not o.dynamicemb_options.caching]
-        cache = [o for o in opts if o.dynamicemb_options.caching]
-        full_bytes = 4096 * 4
-        self.assertEqual(
-            [o.dynamicemb_storage.local_hbm_for_values for o in noncache],
-            [int(r * full_bytes) for r in [0, *partial_ratios, 1]],
-        )
-        self.assertEqual(len(cache), ncache)
-        if cache:
-            self.assertEqual(
-                cache[0].dynamicemb_storage.local_hbm_for_values,
-                int(cache_start * full_bytes),
-            )
-
-    @parameterized.expand(
-        [
-            ("host", 0, 1, [False]),
-            ("full", 1, 1, [False]),
-            ("insufficient_cache", 0.1, 9, [False]),
-            ("one_byte", 1 / 16384, 1, [False, True]),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_ratio_pin(self, _, ratio, pooling, families):
-        opts = self._options(ratio=ratio, pooling=pooling)
-        self.assertEqual(
-            [
-                (
-                    o.dynamicemb_storage.local_hbm_for_values,
-                    o.dynamicemb_options.caching,
-                )
-                for o in opts
-            ],
-            [(int(ratio * 16384), family) for family in families],
-        )
-
-    def test_subbyte_budget_becomes_zero_endpoint(self):
-        opts = self._options(ratio=0.5 / 4096, rows=1024)
-        self.assertEqual(
-            [(o.cache_load_factor, o.dynamicemb_options.caching) for o in opts],
-            [(0.0, False)],
-        )
-
-    @parameterized.expand(
-        [("exact", 1024), ("oversized_bucket", 512)], name_func=parameterized_name_func
-    )
-    def test_full_cache_becomes_one_non_caching_endpoint(self, _, rows):
-        options = self._options(rows=rows)
-        self.assertFalse(any(o.dynamicemb_options.caching for o in options))
-        self.assertEqual(sum(o.cache_load_factor == 1 for o in options), 1)
-
-        pinned = self._options(ratio=0.1, rows=rows)
-        self.assertEqual(
-            [
-                (
-                    o.dynamicemb_storage.local_hbm_for_values,
-                    o.dynamicemb_options.caching,
-                )
-                for o in pinned
-            ],
-            [(int(0.1 * rows * 4), False), (rows * 4, False)],
-        )
-
-    def test_physical_dedup_keeps_first_budget(self):
-        pinned = [
-            next(o for o in self._options(ratio=ratio) if o.dynamicemb_options.caching)
-            for ratio in (0.6, 0.7)
-        ]
-        first, second = [o.dynamicemb_storage for o in pinned]
-        for candidate in (first, second):
-            self.assertEqual(
-                (candidate.resident_rows, candidate.backing_rows), (3072, 4096)
-            )
-        self.assertEqual(first.storage, second.storage)
-        self.assertNotEqual(first.local_hbm_for_values, second.local_hbm_for_values)
-        opts = self._options()
-        caches = [o for o in opts if o.dynamicemb_options.caching]
-        self.assertEqual(
-            [
-                (o.cache_load_factor, o.dynamicemb_storage.local_hbm_for_values)
-                for o in caches
-            ],
-            [
-                (0.25, int(0.1 * 16384)),
-                (0.5, int(0.1 * 5**0.75 * 16384)),
-                (0.75, int(0.6 * 16384)),
-            ],
-        )
-        self.assertEqual(caches[-1].dynamicemb_storage, first)
-        hybrid, cache = self._options(ratio=0.15)
-        self.assertFalse(hybrid.dynamicemb_options.caching)
-        self.assertTrue(cache.dynamicemb_options.caching)
-        self.assertEqual(cache.cache_load_factor, 0.25)
-        for option in (hybrid, cache):
-            self.assertEqual(
-                option.dynamicemb_storage.local_hbm_for_values, int(0.15 * 16384)
-            )
-
-    def test_equal_tier_rows_keep_zero_partial_and_full(self):
-        opts = self._options(rows=16)
-        self.assertEqual(
-            [
-                (o.cache_load_factor, o.dynamicemb_storage.local_hbm_for_values)
-                for o in opts
-            ],
-            [(0, 0), (1024 / 1040, 6), (1, 64)],
-        )
-        self.assertEqual(
-            {
-                (o.dynamicemb_storage.resident_rows, o.dynamicemb_storage.backing_rows)
-                for o in opts
-            },
-            {(1024, 16)},
-        )
-
-    def test_invalid_factor(self):
-        for factor in (float("nan"), -1):
-            with self.assertRaisesRegex(ValueError, "unique_id_factor"):
-                self._options(factor)
-
-    @parameterized.expand(
-        [
-            ("zero", 0, False, None, 0),
-            ("full", 1, False, None, 1),
-            ("hybrid", 0.1, False, None, 0.11 + 0.01 * 1024 / (1024 + 3696)),
-            ("cache", 0.1, True, None, 0.28 + 0.01 * 0.25),
-            ("measured_cache", 0.1, True, 2.4, 0.6),
-            ("miss_rate_above_one", 0.1, True, -1.0, 0),
-            ("miss_rate_below_zero", 0.1, True, 8.0, 1),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_performance_bandwidth_preserves_allocated_share(
-        self, _, ratio, caching, stats_scale, expected_weight
-    ):
-        rows = 4096
-        opt = next(
-            o
-            for o in self._options(ratio=ratio, rows=rows)
-            if o.dynamicemb_options.caching == caching
-        )
-        original = opt.cache_params
-        allocated = opt.cache_load_factor
-        if stats_scale is not None:
-            original.stats = mock.Mock()
-            original.stats.expected_miss_rate.side_effect = lambda share: (
-                1 - stats_scale * share
-            )
-        topology = Topology(
-            world_size=1, compute_device="cuda", hbm_mem_bw=1000, hbm_to_ddr_mem_bw=20
-        )
-        config = HardwarePerfConfig()
-        fused_key = ("cuda", EmbeddingComputeKernel.FUSED.value)
-        config.kernel_device_bandwidths = {fused_key: 37.0}
-        sharder_data = SharderData(
-            fused_params={},
-            qcomm_dtype_sizes={},
-            storage_usage_type=StorageUsageType.DEFAULT,
-        )
-        contexts = dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
-            config, [[rows, 1]], opt, topology, {}, sharder_data
-        )
-        self.assertEqual(len(contexts), 1)
-        self.assertAlmostEqual(contexts[0].device_bw, 2 + 98 * expected_weight)
-        self.assertEqual(contexts[0].caching_ratio, allocated)
-        self.assertEqual(contexts[0].hbm_to_ddr_mem_bw, 20)
-        self.assertEqual(
-            dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
-                config, [], opt, topology, {}, sharder_data
-            ),
-            [],
-        )
-        self.assertIs(opt.cache_params, original)
-        self.assertEqual(opt.cache_load_factor, allocated)
-        self.assertEqual(config.kernel_device_bandwidths, {fused_key: 37.0})
-        opt.dynamicemb_options = None
-        opt.compute_kernel = EmbeddingComputeKernel.FUSED.value
-        contexts = dynamicemb_util.ShardPerfContext.build_shard_perf_contexts(
-            config, [[rows, 1]], opt, topology, {}, sharder_data
-        )
-        self.assertEqual(contexts[0].device_bw, 37.0)
-
-
 GIB = 1 << 30
 
 
@@ -1364,9 +566,7 @@ class RocksDBPlannerTest(unittest.TestCase):
                 os.environ,
                 {
                     "STORAGE_RESERVE_PERCENT": "0.15",
-                    "TZREC_DP_HBM_BINS_PER_DEVICE": "20",
-                    "TZREC_DP_DDR_BINS_PER_DEVICE": "20",
-                    "TZREC_DP_SSD_BINS_PER_DEVICE": "20",
+                    "TZREC_PLANNER": "dp",
                 },
             ),
         ):
@@ -1705,7 +905,7 @@ class RocksDBPlannerTest(unittest.TestCase):
             faster_memory = min(b for b in linear if b >= ratio)
             self.assertGreater(perf[(True, ratio)], perf[(False, faster_memory)])
 
-    def test_ssd_axis_picks_the_table_that_fits(self):
+    def test_ssd_capacity_picks_the_table_that_fits(self):
         # Offloading "a" or "b" covers the GPU deficit; "a" is cheaper in
         # the objective but only "b" fits the SSD budget, so the search
         # must select "b".
@@ -1743,9 +943,7 @@ class RocksDBPlannerTest(unittest.TestCase):
             self._plan(tables, 4, 4.75, ssd_gib=40)
 
     def test_infeasible_ssd_leaves_feasible_memory_plan(self):
-        # Every RocksDB candidate needs more SSD than a 1 GiB budget
-        # admits, so the search must fall back to the feasible all-memory
-        # plan, and the failed attempts never mutate the shared topology.
+        # Reject all SSD candidates without changing the input topology.
         tables = {"a": self.BIG, "b": self.BIG}
         planner, model = self._planner(
             tables,

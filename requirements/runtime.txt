@@ -18,6 +18,7 @@ pyfg @ https://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg-1.0.8-cp310-cp
 pyodps>=0.13.1
 safetensors
 scikit-learn
+scipy>=1.13
 tensorboard
 torchmetrics==1.0.3
 transformers>=4.56

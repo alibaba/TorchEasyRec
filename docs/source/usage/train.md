@@ -217,6 +217,27 @@ export STORAGE_RESERVE_PERCENT=0.5
 export HOST_MEMORY_RESERVE_PERCENT=0.15
 ```
 
+### MILP 分片规划
+
+默认仍使用 DP 规划。设置 `TZREC_PLANNER=milp` 可启用 MILP，同时选择每张表的分片候选和各 shard 的 rank，约束各 rank 的 HBM 用量及各 node 的 DDR、SSD 总用量，并优化最慢 rank 的预计耗时。MILP 不使用 DP 的资源分桶配置。
+
+DDR 和 SSD 预算在同一 node 的 rank 之间共享，允许单个 rank 超过均分额度，但该 node 的总用量不能超过对应预算，也不能借用其他 node 的额度。
+
+启用 `train_config.rocksdb_config` 的 RocksDB 后端后，自动使用 MILP，即使 `TZREC_PLANNER=dp` 也不使用 DP。共享资源预留后，内存与 RocksDB 候选一起参与选择和放置；普通配置继续保持默认 DP。跨 node 共享磁盘时，按 `shared_across_nodes` 的配置先分配各 node 的 SSD 额度，再执行 node 内的容量约束。
+
+```bash
+export TZREC_PLANNER=milp
+export TZREC_MILP_TIME_LIMIT_SECONDS=60.0
+export TZREC_MILP_RELATIVE_GAP=0.001
+```
+
+- `TZREC_MILP_TIME_LIMIT_SECONDS`：求解器时间预算（秒），默认 `60.0`，必须为正有限数。
+- `TZREC_MILP_RELATIVE_GAP`：预计性能成本的相对最优性容差，默认 0.001（0.1%）。
+
+支持动态表的 `row_wise` 和静态表的 `data_parallel`、`row_wise`、`table_wise`、`column_wise`、`table_row_wise`、`table_column_wise`，保留后两种分片及依赖表的同 host 放置约束。暂不支持 `grid_shard`。
+
+MILP 的求解器超时默认 60 秒，不包含候选枚举、建模与结果校验，求解器退出也可能略超预算。
+
 (embedding-sharding-constraints)=
 
 ### Embedding分片约束
