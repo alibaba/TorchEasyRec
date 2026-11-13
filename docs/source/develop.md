@@ -48,21 +48,18 @@ python -m tzrec.modules.fm_test FactorizationMachineTest.test_fm_0
 
 ### 并行CI测试
 
-复用现有入口，在已配置的CI runner上运行：
+三条lane各自在workflow中启动一个作业容器，镜像、设备、CPU/内存和共享内存参数直接写在`unittest*_ci.yml`。CPU仍串行运行；GPU/PPU复用现有脚本的并行模式：
 
 ```bash
-bash scripts/ci/ci_test_cpu.sh --container
-bash scripts/ci/ci_test.sh --container
-bash scripts/ci/ci_test_ppu.sh --container
+bash scripts/ci/ci_test.sh --parallel --scope gpu --device-groups '0,1;2,3;4,5;6,7'
+bash scripts/ci/ci_test_ppu.sh --parallel --scope gpu --hardware ppu --device-groups '0,1;2,3;4,5;6,7;8,9;10,11;12,13;14,15'
 ```
 
-`--container`由主仓库启动器管理测试镜像、容器、资源预算和设备。每个job重新探测设备；H20最多4组双卡worker，PPU最多8组，实际并发受CPU、内存和容器配额约束。探针容器也属于本job，失败或取消时一起清理。
+脚本准备一次依赖、proto和数据后，使用`dispatch local`在同一容器中启动worker子进程。每组仅看到指定的两张卡，并验证PCI身份和双rank通信；各组使用独立checkout和编译缓存。基线保留H20的全卡视图及PPU的原双卡视图。取消时清理进程组，workflow的always步骤兜底清理本job容器。CPU和GPU作业仍是两个独立容器。
 
-基线容器调用同一个`ci_test*.sh --native`，一次完成依赖安装、proto生成、数据下载和基线测试。CPU输出完整串行报告；GPU/PPU把可分卡的测试交给dispatch和worker。worker共享只读依赖环境，使用独立checkout和卡对。未指定`--container`的原有调用行为保留，A10 Nightly继续使用原入口。
+未传`--parallel`的调用继续使用原串行入口，A10 Nightly不变。资源限额作用于整个job，各worker共享该额度；不再创建coordinator或worker容器。结果保存在workflow挂载的report目录，临时checkout和编译缓存不上传。
 
-测试镜像摘要、各硬件预算及超时配置在`tzrec/tests/ci_config.json`。探针会核对PCI设备和双rank通信，不复用上次开机的卡号。CI启动失败时查看probe日志；测试失败时查看GitHub上传的`report/`，包含组结果和有界日志。可在验收时追加`--pattern utils_test.py`运行测试子集。
-
-TorchEasyRec-addons负责实例扩缩容、代理及常驻runner，不启动worker或解析测试结果。runner传入节点身份、槽位及作业存储目录；本仓库为所有探针和测试容器附加节点、槽位、job标签，供addons安全排空检查。生产升级需先部署提供runner上下文的addons版本，再切换测试workflow。
+addons只管理实例、代理和runner，按照`tzci.node`、`tzci.role`、`tzci.job`容器标签检查排空。测试阶段可通过`TZREC_CI_RECEIPT`输出通用作业回执；准备阶段尚未开始测试，没有回执时不自动重跑。生产切换前仍需部署提供runner上下文的addons版本。
 
 ## 文档
 

@@ -13,12 +13,14 @@
 
 import argparse
 import importlib
+import json
 import os
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -202,13 +204,43 @@ def local(args: argparse.Namespace) -> int:
         visible = [str(i) for i in range(count)]
     visible = visible[:count]
     pairs = device_groups(args.device_groups, visible)
-    code = baseline(args)
+    from tzrec.tests import ci_devices
+
+    buses = ci_devices.visible_buses()
+    expected = {device: buses[index] for index, device in enumerate(visible)}
+    baseline_env = dict(os.environ)
+    if args.hardware == "ppu":
+        baseline_env["CUDA_VISIBLE_DEVICES"] = ",".join(pairs[0])
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "baseline",
+        "--session",
+        str(args.session),
+        "--session-id",
+        args.session_id,
+        "--test-dir",
+        args.test_dir,
+        "--pattern",
+        args.pattern,
+        "--timeout",
+        str(args.timeout),
+    ]
+    if args.scope:
+        command += ["--scope", args.scope]
+    if args.durations:
+        command += ["--durations", str(args.durations)]
+    code = wire.run_process(command, timeout=args.timeout, env=baseline_env)
     if code:
         return code
     session = args.session.resolve()
     manifest = wire.read_manifest(session)
     if not any(g["devices"] != "baseline" for g in manifest["groups"]):
         return serve(session, 0, args.session_id)
+    Path("tmp").mkdir(exist_ok=True)
+    workdirs = tempfile.TemporaryDirectory(
+        dir=Path("tmp").resolve(), prefix="ci-workers-"
+    )
     processes: list[subprocess.Popen] = []
     streams = []
     previous = signal.getsignal(signal.SIGTERM)
@@ -239,7 +271,7 @@ def local(args: argparse.Namespace) -> int:
         processes.append(coordinator)
         source = Path.cwd()
         for slot, pair in enumerate(pairs):
-            checkout = session / f"checkout-{slot}"
+            checkout = Path(workdirs.name) / f"checkout-{slot}"
             shutil.copytree(
                 source,
                 checkout,
@@ -258,9 +290,15 @@ def local(args: argparse.Namespace) -> int:
             env = dict(
                 os.environ,
                 CUDA_VISIBLE_DEVICES=",".join(pair),
+                TZREC_CI_EXPECTED_BUSES=json.dumps(
+                    [expected[device] for device in pair]
+                ),
+                TZREC_CI_HARDWARE=args.hardware,
                 PYTHONPATH=".",
-                TRITON_CACHE_DIR=str(session / f"cache-{slot}" / "triton"),
-                TORCHINDUCTOR_CACHE_DIR=str(session / f"cache-{slot}" / "inductor"),
+                TRITON_CACHE_DIR=str(Path(workdirs.name) / f"cache-{slot}" / "triton"),
+                TORCHINDUCTOR_CACHE_DIR=str(
+                    Path(workdirs.name) / f"cache-{slot}" / "inductor"
+                ),
             )
             processes.append(
                 subprocess.Popen(
@@ -300,6 +338,8 @@ def local(args: argparse.Namespace) -> int:
         for stream in streams:
             stream.close()
         signal.signal(signal.SIGTERM, previous)
+        (session / "dispatch.sock").unlink(missing_ok=True)
+        workdirs.cleanup()
 
 
 def main() -> int:
@@ -317,6 +357,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=21600)
     parser.add_argument("--durations", type=Path)
     parser.add_argument("--device-groups")
+    parser.add_argument("--hardware", choices=("h20", "ppu"), default="h20")
     parser.add_argument("--workers", type=int, default=0)
     args = parser.parse_args()
     if args.command != "local" and (not args.session or not args.session_id):
@@ -328,7 +369,9 @@ def main() -> int:
     if args.command == "local":
         if not args.device_groups:
             parser.error("local requires --device-groups")
-        return local(args)
+        return wire.run_job(
+            "ppu" if args.hardware == "ppu" else "gpu", lambda: local(args)
+        )
     if args.command == "baseline":
         return baseline(args)
     return serve(args.session, args.workers, args.session_id)

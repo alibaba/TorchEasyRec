@@ -77,6 +77,41 @@ class DispatchTest(unittest.TestCase):
         self.assertEqual(observed, [True])
         self.assertIn('"outcome": "failure"', journal.read_text())
 
+    @parameterized.expand([(0,), (1,), (130,)], name_func=parameterized_name_func)
+    def test_runner_receipt_records_terminal_status(self, outcome):
+        root = self.path / str(outcome)
+
+        def action():
+            if outcome == 130:
+                raise KeyboardInterrupt
+            return outcome
+
+        with mock.patch.dict(
+            os.environ, {"TZREC_CI_RECEIPT": str(root), "TZCI_BOOT_ID": "boot"}
+        ):
+            if outcome == 130:
+                with self.assertRaises(KeyboardInterrupt):
+                    wire.run_job("gpu", action)
+            else:
+                self.assertEqual(wire.run_job("gpu", action), outcome)
+        receipt = wire.read_json(root / "state.json")
+        self.assertEqual(receipt["code"], outcome)
+        self.assertEqual(receipt["boot_id"], "boot")
+
+    def test_empty_serial_report_cannot_pass(self):
+        from tzrec.tests import run
+
+        with (
+            mock.patch.object(sys, "argv", ["run.py", "--report-dir", str(self.path)]),
+            mock.patch.object(
+                run,
+                "_gather_test_cases",
+                return_value=(unittest.TestSuite(), unittest.TestSuite()),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "empty or duplicate"):
+                run.main()
+
     def test_result_subtests_and_teardown_are_one_failed_case(self):
         class Example(unittest.TestCase):
             def test_example(self):

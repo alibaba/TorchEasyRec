@@ -2,7 +2,7 @@
 
 GPU PR 在 H20 上运行完整 `gpu` scope，PPU PR 在 PPU 上运行同一 scope。CPU PR 保留 CPU 镜像的全量串行测试。Nightly 留在原 A10 `tzrec-runner`，保持原工作流和全量串行入口，用于 A10 兼容性回归。
 
-实例启停、常驻 runner、代理和容器部署由 TorchEasyRec-addons 的 `ci/torcheasyrec/` 管理。本仓库决定测试清单、资源需求、分组和最终结果。
+实例启停、常驻 runner和代理由 TorchEasyRec-addons 的 `ci/torcheasyrec/` 管理。本仓库的各lane YAML负责启动单个作业容器；容器内local分发负责测试清单、资源需求、分组和结果。
 
 ## 本地运行
 
@@ -36,7 +36,7 @@ class ExampleTest(unittest.TestCase): ...
 
 ## CI 执行与结果
 
-宿主先在原设备视图中运行 `baseline`，完成发现及独占组，再切换到已经验证过的双卡容器。协调器通过作业私有 Unix socket 给空闲 worker 分配任务。可以使用 `--durations` 提供受信串行/历史执行记录中的 `{test_id: seconds}` 映射，优先分发耗时较长的组；时长不影响覆盖范围。
+同一容器中先在原设备视图中运行 `baseline`，完成发现及独占组，再启动已经验证过的双卡worker进程。协调器通过作业私有 Unix socket 给空闲 worker 分配任务。可以使用 `--durations` 提供受信串行/历史执行记录中的 `{test_id: seconds}` 映射，优先分发耗时较长的组；时长不影响覆盖范围。
 
 每个计划ID都必须恰有一份终态；静态skip决策变化、重复或缺失回执、worker异常退出都不能产生绿色结果。保留subTest、fixture错误、expected failure及真实skip。父进程通过清单和digest核对结果，不解析日志里的“OK”来决定是否通过。
 
@@ -52,10 +52,8 @@ PYTHONPATH=. python tzrec/tests/run.py --report-dir tmp/ci-serial
 
 ## 上线顺序
 
-1. 准备主库CLI、复用工作流 `dsw_ci.yml` 与维护工作流。业务工作流通过仓库内相对路径调用复用文件，使用同一提交的版本，沿用现有管理员审批PR的机制。
-1. 部署并验收addons运行时，按现有管理员审批PR的机制注册仓库级常驻runner，验证双槽和排空。新节点只注册隔离标签，验证前不接生产PR。
-1. 切换三个PR工作流，保留`ci-test`汇总检查：只有真实DSW测试作业成功，它才成功。移除旧`unittest_h20_ci.yml`；Nightly不变。
+1. 部署addons运行时，注册仓库级常驻runner并验证代理和标签排空。
+1. 各lane YAML使用`tzci-dsw`及对应业务标签，直接启动带归属标签的单个作业容器，保留`ci-test`检查名。
+1. GPU/PPU调用现有CI脚本的`--parallel`模式。Nightly保持原工作流和串行入口。
 
-`tzci-dsw`和`tzrec-h20-runner`必须同时匹配，避免新工作流误落到未安装运行时的旧H20节点。旧提交没有分发CLI时，复用工作流入口明确选择`legacy`串行模式；存在CLI但执行或协议失败不会回退后再报绿。代理、数据凭据或排空验证尚未就绪时，不启用生产路由或自动缩容。
-
-启用自动缩容前，须将维护工作流发布到默认分支，并配置已审查的维护版本。该版本校验用于保证排空握手协议一致。
+不再使用`dsw_ci.yml`、维护workflow或legacy回退。DSW DockerBoard拒绝GitHub自动注入的Docker socket挂载，因此三条lane均沿用PPU原有的显式`docker run`方式。

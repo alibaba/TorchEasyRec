@@ -234,7 +234,8 @@ class TZRecTestRunner(TextTestRunner):
         return result
 
 
-if __name__ == "__main__":
+def main() -> int:
+    """Run the requested suites, optionally collecting structured results."""
     parser = argparse.ArgumentParser(description="Test TorchEasyRec")
     parser.add_argument("--list_tests", action="store_true", help="list all tests")
     parser.add_argument(
@@ -272,6 +273,9 @@ if __name__ == "__main__":
             for suite in (test_suite_main, test_suite_subproc)
             for case in ci_execution.leaves(suite)
         ]
+        expected_ids = [case["id"] for case in report_cases]
+        if not expected_ids or len(expected_ids) != len(set(expected_ids)):
+            raise ValueError("empty or duplicate test discovery")
         runner = TZRecTestRunner(
             resultclass=partial(ci_execution.RecordingResult, test_dir=args.test_dir)
         )
@@ -283,10 +287,23 @@ if __name__ == "__main__":
             planned=len(report_cases),
             reported=len(report["cases"]),
         )
+        if {case["id"] for case in report["cases"]} != set(expected_ids):
+            report["code"] = 2
         ci_protocol.write_json(report_dir / "serial-result.json", report)
-        sys.exit(report["code"])
+        return report["code"]
     elif not args.list_tests:
         runner_result = runner.run(test_suite_main, test_suite_subproc)
         failed, errored = len(runner_result.failures), len(runner_result.errors)
         if failed > 0 or errored > 0:
-            sys.exit(1)
+            return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    if os.environ.get("TZREC_CI_RECEIPT"):
+        from tzrec.tests.ci_protocol import run_job
+
+        sys.exit(run_job("cpu", main))
+    else:
+        sys.exit(main())

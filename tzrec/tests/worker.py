@@ -12,7 +12,9 @@
 """Run a certified test group in an already isolated device view."""
 
 import argparse
+import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -117,6 +119,21 @@ def serve(session: Path, slot: int, test_dir: str) -> int:
     visible = torch.cuda.device_count()
     if visible != 2:
         raise ValueError("a pair worker needs exactly two visible accelerators")
+    buses = os.environ.get("TZREC_CI_EXPECTED_BUSES")
+    if buses:
+        from tzrec.tests import ci_devices
+
+        pair = [dict(bus=bus) for bus in json.loads(buses)]
+        probe = subprocess.run(
+            ci_devices.probe_command(pair),
+            capture_output=True,
+            text=True,
+            timeout=min(120, max(1, manifest["deadline"] - time.time())),
+        )
+        if probe.returncode:
+            raise RuntimeError("pair communication failed: " + probe.stderr[-4000:])
+        ci_devices.check_probe(probe.stdout, pair, os.environ["TZREC_CI_HARDWARE"])
+        print(probe.stdout, end="", flush=True)
     groups = {g["key"]: g for g in manifest["groups"]}
     ready_deadline = min(time.time() + 120, manifest["deadline"])
     while True:
