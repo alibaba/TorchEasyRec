@@ -219,7 +219,7 @@ export HOST_MEMORY_RESERVE_PERCENT=0.15
 
 ### MILP 分片规划
 
-默认仍使用 DP 规划。设置 `TZREC_PLANNER=milp` 可启用 MILP，同时选择每张表的分片候选和各 shard 的 rank，约束各 rank 的 HBM、DDR、SSD 用量，并优化最慢 rank 的预计耗时。MILP 不使用 DP 的资源分桶配置。
+默认仍使用 DP 规划。设置 `TZREC_PLANNER=milp` 可启用 MILP，同时选择每张表的分片候选和各 shard 的 rank，约束各 rank 的 HBM、DDR 用量，并优化最慢 rank 的预计耗时。MILP 不使用 DP 的资源分桶配置。 DDR 上限为 node 可用内存扣除预留后按本机 rank 数均分的额度，各 rank 独立受限，不共享空闲额度。
 
 ```bash
 export TZREC_PLANNER=milp

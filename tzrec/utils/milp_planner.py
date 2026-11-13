@@ -43,7 +43,7 @@ from tzrec.utils.logging_util import logger
 
 
 class _PlacementModel:
-    """Select table options and place shards under per-rank resource constraints.
+    """Select table options and place shards under per-rank HBM/DDR constraints.
 
     Each option's index is its binary selection variable. Shard-to-rank mappings
     reference selection, host or shard-placement variables, depending on the
@@ -251,11 +251,11 @@ class _PlacementModel:
         no resource bins or new performance estimates are introduced here.
         """
         capacities = [
-            [getattr(device.storage, name) or 0 for name in ("hbm", "ddr", "ssd")]
+            (device.storage.hbm, device.storage.ddr)
             for device in self._topology.devices
         ]
         rank_storage_terms: List[List[List[tuple[int, float]]]] = [
-            [[] for _ in range(3)] for _ in range(self._world_size)
+            [[] for _ in range(2)] for _ in range(self._world_size)
         ]
         rank_perf_terms: List[List[tuple[int, float]]] = [
             [] for _ in range(self._world_size)
@@ -271,9 +271,7 @@ class _PlacementModel:
         for option, shard_mappings in zip(self._options, self._shard_rank_variables):
             for shard, rank_variables in zip(option.shards, shard_mappings):
                 assert shard.storage is not None and shard.perf is not None
-                storage_costs = [
-                    getattr(shard.storage, name) or 0 for name in ("hbm", "ddr", "ssd")
-                ]
+                storage_costs = (shard.storage.hbm, shard.storage.ddr)
                 scaled_perf_cost = shard.perf.total / perf_scale
                 for rank, placement_variable in rank_variables.items():
                     for resource_index, cost in enumerate(storage_costs):
@@ -305,7 +303,7 @@ class _PlacementModel:
         ):
             raise PlannerError("MILP returned a non-integral placement")
         plan: List[ShardingOption] = []
-        used_storage = [Storage(hbm=0, ddr=0, ssd=0) for _ in range(self._world_size)]
+        used_storage = [Storage(hbm=0, ddr=0) for _ in range(self._world_size)]
         for option_indices in self._option_indices_by_table.values():
             selected = [index for index in option_indices if solution[index] > 0.5]
             if len(selected) != 1:
@@ -326,15 +324,17 @@ class _PlacementModel:
                     )
                 shard.rank = selected_ranks[0]
                 assert shard.storage is not None
-                used_storage[shard.rank] += shard.storage
+                used_storage[shard.rank].hbm += shard.storage.hbm
+                used_storage[shard.rank].ddr += shard.storage.ddr
             plan.append(option)
         for rank, (storage, device) in enumerate(
             zip(used_storage, self._topology.devices)
         ):
-            if not storage.fits_in(device.storage):
+            if storage.hbm > device.storage.hbm or storage.ddr > device.storage.ddr:
                 raise PlannerError(
                     f"MILP placement exceeds exact byte capacity on rank {rank}: "
-                    f"required={storage}, available={device.storage}",
+                    f"required HBM={storage.hbm}, DDR={storage.ddr}; "
+                    f"available HBM={device.storage.hbm}, DDR={device.storage.ddr}",
                     PlannerErrorType.PARTITION,
                 )
         return plan
@@ -358,7 +358,7 @@ def _solve_placement(
     if result.status == 2:
         raise PlannerError(
             "MILP found no feasible selection and placement under the per-rank "
-            "HBM, DDR, SSD and sharding constraints",
+            "HBM, DDR and sharding constraints",
             PlannerErrorType.STRICT_CONSTRAINTS,
         )
     solution = result.x

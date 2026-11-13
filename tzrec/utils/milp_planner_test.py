@@ -68,15 +68,14 @@ def _topology(world=2, local=2, capacity=10):
         compute_device="cuda",
         hbm_cap=capacity,
         ddr_cap=capacity,
-        ssd_cap=capacity,
     )
 
 
 class MILPPlannerTest(unittest.TestCase):
     def test_plan_respects_storage_reservation(self):
         options = [
-            _option("a", "table_wise", [[9, 0, 0]], [1]),
-            _option("a", "table_wise", [[4, 0, 0]], [3]),
+            _option("a", "table_wise", [[9, 0]], [1]),
+            _option("a", "table_wise", [[4, 0]], [3]),
         ]
         planner = MILPPlanner(
             topology=_topology(),
@@ -90,17 +89,17 @@ class MILPPlannerTest(unittest.TestCase):
         self.assertEqual(planner.get_selected_options()[0].total_storage.hbm, 4)
 
     @parameterized.expand(
-        [("hbm", 0), ("ddr", 1), ("ssd", 2)],
+        [("hbm", 0), ("ddr", 1)],
         name_func=parameterized_name_func,
     )
     def test_per_rank_capacity(self, name, axis):
-        cost = [0, 0, 0]
+        cost = [0, 0]
         cost[axis] = 6
         space = [_option(str(i), "table_wise", [cost]) for i in range(3)]
         with self.assertRaises(PlannerError) as cm:
             _solve_placement(space, _topology(), 0)
         self.assertEqual(cm.exception.error_type, PlannerErrorType.STRICT_CONSTRAINTS)
-        base = [0, 0, 0]
+        base = [0, 0]
         base[axis] = 4
         plan = _solve_placement(
             [_option("rw", "row_wise", [base, base])] + space[:2], _topology(), 0
@@ -118,10 +117,8 @@ class MILPPlannerTest(unittest.TestCase):
     )
     def test_host_colocation(self, name, dependency, size):
         space = [
-            _option("a", "table_row_wise", [[size, 0, 0]] * 2, dependency=dependency),
-            _option(
-                "b", "table_column_wise", [[size, 0, 0]] * 2, dependency=dependency
-            ),
+            _option("a", "table_row_wise", [[size, 0]] * 2, dependency=dependency),
+            _option("b", "table_column_wise", [[size, 0]] * 2, dependency=dependency),
         ]
         topology = _topology(world=4)
         if dependency and size == 6:
@@ -146,7 +143,7 @@ class MILPPlannerTest(unittest.TestCase):
     def test_column_wise_rank_restrictions(self, kernel):
         topology = _topology()
         topology.devices[1].storage.hbm = 0
-        space = [_option("cw", "column_wise", [[2, 0, 0]] * 2, kernel=kernel)]
+        space = [_option("cw", "column_wise", [[2, 0]] * 2, kernel=kernel)]
         if kernel == "key_value":
             with self.assertRaises(PlannerError):
                 _solve_placement(space, topology, 0)
@@ -164,13 +161,13 @@ class MILPPlannerTest(unittest.TestCase):
                     _option(
                         str(i),
                         "row_wise",
-                        rng.integers(1, 5, (2, 3)).tolist(),
+                        rng.integers(1, 5, (2, 2)).tolist(),
                         rng.integers(1, 6, 2).tolist(),
                     ),
                     _option(
                         str(i),
                         "table_wise",
-                        rng.integers(3, 9, (1, 3)).tolist(),
+                        rng.integers(3, 9, (1, 2)).tolist(),
                         rng.integers(2, 10, 1).tolist(),
                     ),
                 ]
@@ -180,7 +177,7 @@ class MILPPlannerTest(unittest.TestCase):
             movable = sum(o.sharding_type == "table_wise" for o in choices)
             for positions in itertools.product(range(2), repeat=movable):
                 positions = iter(positions)
-                used = np.zeros((2, 3), dtype=np.int64)
+                used = np.zeros((2, 2), dtype=np.int64)
                 perfs = [0.0, 0.0]
                 for option in choices:
                     ranks = (
@@ -192,7 +189,6 @@ class MILPPlannerTest(unittest.TestCase):
                         used[rank] += [
                             shard.storage.hbm,
                             shard.storage.ddr,
-                            shard.storage.ssd,
                         ]
                         perfs[rank] += shard.perf.total
                 if np.all(used <= 14):
@@ -201,21 +197,20 @@ class MILPPlannerTest(unittest.TestCase):
             [o for group in groups for o in group], _topology(capacity=14), 0
         )
         self.assertEqual(len({o.fqn for o in plan}), 4)
-        used = np.zeros((2, 3), dtype=np.int64)
+        used = np.zeros((2, 2), dtype=np.int64)
         perfs = [0.0, 0.0]
         for option in plan:
             for shard in option.shards:
                 used[shard.rank] += [
                     shard.storage.hbm,
                     shard.storage.ddr,
-                    shard.storage.ssd,
                 ]
                 perfs[shard.rank] += shard.perf.total
         self.assertTrue(np.all(used <= 14))
         self.assertEqual(max(perfs), best)
 
     def test_timeout_without_solution_is_not_infeasibility(self):
-        space = [_option("a", "table_wise", [[1, 0, 0]])]
+        space = [_option("a", "table_wise", [[1, 0]])]
         with mock.patch.object(
             milp_planner,
             "milp",
@@ -236,7 +231,7 @@ class MILPPlannerTest(unittest.TestCase):
             result.mip_gap = 0.02
             return result
 
-        space = [_option("a", "column_wise", [[6, 0, 0]] * 2)]
+        space = [_option("a", "column_wise", [[6, 0]] * 2)]
         with mock.patch.object(milp_planner, "milp", side_effect=timed_out):
             with self.assertLogs("tzrec", level="WARNING") as logs:
                 plan = _solve_placement(space, _topology(), 0.001)
@@ -245,9 +240,7 @@ class MILPPlannerTest(unittest.TestCase):
 
     def test_grid_shard_is_not_silently_ignored(self):
         with self.assertRaisesRegex(NotImplementedError, "grid_shard"):
-            _solve_placement(
-                [_option("a", "grid_shard", [[1, 0, 0]] * 2)], _topology(), 0
-            )
+            _solve_placement([_option("a", "grid_shard", [[1, 0]] * 2)], _topology(), 0)
 
 
 if __name__ == "__main__":
