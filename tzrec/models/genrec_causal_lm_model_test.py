@@ -243,7 +243,10 @@ class GenerateCodesTest(unittest.TestCase):
                 1,
             )
         self.assertEqual(codes.tolist(), local_codes.reshape(2, 2, -1)[:, :1].tolist())
-        searched_lm, padded, mask, widths, searched_bands = beam_search.call_args.args
+        (searched_lm, padded, mask, widths, searched_bands, final_topk_per_prefix) = (
+            beam_search.call_args.args
+        )
+        self.assertFalse(final_topk_per_prefix)
         self.assertIs(searched_lm, lm)
         self.assertEqual(padded.shape, (2, 3, 4))
         self.assertEqual(mask.tolist(), [[0, 1, 1], [1, 1, 1]])
@@ -259,12 +262,16 @@ class GenRecCausalLMModelTest(unittest.TestCase):
         self.compiled_prompt, _ = create_genrec_test_prompt(self.test_dir)
 
     def _beam_model(
-        self, beam_widths=(2, 2, 2), num_return_sequences=2
+        self,
+        beam_widths=(2, 2, 2),
+        num_return_sequences=2,
+        final_topk_per_prefix=False,
     ) -> GenRecCausalLMModel:
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model._prompt = self.compiled_prompt
         common = GenRecModelConfig(num_return_sequences=num_return_sequences)
+        common.final_topk_per_prefix = final_topk_per_prefix
         common.beam_widths.extend(beam_widths)
         model._read_beam_config(common)
         return model
@@ -304,6 +311,23 @@ class GenRecCausalLMModelTest(unittest.TestCase):
             self._beam_model(
                 beam_widths=(1, 1, 100),
                 num_return_sequences=5,
+            )
+
+    def test_final_prefix_topk_decouples_return_count(self) -> None:
+        model = self._beam_model(
+            beam_widths=(2, 4, 2),
+            num_return_sequences=6,
+            final_topk_per_prefix=True,
+        )
+        self.assertEqual(model._capped_widths, [2, 4, 8])
+        self.assertEqual(model._num_return_sequences, 6)
+
+    def test_final_prefix_topk_rejects_insufficient_capacity(self) -> None:
+        with self.assertRaisesRegex(ValueError, "final capped beam width"):
+            self._beam_model(
+                beam_widths=(2, 4, 1),
+                num_return_sequences=5,
+                final_topk_per_prefix=True,
             )
 
 

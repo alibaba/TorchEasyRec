@@ -172,14 +172,67 @@ answer = [1, 8194, 16387, 4, 8197, 16390]
 
 ### genrec_causal_lm_model
 
-| 参数                          | 说明                                                                                                           |
-| ----------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `hf_model_name_or_path`       | 可选，预训练骨干模型的 HuggingFace 模型 ID 或本地目录，默认 `Qwen/Qwen2.5-0.5B`                                |
-| `common.lm_parameter_dtype`   | 可选，LM 参数精度，`FP32`、`BF16` 或 `FP16`，默认 `FP32`；计算的混合精度由 `train_config.mixed_precision` 控制 |
-| `common.attn_kernel`          | 可选，注意力计算方式，默认 `"sdpa"`，也可使用 `"flash_attention_2"`                                            |
-| `common.beam_widths`          | 必填，每层一个 beam 宽度，长度必须等于码本层数，且每项至少为 `1`；可使用固定宽度或逐层递增宽度                 |
-| `common.num_return_sequences` | 必填，返回的 SID 数量，至少为 `1`，不得超过最后一层实际可保留的 beam 数                                        |
-| `common.generated_sids_key`   | 可选，预测输出列名，默认 `"generated_sids"`                                                                    |
+| 参数                            | 说明                                                                                                           |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `hf_model_name_or_path`         | 可选，预训练骨干模型的 HuggingFace 模型 ID 或本地目录，默认 `Qwen/Qwen2.5-0.5B`                                |
+| `common.lm_parameter_dtype`     | 可选，LM 参数精度，`FP32`、`BF16` 或 `FP16`，默认 `FP32`；计算的混合精度由 `train_config.mixed_precision` 控制 |
+| `common.attn_kernel`            | 可选，注意力计算方式，默认 `"sdpa"`，也可使用 `"flash_attention_2"`                                            |
+| `common.use_flash_attn_kvcache` | 可选，默认 `false`；为原生 predict 启用 FlashAttention 2 共享前缀 beam KV 缓存                                 |
+| `common.beam_widths`            | 必填，每层一个 beam 宽度，长度必须等于码本层数，且每项至少为 `1`；可使用固定宽度或逐层递增宽度                 |
+| `common.final_topk_per_prefix`  | 可选，默认 `false`；设为 `true` 时末层宽度表示每个存活前缀的 token TopK                                        |
+| `common.num_return_sequences`   | 必填，返回的 SID 数量，至少为 `1`，不得超过最后一层实际可保留的 beam 数                                        |
+| `common.generated_sids_key`     | 可选，预测输出列名，默认 `"generated_sids"`                                                                    |
+
+`common.final_topk_per_prefix` 默认为 `false`，此时每层 `beam_widths` 都是全局保留数量。
+设置为 `true` 后，前两层保持全局 beam 剪枝，最后一项表示每个存活前缀保留的末层 token 数；
+合并这些候选后按完整序列累计分数排序，再返回 `num_return_sequences` 条 SID。
+例如 `[50, 50, 50]` 表示最多合并 `50×50=2500` 条末层候选，再全局取 Top200；
+`[20, 20, 20]` 对应最多 400 条候选，同样可以返回 Top200。
+候选池容量上限为上一层存活前缀数乘以末层 TopK 与该层 SID 词表大小的较小值，返回数量不能超过该上限。
+该数量仍是 SID 数，映射后的有效物品数需由调用方另行检查。候选不足时不补齐。
+
+```protobuf
+common {
+    beam_widths: 50
+    beam_widths: 50
+    beam_widths: 50
+    final_topk_per_prefix: true
+    num_return_sequences: 200
+    attn_kernel: "flash_attention_2"
+    use_flash_attn_kvcache: true
+}
+```
+
+`common.use_flash_attn_kvcache: true` 为预测共享历史 KV，只缓存分支后新增的 token；
+父 beam 重排时只调整历史的归属并复制短后缀。每次仅为当前 attention 层构造 K/V 输入，
+prefill、FA2 attention kernel 和训练前向均保留原实现。
+缓存按 attention 的 BF16/FP16 计算精度保存，不更改 LM 参数精度。
+该选项要求 `attn_kernel: "flash_attention_2"`、匹配环境的 FlashAttention 2，
+以及使用完整因果 attention 的 Qwen2 或 Qwen3 骨干。预测时模型须处于 eval 模式。
+
+低层 `dynamic_beam_search` 接口支持目录前缀约束：调用端用同代合法 SID 的布尔表调用
+`build_sid_prefix_masks`，将返回值通过 `allowed_prefixes` 传入。每层取 TopK 前会过滤
+不能延伸到合法完整 SID 的前缀；分数仍按完整词表归一化，不对合法子集重新归一化。
+前缀表应在目录加载时构建并复用，与每个前缀的末层 TopK 组合使用。
+该参数是 Python 解码接口的可选参数，不是模型配置字段。
+
+```python
+prefixes = build_sid_prefix_masks(valid_sids, bands)
+widths = capped_beam_widths([50, 50, 50], bands, final_topk_per_prefix=True)
+tokens = dynamic_beam_search(
+    lm,
+    prompt_embeds,
+    attention_mask,
+    widths,
+    bands,
+    final_topk_per_prefix=True,
+    allowed_prefixes=prefixes,
+    initial_cache=create_flash_attention_beam_cache(lm),
+)
+```
+
+`valid_sids` 为按各层本地编码组成的混合进制索引排列的一维布尔目录表。
+解码保持固定候选张量；合法候选不足时，调用方按同一目录过滤占位候选，保留实际数量。
 
 `hf_model_name_or_path` 指定模型 ID 时，所需配置和预训练权重会自动下载并缓存。
 
