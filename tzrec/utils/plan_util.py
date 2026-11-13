@@ -1039,7 +1039,8 @@ def _emit_dynamicemb_variants(
 
     Without an explicit load factor, search the zero and full value budgets
     and both partial-budget modes. A configured unique-id factor sets the
-    same working-set floor for every backend; zero requests at least one row.
+    working-set floor; a zero factor uses a one-row floor.
+    HYBRID starts at min(floor, 0.1), CACHING at max(floor, 0.1).
     Without that factor, built-in grids start at 0.1 and RocksDB at 0.01.
     The built-in partial grids use five geometric points through 0.5, then fixed
     tenths up to 0.9. An explicit partial ratio requests both modes at that
@@ -1092,9 +1093,13 @@ def _emit_dynamicemb_variants(
     requests: List[Tuple[bool, float, Any]]
     if params is None:
         requests = [(False, 0.0, None)]
-        partial_ratios = _dynamicemb_partial_ratios(builtin_floor)
-        requests.extend((False, r, None) for r in partial_ratios)
-        requests.extend((True, r, None) for r in partial_ratios)
+        requests.extend(
+            (False, r, None)
+            for r in _dynamicemb_partial_ratios(min(builtin_floor, 0.1))
+        )
+        requests.extend(
+            (True, r, None) for r in _dynamicemb_partial_ratios(max(builtin_floor, 0.1))
+        )
         requests.append((False, 1.0, None))
     else:
         ratio = float(params.load_factor)
