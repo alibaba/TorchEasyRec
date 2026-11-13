@@ -35,6 +35,6 @@ jobs:
           TZCI_BOOT: ${{ inputs.boot_id }}
           TZCI_TOKEN: ${{ inputs.token }}
         run: |
-          /opt/tzci/current/bin/tzci-node park \
+          /opt/tzci/current/bin/tzci node park \
             --role "$TZCI_ROLE" --epoch "$TZCI_EPOCH" \
             --boot-id "$TZCI_BOOT" --token "$TZCI_TOKEN"

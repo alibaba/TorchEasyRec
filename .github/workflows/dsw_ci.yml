@@ -52,7 +52,7 @@ jobs:
           if [ ! -f "$GITHUB_WORKSPACE/tzrec/tests/dispatch.py" ]; then
             mode=legacy
           fi
-          /opt/tzci/current/bin/tzci-job run --lane "$TZCI_LANE" \
+          /opt/tzci/current/bin/tzci job run --lane "$TZCI_LANE" \
             --mode "$mode" --checkout "$GITHUB_WORKSPACE"
       - name: Retain test evidence
         if: always() && steps.tests.outputs.report_dir != ''
