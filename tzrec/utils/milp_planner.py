@@ -207,7 +207,7 @@ def _solve_placement(
         integrality=integrality,
         bounds=Bounds(0, bounds_upper),
         constraints=LinearConstraint(matrix, lower, upper),
-        options={"mip_rel_gap": relative_gap},
+        options={"time_limit": 60.0, "mip_rel_gap": relative_gap},
     )
     if result.status == 2:
         raise PlannerError(
@@ -215,7 +215,13 @@ def _solve_placement(
             "HBM, DDR, SSD and sharding constraints",
             PlannerErrorType.STRICT_CONSTRAINTS,
         )
-    if result.status != 0 or result.x is None:
+    if result.status == 1 and result.x is None:
+        raise PlannerError(
+            "MILP reached the 60s solver limit without a feasible placement. "
+            "This does not prove insufficient capacity; use TZREC_PLANNER=dp "
+            "to try the DP planner."
+        )
+    if result.status not in (0, 1) or result.x is None:
         raise PlannerError(f"MILP placement solver failed: {result.message}")
     if not np.allclose(
         result.x[:target], np.rint(result.x[:target]), atol=1e-5, rtol=0
@@ -254,6 +260,11 @@ def _solve_placement(
         f"MILP selected {len(plan)} tables from {len(options)} options in "
         f"{elapsed:.3f}s; gap={result.mip_gap:.6g}"
     )
+    if result.status == 1:
+        logger.warning(
+            "MILP reached the 60s solver limit; using the validated feasible "
+            f"plan with gap={result.mip_gap:.6g}"
+        )
     return plan
 
 
@@ -264,6 +275,8 @@ class MILPPlanner(EmbeddingPlannerBase):
     and table-column-wise sharding. Host-local shards and dependent tables stay
     on one host. GRID_SHARD is explicitly unsupported. The solver minimizes the
     maximum per-rank estimated performance cost, matching NoopPerfModel.
+    The solver has a 60-second limit. A feasible incumbent is accepted after
+    exact capacity validation even if the relative gap has not been reached.
 
     Args:
         topology: Hardware capacities and host layout.

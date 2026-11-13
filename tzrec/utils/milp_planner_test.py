@@ -11,6 +11,7 @@
 
 import itertools
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -31,6 +32,7 @@ from torchrec.distributed.planner.types import (
     Topology,
 )
 
+from tzrec.utils import milp_planner
 from tzrec.utils.milp_planner import MILPPlanner, _solve_placement
 from tzrec.utils.test_util import parameterized_name_func
 
@@ -211,6 +213,35 @@ class MILPPlannerTest(unittest.TestCase):
                 perfs[shard.rank] += shard.perf.total
         self.assertTrue(np.all(used <= 14))
         self.assertEqual(max(perfs), best)
+
+    def test_timeout_without_solution_is_not_infeasibility(self):
+        space = [_option("a", "table_wise", [[1, 0, 0]])]
+        with mock.patch.object(
+            milp_planner,
+            "milp",
+            return_value=SimpleNamespace(status=1, x=None),
+        ):
+            with self.assertRaisesRegex(
+                PlannerError, "does not prove insufficient"
+            ) as cm:
+                _solve_placement(space, _topology(), 0)
+        self.assertEqual(cm.exception.error_type, PlannerErrorType.OTHER)
+
+    def test_timeout_uses_feasible_incumbent(self):
+        solve = milp_planner.milp
+
+        def timed_out(*args, **kwargs):
+            result = solve(*args, **kwargs)
+            result.status = 1
+            result.mip_gap = 0.02
+            return result
+
+        space = [_option("a", "column_wise", [[6, 0, 0]] * 2)]
+        with mock.patch.object(milp_planner, "milp", side_effect=timed_out):
+            with self.assertLogs("tzrec", level="WARNING") as logs:
+                plan = _solve_placement(space, _topology(), 0.001)
+        self.assertEqual({s.rank for s in plan[0].shards}, {0, 1})
+        self.assertIn("gap=0.02", " ".join(logs.output))
 
     def test_grid_shard_is_not_silently_ignored(self):
         with self.assertRaisesRegex(NotImplementedError, "grid_shard"):
