@@ -27,27 +27,21 @@ jobs:
         id: tests
         run: |
           JOB_ROOT="$TZCI_JOB_ROOT/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -p "$JOB_ROOT/status" "$JOB_ROOT/report" "$JOB_ROOT/home"
-          printf '%s\n' "job_root=$JOB_ROOT" >> "$GITHUB_OUTPUT"
-          printf 'root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n' > "$JOB_ROOT/passwd"
-          printf '%s:x:%s:%s:CI:/github/home:/bin/bash\n' "$(id -un)" "$(id -u)" "$(id -g)" >> "$JOB_ROOT/passwd"
-          printf 'root:x:0:\nnogroup:x:65534:\n' > "$JOB_ROOT/group"
-          printf '%s:x:%s:\n' "$(id -gn)" "$(id -g)" >> "$JOB_ROOT/group"
+          mkdir -p "$JOB_ROOT/report"
+          printf '%s\n' "report_dir=$JOB_ROOT/report" >> "$GITHUB_OUTPUT"
           docker run --rm --pull=always --name "gpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
             --label "tzci.job=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --user "$(id -u):$(id -g)" --workdir /job/repo \
+            --workdir /job/repo \
             --gpus all --cpus=160 --memory=1672g --shm-size=512g --ulimit memlock=-1 \
-            -e HOME=/github/home -e GITHUB_ACTIONS=true -e CI=true \
+            -e GITHUB_ACTIONS=true -e CI=true \
             -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT -e TZCI_BOOT_ID \
             -e TZREC_CI_RECEIPT=/ci-receipt -e TZREC_CI_ENV=/tmp/ci-env \
             -e TRITON_CACHE_DIR=/tmp/ci-cache/triton -e TORCHINDUCTOR_CACHE_DIR=/tmp/ci-cache/inductor \
              -e CUDA_HOME=/usr/local/cuda-13 -e LD_LIBRARY_PATH=/usr/local/cuda-13/compat \
             -v "$GITHUB_WORKSPACE/run_${GITHUB_RUN_ID}":/job/repo \
             -v "$JOB_ROOT":/ci-receipt -v "$JOB_ROOT/report":/ci-results \
-            -v "$JOB_ROOT/home":/github/home \
-            -v "$JOB_ROOT/passwd":/etc/passwd:ro -v "$JOB_ROOT/group":/etc/group:ro \
-            mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel@sha256:e09ab49b647b8bd33de9f54718213ca583f3acc54d9616b45841c4498bdbb265 \
+            mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5 \
             bash scripts/ci/ci_test.sh --parallel --scope gpu --session /ci-results --device-groups '0,1;2,3;4,5;6,7' --hardware h20 --timeout 21600
       - name: StopDockerContainer
         if: always()
@@ -55,9 +49,20 @@ jobs:
           docker stop --timeout=30 "gpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
           docker rm -f "gpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
       - name: Retain test evidence
-        if: always() && steps.tests.outputs.job_root != ''
+        id: artifacts
+        if: always() && steps.tests.outputs.report_dir != ''
         uses: actions/upload-artifact@v4
         with:
           name: gpu-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.tests.outputs.job_root }}/report
+          path: ${{ steps.tests.outputs.report_dir }}
           retention-days: 14
+          if-no-files-found: error
+      - name: Clean job directories
+        if: always()
+        env:
+          ARTIFACT_OUTCOME: ${{ steps.artifacts.outcome }}
+        run: |
+          rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}"
+          if [ "$ARTIFACT_OUTCOME" = success ]; then
+            rm -rf -- "${TZCI_JOB_ROOT:?}/${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}/report"
+          fi
