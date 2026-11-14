@@ -57,11 +57,11 @@ bash scripts/ci/ci_test_ppu.sh --parallel --scope gpu --hardware ppu --device-gr
 
 脚本准备一次依赖、proto和数据后，使用`dispatch local`在同一容器中启动worker子进程。每组仅看到指定的两张卡，并验证PCI身份和双rank通信；各组使用独立checkout；Triton和Inductor缓存按worker槽位分目录，复用runner工作区的`tzrec-ci-cache`。基线保留H20的全卡视图及PPU的原双卡视图。取消时清理进程组，workflow的always步骤兜底清理本job容器。CPU和GPU作业仍是两个独立容器。
 
-宿主的两个常驻runner均以root运行，各自使用独立注册目录和`_work`；容器使用镜像默认用户。GPU、CPU、PPU镜像分别使用`1.5`、`1.5-cpu`、`1.5-ppu`，每个job重新拉取；实际digest可在拉取日志中核对。工作目录沿用`/__w/TorchEasyRec/TorchEasyRec/run_<run_id>`，报告落在checkout旁的`report_<run_id>_<attempt>`。工作流在结束时清理本次checkout；报告上传成功后清理本地report，上传失败则留存排查。通用回执和失败标记独立保留。
+宿主的两个常驻runner均以root运行，各自使用独立注册目录和`_work`；容器使用镜像默认用户。GPU、CPU、PPU镜像分别使用`1.5`、`1.5-cpu`、`1.5-ppu`，每个job重新拉取；实际digest可在拉取日志中核对。工作目录沿用`/__w/TorchEasyRec/TorchEasyRec/run_<run_id>`，报告落在checkout旁的`report_<run_id>_<attempt>`。工作流在结束时清理本次checkout；报告上传成功后清理本地report，上传失败则留存排查。
 
 未传`--parallel`的调用继续使用原串行入口，A10 Nightly不变。资源限额作用于整个job，各worker共享该额度；不再创建coordinator或worker容器。报告通过工作区挂载上传，临时checkout和编译缓存不上传。
 
-addons只管理实例、代理和runner，按照`tzci.node`、`tzci.role`容器标签检查排空。测试阶段可通过`TZREC_CI_RECEIPT`输出通用作业回执；准备阶段尚未开始测试，没有回执时不自动重跑。生产切换前仍需部署提供runner上下文的addons版本。
+addons只管理实例、代理和runner，按照`tzci.node`、`tzci.role`容器标签检查排空。生产切换前仍需部署提供runner上下文的addons版本。
 
 ## 文档
 

@@ -375,9 +375,7 @@ def main() -> int:
     if args.command == "local":
         if not args.device_groups:
             parser.error("local requires --device-groups")
-        return wire.run_job(
-            "ppu" if args.hardware == "ppu" else "gpu", lambda: local(args)
-        )
+        return local(args)
     if args.command == "baseline":
         return baseline(args)
     return serve(args.session, args.workers, args.session_id)

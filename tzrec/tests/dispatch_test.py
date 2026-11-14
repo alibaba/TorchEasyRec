@@ -34,69 +34,12 @@ from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 class DispatchTest(unittest.TestCase):
     def setUp(self):
         self.path = Path(make_test_dir("dispatch_"))
-        journal = mock.patch.dict(
-            os.environ, {"TZREC_CI_EVENT_LOG": "", "TZREC_CI_FAILURE_FILE": ""}
-        )
+        journal = mock.patch.dict(os.environ, {"TZREC_CI_EVENT_LOG": ""})
         journal.start()
         self.addCleanup(journal.stop)
 
     def tearDown(self):
         shutil.rmtree(self.path)
-
-    def test_failure_marker_is_durable_before_the_test_journal(self):
-        marker = self.path / "failed"
-        journal = self.path / "events.jsonl"
-
-        class Example(unittest.TestCase):
-            def runTest(self):
-                self.fail("known failure")
-
-        observed = []
-        original_open = open
-
-        def observe_journal(file, *args, **kwargs):
-            if Path(file) == journal:
-                observed.append(marker.is_file())
-            return original_open(file, *args, **kwargs)
-
-        with (
-            mock.patch.dict(
-                os.environ,
-                {
-                    "TZREC_CI_FAILURE_FILE": str(marker),
-                    "TZREC_CI_EVENT_LOG": str(journal),
-                },
-            ),
-            mock.patch("builtins.open", side_effect=observe_journal),
-        ):
-            result = unittest.TextTestRunner(
-                stream=io.StringIO(), resultclass=execution.RecordingResult
-            ).run(Example())
-        self.assertFalse(result.wasSuccessful())
-        self.assertTrue(marker.is_file())
-        self.assertEqual(observed, [True])
-        self.assertIn('"outcome": "failure"', journal.read_text())
-
-    @parameterized.expand([(0,), (1,), (130,)], name_func=parameterized_name_func)
-    def test_runner_receipt_records_terminal_status(self, outcome):
-        root = self.path / str(outcome)
-
-        def action():
-            if outcome == 130:
-                raise KeyboardInterrupt
-            return outcome
-
-        with mock.patch.dict(
-            os.environ, {"TZREC_CI_RECEIPT": str(root), "TZCI_BOOT_ID": "boot"}
-        ):
-            if outcome == 130:
-                with self.assertRaises(KeyboardInterrupt):
-                    wire.run_job("gpu", action)
-            else:
-                self.assertEqual(wire.run_job("gpu", action), outcome)
-        receipt = wire.read_json(root / "state.json")
-        self.assertEqual(receipt["code"], outcome)
-        self.assertEqual(receipt["boot_id"], "boot")
 
     def test_empty_serial_report_cannot_pass(self):
         from tzrec.tests import run

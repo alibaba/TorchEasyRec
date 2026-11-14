@@ -18,7 +18,7 @@ import signal
 import socket
 import subprocess
 from pathlib import Path
-from typing import Any, BinaryIO, Callable
+from typing import Any, BinaryIO
 
 VERSION = 1
 MAX_MESSAGE = 1024 * 1024
@@ -134,42 +134,3 @@ def run_process(command: list[str], *, timeout: float, **kwargs: Any) -> int:
     finally:
         signal.signal(signal.SIGTERM, previous)
         terminate(process)
-
-
-def run_job(lane: str, action: Callable[[], int]) -> int:
-    """Publish a generic runner receipt while executing the test phase."""
-    directory = os.environ.get("TZREC_CI_RECEIPT")
-    if not directory:
-        return action()
-    root = Path(directory)
-    (root / "status").mkdir(parents=True, exist_ok=True)
-    path = root / "state.json"
-    if path.exists():
-        raise ValueError("use a fresh job receipt directory")
-    state = dict(
-        version=1,
-        run_id=int(os.environ.get("GITHUB_RUN_ID", "0")),
-        attempt=int(os.environ.get("GITHUB_RUN_ATTEMPT", "0")),
-        lane=lane,
-        boot_id=os.environ["TZCI_BOOT_ID"],
-        code=None,
-    )
-    os.environ["TZREC_CI_FAILURE_FILE"] = str(root / "status/failed")
-    write_json(path, state)
-    previous = signal.getsignal(signal.SIGTERM)
-
-    def cancel(signum: int, frame: Any) -> None:
-        """Allow dispatch cleanup before publishing a cancellation receipt."""
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGTERM, cancel)
-    code = 2
-    try:
-        code = action()
-        return code
-    except KeyboardInterrupt:
-        code = 130
-        raise
-    finally:
-        signal.signal(signal.SIGTERM, previous)
-        write_json(path, dict(state, code=code))

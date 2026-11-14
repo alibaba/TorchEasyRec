@@ -301,9 +301,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    if os.environ.get("TZREC_CI_RECEIPT"):
-        from tzrec.tests.ci_protocol import run_job
-
-        sys.exit(run_job("cpu", main))
-    else:
-        sys.exit(main())
+    sys.exit(main())

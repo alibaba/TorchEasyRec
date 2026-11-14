@@ -30,21 +30,16 @@ jobs:
           REPORT_DIR="../report_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
           CACHE_ROOT="$RUNNER_WORKSPACE/tzrec-ci-cache"
           mkdir -p "$CACHE_ROOT/triton" "$CACHE_ROOT/inductor"
-          RECEIPT_DIR="$TZCI_JOB_ROOT/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -p "$RECEIPT_DIR"
           docker run --rm --pull=always --name "gpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
             --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
             --gpus all --cpus=160 --memory=1672g --shm-size=512g --ulimit memlock=-1 \
             -e GITHUB_ACTIONS=true -e CI=true \
-            -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT -e TZCI_BOOT_ID \
-            -e TZREC_CI_RECEIPT=/ci-receipt \
             -e TRITON_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/triton \
             -e TORCHINDUCTOR_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/inductor \
             -e CUDA_HOME=/usr/local/cuda-13 -e LD_LIBRARY_PATH=/usr/local/cuda-13/compat \
             -e PIP_CACHE_DIR=/root/.cache/pip \
             -v "$WORK_ROOT":/__w \
-            -v "$RECEIPT_DIR":/ci-receipt \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5 \
             bash -eo pipefail scripts/ci/ci_test.sh --parallel --scope gpu --session "$REPORT_DIR" --device-groups '0,1;2,3;4,5;6,7' --hardware h20 --timeout 21600
       - name: StopDockerContainer
