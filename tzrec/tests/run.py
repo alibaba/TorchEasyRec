@@ -652,6 +652,9 @@ def main() -> int:
         if not args.group_file or not args.output:
             parser.error("--group-file and --output must be used together")
         group = read_json(args.group_file)
+        ids = [c["id"] for c in group["cases"]]
+        if not ids or len(ids) != len(set(ids)):
+            raise ValueError("empty or duplicate group assignment")
         expected_devices = group.get("visible_devices")
         if expected_devices is not None:
             import torch

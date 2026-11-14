@@ -49,7 +49,7 @@ def group_cases(cases: list[dict]) -> list[dict]:
 
 
 def cpu_shards(groups: list[dict], count: int) -> list[dict]:
-    """Stripe the groups of each module across CPU slots without splitting fixtures."""
+    """Distribute certified fixture boundaries across CPU slots in rotation."""
     shards: list[list[dict]] = [[] for _ in range(count)]
     for index, group in enumerate(groups):
         shards[index % count].extend(group["cases"])
@@ -122,6 +122,7 @@ def schedule(
                     report = run.read_json(path)
                     check_result(group, report, code)
                     reports.append(report)
+                    print(f"Finished group {group['key']} (exit {code})", flush=True)
                 if queue:
                     group = queue.popleft()
                     group_file = session / "groups" / (group["key"] + ".json")
@@ -150,6 +151,7 @@ def schedule(
                         log.close()
                         raise
                     active[slot] = (process, group, log)
+                    print(f"Slot {slot}: starting group {group['key']}", flush=True)
             if active:
                 time.sleep(0.1)
         return reports
@@ -167,6 +169,7 @@ def schedule(
 def dispatch(args: argparse.Namespace) -> int:
     """Execute the baseline first, then overlap only certified independent groups."""
     cpu = args.hardware == "cpu"
+    baseline_devices = 0
     if cpu:
         if args.workers < 1 or args.device_groups or args.scope:
             raise ValueError(
@@ -177,6 +180,7 @@ def dispatch(args: argparse.Namespace) -> int:
         import torch
 
         count = torch.cuda.device_count()
+        baseline_devices = 2 if args.hardware == "ppu" else count
         visible = (
             os.environ.get("CUDA_VISIBLE_DEVICES") or ",".join(map(str, range(count)))
         ).split(",")[:count]
@@ -230,8 +234,9 @@ def dispatch(args: argparse.Namespace) -> int:
     identity = uuid.uuid4().hex
     for i, group in enumerate(plan):
         group.update(key=str(i), session_id=identity)
-        if cpu or group["devices"] != "baseline":
-            group["visible_devices"] = 0 if cpu else 2
+        group["visible_devices"] = (
+            baseline_devices if group["devices"] == "baseline" else (0 if cpu else 2)
+        )
     run.write_json(session / "plan.json", dict(session_id=identity, groups=plan))
     reports = schedule(baseline, [(Path.cwd(), env)], session, deadline, args.test_dir)
     if queued:
