@@ -118,6 +118,7 @@ from tzrec.utils.feature_store_uploader import (
 )
 from tzrec.utils.quant_util import dequantize_quint8_rowwise_f16
 from tzrec.utils.test_util import (
+    ci_resources,
     gpu_unavailable,
     make_test_dir,
     mark_ci_scope,
@@ -3546,6 +3547,7 @@ class DynamicembUtilAutoRetainTest(unittest.TestCase):
             build_dynamicemb_constraints(self.dynamicemb_cfg, self.emb_config)
 
 
+@ci_resources(slots=2)
 class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
     def __init__(self, methodName="runTest") -> None:
         super().__init__(methodName)
@@ -3674,6 +3676,7 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
         )
 
 
+@ci_resources(slots=2)
 class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
     """End-to-end multi-process delta dump over a sharded dynamicemb model.
 
@@ -3807,6 +3810,7 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
             )
 
 
+@ci_resources(slots=2)
 class DeltaEmbeddingDumpZchIntegrationTest(unittest.TestCase):
     """End-to-end multi-process delta dump over a sharded ZCH model.
 

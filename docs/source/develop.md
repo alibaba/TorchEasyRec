@@ -46,6 +46,24 @@ bash scripts/ci_test.sh
 python -m tzrec.modules.fm_test FactorizationMachineTest.test_fm_0
 ```
 
+### 并行CI测试
+
+三条lane各自在workflow中启动一个作业容器，镜像tag、设备、CPU/内存和共享内存参数直接写在`unittest*_ci.yml`。CPU在64核、256GiB的限额内动态分配8个逻辑slot；H20/PPU按需分配一张或两张卡：
+
+```bash
+bash scripts/ci/ci_test_cpu.sh --parallel --capacity 8 --session ../report
+bash scripts/ci/ci_test.sh --parallel --hardware h20 --scope gpu --session ../report --capacity 8
+bash scripts/ci/ci_test_ppu.sh --parallel --scope gpu --hardware ppu --session ../report --capacity 16
+```
+
+脚本准备一次依赖、proto和数据，`dispatch.py`直接启动`run.py --group-file`执行精确的测试ID。CPU、H20、PPU共用同一套按需分配和归还slot的队列。CPU和GPU都用`@ci_resources(split="class")`或`split="case"`声明更细的边界，容量用`capacity`表示，资源需求用`slots`表示，二者不改变测试的rank数。每组使用独立checkout。发现测试时H20保留全卡视图，PPU保留双卡视图；执行时所有组统一按FIFO申请1或2个slot，执行前检查可见设备数。各槽位编译缓存独立并跨job复用。
+
+宿主的两个常驻runner均以root运行，各自使用独立注册目录和`_work`；容器使用镜像默认用户。GPU、CPU、PPU镜像分别使用`1.5`、`1.5-cpu`、`1.5-ppu`，每个job重新拉取；实际digest可在拉取日志中核对。工作目录沿用`/__w/TorchEasyRec/TorchEasyRec/run_<run_id>`，报告落在checkout旁的`report_<run_id>_<attempt>`。工作流在结束时清理本次checkout；报告上传成功后清理本地report，上传失败则留存排查。
+
+未传`--parallel`的调用继续使用原串行入口，A10 Nightly不变。资源限额作用于整个job，各worker共享该额度；不再创建coordinator或worker容器。报告通过工作区挂载上传，临时checkout和编译缓存不上传。
+
+addons只管理实例、代理和runner，按照`tzci.node`、`tzci.role`容器标签检查排空。生产切换前仍需部署提供runner上下文的addons版本。
+
 ## 文档
 
 我们支持 [MarkDown](https://guides.github.com/features/mastering-markdown/) 格式和 [reStructuredText](https://www.sphinx-doc.org/en/master/usage/restructuredtext/index.html) 格式的文档。

@@ -5,32 +5,63 @@ on:
     types: [opened, reopened, synchronize]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: unittest-ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   ci-test:
-    runs-on: tzrec-runner
-    container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5
-      options: --gpus all --ipc host --ulimit memlock=-1
+    runs-on: [tzci-dsw, tzrec-h20-runner]
+    timeout-minutes: 360
     steps:
-      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+      - name: FetchCommit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
           path: run_${{ github.run_id }}
       - name: RunUnitTestCI
-        id: run_unittest_ci
+        id: tests
         run: |
-          CACHE_ROOT="/__w/TorchEasyRec/tzrec-ci-cache"
+          WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
+          REPORT_DIR="../report_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          CACHE_ROOT="$RUNNER_WORKSPACE/tzrec-ci-cache"
           mkdir -p "$CACHE_ROOT/triton" "$CACHE_ROOT/inductor"
-          cd run_${{ github.run_id }}
-          # GHA overrides HOME to /github/home, hiding the image's warm pip cache.
-          PIP_CACHE_DIR=/root/.cache/pip \
-          TRITON_CACHE_DIR="$CACHE_ROOT/triton" \
-          TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/inductor" \
-          LD_LIBRARY_PATH=/usr/local/cuda-13/compat \
-          CUDA_HOME=/usr/local/cuda-13 \
-          bash scripts/ci/ci_test.sh --scope gpu
+          docker run --rm --pull=always --name "gpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
+            --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
+            --gpus all --cpus=116 --memory=1528g --shm-size=512g --ulimit memlock=-1 \
+            -e GITHUB_ACTIONS=true -e CI=true \
+            -e TRITON_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/triton \
+            -e TORCHINDUCTOR_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/inductor \
+            -e CUDA_HOME=/usr/local/cuda-13 -e LD_LIBRARY_PATH=/usr/local/cuda-13/compat \
+            -e PIP_CACHE_DIR=/root/.cache/pip \
+            -v "$WORK_ROOT":/__w \
+            mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5 \
+            bash -eo pipefail scripts/ci/ci_test.sh --parallel --scope gpu --session "$REPORT_DIR" --capacity 8 --hardware h20 --timeout 21600
+      - name: StopDockerContainer
+        if: always()
+        run: |
+          docker stop --timeout=30 "gpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+          docker rm -f "gpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+      - name: Retain test evidence
+        id: artifacts
+        if: always() && steps.tests.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/report_${{ github.run_id }}_${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+      - name: Clean job directories
+        if: always()
+        env:
+          ARTIFACT_OUTCOME: ${{ steps.artifacts.outcome }}
+        run: |
+          rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}"
+          if [ "$ARTIFACT_OUTCOME" = success ]; then
+            rm -rf -- "${GITHUB_WORKSPACE:?}/report_${GITHUB_RUN_ID:?}_${GITHUB_RUN_ATTEMPT:?}"
+          fi

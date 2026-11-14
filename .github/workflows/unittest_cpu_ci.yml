@@ -5,24 +5,26 @@ on:
     types: [opened, reopened, synchronize]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: unittest-cpu-ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   ci-test:
-    runs-on: tzrec-cpu-runner
-    container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5-cpu
-      options: --ipc host
+    runs-on: [tzci-dsw, dsw-cpu]
+    timeout-minutes: 360
     steps:
-      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+      - name: FetchCommit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
           path: run_${{ github.run_id }}
       - name: RunUnitTestCI
-        id: run_unittest_ci
+        id: tests
         env:
           ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
           CI_ODPS_PROJECT_NAME: ${{ secrets.CI_ODPS_PROJECT_NAME }}
@@ -31,5 +33,38 @@ jobs:
           CI_ALIKAFKA_BROKERS: ${{ secrets.CI_ALIKAFKA_BROKERS }}
           CI_REGION: ${{ secrets.CI_REGION }}
         run: |
-          cd run_${{ github.run_id }}
-          PIP_CACHE_DIR=/root/.cache/pip bash scripts/ci/ci_test_cpu.sh
+          WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
+          REPORT_DIR="../report_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          docker run --rm --pull=always --name "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
+            --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
+            --cpus=64 --memory=256g --shm-size=64g --ulimit memlock=-1 \
+            -e GITHUB_ACTIONS=true -e CI=true \
+            -e ALIBABA_CLOUD_ECS_METADATA -e CI_ODPS_PROJECT_NAME -e ODPS_ENDPOINT -e CI_ALIKAFKA_INSTANCE_ID -e CI_ALIKAFKA_BROKERS -e CI_REGION -e CUDA_VISIBLE_DEVICES= -e NVIDIA_VISIBLE_DEVICES=void \
+            -e PIP_CACHE_DIR=/root/.cache/pip \
+            -v "$WORK_ROOT":/__w \
+            mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5-cpu \
+            bash -eo pipefail scripts/ci/ci_test_cpu.sh --parallel --capacity 8 --session "$REPORT_DIR"
+      - name: StopDockerContainer
+        if: always()
+        run: |
+          docker stop --timeout=30 "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+          docker rm -f "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+      - name: Retain test evidence
+        id: artifacts
+        if: always() && steps.tests.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/report_${{ github.run_id }}_${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+      - name: Clean job directories
+        if: always()
+        env:
+          ARTIFACT_OUTCOME: ${{ steps.artifacts.outcome }}
+        run: |
+          rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}"
+          if [ "$ARTIFACT_OUTCOME" = success ]; then
+            rm -rf -- "${GITHUB_WORKSPACE:?}/report_${GITHUB_RUN_ID:?}_${GITHUB_RUN_ATTEMPT:?}"
+          fi

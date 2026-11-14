@@ -19,9 +19,15 @@ import pyarrow.dataset as ds
 
 from tzrec.tests import utils
 from tzrec.utils import config_util, dynamicemb_util, misc_util
-from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
+from tzrec.utils.test_util import (
+    ci_resources,
+    gpu_unavailable,
+    make_test_dir,
+    mark_ci_scope,
+)
 
 
+@ci_resources(slots=2)
 class CreateDynamicEmbInitCkptTest(unittest.TestCase):
     def setUp(self):
         self.success = False

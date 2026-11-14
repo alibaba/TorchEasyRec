@@ -15,9 +15,15 @@ import shutil
 import unittest
 
 from tzrec.tests import utils
-from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
+from tzrec.utils.test_util import (
+    ci_resources,
+    gpu_unavailable,
+    make_test_dir,
+    mark_ci_scope,
+)
 
 
+@ci_resources(slots=2, split="case")
 class MatchIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False

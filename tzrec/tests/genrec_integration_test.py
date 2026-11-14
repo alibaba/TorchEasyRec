@@ -21,7 +21,6 @@ from unittest import mock
 import pyarrow as pa
 import torch
 from google.protobuf import text_format
-from parameterized import parameterized
 from pyarrow import parquet as pq
 
 from tzrec.datasets.data_parser import DataParser
@@ -39,6 +38,7 @@ from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.tests import utils
 from tzrec.utils import config_util
 from tzrec.utils.test_util import (
+    ci_resources,
     create_genrec_test_tokenizer,
     create_tiny_causal_lm,
     flash_attn_unavailable,
@@ -46,7 +46,6 @@ from tzrec.utils.test_util import (
     make_test_dir,
     mark_ci_scope,
     nv_gpu_unavailable,
-    parameterized_name_func,
 )
 
 _MOCK_CONFIG = "tzrec/tests/configs/genrec_causal_lm_model_mock.config"
@@ -85,6 +84,7 @@ def _md5(path: str) -> str:
         return hashlib.md5(f.read()).hexdigest()
 
 
+@ci_resources(split="case")
 class GenRecIntegrationTest(unittest.TestCase):
     """train_eval -> eval -> export in subprocesses, then read the export back."""
 
@@ -321,16 +321,18 @@ class GenRecIntegrationTest(unittest.TestCase):
                         all(0 <= c < n for c, n in zip(beam, _CODEBOOK)), beam
                     )
 
-    @parameterized.expand(
-        [
-            [1, "sdpa"],
-            [2, "flash_attention_2"],
-        ],
-        name_func=parameterized_name_func,
-    )
     @unittest.skipIf(*nv_gpu_unavailable)
     @mark_ci_scope("gpu")
-    def test_genrec_multi_target_train_eval(self, world_size, attn_kernel):
+    def test_genrec_multi_target_train_eval_0(self):
+        self._multi_target_train_eval(1, "sdpa")
+
+    @unittest.skipIf(*nv_gpu_unavailable)
+    @mark_ci_scope("gpu")
+    @ci_resources(slots=2, split="case")
+    def test_genrec_multi_target_train_eval_1(self):
+        self._multi_target_train_eval(2, "flash_attention_2")
+
+    def _multi_target_train_eval(self, world_size, attn_kernel):
         if torch.cuda.device_count() < world_size:
             self.skipTest(f"Requires {world_size} GPUs")
         patcher = mock.patch.dict(os.environ, {"TEST_NPROC_PER_NODE": str(world_size)})

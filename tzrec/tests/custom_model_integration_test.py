@@ -20,7 +20,7 @@ import unittest
 import tzrec
 from tzrec.tests import utils
 from tzrec.utils import checkpoint_util
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import ci_resources, make_test_dir
 
 _PROTO = """syntax = "proto2";
 package my_models.protos;
@@ -149,6 +149,7 @@ model_config {
 """
 
 
+@ci_resources(slots=2, split="case")
 class CustomModelIntegrationTest(unittest.TestCase):
     """A custom model defined and trained from outside the TorchEasyRec tree."""
 

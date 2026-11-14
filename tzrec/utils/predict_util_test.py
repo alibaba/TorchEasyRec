@@ -49,6 +49,7 @@ from tzrec.utils.predict_util import (
     load_predict_model,
 )
 from tzrec.utils.test_util import (
+    ci_resources,
     create_tiny_causal_lm,
     make_test_dir,
     mark_ci_scope,
@@ -963,6 +964,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         )
 
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires 2 GPUs")
+    @ci_resources(slots=2)
     def test_devices_share_tables(self) -> None:
         dyn = _Table("model.ebc.dyn", 50, 8, True, dynamic=True)
         features = {

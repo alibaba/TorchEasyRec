@@ -232,6 +232,29 @@ class hypothesis_settings(_settings):
         )
 
 
+def ci_resources(slots: int = 1, split: str = "module") -> Any:
+    """Declare fixture boundaries and optional accelerator requirements for CI.
+
+    Args:
+        slots: One or two scheduling units. An accelerator unit is one card;
+            CPU units budget concurrency without changing the test rank count.
+        split: Smallest independent fixture boundary: module, class, or case.
+    """
+    if (
+        type(slots) is not int
+        or slots not in (1, 2)
+        or split not in ("module", "class", "case")
+    ):
+        raise ValueError("invalid CI resource declaration")
+
+    def decorate(obj: Any) -> Any:
+        """Attach resource requirements to a test class or method."""
+        obj._ci_resources = (slots, split)
+        return obj
+
+    return decorate
+
+
 def mark_ci_scope(*scopes: str) -> Any:
     """Tag a unittest method or class as in-scope for the given CI lane(s).
 
