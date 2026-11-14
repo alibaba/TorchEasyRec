@@ -3937,6 +3937,77 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             )
         self.assertEqual(os.listdir(sparse_dir), [])
 
+    def test_dynamicemb_auto_enables_distributed_embedding(self):
+        static_config = copy.deepcopy(self.pipeline_config)
+        static_config.feature_configs[0].id_feature.ClearField("dynamicemb")
+        static_config.feature_configs[0].id_feature.num_buckets = 8
+        with mock.patch.dict(
+            os.environ,
+            {"USE_DISTRIBUTED_EMBEDDING": "0", "INPUT_TILE": "0"},
+        ):
+            export_util.ensure_input_tile_for_distributed_embedding(static_config)
+            self.assertEqual(os.environ["USE_DISTRIBUTED_EMBEDDING"], "0")
+            self.assertEqual(os.environ["INPUT_TILE"], "0")
+
+            export_util.ensure_input_tile_for_distributed_embedding(
+                self.pipeline_config
+            )
+            self.assertEqual(os.environ["USE_DISTRIBUTED_EMBEDDING"], "1")
+            self.assertEqual(os.environ["INPUT_TILE"], "3")
+
+        seq_config = EasyRecConfig(
+            feature_configs=[
+                feature_pb2.FeatureConfig(
+                    sequence_feature=feature_pb2.SequenceFeature(
+                        sequence_name="seq",
+                        sequence_length=2,
+                        sequence_pk="user:seq_pk",
+                        features=[
+                            feature_pb2.SeqFeatureConfig(
+                                id_feature=feature_pb2.IdFeature(
+                                    feature_name="item_id",
+                                    expression="item:item_id",
+                                    embedding_dim=8,
+                                    dynamicemb=feature_pb2.DynamicEmbedding(
+                                        max_capacity=1024
+                                    ),
+                                )
+                            )
+                        ],
+                    )
+                )
+            ]
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"USE_DISTRIBUTED_EMBEDDING": "0", "INPUT_TILE": "0"},
+        ):
+            export_util.ensure_input_tile_for_distributed_embedding(seq_config)
+            self.assertEqual(os.environ["USE_DISTRIBUTED_EMBEDDING"], "1")
+            self.assertEqual(os.environ["INPUT_TILE"], "3")
+
+        model = self._build_model()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"USE_DISTRIBUTED_EMBEDDING": "0", "INPUT_TILE": "0"},
+            ),
+            mock.patch.object(
+                export_util, "export_distributed_embedding"
+            ) as dist_export,
+            mock.patch.object(export_util, "export_model_normal") as normal_export,
+        ):
+            export_util.export_model(
+                self.pipeline_config,
+                model,
+                self.checkpoint_dir,
+                self.export_dir,
+            )
+            self.assertEqual(os.environ["USE_DISTRIBUTED_EMBEDDING"], "1")
+            self.assertEqual(os.environ["INPUT_TILE"], "3")
+            dist_export.assert_called_once()
+            normal_export.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
