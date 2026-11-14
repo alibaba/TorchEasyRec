@@ -34,7 +34,6 @@ from tzrec.datasets.utils import (
 )
 from tzrec.features.feature import BaseFeature, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
-from tzrec.utils.test_util import cpu_parallel
 
 
 class _TestReader(BaseReader):
@@ -162,7 +161,6 @@ class _TestDataset(BaseDataset):
         )
 
 
-@cpu_parallel
 class DatasetTest(unittest.TestCase):
     def setUp(self):
         self._temp_files = []

@@ -337,13 +337,9 @@ def discover(test_dir: str, pattern: str, scope: str | None) -> list[dict]:
             devices, split = getattr(
                 method,
                 "_ci_resources",
-                getattr(cls, "_ci_resources", ("baseline", "module")),
+                getattr(cls, "_ci_resources", (None, "module")),
             )
-            if scope is None:
-                parallel = getattr(
-                    method, "_ci_cpu_parallel", getattr(cls, "_ci_cpu_parallel", False)
-                )
-                devices, split = (0, split) if parallel else ("baseline", "module")
+            devices = 0 if scope is None else (devices or "baseline")
             module = sys.modules[case.__module__]
             if split != "module" and any(
                 hasattr(module, name) for name in ("setUpModule", "tearDownModule")

@@ -30,10 +30,9 @@ from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils import misc_util
 from tzrec.utils.checkpoint_util import EPOCHS_COMPLETED, update_dataloder_state
-from tzrec.utils.test_util import cpu_parallel, make_test_dir, parameterized_name_func
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
-@cpu_parallel
 class ParquetDatasetTest(unittest.TestCase):
     def _create_test_parquet_data(self, test_dir: str, num_rows: int = 1000) -> None:
         """Create test parquet data files."""
@@ -462,7 +461,6 @@ class ParquetDatasetTest(unittest.TestCase):
             del dataloader
 
 
-@cpu_parallel
 class ParquetReaderTest(unittest.TestCase):
     def setUp(self):
         self.test_dir = make_test_dir()
@@ -590,7 +588,6 @@ class ParquetReaderTest(unittest.TestCase):
                 raise RuntimeError(f"reader worker-{i} failed.")
 
 
-@cpu_parallel
 class ParquetWriterTest(unittest.TestCase):
     def setUp(self):
         self.test_dir = make_test_dir()

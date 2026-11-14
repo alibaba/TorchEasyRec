@@ -262,7 +262,7 @@ def test_delta_attn(
     )
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("h20", "gpu")
 class HSTUAttentionTest(unittest.TestCase):
     def teardown_example(self, example):

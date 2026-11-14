@@ -77,7 +77,7 @@ class _StubOutputPostprocessor(torch.nn.Module):
         return seq_embeddings
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("h20", "gpu")
 class HSTUTransducerTest(unittest.TestCase):
     # ---------- _replay_truncation_state unit tests ----------

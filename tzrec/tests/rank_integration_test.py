@@ -28,7 +28,6 @@ from tzrec.tests import utils
 from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
 from tzrec.utils.test_util import (
     ci_resources,
-    cpu_parallel,
     cutlass_hstu_unavailable,
     dfs_are_close,
     gpu_unavailable,
@@ -46,7 +45,6 @@ _QUANT_EMBS = (
 )
 
 
-@cpu_parallel
 @ci_resources(devices=2, split="case")
 class RankIntegrationTest(unittest.TestCase):
     def setUp(self):

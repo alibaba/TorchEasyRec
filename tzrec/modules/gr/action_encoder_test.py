@@ -25,7 +25,7 @@ from tzrec.utils.test_util import (
 )
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("h20", "gpu")
 class ActionEncoderTest(unittest.TestCase):
     @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])

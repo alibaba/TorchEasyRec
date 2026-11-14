@@ -473,7 +473,7 @@ def _build_request_permuted_batch(device: torch.device) -> Batch:
     ).to(device)
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("gpu")
 class DlrmHSTUOneRankTest(unittest.TestCase):
     """End-to-end tests of the OneRank model on the PYTORCH/CUTLASS kernels."""

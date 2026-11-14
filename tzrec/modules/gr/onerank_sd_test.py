@@ -33,7 +33,7 @@ _NUM_CANDIDATES = [2, 4]
 _TOTAL = sum(_NUM_CANDIDATES)
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("h20", "gpu")
 class JaggedCrossAttentionTest(unittest.TestCase):
     """Value-level tests for the single-query jagged MHCA of SD.
@@ -145,7 +145,7 @@ class JaggedCrossAttentionTest(unittest.TestCase):
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("h20", "gpu")
 class JaggedCrossAttentionVarlenDispatchTest(unittest.TestCase):
     """The CUDA varlen fast path against the reference math.

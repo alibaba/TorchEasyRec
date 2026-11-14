@@ -40,7 +40,7 @@ def group_cases(cases: list[dict]) -> list[dict]:
             boundary = case["id"].rsplit(".", 1)[0]
         elif case["split"] == "case":
             boundary = case["id"]
-        key = (case["route"], case["split"], boundary)
+        key = (case["split"], boundary, case["route"] if case["devices"] != 0 else None)
         group = groups.setdefault(key, dict(cases=[], devices=case["devices"]))
         group["cases"].append(case)
         if case["devices"] == "baseline":
@@ -167,7 +167,7 @@ def schedule(
 
 
 def dispatch(args: argparse.Namespace) -> int:
-    """Execute the baseline first, then overlap only certified independent groups."""
+    """Dispatch CPU shards or run accelerator groups in their assigned views."""
     cpu = args.hardware == "cpu"
     baseline_devices = 0
     if cpu:
@@ -221,15 +221,12 @@ def dispatch(args: argparse.Namespace) -> int:
             raise RuntimeError(f"discovery exited with code {code}")
         cases = run.read_json(output)
     groups = group_cases(cases)
-    baseline = [g for g in groups if g["devices"] == "baseline"]
-    queued = [g for g in groups if g["devices"] != "baseline"]
     if cpu:
-        baseline = (
-            [dict(cases=[c for g in baseline for c in g["cases"]], devices="baseline")]
-            if baseline
-            else []
-        )
-        queued = cpu_shards(queued, len(pairs))
+        baseline = []
+        queued = cpu_shards(groups, len(pairs))
+    else:
+        baseline = [g for g in groups if g["devices"] == "baseline"]
+        queued = [g for g in groups if g["devices"] != "baseline"]
     plan = baseline + queued
     identity = uuid.uuid4().hex
     for i, group in enumerate(plan):
@@ -301,7 +298,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", type=Path, required=True)
     parser.add_argument("--hardware", choices=("cpu", "h20", "ppu"), required=True)
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--device-groups")
     parser.add_argument("--test-dir", default="tzrec")
     parser.add_argument("--pattern", default="*_test.py")

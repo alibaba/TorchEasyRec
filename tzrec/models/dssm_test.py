@@ -34,7 +34,7 @@ from tzrec.utils.test_util import (
 )
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("gpu")
 class DSSMTest(unittest.TestCase):
     @parameterized.expand(

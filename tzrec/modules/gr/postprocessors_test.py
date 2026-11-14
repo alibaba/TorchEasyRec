@@ -21,7 +21,7 @@ from tzrec.modules.gr.postprocessors import (
 from tzrec.utils.test_util import ci_resources, mark_ci_scope
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("h20", "gpu")
 class PostprocessorTest(unittest.TestCase):
     def test_l2norm_postprocessor(self):

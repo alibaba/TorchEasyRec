@@ -678,7 +678,7 @@ def _lookup_batch(bags, weights, kjts=None):
     return Batch(sparse_features=sparse)
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
 class DistributedEmbeddingLookupTest(unittest.TestCase):
@@ -987,7 +987,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         torch.testing.assert_close(outs[0].cpu(), outs[1].cpu())
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
 class DistributedEmbeddingModelTest(unittest.TestCase):

@@ -232,20 +232,15 @@ class hypothesis_settings(_settings):
         )
 
 
-def cpu_parallel(obj: Any) -> Any:
-    """Allow this test boundary to overlap other CPU groups in private checkouts."""
-    obj._ci_cpu_parallel = True
-    return obj
-
-
-def ci_resources(devices: int = 2, split: str = "module") -> Any:
-    """Declare a test boundary that can run on a CI device group.
+def ci_resources(devices: Optional[int] = None, split: str = "module") -> Any:
+    """Declare fixture boundaries and optional accelerator requirements for CI.
 
     Args:
-        devices: Minimum number of visible accelerators, one or two.
-        split: Smallest certified fixture boundary: module, class, or case.
+        devices: One or two devices for a pair slot; omit to keep the lane's
+            original accelerator view. CPU ignores this setting.
+        split: Smallest independent fixture boundary: module, class, or case.
     """
-    if devices not in (1, 2) or split not in ("module", "class", "case"):
+    if devices not in (None, 1, 2) or split not in ("module", "class", "case"):
         raise ValueError("invalid CI resource declaration")
 
     def decorate(obj: Any) -> Any:

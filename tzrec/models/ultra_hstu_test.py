@@ -327,7 +327,7 @@ def _build_batch(device: torch.device, channel_names: List[str]) -> Batch:
     ).to(device)
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("gpu")
 class UltraHSTUTest(unittest.TestCase):
     def teardown_example(self, example):

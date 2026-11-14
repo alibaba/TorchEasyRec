@@ -28,7 +28,7 @@ from tzrec.utils.test_util import (
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
-@ci_resources(devices=2, split="module")
+@ci_resources(devices=2)
 @mark_ci_scope("h20", "gpu")
 class JaggedTensorsTest(unittest.TestCase):
     def teardown_example(self, example):

@@ -23,7 +23,7 @@ from unittest import mock
 from parameterized import parameterized
 
 from tzrec.tests import dispatch, run
-from tzrec.utils.test_util import make_test_dir, parameterized_name_func
+from tzrec.utils.test_util import ci_resources, make_test_dir, parameterized_name_func
 
 
 class DispatchTest(unittest.TestCase):
@@ -259,20 +259,39 @@ class DispatchTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 dispatch.check_result(group, broken, 0)
 
-    def test_cpu_parallelism_is_opt_in_not_inferred_from_device_count(self):
+    def test_cpu_and_gpu_share_split_but_not_device_requirements(self):
         class Example(unittest.TestCase):
-            _ci_resources = (2, "case")
-
-            def test_example(self):
+            def test_default(self):
                 pass
 
-        suite = unittest.TestSuite([Example("test_example")])
+            @ci_resources(split="class")
+            def test_class(self):
+                pass
+
+            @ci_resources(devices=2, split="case")
+            def test_pair(self):
+                pass
+
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(Example)
         with mock.patch.object(
             run, "_gather_test_cases", return_value=(suite, unittest.TestSuite())
         ):
-            self.assertEqual(run.discover("tzrec", "*", None)[0]["devices"], "baseline")
-            Example._ci_cpu_parallel = True
-            self.assertEqual(run.discover("tzrec", "*", None)[0]["devices"], 0)
+            for scope, devices in [
+                (None, [0, 0, 0]),
+                ("gpu", ["baseline", "baseline", 2]),
+            ]:
+                cases = run.discover("tzrec", "*", scope)
+                self.assertEqual(
+                    [c["split"] for c in cases], ["class", "module", "case"]
+                )
+                self.assertEqual([c["devices"] for c in cases], devices)
+
+    def test_cpu_module_stays_on_one_slot_across_execution_routes(self):
+        cases = [
+            dict(id=name, module="pkg", split="module", devices=0, route=route)
+            for name, route in (("pkg.A.test_a", "main"), ("pkg.B.test_b", "subproc"))
+        ]
+        self.assertEqual(dispatch.group_cases(cases), [dict(devices=0, cases=cases)])
 
     def test_four_cpu_shards_keep_each_fixture_boundary_intact(self):
         groups = [
