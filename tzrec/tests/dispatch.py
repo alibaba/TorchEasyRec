@@ -43,10 +43,7 @@ def group_cases(cases: list[dict]) -> list[dict]:
         key = (case["split"], boundary)
         group = groups.setdefault(key, dict(cases=[], slots=case["slots"]))
         group["cases"].append(case)
-        if group["slots"] is not None:
-            group["slots"] = (
-                None if case["slots"] is None else max(group["slots"], case["slots"])
-            )
+        group["slots"] = max(group["slots"], case["slots"])
     return list(groups.values())
 
 
@@ -125,42 +122,40 @@ def schedule(
                 free.update(lease)
             while queue:
                 group = queue[0]
-                units = group["slots"] or capacity
+                units = group["slots"]
                 if len(free) < units:
                     break
                 queue.popleft()
                 lease = sorted(free)[:units]
                 free.difference_update(lease)
-                selected = [cards[i] for i in lease[: group["visible_devices"]]]
+                selected = [cards[i] for i in lease] if cards else []
                 child_env = dict(env, CUDA_VISIBLE_DEVICES=",".join(selected))
-                checkout = Path.cwd()
-                if group["slots"] is not None:
-                    worker = lease[0]
-                    checkout = directory / str(worker)
-                    if not checkout.exists():
-                        shutil.copytree(
-                            Path.cwd(),
-                            checkout,
-                            symlinks=True,
-                            ignore=shutil.ignore_patterns(
-                                ".git",
-                                "tmp",
-                                "experiments",
-                                "__pycache__",
-                                ".hypothesis",
-                                ".ruff_cache",
-                            ),
-                        )
-                    for variable, kind in (
-                        ("TRITON_CACHE_DIR", "triton"),
-                        ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
-                    ):
-                        cache = (
-                            Path(env.get(variable, str(directory / kind)))
-                            / f"worker-{worker}"
-                        )
-                        cache.mkdir(parents=True, exist_ok=True)
-                        child_env[variable] = str(cache.resolve())
+                worker = lease[0]
+                checkout = directory / str(worker)
+                if not checkout.exists():
+                    shutil.copytree(
+                        Path.cwd(),
+                        checkout,
+                        symlinks=True,
+                        ignore=shutil.ignore_patterns(
+                            ".git",
+                            "tmp",
+                            "experiments",
+                            "__pycache__",
+                            ".hypothesis",
+                            ".ruff_cache",
+                        ),
+                    )
+                for variable, kind in (
+                    ("TRITON_CACHE_DIR", "triton"),
+                    ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+                ):
+                    cache = (
+                        Path(env.get(variable, str(directory / kind)))
+                        / f"worker-{worker}"
+                    )
+                    cache.mkdir(parents=True, exist_ok=True)
+                    child_env[variable] = str(cache.resolve())
                 group["assigned_devices"] = selected
                 group_file = session / "groups" / (group["key"] + ".json")
                 run.write_json(group_file, group)
@@ -229,7 +224,7 @@ def dispatch(args: argparse.Namespace) -> int:
         cards = visible_pool(
             env.get("CUDA_VISIBLE_DEVICES"), torch.cuda.device_count(), capacity
         )
-    baseline_view = cards[:2] if args.hardware == "ppu" else cards
+    discovery_view = cards[:2] if args.hardware == "ppu" else cards
     session = args.session.resolve()
     session.mkdir(parents=True, exist_ok=True)
     if any(session.iterdir()):
@@ -255,21 +250,19 @@ def dispatch(args: argparse.Namespace) -> int:
         code = run.run_process(
             command,
             timeout=max(0.01, deadline - time.monotonic()),
-            env=dict(env, CUDA_VISIBLE_DEVICES=",".join(baseline_view)),
+            env=dict(env, CUDA_VISIBLE_DEVICES=",".join(discovery_view)),
         )
         if code:
             raise RuntimeError(f"discovery exited with code {code}")
         cases = run.read_json(output)
-    plan = sorted(group_cases(cases), key=lambda g: g["slots"] is not None)
+    plan = group_cases(cases)
     identity = uuid.uuid4().hex
     for i, group in enumerate(plan):
-        if group["slots"] and group["slots"] > capacity:
+        if group["slots"] > capacity:
             raise ValueError("test group exceeds lane capacity")
         group.update(key=str(i), session_id=identity)
-        group["visible_devices"] = (
-            (group["slots"] or len(baseline_view)) if cards else 0
-        )
-    counts = Counter(str(g["slots"] or "baseline") for g in plan)
+        group["visible_devices"] = group["slots"] if cards else 0
+    counts = Counter(str(g["slots"]) for g in plan)
     run.write_json(
         session / "plan.json",
         dict(session_id=identity, capacity=capacity, slot_counts=counts, groups=plan),

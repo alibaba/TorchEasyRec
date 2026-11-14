@@ -314,7 +314,6 @@ class DeriveScoresTests(unittest.TestCase):
 # -----------------------------------------------------------------------------
 
 
-@ci_resources(slots=None)
 @unittest.skipUnless(has_dynamicemb, "dynamicemb not available")
 @mark_ci_scope("gpu")
 class ShardWriteTests(unittest.TestCase):
@@ -568,7 +567,7 @@ _SRC_CONFIG = "tzrec/tests/configs/zch_to_dynamicemb_convert_src.config"
 _TGT_CONFIG = "tzrec/tests/configs/zch_to_dynamicemb_convert_tgt.config"
 
 
-@ci_resources(slots=None)
+@ci_resources(slots=2)
 class ConvertE2ETests(unittest.TestCase):
     """End-to-end test of the converter CLI.
 

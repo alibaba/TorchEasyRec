@@ -193,7 +193,7 @@ def _dataset_worker(rank, backend, timeout_seconds, test_dir):
             dist.destroy_process_group()
 
 
-@ci_resources(slots=None)
+@ci_resources(slots=2)
 @mark_ci_scope("gpu")
 class DatasetProcessGroupTest(unittest.TestCase):
     @parameterized.expand(

@@ -365,7 +365,7 @@ def _run(target) -> None:
             raise RuntimeError(f"worker-{i} failed (exitcode={p.exitcode}).")
 
 
-@ci_resources(slots=None)
+@ci_resources(slots=2)
 @mark_ci_scope("gpu")
 class SidContrastiveDistTest(unittest.TestCase):
     """2-rank tests for the contrastive distributed collectives."""

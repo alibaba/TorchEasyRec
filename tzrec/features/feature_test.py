@@ -35,7 +35,6 @@ from tzrec.features.feature import FgMode
 from tzrec.protos import feature_pb2
 from tzrec.utils import dynamicemb_util
 from tzrec.utils.test_util import (
-    ci_resources,
     make_test_dir,
     mark_ci_scope,
     parameterized_name_func,
@@ -45,7 +44,6 @@ _VOCAB_CONTENT = "a 1\nb 2\n"
 _VOCAB_ASSET_NAME = f"custom_vocab_{hashlib.md5(_VOCAB_CONTENT.encode()).hexdigest()}"
 
 
-@ci_resources(slots=None)
 class FeatureTest(unittest.TestCase):
     def setUp(self):
         self.test_dir = None

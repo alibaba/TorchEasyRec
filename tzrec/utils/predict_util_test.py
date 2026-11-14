@@ -678,7 +678,6 @@ def _lookup_batch(bags, weights, kjts=None):
     return Batch(sparse_features=sparse)
 
 
-@ci_resources(slots=2)
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
 class DistributedEmbeddingLookupTest(unittest.TestCase):
@@ -965,6 +964,7 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         )
 
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires 2 GPUs")
+    @ci_resources(slots=2)
     def test_devices_share_tables(self) -> None:
         dyn = _Table("model.ebc.dyn", 50, 8, True, dynamic=True)
         features = {
@@ -987,7 +987,6 @@ class DistributedEmbeddingLookupTest(unittest.TestCase):
         torch.testing.assert_close(outs[0].cpu(), outs[1].cpu())
 
 
-@ci_resources(slots=2)
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
 class DistributedEmbeddingModelTest(unittest.TestCase):

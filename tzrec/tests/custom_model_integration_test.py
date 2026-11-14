@@ -149,7 +149,7 @@ model_config {
 """
 
 
-@ci_resources(split="case")
+@ci_resources(slots=2, split="case")
 class CustomModelIntegrationTest(unittest.TestCase):
     """A custom model defined and trained from outside the TorchEasyRec tree."""
 

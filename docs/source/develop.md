@@ -56,7 +56,7 @@ bash scripts/ci/ci_test.sh --parallel --hardware h20 --scope gpu --session ../re
 bash scripts/ci/ci_test_ppu.sh --parallel --scope gpu --hardware ppu --session ../report --capacity 16
 ```
 
-脚本准备一次依赖、proto和数据，`dispatch.py`直接启动`run.py --group-file`执行精确的测试ID。CPU、H20、PPU共用同一套按需分配和归还slot的队列。CPU和GPU都用`@ci_resources(split="class")`或`split="case"`声明更细的边界，容量用`capacity`表示，资源需求用`slots`表示，二者不改变测试的rank数。每组使用独立checkout。H20基线保留全卡视图，PPU基线保留双卡视图；随后按队列顺序从空闲卡池分配，执行前检查可见设备数。各槽位编译缓存独立并跨job复用。
+脚本准备一次依赖、proto和数据，`dispatch.py`直接启动`run.py --group-file`执行精确的测试ID。CPU、H20、PPU共用同一套按需分配和归还slot的队列。CPU和GPU都用`@ci_resources(split="class")`或`split="case"`声明更细的边界，容量用`capacity`表示，资源需求用`slots`表示，二者不改变测试的rank数。每组使用独立checkout。发现测试时H20保留全卡视图，PPU保留双卡视图；执行时所有组统一按FIFO申请1或2个slot，执行前检查可见设备数。各槽位编译缓存独立并跨job复用。
 
 宿主的两个常驻runner均以root运行，各自使用独立注册目录和`_work`；容器使用镜像默认用户。GPU、CPU、PPU镜像分别使用`1.5`、`1.5-cpu`、`1.5-ppu`，每个job重新拉取；实际digest可在拉取日志中核对。工作目录沿用`/__w/TorchEasyRec/TorchEasyRec/run_<run_id>`，报告落在checkout旁的`report_<run_id>_<attempt>`。工作流在结束时清理本次checkout；报告上传成功后清理本地report，上传失败则留存排查。
 

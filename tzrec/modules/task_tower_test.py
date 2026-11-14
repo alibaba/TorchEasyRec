@@ -37,7 +37,6 @@ from tzrec.protos.module_pb2 import MLP
 from tzrec.utils.config_util import config_to_kwargs
 from tzrec.utils.test_util import (
     TestGraphType,
-    ci_resources,
     create_test_module,
     mark_ci_scope,
 )
@@ -62,7 +61,6 @@ class TaskTowerTest(unittest.TestCase):
         self.assertEqual(list(output.size()), [4, 2])
 
 
-@ci_resources(slots=None)
 @mark_ci_scope("h20", "gpu")
 class OneRankPredictionHeadTest(unittest.TestCase):
     """Tests for the scorer variants and ``task_bias_init``."""

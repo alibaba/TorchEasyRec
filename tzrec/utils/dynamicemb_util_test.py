@@ -28,7 +28,6 @@ from tzrec.protos import feature_pb2
 from tzrec.utils import dynamicemb_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import DynamicEmbTableStorage
 from tzrec.utils.test_util import (
-    ci_resources,
     make_test_dir,
     mark_ci_scope,
     parameterized_name_func,
@@ -47,7 +46,6 @@ def _table_options(rows, dim, **config):
     ).dynamicemb_options
 
 
-@ci_resources(slots=2)
 @unittest.skipUnless(
     dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
 )
@@ -136,7 +134,6 @@ class OptimizerMultiplerTest(unittest.TestCase):
         )
 
 
-@ci_resources(slots=2)
 @unittest.skipUnless(
     dynamicemb_util.has_dynamicemb and has_fbgemm_ftrl(),
     "dynamicemb or the FBGEMM FTRL embedding kernel is not installed; skipping.",
@@ -187,7 +184,6 @@ class DynamicEmbFTRLFusedParamsTest(unittest.TestCase):
         )
 
 
-@ci_resources(slots=2)
 @unittest.skipUnless(
     dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
 )
@@ -338,7 +334,6 @@ class AdmissionStrategyTest(unittest.TestCase):
         self.assertNotEqual(first.get_grouped_key(), frequency.get_grouped_key())
 
 
-@ci_resources(slots=2)
 @unittest.skipUnless(
     dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
 )
@@ -417,7 +412,6 @@ class DynamicEmbCapacityTest(unittest.TestCase):
         )
 
 
-@ci_resources(slots=2)
 @unittest.skipUnless(
     dynamicemb_util.has_dynamicemb, "dynamicemb is not installed; skipping."
 )
@@ -469,7 +463,6 @@ class DynamicEmbGroupingTest(unittest.TestCase):
         )
 
 
-@ci_resources(slots=2)
 @unittest.skipUnless(
     dynamicemb_util.has_dynamicemb and torch.cuda.is_available(),
     "requires dynamicemb on CUDA",
@@ -678,7 +671,6 @@ def _has_rocksdb() -> bool:
     return dynamicemb_util.has_dynamicemb
 
 
-@ci_resources(slots=None)
 @unittest.skipUnless(_has_rocksdb(), "tzrec_ext.rocksdb is not installed; skipping.")
 @mark_ci_scope("gpu")
 class RocksDBTableTest(unittest.TestCase):

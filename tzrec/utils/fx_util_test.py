@@ -36,7 +36,6 @@ from torchrec.quant.embedding_modules import _permute_kjt
 from tzrec.utils import fx_util
 from tzrec.utils.fx_util import fx_avg_counts
 from tzrec.utils.test_util import (
-    ci_resources,
     gpu_unavailable,
     make_test_dir,
     mark_ci_scope,
@@ -117,7 +116,6 @@ print(f"{len(cases)} native TorchScript cases passed on {device}")
 """
 
 
-@ci_resources(slots=None)
 @mark_ci_scope("gpu", "h20")
 class KJTPermutationTest(unittest.TestCase):
     def setUp(self) -> None:

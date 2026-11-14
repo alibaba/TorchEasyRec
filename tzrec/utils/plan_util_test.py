@@ -40,14 +40,12 @@ from tzrec.utils.planner.enumerators import (
 )
 from tzrec.utils.planner.proposers_test import _dp_proposals
 from tzrec.utils.test_util import (
-    ci_resources,
     make_test_dir,
     mark_ci_scope,
     parameterized_name_func,
 )
 
 
-@ci_resources(slots=None)
 class PlanUtilTest(unittest.TestCase):
     def setUp(self):
         self.maxDiff = None
@@ -286,7 +284,6 @@ class PlanUtilTest(unittest.TestCase):
         self.assertEqual(plan.plan["sparse.ebc"]["table_a"].sharding_type, "row_wise")
 
 
-@ci_resources(slots=None)
 @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
 @mark_ci_scope("gpu")
@@ -519,7 +516,6 @@ def _model_and_constraints(tables):
     return TestSparseNN(tables=configs, sparse_device=torch.device("meta")), constraints
 
 
-@ci_resources(slots=None)
 @unittest.skipUnless(has_dynamicemb, "dynamicemb is required")
 @mark_ci_scope("gpu")
 class RocksDBPlannerTest(unittest.TestCase):

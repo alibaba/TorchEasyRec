@@ -27,7 +27,7 @@ from tzrec.utils.test_util import (
 )
 
 
-@ci_resources(slots=None)
+@ci_resources(slots=2)
 class CreateDynamicEmbInitCkptTest(unittest.TestCase):
     def setUp(self):
         self.success = False

@@ -18,7 +18,6 @@ from parameterized import parameterized
 
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
 from tzrec.utils.test_util import (
-    ci_resources,
     create_tiny_causal_lm,
     flash_attn_unavailable,
     mark_ci_scope,
@@ -139,7 +138,6 @@ class DynamicBeamSearchTest(unittest.TestCase):
         self.assertEqual(got[0], max(ref, key=lambda combo: ref[combo]))
 
 
-@ci_resources(slots=None)
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
 @unittest.skipIf(*flash_attn_unavailable)

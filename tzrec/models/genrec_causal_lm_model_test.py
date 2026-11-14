@@ -38,7 +38,6 @@ from tzrec.utils.test_util import (
     GENREC_ANSWER_CODES,
     GENREC_HIST_CODES,
     GENREC_LONG_HIST_CODES,
-    ci_resources,
     create_genrec_test_model,
     create_genrec_test_prompt,
     flash_attn_unavailable,
@@ -340,7 +339,6 @@ _TWO_ROWS = (
 )
 
 
-@ci_resources(slots=None)
 class LayoutInvarianceTest(unittest.TestCase):
     """Neither batching nor the kernel may change what a row scores.
 

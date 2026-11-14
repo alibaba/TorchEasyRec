@@ -155,7 +155,7 @@ class DispatchTest(unittest.TestCase):
                 if key == package or key.startswith(package + "."):
                     sys.modules.pop(key)
 
-    def test_grouping_keeps_unknown_modules_exclusive(self):
+    def test_module_uses_peak_slot_requirement(self):
         cases = [
             dict(
                 id="pkg.First.test_a",
@@ -168,15 +168,14 @@ class DispatchTest(unittest.TestCase):
                 id="pkg.Second.test_b",
                 module="pkg",
                 split="module",
-                slots=None,
+                slots=1,
                 route="main",
             ),
         ]
         groups = dispatch.group_cases(cases)
         self.assertEqual(len(groups), 1)
-        self.assertEqual(groups[0]["slots"], None)
+        self.assertEqual(groups[0]["slots"], 2)
         self.assertEqual(groups[0]["cases"], cases)
-        cases[1]["slots"] = 1
         for ordered in (cases, cases[::-1]):
             self.assertEqual(dispatch.group_cases(ordered)[0]["slots"], 2)
         cases[0]["split"] = "case"
@@ -278,12 +277,17 @@ class DispatchTest(unittest.TestCase):
                 )
                 self.assertEqual([c["slots"] for c in cases], [1, 1, 2])
 
+    def test_slots_must_be_one_or_two(self):
+        for slots in [None, 0, 3, True]:
+            with self.assertRaises(ValueError):
+                ci_resources(slots=slots)
+
     def test_cpu_module_stays_on_one_slot_across_execution_routes(self):
         cases = [
-            dict(id=name, module="pkg", split="module", slots=None, route=route)
+            dict(id=name, module="pkg", split="module", slots=1, route=route)
             for name, route in (("pkg.A.test_a", "main"), ("pkg.B.test_b", "subproc"))
         ]
-        self.assertEqual(dispatch.group_cases(cases), [dict(slots=None, cases=cases)])
+        self.assertEqual(dispatch.group_cases(cases), [dict(slots=1, cases=cases)])
 
     def test_eight_default_groups_can_start_before_any_cpu_group_finishes(self):
         from contextlib import ExitStack
