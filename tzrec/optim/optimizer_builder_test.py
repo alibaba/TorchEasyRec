@@ -28,7 +28,7 @@ from tzrec.optim.optimizer import (
     sparse_init_accumulator_value,
 )
 from tzrec.protos import optimizer_pb2
-from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
+from tzrec.utils.test_util import ci_resources, mark_ci_scope, parameterized_name_func
 
 try:
     from dynamicemb import DynamicEmbOptimType
@@ -38,6 +38,7 @@ except ImportError:
     has_dynamicemb = False
 
 
+@ci_resources(slots=None)
 class OpimizerBuilderTest(unittest.TestCase):
     def tearDown(self):
         set_sparse_init_accumulator_value(0.0)

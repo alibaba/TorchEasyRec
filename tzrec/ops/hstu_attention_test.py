@@ -21,7 +21,6 @@ from tzrec.ops import (
     Kernel,
 )
 from tzrec.utils.test_util import (
-    ci_resources,
     cleanup_cuda_memory,
     cutlass_hstu_unavailable,
     generate_sparse_seq_len,
@@ -262,7 +261,6 @@ def test_delta_attn(
     )
 
 
-@ci_resources(slots=1)
 @mark_ci_scope("h20", "gpu")
 class HSTUAttentionTest(unittest.TestCase):
     def teardown_example(self, example):

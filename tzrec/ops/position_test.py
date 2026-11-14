@@ -17,7 +17,6 @@ from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
 from tzrec.utils.test_util import (
-    ci_resources,
     cleanup_cuda_memory,
     generate_sparse_seq_len,
     get_test_dtypes,
@@ -44,7 +43,6 @@ def _retry(max_attempts=3):
     return decorator
 
 
-@ci_resources(slots=1)
 @mark_ci_scope("h20", "gpu")
 class PositionEmbeddingsTest(unittest.TestCase):
     def teardown_example(self, example):

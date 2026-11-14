@@ -8,7 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dispatch unittest groups to CPU batches or a pool of accelerator cards."""
+"""Dispatch unittest groups against a common slot budget on CPU and accelerators."""
 
 import argparse
 import importlib
@@ -48,14 +48,6 @@ def group_cases(cases: list[dict]) -> list[dict]:
                 None if case["slots"] is None else max(group["slots"], case["slots"])
             )
     return list(groups.values())
-
-
-def cpu_shards(groups: list[dict], count: int) -> list[dict]:
-    """Distribute certified fixture boundaries across CPU slots in rotation."""
-    shards: list[list[dict]] = [[] for _ in range(count)]
-    for index, group in enumerate(groups):
-        shards[index % count].extend(group["cases"])
-    return [dict(cases=cases, slots=2) for cases in shards if cases]
 
 
 def visible_pool(mask: str | None, count: int, capacity: int) -> list[str]:
@@ -217,9 +209,9 @@ def dispatch(args: argparse.Namespace) -> int:
     """Discover once in the lane's original view, then schedule the full plan."""
     cpu = args.hardware == "cpu"
     capacity = args.capacity
-    if capacity < 1 or (cpu and (args.scope or capacity % 2)):
+    if capacity < 1 or (cpu and args.scope):
         raise ValueError(
-            "capacity must be positive; CPU uses two slots per full-suite batch"
+            "capacity must be positive; the CPU lane discovers the full suite"
         )
     env = dict(os.environ, PYTHONPATH=".")
     cards = []
@@ -268,12 +260,7 @@ def dispatch(args: argparse.Namespace) -> int:
         if code:
             raise RuntimeError(f"discovery exited with code {code}")
         cases = run.read_json(output)
-    groups = group_cases(cases)
-    plan = (
-        cpu_shards(groups, capacity // 2)
-        if cpu
-        else sorted(groups, key=lambda g: g["slots"] is not None)
-    )
+    plan = sorted(group_cases(cases), key=lambda g: g["slots"] is not None)
     identity = uuid.uuid4().hex
     for i, group in enumerate(plan):
         if group["slots"] and group["slots"] > capacity:

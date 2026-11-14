@@ -337,7 +337,7 @@ def discover(test_dir: str, pattern: str, scope: str | None) -> list[dict]:
             slots, split = getattr(
                 method,
                 "_ci_resources",
-                getattr(cls, "_ci_resources", (None, "module")),
+                getattr(cls, "_ci_resources", (1, "module")),
             )
             module = sys.modules[case.__module__]
             if split != "module" and any(

@@ -35,6 +35,7 @@ from tzrec.datasets.utils import (
 from tzrec.protos import data_pb2
 from tzrec.protos.data_pb2 import FieldType
 from tzrec.utils.test_util import (
+    ci_resources,
     gpu_unavailable,
     mark_ci_scope,
     parameterized_name_func,
@@ -835,6 +836,7 @@ _TO_DICT_CASES = [
 ]
 
 
+@ci_resources(slots=None)
 class BatchToDictTest(unittest.TestCase):
     def _kjt(self, keys, batch_size, weighted, device):
         lengths = torch.randint(0, 4, (len(keys) * batch_size,), dtype=torch.int32)

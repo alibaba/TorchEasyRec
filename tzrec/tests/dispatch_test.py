@@ -276,7 +276,7 @@ class DispatchTest(unittest.TestCase):
                 self.assertEqual(
                     [c["split"] for c in cases], ["class", "module", "case"]
                 )
-                self.assertEqual([c["slots"] for c in cases], [None, None, 2])
+                self.assertEqual([c["slots"] for c in cases], [1, 1, 2])
 
     def test_cpu_module_stays_on_one_slot_across_execution_routes(self):
         cases = [
@@ -285,15 +285,62 @@ class DispatchTest(unittest.TestCase):
         ]
         self.assertEqual(dispatch.group_cases(cases), [dict(slots=None, cases=cases)])
 
-    def test_four_cpu_shards_keep_each_fixture_boundary_intact(self):
+    def test_eight_default_groups_can_start_before_any_cpu_group_finishes(self):
+        from contextlib import ExitStack
+
+        capacity = 8
         groups = [
-            dict(cases=[dict(id=f"{i}.one"), dict(id=f"{i}.two")]) for i in range(9)
+            dict(
+                key=str(i),
+                session_id="s",
+                slots=1,
+                visible_devices=0,
+                cases=[dict(id=str(i))],
+            )
+            for i in range(capacity)
         ]
-        shards = dispatch.cpu_shards(groups, 4)
-        self.assertEqual(len(shards), 4)
-        for i, group in enumerate(groups):
-            self.assertTrue(all(c in shards[i % 4]["cases"] for c in group["cases"]))
-        self.assertEqual(sum(len(s["cases"]) for s in shards), 18)
+        started = []
+        envs = []
+
+        def start(cmd, **kwargs):
+            process = mock.Mock()
+            process.poll.side_effect = lambda: 0 if len(started) == capacity else None
+            started.append(process)
+            envs.append(kwargs["env"])
+            group = groups[len(started) - 1]
+            run.write_json(
+                Path(cmd[cmd.index("--output") + 1]),
+                dict(
+                    group=group["key"],
+                    session_id="s",
+                    code=0,
+                    fixtures=[],
+                    cases=[dict(id=group["key"], outcome="success")],
+                ),
+            )
+            return process
+
+        root = self.path.resolve()
+        (root / "logs").mkdir()
+        for i in range(capacity):
+            (root / str(i)).mkdir()
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(dispatch.subprocess, "Popen", side_effect=start)
+            )
+            stack.enter_context(mock.patch.object(run, "terminate"))
+            reports = dispatch.schedule(
+                groups,
+                [],
+                capacity,
+                {},
+                root,
+                root,
+                dispatch.time.monotonic() + 5,
+                "tzrec",
+            )
+        self.assertEqual(len(reports), capacity)
+        self.assertTrue(all(env["CUDA_VISIBLE_DEVICES"] == "" for env in envs))
 
 
 if __name__ == "__main__":

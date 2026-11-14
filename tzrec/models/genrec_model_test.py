@@ -46,6 +46,7 @@ from tzrec.utils.test_util import (
     GENREC_ANSWER_CODES,
     GENREC_HIST_CODES,
     GENREC_LONG_HIST_CODES,
+    ci_resources,
     create_genrec_test_model,
     flash_attn_unavailable,
     make_test_dir,
@@ -100,6 +101,7 @@ def _projected_batch(compiled_prompt) -> Batch:
     )
 
 
+@ci_resources(slots=None)
 class BaseGenRecModelTest(unittest.TestCase):
     """Shared causal-LM behavior, reached through its concrete subclass."""
 

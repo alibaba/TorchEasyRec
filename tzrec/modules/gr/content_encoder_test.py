@@ -21,13 +21,11 @@ from tzrec.modules.gr.content_encoder import (
 )
 from tzrec.utils.test_util import (
     TestGraphType,
-    ci_resources,
     gpu_unavailable,
     mark_ci_scope,
 )
 
 
-@ci_resources(slots=1)
 @mark_ci_scope("h20", "gpu")
 class ContentEncoderTest(unittest.TestCase):
     @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])

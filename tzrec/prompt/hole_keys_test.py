@@ -28,7 +28,7 @@ from tzrec.prompt.types import (
 )
 from tzrec.protos.model_pb2 import FeatureGroupType
 from tzrec.utils.fx_util import symbolic_trace
-from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import ci_resources, gpu_unavailable, mark_ci_scope
 
 
 def _slot(
@@ -86,6 +86,7 @@ class MixTest(unittest.TestCase):
         self.assertEqual(got, [reference(v) for v in values])
 
 
+@ci_resources(slots=None)
 class HoleKeyBuilderTest(unittest.TestCase):
     def setUp(self) -> None:
         self.plan = _plan((_slot("beh"),))

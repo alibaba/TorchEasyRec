@@ -15,11 +15,10 @@ import torch
 from hypothesis import Verbosity, given
 from hypothesis import strategies as st
 
-from tzrec.utils.test_util import ci_resources, gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
-@ci_resources(slots=1)
 @mark_ci_scope("h20", "gpu")
 class PreprocessorTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
@@ -251,7 +250,6 @@ class PreprocessorTest(unittest.TestCase):
         )
 
 
-@ci_resources(slots=1)
 @mark_ci_scope("h20", "gpu")
 class UIHPreprocessorTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)

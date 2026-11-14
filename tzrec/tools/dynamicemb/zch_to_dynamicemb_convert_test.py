@@ -30,7 +30,12 @@ from tzrec.tests import utils
 from tzrec.tools.dynamicemb import zch_to_dynamicemb_convert as conv
 from tzrec.utils import checkpoint_util, misc_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
+from tzrec.utils.test_util import (
+    ci_resources,
+    gpu_unavailable,
+    make_test_dir,
+    mark_ci_scope,
+)
 
 _IINFO_MAX = torch.iinfo(torch.int64).max
 
@@ -309,6 +314,7 @@ class DeriveScoresTests(unittest.TestCase):
 # -----------------------------------------------------------------------------
 
 
+@ci_resources(slots=None)
 @unittest.skipUnless(has_dynamicemb, "dynamicemb not available")
 @mark_ci_scope("gpu")
 class ShardWriteTests(unittest.TestCase):
@@ -562,6 +568,7 @@ _SRC_CONFIG = "tzrec/tests/configs/zch_to_dynamicemb_convert_src.config"
 _TGT_CONFIG = "tzrec/tests/configs/zch_to_dynamicemb_convert_tgt.config"
 
 
+@ci_resources(slots=None)
 class ConvertE2ETests(unittest.TestCase):
     """End-to-end test of the converter CLI.
 

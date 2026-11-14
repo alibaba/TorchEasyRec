@@ -30,6 +30,7 @@ from tzrec.utils.planner.enumerators import (
     _emit_dynamicemb_variants,
 )
 from tzrec.utils.test_util import (
+    ci_resources,
     mark_ci_scope,
     parameterized_name_func,
 )
@@ -90,6 +91,7 @@ class EmbeddingEnumeratorTest(unittest.TestCase):
         )
 
 
+@ci_resources(slots=None)
 @unittest.skipUnless(has_dynamicemb, "dynamicemb is not installed; skipping.")
 @mark_ci_scope("gpu")
 class DynamicEmbEnumeratorTest(unittest.TestCase):

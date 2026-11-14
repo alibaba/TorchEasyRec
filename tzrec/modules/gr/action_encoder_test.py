@@ -18,14 +18,12 @@ from parameterized import parameterized
 from tzrec.modules.gr.action_encoder import SimpleActionEncoder
 from tzrec.utils.test_util import (
     TestGraphType,
-    ci_resources,
     create_test_module,
     gpu_unavailable,
     mark_ci_scope,
 )
 
 
-@ci_resources(slots=1)
 @mark_ci_scope("h20", "gpu")
 class ActionEncoderTest(unittest.TestCase):
     @parameterized.expand([[TestGraphType.NORMAL], [TestGraphType.FX_TRACE]])

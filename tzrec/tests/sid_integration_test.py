@@ -27,7 +27,7 @@ from tzrec.utils import config_util
 from tzrec.utils.test_util import ci_resources, make_test_dir, mark_ci_scope
 
 
-@ci_resources(slots=1, split="case")
+@ci_resources(split="case")
 class SidIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False

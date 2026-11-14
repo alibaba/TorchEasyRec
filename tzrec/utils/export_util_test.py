@@ -92,7 +92,12 @@ from tzrec.utils.export_util import (
 )
 from tzrec.utils.fx_util import fx_mark_keyed_tensor
 from tzrec.utils.state_dict_util import init_parameters
-from tzrec.utils.test_util import make_test_dir, mark_ci_scope, parameterized_name_func
+from tzrec.utils.test_util import (
+    ci_resources,
+    make_test_dir,
+    mark_ci_scope,
+    parameterized_name_func,
+)
 
 # register the mark for fx tracing from this module's call sites, as
 # tzrec/modules/embedding.py does for its own
@@ -204,6 +209,7 @@ def _hard_search_export_inputs(lengths):
     }
 
 
+@ci_resources(slots=None)
 @mark_ci_scope("gpu")
 class HardSearchExportTest(unittest.TestCase):
     def setUp(self):
@@ -3243,6 +3249,7 @@ class ExportUtilTest(unittest.TestCase):
             shutil.rmtree(test_dir, ignore_errors=True)
 
 
+@ci_resources(slots=None)
 class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
     def setUp(self):
         self.test_dir = make_test_dir()

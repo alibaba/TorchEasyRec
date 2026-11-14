@@ -18,6 +18,7 @@ from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
 from tzrec.utils.test_util import (
+    ci_resources,
     get_test_dtypes,
     gpu_unavailable,
     mark_ci_scope,
@@ -27,6 +28,7 @@ from tzrec.utils.test_util import (
 )
 
 
+@ci_resources(slots=None)
 @mark_ci_scope("h20", "gpu")
 class LayerNormTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)

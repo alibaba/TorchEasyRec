@@ -18,7 +18,6 @@ from hypothesis import strategies as st
 
 from tzrec.ops import Kernel
 from tzrec.utils.test_util import (
-    ci_resources,
     cleanup_cuda_memory,
     get_test_dtypes,
     gpu_unavailable,
@@ -27,7 +26,6 @@ from tzrec.utils.test_util import (
 from tzrec.utils.test_util import hypothesis_settings as settings
 
 
-@ci_resources(slots=1)
 @mark_ci_scope("h20", "gpu")
 class MMlTest(unittest.TestCase):
     def teardown_example(self, example):

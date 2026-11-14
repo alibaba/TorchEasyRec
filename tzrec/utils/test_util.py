@@ -232,12 +232,12 @@ class hypothesis_settings(_settings):
         )
 
 
-def ci_resources(slots: Optional[int] = None, split: str = "module") -> Any:
+def ci_resources(slots: Optional[int] = 1, split: str = "module") -> Any:
     """Declare fixture boundaries and optional accelerator requirements for CI.
 
     Args:
         slots: One or two scheduling units. An accelerator unit is one card;
-            omit to preserve the original view. CPU batches reserve two units.
+            use None to reserve the pool and retain the original lane view.
         split: Smallest independent fixture boundary: module, class, or case.
     """
     if slots not in (None, 1, 2) or split not in ("module", "class", "case"):

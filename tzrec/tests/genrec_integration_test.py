@@ -84,7 +84,7 @@ def _md5(path: str) -> str:
         return hashlib.md5(f.read()).hexdigest()
 
 
-@ci_resources(slots=1, split="case")
+@ci_resources(split="case")
 class GenRecIntegrationTest(unittest.TestCase):
     """train_eval -> eval -> export in subprocesses, then read the export back."""
 

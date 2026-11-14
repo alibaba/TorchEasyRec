@@ -21,7 +21,7 @@ from parameterized import param, parameterized
 from tzrec.modules.gr.hstu_transducer import HSTUTransducer
 from tzrec.ops import Kernel
 from tzrec.ops.hstu_attention_utils import compute_stu_truncation_plan
-from tzrec.utils.test_util import ci_resources, mark_ci_scope, reference_stu_truncation
+from tzrec.utils.test_util import mark_ci_scope, reference_stu_truncation
 
 
 class _StubInputPreprocessor(torch.nn.Module):
@@ -77,7 +77,6 @@ class _StubOutputPostprocessor(torch.nn.Module):
         return seq_embeddings
 
 
-@ci_resources(slots=1)
 @mark_ci_scope("h20", "gpu")
 class HSTUTransducerTest(unittest.TestCase):
     # ---------- _replay_truncation_state unit tests ----------

@@ -22,7 +22,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from tzrec.loss.sid_contrastive_loss import SidContrastiveLoss
 from tzrec.utils import misc_util
-from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
+from tzrec.utils.test_util import ci_resources, mark_ci_scope, parameterized_name_func
 
 
 def _reference_loss(loss_fn, embed_a, embed_b, embed_a_ori, embed_b_ori, pair_mask):
@@ -365,6 +365,7 @@ def _run(target) -> None:
             raise RuntimeError(f"worker-{i} failed (exitcode={p.exitcode}).")
 
 
+@ci_resources(slots=None)
 @mark_ci_scope("gpu")
 class SidContrastiveDistTest(unittest.TestCase):
     """2-rank tests for the contrastive distributed collectives."""

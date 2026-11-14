@@ -21,7 +21,12 @@ from tzrec.protos import data_pb2, model_pb2, pipeline_pb2
 from tzrec.tools.add_pooling_factor_to_config import AddPoolingFactorToConfig
 from tzrec.utils import config_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
-from tzrec.utils.test_util import make_test_dir, mark_ci_scope, parameterized_name_func
+from tzrec.utils.test_util import (
+    ci_resources,
+    make_test_dir,
+    mark_ci_scope,
+    parameterized_name_func,
+)
 
 
 def _write_parquet(test_dir, num_rows=10):
@@ -116,6 +121,7 @@ def _config(train_input_path, with_model=True):
     return cfg
 
 
+@ci_resources(slots=None)
 class AddPoolingFactorToConfigTest(unittest.TestCase):
     """Measuring a train input and filling embedding_constraints from it."""
 

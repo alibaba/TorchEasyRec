@@ -678,6 +678,7 @@ def _has_rocksdb() -> bool:
     return dynamicemb_util.has_dynamicemb
 
 
+@ci_resources(slots=None)
 @unittest.skipUnless(_has_rocksdb(), "tzrec_ext.rocksdb is not installed; skipping.")
 @mark_ci_scope("gpu")
 class RocksDBTableTest(unittest.TestCase):

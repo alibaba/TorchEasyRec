@@ -48,7 +48,6 @@ from tzrec.utils import fx_util
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
-    ci_resources,
     cleanup_cuda_memory,
     create_test_model,
     cutlass_hstu_unavailable,
@@ -473,7 +472,6 @@ def _build_request_permuted_batch(device: torch.device) -> Batch:
     ).to(device)
 
 
-@ci_resources(slots=1)
 @mark_ci_scope("gpu")
 class DlrmHSTUOneRankTest(unittest.TestCase):
     """End-to-end tests of the OneRank model on the PYTORCH/CUTLASS kernels."""
