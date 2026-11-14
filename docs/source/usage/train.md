@@ -217,6 +217,25 @@ export STORAGE_RESERVE_PERCENT=0.5
 export HOST_MEMORY_RESERVE_PERCENT=0.15
 ```
 
+### MILP 分片规划
+
+默认仍使用 DP 规划。设置 `TZREC_PLANNER=milp` 可启用 MILP，同时选择每张表的分片候选和各 shard 的 rank，约束各 rank 的 HBM 用量及各 node 的 DDR、SSD 总用量，并优化最慢 rank 的预计耗时。
+
+启用 `train_config.rocksdb_config` 的 RocksDB 后端后，自动使用 MILP。
+
+```bash
+export TZREC_PLANNER=milp
+export TZREC_MILP_TIME_LIMIT_SECONDS=60.0
+export TZREC_MILP_RELATIVE_GAP=0.001
+```
+
+- `TZREC_MILP_TIME_LIMIT_SECONDS`：求解器时间预算（秒），默认 `60.0`，必须为正有限数。
+- `TZREC_MILP_RELATIVE_GAP`：预计性能成本的相对最优性容差，默认 0.001（0.1%）。
+
+支持动态表的 `row_wise` 和静态表的 `data_parallel`、`row_wise`、`table_wise`、`column_wise`、`table_row_wise`、`table_column_wise`，保留后两种分片及依赖表的同 host 放置约束。暂不支持 `grid_shard`。
+
+MILP 的求解器超时默认 60 秒，不包含候选枚举、建模与结果校验，求解器退出也可能略超预算。
+
 (embedding-sharding-constraints)=
 
 ### Embedding分片约束
@@ -254,7 +273,7 @@ train_config {
 每个特征可以在`embedding_constraints`中配置两个从训练数据测量的参数来使得EmbeddingPlanner根据数据分布更合理地进行规划：
 
 - `pooling_factor`：一个样本通过该特征查这张表的平均原始Id位置数（含重复），最小为1。规划器用它估算每步查表量、输入输出张量大小和通信量
-- `unique_id_factor`：单个样本通过共用这张表的所有特征查表的去重Id数的最大值（注意与`pooling_factor`不同，它不是平均值，而是最重的一个样本的去重数）。`batch_size * unique_id_factor`是这张表保守的cache工作集估计（例如dynamicemb GPU cache需要容纳它）
+- `unique_id_factor`：每个 global batch 内，共用物理 embedding 表的所有特征、所有样本的 ID 联合去重数除以该批实际样本数，再取多个 batch 的最大值。共享表只统计一次，同一个结果写入各成员特征。尾批使用实际样本数归一化。
 
 ```
 feature_configs {
@@ -262,10 +281,10 @@ feature_configs {
         feature_name: "tag"
         embedding_dim: 8
         embedding_constraints {
-            # 平均每个样本36.3个原始Id；最重的一个样本41个去重Id
-            # batch_size=1024时，该表单个batch的去重工作集估计为1024*41=41984
+            # 平均每样本36.3个原始Id；global batch联合去重后每样本因子为4.1
+            # local batch_size=1024时，每分片工作集估计为1024*4.1
             pooling_factor: 36.3
-            unique_id_factor: 41
+            unique_id_factor: 4.1
         }
     }
 }
@@ -277,9 +296,14 @@ feature_configs {
 python -m tzrec.tools.add_pooling_factor_to_config \
     --pipeline_config_path pipeline.config \
     --output_path pipeline_measured.config \
+    --dataset_type OdpsDataset \
+    --input_path 'odps://your_project/tables/your_table/ds=20261111' \
+    --batch_size 4096 \
     --num_batches 100
 ```
 
-- 表的划分从配置的`feature_groups`解析（与模型构建一致，含ZCH表），不构建模型；遵循标准`feature_groups`语义的自定义模型无需导入模型类即可使用。ZCH表的去重计数基于原始Id，不代表碰撞后的行工作集
+统计用单进程执行，建议将 `--batch_size` 设置为目标训练的 global batch size，即 `local_batch_size × world_size`。`num_batches` 表示采样多少个 global batch。
+
+`--dataset_type`、`--input_path` 和 `--batch_size` 仅覆盖本次统计的数据集类型、输入路径和 batch size，未传时沿用原配置。输出配置只会更新 `pooling_factor` 和 `unique_id_factor`，原来的训练数据源、batch size 及其他配置会被保留。
 
 注: 数据分布变化后请重新测量；测量值不保证覆盖未来的数据

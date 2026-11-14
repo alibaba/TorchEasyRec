@@ -17,11 +17,10 @@ message ParameterConstraints {
     // tzrec.tools.add_pooling_factor_to_config to measure it from training
     // data. the planner uses it for input, output and communication estimates.
     optional float pooling_factor = 3;
-    // largest number of distinct ids one sample looks up in this table
-    // through all the features that share it (their per-sample union). a
-    // conservative cache working-set estimate of the table is
-    // batch_size * unique_id_factor. measured jointly for the sharing
-    // features and aggregated with max; unset below means not measured.
+    // Maximum over global batches of joint distinct table IDs / actual samples.
+    // Union includes all samples and all sharing features. Members receive the
+    // same value. Planner multiplies by local batch size for a per-rank working
+    // set assuming uniform ID sharding; no additional world-size division.
     optional float unique_id_factor = 4;
 }
 

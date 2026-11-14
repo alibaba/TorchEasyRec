@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import dataclasses
 import math
 import os
@@ -22,10 +23,7 @@ from torchrec.distributed.planner import (
     planners,
     shard_estimators,
 )
-from torchrec.distributed.planner.estimator.types import (
-    HardwarePerfConfig,
-    ShardPerfContext,
-)
+from torchrec.distributed.planner.estimator.types import ShardPerfContext
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     SharderData,
@@ -52,6 +50,7 @@ from tzrec.optim.optimizer import (
     sparse_init_accumulator_value,
 )
 from tzrec.protos import feature_pb2
+from tzrec.utils import rocksdb_util
 from tzrec.utils.logging_util import logger
 
 _DYNAMICEMB_CACHING_X_EFF_BASE = 0.28
@@ -62,31 +61,25 @@ DYNAMICEMB_CACHE_BUCKET_CAPACITY = 1024
 _DYNAMICEMB_CACHE_OVERFLOW_BUCKETS = 3
 
 
-class DynamicEmbTableMemory(NamedTuple):
-    """Physical per-shard capacities of one dynamicemb candidate.
+class DynamicEmbTableStorage(NamedTuple):
+    """Per-shard capacities and table storage costs of one dynamicemb candidate.
 
     Fields:
-        hbm_values: value+optimizer bytes in HBM (cache tier plus its overflow
-            area for CACHING).
-        host_values: value+optimizer bytes on the host (full backing table for
-            CACHING, remainder partition for HYBRID).
-        hbm_index: HBM hash-map metadata bytes: per-slot key/digest/score
-            words and reference counters, plus per-bucket size counters.
-            Host tiers keep their key maps on HBM too.
-        hbm_rows: HBM value rows including the cache overflow area.
-        host_rows: host value rows.
-        resident_rows: rows credited toward normal cache residency -- the cache
-            tier without its overflow area (all HBM value rows otherwise).
-        local_hbm_for_values: requested value bytes, before physical tier rounding.
+        resident_rows: normal GPU cache capacity for CACHING, excluding its
+            overflow area; GPU partition capacity for other placements.
+        backing_rows: full backing-table capacity for CACHING; backing
+            partition capacity for HYBRID, including conservative endpoint
+            capacity needed for fused layouts.
+        local_hbm_for_values: requested GPU value+optimizer bytes for the
+            runtime, before physical bucket rounding.
+        storage: table-only HBM/DDR/SSD costs, excluding admission counters,
+            pipeline I/O and any shared backend overhead.
     """
 
-    hbm_values: int
-    host_values: int
-    hbm_index: int
-    hbm_rows: int
-    host_rows: int
     resident_rows: int
+    backing_rows: int
     local_hbm_for_values: int
+    storage: Storage
 
     @classmethod
     def from_options(
@@ -95,8 +88,8 @@ class DynamicEmbTableMemory(NamedTuple):
         options: "dynamicemb.DynamicEmbTableOptions",
         *,
         ratio: float,
-    ) -> "DynamicEmbTableMemory":
-        """Estimate the value budget and physical HBM and DDR bytes for one shard.
+    ) -> "DynamicEmbTableStorage":
+        """Estimate the value budget and HBM, DDR and SSD costs for one shard.
 
         The options carry the aligned per-rank max_capacity; the tensor supplies
         the embedding width, dtype and optimizer. The caching mode comes from
@@ -111,11 +104,15 @@ class DynamicEmbTableMemory(NamedTuple):
         ratio * shard_rows * row_bytes to whole bytes and cap it at full_bytes - 1.
         The runtime splits rows using that byte budget divided by full_bytes.
 
-        Physical table storage uses the resulting bucket-rounded capacities::
+        Built-in table storage uses the resulting bucket-rounded capacities::
 
-            HBM = hbm_rows * row_bytes + hbm_index
-            DDR = host_rows * row_bytes
+            physical_hbm_rows = resident_rows + overflow_rows
+            storage.hbm = physical_hbm_rows * row_bytes + key_map_bytes_total
+            storage.ddr = backing_rows * row_bytes
             key_map_bytes = slots * (8 + 1 + 8 * score_words + 4) + 4 * buckets
+
+        Here overflow_rows is zero outside CACHING, and key_map_bytes_total
+        includes all tier maps charged to HBM.
 
         HYBRID divides values between the two tiers. Each tier takes at least one
         row, rounded up to a whole bucket: 1024 rows on HBM, the table's bucket
@@ -123,19 +120,28 @@ class DynamicEmbTableMemory(NamedTuple):
         include the resident cache plus three overflow buckets. Only resident rows
         count toward cache coverage.
 
-        Every tier's key map lives on HBM, including the host tier's. Each slot
+        Built-in tiers keep their key maps on HBM, including the host tier.
+        A RocksDB backing keeps its key map in the database instead. Each slot
         stores a key, digest, score words and reference counter; each bucket also
         has a size counter. LRU+LFU stores two score words (timestamp and frequency);
         other policies store one. The cache overflow has its own map. A full
         NO_EVICTION map stores the value row index in its score word and has twice
         as many slots as value rows.
 
+        RocksDB charges backing metadata to DDR and live records, eviction
+        indexes and cache-writeback versions to SSD. Temporary growth before
+        eviction uses the topology's SSD reserve rather than a batch-size term.
+
         For zero and full budgets, take the larger cost per field across the
-        standalone endpoint and its placement in a fused HYBRID group. NO_EVICTION
-        cannot form a HYBRID group. The storage estimator charges admission
-        counters and pipeline I/O separately.
+        standalone endpoint and its placement in a fused HYBRID group. The
+        host-only endpoint has the full shard as backing_rows; the ordinary
+        full endpoint retains one backing bucket for a fused HYBRID layout.
+        NO_EVICTION cannot form a HYBRID group and has zero backing_rows at
+        the full endpoint. The storage estimator charges admission counters
+        and pipeline I/O separately.
         """
         caching = options.caching
+        rocksdb_backing = rocksdb_util.is_rocksdb_options(options)
         if not 0.0 <= ratio <= 1.0 or (caching and ratio in (0.0, 1.0)):
             raise ValueError(
                 f"invalid dynamicemb placement: caching={caching}, {ratio=}"
@@ -146,7 +152,8 @@ class DynamicEmbTableMemory(NamedTuple):
         multiplier = _get_optimizer_multipler(
             getattr(tensor, "_optimizer_classes", [None])[0], tensor.shape, tensor.dtype
         )
-        row_bytes = (dim + round(dim * multiplier)) * tensor.element_size()
+        optimizer_state_dim = round(dim * multiplier)
+        row_bytes = (dim + optimizer_state_dim) * tensor.element_size()
         width = options.bucket_capacity
         strategy = options.score_strategy
         score_words = score_policy_num_scores(get_score_policy(strategy).policy)
@@ -175,11 +182,11 @@ class DynamicEmbTableMemory(NamedTuple):
                 overflow = _DYNAMICEMB_CACHE_OVERFLOW_BUCKETS * cache_width
                 cache_words = 1 if no_eviction else score_words
                 hbm, host = resident + overflow, shard_rows
-                index = (
-                    full_index
-                    + _keymap_bytes(resident, cache_width, cache_words)
-                    + _keymap_bytes(overflow, overflow, cache_words)
-                )
+                index = _keymap_bytes(
+                    resident, cache_width, cache_words
+                ) + _keymap_bytes(overflow, overflow, cache_words)
+                if not rocksdb_backing:
+                    index += full_index
             else:
                 hbm = resident
                 host = _bucket_rounded_rows(
@@ -190,8 +197,31 @@ class DynamicEmbTableMemory(NamedTuple):
                 )
                 if ratio == 1:
                     index = max(index, full_index)
+        storage = Storage(hbm=hbm * row_bytes + index, ddr=host * row_bytes, ssd=0)
+        if rocksdb_backing:
+            from tzrec_ext.rocksdb import (
+                index_entry_bytes,
+                logical_row_bytes,
+                metadata_cache_bytes,
+            )
+
+            record_bytes = logical_row_bytes(
+                dim, optimizer_state_dim, tensor.element_size()
+            )
+            index_bytes = index_entry_bytes() if not no_eviction else 0
+            storage.ddr = metadata_cache_bytes(
+                shard_rows, record_bytes, not no_eviction
+            )
+            live_bytes = shard_rows * (record_bytes + index_bytes)
+            storage.ssd = (
+                math.ceil(rocksdb_util.SST_FACTOR * live_bytes)
+                + resident * record_bytes
+            )
         return cls(
-            hbm * row_bytes, host * row_bytes, index, hbm, host, resident, budget
+            resident_rows=resident,
+            backing_rows=host,
+            local_hbm_for_values=budget,
+            storage=storage,
         )
 
 
@@ -282,41 +312,61 @@ def _validate_eval_initializer_for_tombstones(
         )
 
 
-def _dynamicemb_effective_cache_ratio(
-    cache_load_factor: Optional[float],
-    caching: bool,
-    stats: Optional[Any] = None,
+def _dynamicemb_effective_bandwidth(
+    sharding_option: ShardingOption,
+    topology: Topology,
 ) -> float:
-    """Effective HBM-hit ratio for the dynamicemb perf model.
+    """Estimate DynamicEmb bandwidth without changing its allocated cache share.
 
-    The bandwidth model uses ``(x_eff*hbm_bw + (1-x_eff)*hbm_to_ddr_bw) / 10``.
-    The candidate's load factor ``x`` is its allocated HBM share; ``x_eff`` is
-    the bandwidth weight fitted from an A10 sweep (power-law access, alpha=1.05):
+    The bandwidth weight is fitted from an A10 sweep (power-law access,
+    alpha=1.05): partial CACHING uses a 0.28 base (3.3x slower than HBM-only),
+    partial HYBRID a 0.11 base (6.8x slower). The 0.01 * ratio term breaks
+    ties between otherwise similar partial placements. These weights are
+    calibration values, not measured cache hit rates.
 
-      * Partial CACHING: 3.3x slower than HBM-only -> base 0.28.
-      * Partial HYBRID: 6.8x slower than HBM-only -> base 0.11.
+    CACHING statistics override the fitted weight with one minus the expected
+    miss rate, clamped to [0, 1]. Otherwise the full endpoint uses HBM
+    bandwidth and the zero non-caching endpoint uses the host link. The
+    weight jump from partial HYBRID to full budget models the HBM-only
+    transition; the runtime takes that path only when the entire fused group
+    fits, so this remains a per-table approximation. All cases scale the
+    weighted bandwidth by 0.1. Bandwidth units follow the topology.
 
-    Within each partial mode, measured performance was roughly flat. The
-    ``0.01 * x`` term lets the DP break ties. The roughly 8x jump in ``x_eff``
-    from HYBRID at x=0.9 to the full endpoint at x=1 is intentional: it
-    models the switch to the HBM-only kernel. The runtime makes that switch
-    when the entire fused group fits, not when a single member is fully funded.
-    The zero-budget non-caching endpoint is scored as host access (x_eff=0).
+    RocksDB-backed candidates use SSD bandwidth for the backing link in this
+    approximation; the topology's host-link bandwidth remains unchanged.
 
-    For CACHING candidates with measured stats, ``1 - stats.expected_miss_rate(x)``
-    overrides the fitted value, clamped to [0, 1].
+    Args:
+        sharding_option: Candidate carrying DynamicEmb options and cache stats.
+        topology: Hardware bandwidths used by the performance estimator.
+
+    Returns:
+        Effective bandwidth for the candidate's shard contexts.
     """
-    x = float(cache_load_factor) if cache_load_factor is not None else 0.0
+    options = sharding_option.dynamicemb_options
+    params = sharding_option.cache_params
+    ratio = sharding_option.cache_load_factor
+    stats = params.stats if params is not None else None
+    x = float(ratio) if ratio is not None else 0.0
     x = max(0.0, min(1.0, x))
-    if caching and stats is not None:
-        miss_rate = float(stats.expected_miss_rate(x))
-        return max(0.0, min(1.0, 1.0 - miss_rate))
-    if x >= 1.0:
-        return 1.0
-    if not caching and cache_load_factor == 0.0:
-        return 0.0
-    base = _DYNAMICEMB_CACHING_X_EFF_BASE if caching else _DYNAMICEMB_HYBRID_X_EFF_BASE
-    return base + _DYNAMICEMB_X_EFF_TIEBREAK * x
+    if options.caching and stats is not None:
+        weight = max(0.0, min(1.0, 1.0 - float(stats.expected_miss_rate(x))))
+    elif x >= 1.0:
+        weight = 1.0
+    elif not options.caching and ratio == 0.0:
+        weight = 0.0
+    else:
+        base = (
+            _DYNAMICEMB_CACHING_X_EFF_BASE
+            if options.caching
+            else _DYNAMICEMB_HYBRID_X_EFF_BASE
+        )
+        weight = base + _DYNAMICEMB_X_EFF_TIEBREAK * x
+    backing_bw = (
+        topology.ssd_mem_bw
+        if rocksdb_util.is_rocksdb_options(options)
+        else topology.hbm_to_ddr_mem_bw
+    )
+    return (weight * topology.hbm_mem_bw + (1 - weight) * backing_bw) / 10
 
 
 def _log_dynamicemb_table_plan(
@@ -738,7 +788,7 @@ if has_dynamicemb:
                 optimizer_kwargs = getattr(tensor, "_optimizer_kwargs", [{}])[0]
                 dynamicemb_options.training = optimizer_class is not None
                 dynamicemb_options.local_hbm_for_values = (
-                    sharding_option.dynamicemb_memory.local_hbm_for_values
+                    sharding_option.dynamicemb_storage.local_hbm_for_values
                 )
                 # Fill in per-shard fields that used to be populated by
                 # dynamicemb's internal ``_get_dynamicemb_options_per_table``.
@@ -808,37 +858,6 @@ if has_dynamicemb:
     # pyre-ignore [9]
     planners.to_sharding_plan = _to_sharding_plan
 
-    _orig_hw_perf_config_get_device_bw = HardwarePerfConfig.get_device_bw
-
-    def _customized_kernel_aware_get_device_bw(
-        self,  # pyre-ignore [2]
-        compute_device: str,
-        compute_kernel: str,
-        hbm_mem_bw: float,
-        ddr_mem_bw: float,
-        ssd_mem_bw: float,
-        hbm_to_ddr_mem_bw: float,
-        caching_ratio: Optional[float] = None,
-        prefetch_pipeline: bool = False,
-    ) -> Optional[float]:
-        if compute_kernel == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value:
-            cr = caching_ratio if caching_ratio is not None else 0.0
-            return (cr * hbm_mem_bw + (1 - cr) * hbm_to_ddr_mem_bw) / 10
-        return _orig_hw_perf_config_get_device_bw(
-            self,
-            compute_device,
-            compute_kernel,
-            hbm_mem_bw,
-            ddr_mem_bw,
-            ssd_mem_bw,
-            hbm_to_ddr_mem_bw,
-            caching_ratio,
-            prefetch_pipeline,
-        )
-
-    # pyre-ignore [9]
-    HardwarePerfConfig.get_device_bw = _customized_kernel_aware_get_device_bw
-
     _orig_build_shard_perf_contexts = (
         ShardPerfContext.build_shard_perf_contexts.__func__
     )
@@ -855,35 +874,25 @@ if has_dynamicemb:
     ):
         """Estimate performance from allocated residency without changing the budget."""
         dynamicemb_options = getattr(sharding_option, "dynamicemb_options", None)
-        original_cache_params = sharding_option.cache_params
-        if dynamicemb_options is not None and shard_sizes:
-            x_eff = _dynamicemb_effective_cache_ratio(
-                sharding_option.cache_load_factor,
-                caching=bool(dynamicemb_options.caching),
-                stats=original_cache_params.stats if original_cache_params else None,
-            )
-            sharding_option.cache_params = (
-                dataclasses.replace(original_cache_params, load_factor=x_eff)
-                if original_cache_params is not None
-                else CacheParams(load_factor=x_eff)
-            )
-        # try/finally so an estimator exception cannot leak the boosted
-        # cache_params clone into the storage estimator's view of the
-        # same ShardingOption.
-        try:
-            result = _orig_build_shard_perf_contexts(
-                cls,
-                config,
-                shard_sizes,
-                sharding_option,
-                topology,
-                constraints,
-                *args,
-                **kwargs,
-            )
-        finally:
-            sharding_option.cache_params = original_cache_params
-        return result
+        if dynamicemb_options is not None:
+            config = copy.copy(config)
+            config.kernel_device_bandwidths = {
+                **config.kernel_device_bandwidths,
+                (
+                    topology.compute_device.lower(),
+                    sharding_option.compute_kernel.lower(),
+                ): _dynamicemb_effective_bandwidth(sharding_option, topology),
+            }
+        return _orig_build_shard_perf_contexts(
+            cls,
+            config,
+            shard_sizes,
+            sharding_option,
+            topology,
+            constraints,
+            *args,
+            **kwargs,
+        )
 
     # pyre-ignore [9]
     ShardPerfContext.build_shard_perf_contexts = classmethod(
@@ -902,7 +911,7 @@ if has_dynamicemb:
         local_world_size: int,
         input_lengths: List[float],
         num_poolings: List[float],
-        dynamicemb_memory: DynamicEmbTableMemory,
+        dynamicemb_storage: DynamicEmbTableStorage,
         dynamicemb_options: dynamicemb.DynamicEmbTableOptions,
         is_pooled: bool,
         input_data_type_size: float,
@@ -941,7 +950,8 @@ if has_dynamicemb:
             is_inference: bool, whether the model is for inference.
             multipass_prefetch_max_pass (int): multipass prefetch max_pass
             dynamicemb_options (DynamicEmbTableOptions): dynamic embedding options.
-            dynamicemb_memory: capacity shared by all row-wise shards of this candidate.
+            dynamicemb_storage (DynamicEmbTableStorage): capacities and table
+                storage costs shared by all row-wise shards of this candidate.
 
         Returns:
             List[Storage]: storage object for each device in topology.
@@ -973,10 +983,10 @@ if has_dynamicemb:
             slots = _bucket_rounded_rows(counter.capacity, width)
             counter_hbm_specific_size = _keymap_bytes(slots, width, score_words=1)
 
+        table_storage = dynamicemb_storage.storage
         return [
             Storage(
-                hbm=dynamicemb_memory.hbm_values
-                + dynamicemb_memory.hbm_index
+                hbm=table_storage.hbm
                 + counter_hbm_specific_size
                 + shard_estimators.calculate_pipeline_io_cost(
                     input_size=input_size,
@@ -987,7 +997,8 @@ if has_dynamicemb:
                     count_ephemeral_storage_cost=count_ephemeral_storage_cost,
                     is_inference=is_inference,
                 ),
-                ddr=dynamicemb_memory.host_values,
+                ddr=table_storage.ddr,
+                ssd=table_storage.ssd,
             )
             for input_size, output_size in zip(input_sizes, output_sizes)
         ]
