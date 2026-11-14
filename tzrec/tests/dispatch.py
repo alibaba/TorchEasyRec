@@ -295,11 +295,17 @@ def local(args: argparse.Namespace) -> int:
                 ),
                 TZREC_CI_HARDWARE=args.hardware,
                 PYTHONPATH=".",
-                TRITON_CACHE_DIR=str(Path(workdirs.name) / f"cache-{slot}" / "triton"),
-                TORCHINDUCTOR_CACHE_DIR=str(
-                    Path(workdirs.name) / f"cache-{slot}" / "inductor"
-                ),
             )
+            for variable, kind in (
+                ("TRITON_CACHE_DIR", "triton"),
+                ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+            ):
+                cache = (
+                    Path(env.get(variable, str(Path(workdirs.name) / kind)))
+                    / f"worker-{slot}"
+                )
+                cache.mkdir(parents=True, exist_ok=True)
+                env[variable] = str(cache.resolve())
             processes.append(
                 subprocess.Popen(
                     [

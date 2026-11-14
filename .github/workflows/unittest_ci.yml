@@ -26,23 +26,27 @@ jobs:
       - name: RunUnitTestCI
         id: tests
         run: |
-          JOB_ROOT="$TZCI_JOB_ROOT/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -p "$JOB_ROOT/report"
-          printf '%s\n' "report_dir=$JOB_ROOT/report" >> "$GITHUB_OUTPUT"
+          WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
+          REPORT_DIR="../report_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          CACHE_ROOT="$RUNNER_WORKSPACE/tzrec-ci-cache"
+          mkdir -p "$CACHE_ROOT/triton" "$CACHE_ROOT/inductor"
+          RECEIPT_DIR="$TZCI_JOB_ROOT/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$RECEIPT_DIR"
           docker run --rm --pull=always --name "gpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
-            --label "tzci.job=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --workdir /job/repo \
+            --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
             --gpus all --cpus=160 --memory=1672g --shm-size=512g --ulimit memlock=-1 \
             -e GITHUB_ACTIONS=true -e CI=true \
             -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT -e TZCI_BOOT_ID \
-            -e TZREC_CI_RECEIPT=/ci-receipt -e TZREC_CI_ENV=/tmp/ci-env \
-            -e TRITON_CACHE_DIR=/tmp/ci-cache/triton -e TORCHINDUCTOR_CACHE_DIR=/tmp/ci-cache/inductor \
-             -e CUDA_HOME=/usr/local/cuda-13 -e LD_LIBRARY_PATH=/usr/local/cuda-13/compat \
-            -v "$GITHUB_WORKSPACE/run_${GITHUB_RUN_ID}":/job/repo \
-            -v "$JOB_ROOT":/ci-receipt -v "$JOB_ROOT/report":/ci-results \
+            -e TZREC_CI_RECEIPT=/ci-receipt \
+            -e TRITON_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/triton \
+            -e TORCHINDUCTOR_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/inductor \
+            -e CUDA_HOME=/usr/local/cuda-13 -e LD_LIBRARY_PATH=/usr/local/cuda-13/compat \
+            -e PIP_CACHE_DIR=/root/.cache/pip \
+            -v "$WORK_ROOT":/__w \
+            -v "$RECEIPT_DIR":/ci-receipt \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5 \
-            bash scripts/ci/ci_test.sh --parallel --scope gpu --session /ci-results --device-groups '0,1;2,3;4,5;6,7' --hardware h20 --timeout 21600
+            bash -eo pipefail scripts/ci/ci_test.sh --parallel --scope gpu --session "$REPORT_DIR" --device-groups '0,1;2,3;4,5;6,7' --hardware h20 --timeout 21600
       - name: StopDockerContainer
         if: always()
         run: |
@@ -50,11 +54,11 @@ jobs:
           docker rm -f "gpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
       - name: Retain test evidence
         id: artifacts
-        if: always() && steps.tests.outputs.report_dir != ''
+        if: always() && steps.tests.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: gpu-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.tests.outputs.report_dir }}
+          path: ${{ github.workspace }}/report_${{ github.run_id }}_${{ github.run_attempt }}
           retention-days: 14
           if-no-files-found: error
       - name: Clean job directories
@@ -64,5 +68,5 @@ jobs:
         run: |
           rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}"
           if [ "$ARTIFACT_OUTCOME" = success ]; then
-            rm -rf -- "${TZCI_JOB_ROOT:?}/${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}/report"
+            rm -rf -- "${GITHUB_WORKSPACE:?}/report_${GITHUB_RUN_ID:?}_${GITHUB_RUN_ATTEMPT:?}"
           fi

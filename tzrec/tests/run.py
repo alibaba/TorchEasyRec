@@ -265,7 +265,7 @@ def main() -> int:
 
         from tzrec.tests import ci_execution, ci_protocol
 
-        report_dir = Path(args.report_dir)
+        report_dir = Path(args.report_dir).resolve()
         report_dir.mkdir(parents=True, exist_ok=True)
         os.environ["TZREC_CI_EVENT_LOG"] = str(report_dir / "events.jsonl")
         report_cases = [
