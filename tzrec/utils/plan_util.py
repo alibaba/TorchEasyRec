@@ -12,6 +12,7 @@
 import copy
 import json
 import os
+from functools import partial
 from queue import Queue
 from typing import List, Optional, cast
 
@@ -26,14 +27,14 @@ from torchrec.distributed.planner.proposers import UniformProposer
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
-from torchrec.distributed.planner.types import Topology
+from torchrec.distributed.planner.types import PlannerError, PlannerErrorType, Topology
 from torchrec.distributed.sharding_plan import (
     get_default_sharders as _get_default_sharders,
 )
 from torchrec.distributed.types import ModuleSharder
 
 from tzrec.protos import feature_pb2
-from tzrec.utils import env_util, resource_util
+from tzrec.utils import env_util, resource_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
 from tzrec.utils.planner.enumerators import EmbeddingEnumerator
@@ -46,6 +47,7 @@ def create_planner(
     ckpt_plan_path: Optional[str] = None,
     global_constraints_cfg: Optional[feature_pb2.ParameterConstraints] = None,
     model: Optional[nn.Module] = None,
+    rocksdb: Optional["rocksdb_util.RocksDBRuntime"] = None,
 ) -> EmbeddingPlannerBase:
     """Create an embedding sharding planner.
 
@@ -76,6 +78,20 @@ def create_planner(
         local_world_size=local_world_size,
         reserve_percent=host_reserve_percent,
     )
+    allow_rocksdb = rocksdb is not None
+    if allow_rocksdb:
+        cfg = rocksdb.config
+        sharing_ranks = (
+            dist.get_world_size() if cfg.shared_across_nodes else local_world_size
+        )
+        topo_kwargs["ssd_cap"] = resource_util.ssd_capacity_per_rank(
+            cfg.root_dir,
+            sharing_ranks=sharing_ranks,
+            budget_bytes=cfg.ssd_budget_bytes
+            if cfg.HasField("ssd_budget_bytes")
+            else None,
+            reserve_bytes=rocksdb_util.SSD_RESERVE_BYTES,
+        )
     if "INTRA_NODE_BANDWIDTH" in os.environ:
         topo_kwargs["intra_host_bw"] = float(os.environ["INTRA_NODE_BANDWIDTH"])
     if "CROSS_NODE_BANDWIDTH" in os.environ:
@@ -86,6 +102,21 @@ def create_planner(
         compute_device=device.type,
         **topo_kwargs,
     )
+
+    ddr_caps = tuple(d.storage.ddr or 0 for d in topology.devices)
+    if allow_rocksdb:
+        shared = rocksdb_util.shared_storage(local_world_size)
+        for device_storage in topology.devices:
+            if not shared.fits_in(device_storage.storage):
+                available = device_storage.storage
+                raise PlannerError(
+                    "insufficient capacity for the configured RocksDB shared reserve: "
+                    f"DDR available={available.ddr} bytes, "
+                    f"required={shared.ddr} bytes; "
+                    f"SSD available={available.ssd} bytes, required={shared.ssd} bytes",
+                    PlannerErrorType.INSUFFICIENT_STORAGE,
+                )
+            device_storage.storage = device_storage.storage - shared
 
     # build storage reservation
     # If experience OOM, increase the percentage. see
@@ -165,9 +196,19 @@ def create_planner(
         batch_size=batch_size,
         fqn_constraints=fqn_constraints,
         global_constraints=global_constraints,
+        allow_rocksdb=allow_rocksdb,
     )
+    callbacks = None
+    if allow_rocksdb:
+        callbacks = [
+            partial(
+                rocksdb_util.configure_backend,
+                ddr_caps=ddr_caps,
+                local_world_size=local_world_size,
+            )
+        ]
     planner_type = os.environ.get("TZREC_PLANNER", "dp")
-    if planner_type == "milp":
+    if allow_rocksdb or planner_type == "milp":
         from tzrec.utils.planner.planners import MILPEmbeddingShardingPlanner
 
         return MILPEmbeddingShardingPlanner(
@@ -175,6 +216,7 @@ def create_planner(
             batch_size=batch_size,
             enumerator=enumerator,
             storage_reservation=storage_reservation,
+            callbacks=callbacks,
             relative_gap=float(os.environ.get("TZREC_MILP_RELATIVE_GAP", "0.001")),
             time_limit=float(os.environ.get("TZREC_MILP_TIME_LIMIT_SECONDS", "60.0")),
         )

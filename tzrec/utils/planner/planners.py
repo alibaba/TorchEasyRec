@@ -43,7 +43,7 @@ from tzrec.utils.logging_util import logger
 
 
 class _MILPPlacementModel:
-    """Select table options and place shards under rank HBM and node DDR constraints.
+    """Select and place table shards under rank HBM and node DDR/SSD constraints.
 
     Each option's index is its binary selection variable. Shard-to-rank mappings
     reference selection, host or shard-placement variables, depending on the
@@ -58,15 +58,18 @@ class _MILPPlacementModel:
         self._num_hosts, remainder = divmod(self._world_size, self._host_size)
         if remainder:
             raise ValueError("MILP requires complete hosts in the topology")
-        # DDR pools follow physical nodes, not potentially larger placement groups.
+        # DDR/SSD pools follow physical nodes, not larger placement groups.
         self._node_size = topology.local_world_size
-        self._node_ddr_capacities = [
-            sum(
-                device.storage.ddr
-                for device in topology.devices[start : start + self._node_size]
+        self._node_storage_capacities = []
+        for start in range(0, self._world_size, self._node_size):
+            devices = topology.devices[start : start + self._node_size]
+            self._node_storage_capacities.append(
+                Storage(
+                    hbm=0,
+                    ddr=sum(d.storage.ddr for d in devices),
+                    ssd=sum(d.storage.ssd for d in devices),
+                )
             )
-            for start in range(0, self._world_size, self._node_size)
-        ]
         supported = {
             ShardingType.ROW_WISE.value,
             ShardingType.DATA_PARALLEL.value,
@@ -253,7 +256,7 @@ class _MILPPlacementModel:
             )
 
     def _add_cost_constraints(self) -> None:
-        """Aggregate shard HBM/perf by rank and DDR by physical node.
+        """Aggregate shard HBM/perf by rank and DDR/SSD by physical node.
 
         Normalize resource costs by capacity and performance by a common scale.
         This changes neither the byte budgets nor the estimated execution costs;
@@ -263,8 +266,8 @@ class _MILPPlacementModel:
         rank_hbm_terms: List[List[tuple[int, float]]] = [
             [] for _ in range(self._world_size)
         ]
-        node_ddr_terms: List[List[tuple[int, float]]] = [
-            [] for _ in self._node_ddr_capacities
+        node_storage_terms: List[List[List[tuple[int, float]]]] = [
+            [[], []] for _ in self._node_storage_capacities
         ]
         rank_perf_terms: List[List[tuple[int, float]]] = [
             [] for _ in range(self._world_size)
@@ -284,11 +287,18 @@ class _MILPPlacementModel:
                 for rank, placement_variable in rank_variables.items():
                     node = rank // self._node_size
                     hbm_fraction = shard.storage.hbm / max(rank_hbm_capacities[rank], 1)
-                    ddr_fraction = shard.storage.ddr / max(
-                        self._node_ddr_capacities[node], 1
-                    )
                     rank_hbm_terms[rank].append((placement_variable, hbm_fraction))
-                    node_ddr_terms[node].append((placement_variable, ddr_fraction))
+                    node_capacity = self._node_storage_capacities[node]
+                    for resource, (cost, capacity) in enumerate(
+                        zip(
+                            (shard.storage.ddr, shard.storage.ssd),
+                            (node_capacity.ddr, node_capacity.ssd),
+                        )
+                    ):
+                        capacity_fraction = cost / max(capacity, 1)
+                        node_storage_terms[node][resource].append(
+                            (placement_variable, capacity_fraction)
+                        )
                     rank_perf_terms[rank].append((placement_variable, scaled_perf_cost))
         for rank, capacity in enumerate(rank_hbm_capacities):
             self._add_constraint(
@@ -301,12 +311,11 @@ class _MILPPlacementModel:
                 lower=-np.inf,
                 upper=0,
             )
-        for node, capacity in enumerate(self._node_ddr_capacities):
-            self._add_constraint(
-                node_ddr_terms[node],
-                lower=-np.inf,
-                upper=1 if capacity > 0 else 0,
-            )
+        for node, capacity in enumerate(self._node_storage_capacities):
+            for terms, limit in zip(
+                node_storage_terms[node], (capacity.ddr, capacity.ssd)
+            ):
+                self._add_constraint(terms, lower=-np.inf, upper=1 if limit > 0 else 0)
 
     def decode_plan(self, solution: np.ndarray) -> List[ShardingOption]:
         """Recover selected options, assign ranks and check exact byte capacities."""
@@ -339,6 +348,7 @@ class _MILPPlacementModel:
                 assert shard.storage is not None
                 used_storage[shard.rank].hbm += shard.storage.hbm
                 used_storage[shard.rank].ddr += shard.storage.ddr
+                used_storage[shard.rank].ssd += shard.storage.ssd
             plan.append(option)
         for rank, (storage, device) in enumerate(
             zip(used_storage, self._topology.devices)
@@ -349,17 +359,21 @@ class _MILPPlacementModel:
                     f"required HBM={storage.hbm}, available HBM={device.storage.hbm}",
                     PlannerErrorType.PARTITION,
                 )
-        for node, capacity in enumerate(self._node_ddr_capacities):
+        for node, capacity in enumerate(self._node_storage_capacities):
             start = node * self._node_size
-            used_ddr = sum(
-                storage.ddr for storage in used_storage[start : start + self._node_size]
+            node_usage = sum(
+                used_storage[start : start + self._node_size], Storage(hbm=0, ddr=0)
             )
-            if used_ddr > capacity:
-                raise PlannerError(
-                    f"MILP placement exceeds exact byte capacity on node {node}: "
-                    f"required DDR={used_ddr}, available DDR={capacity}",
-                    PlannerErrorType.PARTITION,
-                )
+            for name in ("ddr", "ssd"):
+                used = getattr(node_usage, name)
+                available = getattr(capacity, name)
+                if used > available:
+                    raise PlannerError(
+                        f"MILP placement exceeds exact byte capacity on node {node}: "
+                        f"required {name.upper()}={used}, "
+                        f"available {name.upper()}={available}",
+                        PlannerErrorType.PARTITION,
+                    )
         return plan
 
 
@@ -382,7 +396,7 @@ def _solve_milp_placement(
     if result.status == 2:
         raise PlannerError(
             "MILP found no feasible selection and placement under the per-rank "
-            "HBM, per-node DDR and sharding constraints",
+            "HBM, per-node DDR/SSD and sharding constraints",
             PlannerErrorType.STRICT_CONSTRAINTS,
         )
     solution = result.x
@@ -417,7 +431,7 @@ class MILPEmbeddingShardingPlanner(EmbeddingPlannerBase):
     and table-column-wise sharding. Host-local shards and dependent tables stay
     on one host. GRID_SHARD is explicitly unsupported. The solver minimizes the
     maximum per-rank estimated performance cost, matching NoopPerfModel.
-    HBM is constrained per rank; DDR is shared by ranks on the same node.
+    HBM is constrained per rank; DDR and SSD are shared within each node.
     A feasible incumbent is accepted at timeout after exact capacity validation,
     even if the relative gap has not been reached.
 

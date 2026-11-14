@@ -134,27 +134,36 @@ def _dynamicemb_partial_ratios(low: float) -> List[float]:
 
 
 def _emit_dynamicemb_variants(
-    base_option: ShardingOption, unique_id_factor: Optional[float]
+    base_option: ShardingOption,
+    unique_id_factor: Optional[float],
+    allow_rocksdb: bool = False,
 ) -> List[ShardingOption]:
     """Expand a DynamicEmb sharding option into caching and non-caching candidates.
 
     Without an explicit load factor, search the zero and full value budgets
     and both partial-budget modes. A configured unique-id factor sets the
-    working-set floor for CACHING; zero requests at least one row.
+    working-set floor; a zero factor uses a one-row floor.
     HYBRID starts at min(floor, 0.1), CACHING at max(floor, 0.1).
-    Without that factor, partial grids start at 0.1. The grids use up to
-    five geometric points through 0.5, then fixed
+    Without that factor, built-in grids start at 0.1 and RocksDB at 0.01.
+    The built-in partial grids use five geometric points through 0.5, then fixed
     tenths up to 0.9. An explicit partial ratio requests both modes at that
     budget. A cache must cover the working set; a cache covering the entire
     shard is represented by the full non-caching endpoint.
 
-    In automatic search, keep the first budget for each set of rounded tier
-    capacities within a mode. Zero, partial and full budgets remain distinct:
-    equal row estimates do not imply the same layout after native fusion.
+    In automatic search, keep the first built-in budget for each set of
+    rounded tier capacities within a mode. Zero, partial and full budgets
+    remain distinct: equal row estimates do not imply the same layout after
+    native fusion.
     Within a mode the HBM value rows follow from the resident rows -- equal
     for HYBRID, plus the fixed overflow area for CACHING -- so the key tracks
-    only the resident and backing rows. The DP proposer uses the candidates'
-    HBM and host costs to select a plan.
+    only the resident and backing rows. The planner uses the candidates'
+    resource and performance costs to select a plan.
+
+    With RocksDB planning, a table with a supported single score strategy
+    can also use CACHING_PS. An explicit partial ratio requests exactly that
+    value budget. Only automatic search uses the ten-point geometric grid
+    from the working-set floor to ``0.5``. A cache that cannot cover the
+    batch or already covers the whole shard needs no RocksDB candidate.
 
     The caller supplies base_option.dynamicemb_options. Each emitted option
     owns a deep copy of its table options and reports the allocated share as
@@ -169,7 +178,7 @@ def _emit_dynamicemb_variants(
         raise ValueError("DynamicEmb shard rows must match the per-rank max_capacity")
     if unique_id_factor is None:
         required = math.ceil(base_option.batch_size * sum(base_option.input_lengths))
-        floor = 0.1
+        builtin_floor, rocksdb_floor = 0.1, 0.01
     else:
         if not math.isfinite(unique_id_factor) or unique_id_factor < 0:
             raise ValueError(
@@ -181,24 +190,48 @@ def _emit_dynamicemb_variants(
             * base_option.batch_size
         )
         required = min(rows, required)
-        floor = max(required, 1) / rows
+        builtin_floor = rocksdb_floor = max(required, 1) / rows
 
     params = base_option.cache_params
+    requests: List[Tuple[bool, float, Any]]
+    rocksdb_ratios: List[float] = []
     if params is None:
-        requests = [(False, 0.0)]
-        requests.extend((False, r) for r in _dynamicemb_partial_ratios(min(floor, 0.1)))
-        requests.extend((True, r) for r in _dynamicemb_partial_ratios(max(floor, 0.1)))
-        requests.append((False, 1.0))
+        requests = [(False, 0.0, None)]
+        requests.extend(
+            (False, r, None)
+            for r in _dynamicemb_partial_ratios(min(builtin_floor, 0.1))
+        )
+        requests.extend(
+            (True, r, None) for r in _dynamicemb_partial_ratios(max(builtin_floor, 0.1))
+        )
+        requests.append((False, 1.0, None))
+        if allow_rocksdb and rocksdb_floor <= 0.5:
+            rocksdb_ratios = sorted(
+                set(np.geomspace(rocksdb_floor, 0.5, num=10).tolist())
+            )
     else:
         ratio = float(params.load_factor)
-        requests = [(False, ratio)]
+        requests = [(False, ratio, None)]
         if 0 < ratio < 1:
-            requests.append((True, ratio))
+            requests.append((True, ratio, None))
+            rocksdb_ratios = [ratio]
+
+    if (
+        allow_rocksdb
+        and rocksdb_ratios
+        and getattr(options.score_strategy, "name", None)
+        in ("STEP", "TIMESTAMP", "LFU", "NO_EVICTION")
+    ):
+        from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+
+        factory = RocksDBStorageFactory(None, base_option.fqn)
+        requests.extend((True, ratio, factory) for ratio in rocksdb_ratios)
 
     candidates = []
     seen = set()
-    for caching, requested in requests:
+    for caching, requested, external_storage in requests:
         options.caching = caching
+        options.external_storage = external_storage
         ratio = requested
         dynamicemb_storage = DynamicEmbTableStorage.from_options(
             tensor, options, ratio=ratio
@@ -211,8 +244,8 @@ def _emit_dynamicemb_variants(
             options.caching
             and dynamicemb_storage.resident_rows >= dynamicemb_storage.backing_rows
         ):
-            if params is None:
-                continue  # Automatic search already includes the full endpoint.
+            if params is None or external_storage is not None:
+                continue  # A full cache uses the built-in endpoint.
             options.caching = False
             ratio = 1.0
         if ratio != requested:
@@ -221,7 +254,7 @@ def _emit_dynamicemb_variants(
             )
         if options.caching and dynamicemb_storage.resident_rows < required:
             continue
-        if params is None:
+        if params is None and external_storage is None:
             endpoint = ratio if ratio in (0, 1) else None
             key = (
                 options.caching,
@@ -249,6 +282,7 @@ def _emit_dynamicemb_variants(
         )
         option.dynamicemb_storage = dynamicemb_storage
         candidates.append(option)
+
     return candidates
 
 
@@ -268,6 +302,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
             fqns to provided ParameterConstraints.
         global_constraints (Optional[ParameterConstraints]): all parameters provided
             ParameterConstraints.
+        allow_rocksdb: Whether to enumerate eligible RocksDB candidates.
     """
 
     def __init__(
@@ -279,6 +314,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         use_exact_enumerate_order: Optional[bool] = False,
         fqn_constraints: Optional[Dict[str, ParameterConstraints]] = None,
         global_constraints: Optional[ParameterConstraints] = None,
+        allow_rocksdb: bool = False,
     ) -> None:
         if not estimator:
             estimator = [
@@ -290,6 +326,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         )
         self._fqn_constraints = fqn_constraints
         self._global_constraints = global_constraints
+        self.allow_rocksdb = allow_rocksdb
 
     def _get_constraints(
         self, child_path: str, name: str
@@ -454,7 +491,9 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                             sharding_option.dynamicemb_options = dynamicemb_options
                             sharding_options_per_table.extend(
                                 _emit_dynamicemb_variants(
-                                    sharding_option, unique_id_factor
+                                    sharding_option,
+                                    unique_id_factor,
+                                    self.allow_rocksdb,
                                 )
                             )
                         else:

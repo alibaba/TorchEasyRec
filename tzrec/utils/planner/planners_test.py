@@ -72,6 +72,7 @@ def _topology(world=2, local=2, capacity=10):
         compute_device="cuda",
         hbm_cap=capacity,
         ddr_cap=capacity,
+        ssd_cap=capacity,
     )
 
 
@@ -111,26 +112,34 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("uneven", 18, True),
-            ("exact_capacity", 20, True),
-            ("exceeds_node", 21, False),
+            ("ddr_uneven", 1, 18, True),
+            ("ddr_exact_capacity", 1, 20, True),
+            ("ddr_exceeds_node", 1, 21, False),
+            ("ssd_uneven", 2, 18, True),
+            ("ssd_exact_capacity", 2, 20, True),
+            ("ssd_exceeds_node", 2, 21, False),
         ],
         name_func=parameterized_name_func,
     )
-    def test_ddr_capacity_per_node(self, name, ddr, fits):
+    def test_host_storage_capacity_per_node(self, name, axis, size, fits):
         topology = _topology(world=4, local=2)
-        space = [_option("a", "table_wise", [[1, ddr]])]
+        resource = ("hbm", "ddr", "ssd")[axis]
+        cost = [1, 0, 0]
+        cost[axis] = size
+        space = [_option("a", "table_wise", [cost])]
         if fits:
             plan = _solve_milp_placement(space, topology, 0)
             shard = plan[0].shards[0]
             self.assertGreater(
-                shard.storage.ddr, topology.devices[shard.rank].storage.ddr
+                getattr(shard.storage, resource),
+                getattr(topology.devices[shard.rank].storage, resource),
             )
             node_start = shard.rank // 2 * 2
             self.assertLessEqual(
-                shard.storage.ddr,
+                getattr(shard.storage, resource),
                 sum(
-                    d.storage.ddr for d in topology.devices[node_start : node_start + 2]
+                    getattr(d.storage, resource)
+                    for d in topology.devices[node_start : node_start + 2]
                 ),
             )
         else:
@@ -140,7 +149,8 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
                 cm.exception.error_type, PlannerErrorType.STRICT_CONSTRAINTS
             )
 
-    def test_ddr_pool_does_not_span_a_pod(self):
+    @parameterized.expand([("ddr", 1), ("ssd", 2)], name_func=parameterized_name_func)
+    def test_host_storage_pool_does_not_span_a_pod(self, name, axis):
         topology = Topology(
             world_size=4,
             local_world_size=2,
@@ -148,8 +158,11 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
             compute_device="cuda",
             hbm_cap=10,
             ddr_cap=10,
+            ssd_cap=10,
         )
-        space = [_option("rw", "row_wise", [[1, 11], [1, 11], [1, 0], [1, 0]])]
+        costs = [[1, 0, 0] for _ in range(4)]
+        costs[0][axis] = costs[1][axis] = 11
+        space = [_option("rw", "row_wise", costs)]
         with self.assertRaises(PlannerError) as cm:
             _solve_milp_placement(space, topology, 0)
         self.assertEqual(cm.exception.error_type, PlannerErrorType.STRICT_CONSTRAINTS)
@@ -203,20 +216,21 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
         rng = np.random.default_rng(seed)
         groups = []
         for i in range(4):
-            replica_cost = rng.integers(1, 5, 2).tolist()
+            replica_cost = rng.integers(1, 5, 3).tolist()
+            replica_cost[2] = 0
             replica_perf = int(rng.integers(1, 6))
             groups.append(
                 [
                     _option(
                         str(i),
                         "row_wise",
-                        rng.integers(1, 5, (2, 2)).tolist(),
+                        rng.integers(1, 5, (2, 3)).tolist(),
                         rng.integers(1, 6, 2).tolist(),
                     ),
                     _option(
                         str(i),
                         "table_wise",
-                        rng.integers(3, 9, (1, 2)).tolist(),
+                        rng.integers(3, 9, (1, 3)).tolist(),
                         rng.integers(2, 10, 1).tolist(),
                     ),
                     _option(
@@ -233,7 +247,7 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
             movable = sum(o.sharding_type == "table_wise" for o in choices)
             for positions in itertools.product(range(2), repeat=movable):
                 positions = iter(positions)
-                used = np.zeros((2, 2), dtype=np.int64)
+                used = np.zeros((2, 3), dtype=np.int64)
                 perfs = [0.0, 0.0]
                 for option in choices:
                     ranks = (
@@ -245,25 +259,27 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
                         used[rank] += [
                             shard.storage.hbm,
                             shard.storage.ddr,
+                            shard.storage.ssd,
                         ]
                         perfs[rank] += shard.perf.total
-                if np.all(used[:, 0] <= 14) and used[:, 1].sum() <= 28:
+                if np.all(used[:, 0] <= 14) and np.all(used[:, 1:].sum(axis=0) <= 28):
                     best = min(best, max(perfs))
         plan = _solve_milp_placement(
             [o for group in groups for o in group], _topology(capacity=14), 0
         )
         self.assertEqual(len({o.fqn for o in plan}), 4)
-        used = np.zeros((2, 2), dtype=np.int64)
+        used = np.zeros((2, 3), dtype=np.int64)
         perfs = [0.0, 0.0]
         for option in plan:
             for shard in option.shards:
                 used[shard.rank] += [
                     shard.storage.hbm,
                     shard.storage.ddr,
+                    shard.storage.ssd,
                 ]
                 perfs[shard.rank] += shard.perf.total
         self.assertTrue(np.all(used[:, 0] <= 14))
-        self.assertLessEqual(used[:, 1].sum(), 28)
+        self.assertTrue(np.all(used[:, 1:].sum(axis=0) <= 28))
         self.assertEqual(max(perfs), best)
 
     def test_timeout_without_solution_is_not_infeasibility(self):
@@ -324,12 +340,12 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
             )
 
     @parameterized.expand(
-        [("hbm", 0, "rank"), ("ddr", 1, "node")],
+        [("hbm", 0, "rank"), ("ddr", 1, "node"), ("ssd", 2, "node")],
         name_func=parameterized_name_func,
     )
     def test_rejects_timeout_plan_over_byte_capacity(self, name, axis, scope):
         capacity = 1 << 30
-        cost = [0, 0]
+        cost = [0, 0, 0]
         cost[axis] = capacity + 1
         space = [_option("a", "table_wise", [cost])]
         solve = planners.milp
@@ -353,6 +369,18 @@ class MILPEmbeddingShardingPlannerTest(unittest.TestCase):
                     space, _topology(world=1, local=1, capacity=capacity), 0
                 )
         self.assertEqual(cm.exception.error_type, PlannerErrorType.PARTITION)
+
+    def test_zero_ssd_selects_memory_candidate(self):
+        topology = _topology()
+        for device in topology.devices:
+            device.storage.ssd = 0
+        options = [
+            _option("a", "table_wise", [[1, 0, 1]], [1]),
+            _option("a", "table_wise", [[1, 0, 0]], [2]),
+        ]
+        plan = _solve_milp_placement(options, topology, 0)
+        self.assertEqual(plan[0].total_storage.ssd, 0)
+        self.assertEqual(plan[0].total_perf, 2)
 
     def test_grid_shard_is_not_silently_ignored(self):
         with self.assertRaisesRegex(NotImplementedError, "grid_shard"):
