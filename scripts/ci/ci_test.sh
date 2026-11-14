@@ -9,7 +9,7 @@ export -n SHELLOPTS
 
 if [ "${1:-}" = --parallel ]; then
   shift
-  exec env MKL_THREADING_LAYER=GNU PYTHONPATH=. python tzrec/tests/dispatch.py local "$@"
+  exec env MKL_THREADING_LAYER=GNU PYTHONPATH=. python tzrec/tests/dispatch.py "$@"
 fi
 
 MKL_THREADING_LAYER=GNU PYTHONPATH=. python tzrec/tests/run.py "$@"

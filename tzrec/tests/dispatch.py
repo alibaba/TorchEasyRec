@@ -1,4 +1,4 @@
-# Copyright (c) 2026, Alibaba Group;
+# Copyright (c) 2024, Alibaba Group;
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -8,179 +8,52 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Dispatch unittest groups locally or to externally isolated CI workers."""
+"""Dispatch exact unittest groups into isolated CPU slots or accelerator pairs."""
 
 import argparse
 import importlib
-import json
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import traceback
 import uuid
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING or __package__:
-    from tzrec.tests import ci_execution as execution
-    from tzrec.tests import ci_protocol as wire
+    from tzrec.tests import run
 else:
-    execution = importlib.import_module("ci_execution")
-    wire = importlib.import_module("ci_protocol")
+    run = importlib.import_module("run")
 
 
-def baseline(args: argparse.Namespace) -> int:
-    """Discover once and complete groups requiring the original device view."""
-    from tzrec.tests.worker import run_group
-
-    session = args.session.resolve()
-    session.mkdir(parents=True, exist_ok=True)
-    if (session / "manifest.json").exists():
-        raise ValueError("session already contains a manifest; use a fresh session")
-    for name in ("results", "logs"):
-        (session / name).mkdir(exist_ok=True)
-    durations = wire.read_json(args.durations) if args.durations else {}
-    cases = execution.discover(args.test_dir, args.pattern, args.scope)
-    manifest = dict(
-        version=wire.VERSION,
-        session_id=args.session_id,
-        scope=args.scope,
-        test_dir=args.test_dir,
-        pattern=args.pattern,
-        deadline=time.time() + args.timeout,
-        groups=execution.group_cases(cases, durations),
-    )
-    manifest["digest"] = wire.digest(manifest)
-    wire.write_json(session / "manifest.json", manifest)
-    for group in manifest["groups"]:
-        if group["devices"] == "baseline":
-            run_group(session, manifest, group, args.test_dir)
-    pairs = any(g["devices"] != "baseline" for g in manifest["groups"])
-    wire.write_json(
-        session / "phase.json",
-        dict(
-            version=wire.VERSION,
-            session_id=args.session_id,
-            next="pairs" if pairs else "finish",
-        ),
-    )
-    return 0
+def group_cases(cases: list[dict]) -> list[dict]:
+    """Group at certified fixture boundaries, retaining discovery order."""
+    groups: dict[tuple, dict] = {}
+    for case in cases:
+        boundary = case["module"]
+        if case["split"] == "class":
+            boundary = case["id"].rsplit(".", 1)[0]
+        elif case["split"] == "case":
+            boundary = case["id"]
+        key = (case["route"], case["split"], boundary)
+        group = groups.setdefault(key, dict(cases=[], devices=case["devices"]))
+        group["cases"].append(case)
+        if case["devices"] == "baseline":
+            group["devices"] = "baseline"
+    return list(groups.values())
 
 
-def serve(session: Path, workers: int, session_id: str) -> int:
-    """Assign each group once and reject incomplete worker results."""
-    manifest = wire.read_manifest(session)
-    if manifest["version"] != wire.VERSION or manifest["session_id"] != session_id:
-        raise ValueError("manifest identity mismatch")
-    pairs = [g for g in manifest["groups"] if g["devices"] != "baseline"]
-    if workers < 0 or (pairs and workers == 0):
-        raise ValueError("no workers for pending device groups")
-    queue = deque(sorted(pairs, key=lambda g: (-g["estimate"], g["key"])))
-    seen: set[int] = set()
-    completed: set[str] = set()
-    errors: list[str] = []
-    lock = threading.Lock()
-    threads = []
-    sockets = []
-    server = wire.session_socket(session, listen=True)
-
-    def handle(sock: socket.socket) -> None:
-        """Keep a single worker's assignments and receipts in order."""
-        try:
-            sock.settimeout(max(0.01, manifest["deadline"] - time.time()))
-            with sock.makefile("rwb") as stream:
-                message = wire.receive(stream)
-                slot = message.get("slot")
-                with lock:
-                    if (
-                        message.get("kind") != "ready"
-                        or message.get("version") != wire.VERSION
-                        or message.get("session_id") != session_id
-                        or message.get("digest") != manifest["digest"]
-                        or type(slot) is not int
-                        or slot not in range(workers)
-                        or slot in seen
-                        or message.get("devices", 0) < 2
-                    ):
-                        raise ValueError("invalid or duplicate worker registration")
-                    seen.add(slot)
-                while True:
-                    with lock:
-                        if errors:
-                            raise RuntimeError("another worker failed")
-                        group = queue.popleft() if queue else None
-                    if group is None:
-                        wire.send(stream, dict(kind="stop"))
-                        return
-                    wire.send(
-                        stream,
-                        dict(kind="run", group=group["key"], digest=manifest["digest"]),
-                    )
-                    message = wire.receive(stream)
-                    if message != dict(
-                        kind="done", group=group["key"], digest=manifest["digest"]
-                    ):
-                        raise ValueError("receipt does not match assignment")
-                    report = wire.read_json(
-                        session / "results" / f"{group['key']}.json"
-                    )
-                    check = execution.verify(dict(manifest, groups=[group]), [report])
-                    if check["code"] == 2:
-                        raise ValueError("invalid group receipt")
-                    with lock:
-                        completed.add(group["key"])
-                    print(
-                        f"Completed {group['key']} ({len(group['cases'])} cases)",
-                        flush=True,
-                    )
-        except Exception as error:
-            with lock:
-                errors.append(str(error))
-        finally:
-            sock.close()
-
-    try:
-        server.settimeout(min(120, max(0.01, manifest["deadline"] - time.time())))
-        for _ in range(workers):
-            sock, _ = server.accept()
-            sockets.append(sock)
-            thread = threading.Thread(target=handle, args=(sock,), daemon=True)
-            threads.append(thread)
-            thread.start()
-        while any(t.is_alive() for t in threads):
-            if errors or time.time() >= manifest["deadline"]:
-                raise RuntimeError("; ".join(errors) or "job deadline exceeded")
-            for thread in threads:
-                thread.join(timeout=0.1)
-        if errors or seen != set(range(workers)) or len(completed) != len(pairs):
-            raise RuntimeError("; ".join(errors) or "workers did not finish the plan")
-        reports = [
-            wire.read_json(session / "results" / f"{g['key']}.json")
-            for g in manifest["groups"]
-        ]
-        summary = execution.verify(manifest, reports)
-        summary["durations"] = {
-            c["id"]: c["seconds"] for r in reports for c in r["cases"]
-        }
-        wire.write_json(session / "summary.json", summary)
-        return summary["code"]
-    finally:
-        server.close()
-        for sock in sockets:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            sock.close()
-        (session / "dispatch.sock").unlink(missing_ok=True)
+def cpu_shards(groups: list[dict], count: int) -> list[dict]:
+    """Stripe the groups of each module across CPU slots without splitting fixtures."""
+    shards: list[list[dict]] = [[] for _ in range(count)]
+    for index, group in enumerate(groups):
+        shards[index % count].extend(group["cases"])
+    return [dict(cases=cases, devices=0) for cases in shards if cases]
 
 
 def device_groups(value: str, visible: list[str]) -> list[list[str]]:
@@ -194,198 +67,255 @@ def device_groups(value: str, visible: list[str]) -> list[list[str]]:
     return [[visible[i] for i in group] for group in groups]
 
 
-def local(args: argparse.Namespace) -> int:
-    """Run the same protocol with fresh processes on a local CUDA machine."""
-    import torch
-
-    count = torch.cuda.device_count()
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
-        visible = [str(i) for i in range(count)]
-    visible = visible[:count]
-    pairs = device_groups(args.device_groups, visible)
-    from tzrec.tests import ci_devices
-
-    buses = ci_devices.visible_buses()
-    expected = {device: buses[index] for index, device in enumerate(visible)}
-    baseline_env = dict(os.environ)
-    if args.hardware == "ppu":
-        baseline_env["CUDA_VISIBLE_DEVICES"] = ",".join(pairs[0])
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "baseline",
-        "--session",
-        str(args.session),
-        "--session-id",
-        args.session_id,
-        "--test-dir",
-        args.test_dir,
-        "--pattern",
-        args.pattern,
-        "--timeout",
-        str(args.timeout),
-    ]
-    if args.scope:
-        command += ["--scope", args.scope]
-    if args.durations:
-        command += ["--durations", str(args.durations)]
-    code = wire.run_process(command, timeout=args.timeout, env=baseline_env)
-    if code:
-        return code
-    session = args.session.resolve()
-    manifest = wire.read_manifest(session)
-    if not any(g["devices"] != "baseline" for g in manifest["groups"]):
-        return serve(session, 0, args.session_id)
-    Path("tmp").mkdir(exist_ok=True)
-    workdirs = tempfile.TemporaryDirectory(
-        dir=Path("tmp").resolve(), prefix="ci-workers-"
+def check_result(group: dict, report: dict, code: int) -> None:
+    """Require exactly one valid outcome per planned case and a matching exit."""
+    expected = Counter(c["id"] for c in group["cases"])
+    observed = Counter(c["id"] for c in report["cases"])
+    outcomes = {c["outcome"] for c in report["cases"]}
+    failures = {"failure", "error", "unexpected_success", "blocked_by_fixture"}
+    failed = bool(outcomes & failures) or any(
+        e["outcome"] != "skip" for e in report["fixtures"]
     )
-    processes: list[subprocess.Popen] = []
-    streams = []
-    previous = signal.getsignal(signal.SIGTERM)
+    if (
+        type(report["code"]) is not int
+        or code != report["code"]
+        or code != int(failed)
+        or report["group"] != group["key"]
+        or report["session_id"] != group["session_id"]
+        or not outcomes <= failures | {"success", "skip", "expected_failure"}
+        or expected != observed
+        or any(n != 1 for n in expected.values())
+    ):
+        raise RuntimeError(f"incomplete or inconsistent group: {group['key']}")
 
-    def cancel(signum: int, frame: Any) -> None:
-        """Clean all workers when the local job is cancelled."""
-        raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, cancel)
+def schedule(
+    groups: list[dict],
+    slots: list[tuple[Path, dict]],
+    session: Path,
+    deadline: float,
+    test_dir: str,
+) -> list[dict]:
+    """Start run.py directly, assigning another group when a slot becomes free."""
+    queue = deque(groups)
+    active: dict[int, tuple] = {}
+    reports = []
     try:
-        coordinator = subprocess.Popen(
-            [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "serve",
-                "--session",
-                str(session),
-                "--session-id",
-                args.session_id,
-                "--protocol",
-                str(wire.VERSION),
-                "--workers",
-                str(len(pairs)),
-            ],
-            start_new_session=True,
-            env=dict(os.environ, CUDA_VISIBLE_DEVICES=""),
-        )
-        processes.append(coordinator)
-        source = Path.cwd()
-        for slot, pair in enumerate(pairs):
-            checkout = Path(workdirs.name) / f"checkout-{slot}"
-            shutil.copytree(
-                source,
-                checkout,
-                symlinks=True,
-                ignore=shutil.ignore_patterns(
-                    ".git",
-                    "tmp",
-                    "experiments",
-                    ".hypothesis",
-                    "__pycache__",
-                    ".ruff_cache",
-                ),
-            )
-            log = (session / f"worker-{slot}.log").open("w")
-            streams.append(log)
-            env = dict(
-                os.environ,
-                CUDA_VISIBLE_DEVICES=",".join(pair),
-                TZREC_CI_EXPECTED_BUSES=json.dumps(
-                    [expected[device] for device in pair]
-                ),
-                TZREC_CI_HARDWARE=args.hardware,
-                PYTHONPATH=".",
-            )
-            for variable, kind in (
-                ("TRITON_CACHE_DIR", "triton"),
-                ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
-            ):
-                cache = (
-                    Path(env.get(variable, str(Path(workdirs.name) / kind)))
-                    / f"worker-{slot}"
-                )
-                cache.mkdir(parents=True, exist_ok=True)
-                env[variable] = str(cache.resolve())
-            processes.append(
-                subprocess.Popen(
-                    [
-                        sys.executable,
-                        "tzrec/tests/worker.py",
-                        "serve",
-                        "--session",
-                        str(session),
-                        "--protocol",
-                        str(wire.VERSION),
-                        "--slot",
-                        str(slot),
-                        "--test-dir",
-                        args.test_dir,
-                    ],
-                    cwd=checkout,
-                    env=env,
-                    stdout=log,
-                    stderr=log,
-                    start_new_session=True,
-                )
-            )
-        while coordinator.poll() is None:
-            if any(p.poll() not in (None, 0) for p in processes[1:]):
-                raise RuntimeError("worker process failed")
-            if time.time() >= manifest["deadline"]:
-                raise TimeoutError("job deadline exceeded")
-            time.sleep(0.2)
-        for process in processes[1:]:
-            if process.wait(timeout=15):
-                raise RuntimeError("worker exit disagrees with coordinator")
-        return coordinator.returncode
+        while queue or active:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("test job deadline exceeded")
+            for slot, (checkout, env) in enumerate(slots):
+                if slot in active:
+                    process, group, log = active[slot]
+                    code = process.poll()
+                    if code is None:
+                        continue
+                    run.terminate(process)
+                    log.close()
+                    del active[slot]
+                    path = session / "results" / (group["key"] + ".json")
+                    if not path.is_file():
+                        raise RuntimeError(
+                            f"group {group['key']} exited {code} without a result; "
+                            f"see {log.name}"
+                        )
+                    report = run.read_json(path)
+                    check_result(group, report, code)
+                    reports.append(report)
+                if queue:
+                    group = queue.popleft()
+                    group_file = session / "groups" / (group["key"] + ".json")
+                    output = session / "results" / group_file.name
+                    run.write_json(group_file, group)
+                    log = (session / "logs" / (group["key"] + ".log")).open("w")
+                    try:
+                        process = subprocess.Popen(
+                            [
+                                sys.executable,
+                                "tzrec/tests/run.py",
+                                "--group-file",
+                                str(group_file),
+                                "--output",
+                                str(output),
+                                "--test_dir",
+                                test_dir,
+                            ],
+                            cwd=checkout,
+                            env=env,
+                            start_new_session=True,
+                            stdout=log,
+                            stderr=log,
+                        )
+                    except BaseException:
+                        log.close()
+                        raise
+                    active[slot] = (process, group, log)
+            if active:
+                time.sleep(0.1)
+        return reports
     finally:
-        for process in reversed(processes):
-            wire.terminate(process)
-        for stream in streams:
-            stream.close()
-        signal.signal(signal.SIGTERM, previous)
-        (session / "dispatch.sock").unlink(missing_ok=True)
-        workdirs.cleanup()
+        for process, _, _ in active.values():
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        for process, _, log in active.values():
+            run.terminate(process)
+            log.close()
+
+
+def dispatch(args: argparse.Namespace) -> int:
+    """Execute the baseline first, then overlap only certified independent groups."""
+    cpu = args.hardware == "cpu"
+    if cpu:
+        if args.workers < 1 or args.device_groups or args.scope:
+            raise ValueError(
+                "CPU requires positive slots and full, device-free discovery"
+            )
+        pairs = [[] for _ in range(args.workers)]
+    else:
+        import torch
+
+        count = torch.cuda.device_count()
+        visible = (
+            os.environ.get("CUDA_VISIBLE_DEVICES") or ",".join(map(str, range(count)))
+        ).split(",")[:count]
+        if not args.device_groups:
+            raise ValueError("accelerator lanes require disjoint device pairs")
+        pairs = device_groups(args.device_groups, visible)
+    session = args.session.resolve()
+    session.mkdir(parents=True, exist_ok=True)
+    if any(session.iterdir()):
+        raise ValueError("use an empty report directory")
+    (session / "logs").mkdir()
+    (session / "results").mkdir()
+    deadline = time.monotonic() + args.timeout
+    started = time.monotonic()
+    env = dict(os.environ, PYTHONPATH=".")
+    if cpu:
+        env.update(CUDA_VISIBLE_DEVICES="", NVIDIA_VISIBLE_DEVICES="void")
+    elif args.hardware == "ppu":
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(pairs[0])
+    with tempfile.TemporaryDirectory() as temporary:
+        output = Path(temporary) / "discovery.json"
+        command = [
+            sys.executable,
+            "tzrec/tests/run.py",
+            "--discover-to",
+            str(output),
+            "--pattern",
+            args.pattern,
+            "--test_dir",
+            args.test_dir,
+        ]
+        if not cpu:
+            command.extend(["--scope", args.scope or "gpu"])
+        code = run.run_process(
+            command, timeout=max(0.01, deadline - time.monotonic()), env=env
+        )
+        if code:
+            raise RuntimeError(f"discovery exited with code {code}")
+        cases = run.read_json(output)
+    groups = group_cases(cases)
+    baseline = [g for g in groups if g["devices"] == "baseline"]
+    queued = [g for g in groups if g["devices"] != "baseline"]
+    if cpu:
+        baseline = (
+            [dict(cases=[c for g in baseline for c in g["cases"]], devices="baseline")]
+            if baseline
+            else []
+        )
+        queued = cpu_shards(queued, len(pairs))
+    plan = baseline + queued
+    identity = uuid.uuid4().hex
+    for i, group in enumerate(plan):
+        group.update(key=str(i), session_id=identity)
+        if cpu or group["devices"] != "baseline":
+            group["visible_devices"] = 0 if cpu else 2
+    run.write_json(session / "plan.json", dict(session_id=identity, groups=plan))
+    reports = schedule(baseline, [(Path.cwd(), env)], session, deadline, args.test_dir)
+    if queued:
+        Path("tmp").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            dir=Path("tmp").resolve(), prefix="ci-slots-"
+        ) as directory:
+            slots = []
+            for i, pair in enumerate(pairs[: len(queued)]):
+                checkout = Path(directory) / str(i)
+                shutil.copytree(
+                    Path.cwd(),
+                    checkout,
+                    symlinks=True,
+                    ignore=shutil.ignore_patterns(
+                        ".git",
+                        "tmp",
+                        "experiments",
+                        "__pycache__",
+                        ".hypothesis",
+                        ".ruff_cache",
+                    ),
+                )
+                slot_env = dict(env, CUDA_VISIBLE_DEVICES=",".join(pair))
+                if cpu:
+                    slot_env.update(
+                        OMP_NUM_THREADS="1",
+                        MKL_NUM_THREADS="1",
+                        OPENBLAS_NUM_THREADS="1",
+                    )
+                for variable, kind in (
+                    ("TRITON_CACHE_DIR", "triton"),
+                    ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+                ):
+                    cache = (
+                        Path(env.get(variable, str(Path(directory) / kind)))
+                        / f"worker-{i}"
+                    )
+                    cache.mkdir(parents=True, exist_ok=True)
+                    slot_env[variable] = str(cache.resolve())
+                slots.append((checkout, slot_env))
+            reports += schedule(queued, slots, session, deadline, args.test_dir)
+    expected = Counter(c["id"] for c in cases)
+    actual = Counter(c["id"] for report in reports for c in report["cases"])
+    if actual != expected or any(n != 1 for n in expected.values()):
+        raise RuntimeError("missing, unexpected or duplicate case results")
+    code = max(report["code"] for report in reports)
+    summary = dict(
+        session_id=identity,
+        planned=sum(expected.values()),
+        reported=sum(actual.values()),
+        code=code,
+        outcomes=dict(Counter(c["outcome"] for r in reports for c in r["cases"])),
+        seconds=time.monotonic() - started,
+    )
+    run.write_json(session / "summary.json", summary)
+    return code
 
 
 def main() -> int:
-    """Expose the versioned CLI without depending on the hosting platform."""
+    """Run all selected tests within one job-wide deadline."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("baseline", "serve", "local"))
-    parser.add_argument("--session", type=Path)
-    parser.add_argument("--session-id")
-    parser.add_argument(
-        "--protocol", type=int, choices=(wire.VERSION,), default=wire.VERSION
-    )
-    parser.add_argument("--scope", choices=("gpu", "h20"))
+    parser.add_argument("--session", type=Path, required=True)
+    parser.add_argument("--hardware", choices=("cpu", "h20", "ppu"), required=True)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--device-groups")
     parser.add_argument("--test-dir", default="tzrec")
     parser.add_argument("--pattern", default="*_test.py")
+    parser.add_argument("--scope", choices=("gpu", "h20"))
     parser.add_argument("--timeout", type=float, default=21600)
-    parser.add_argument("--durations", type=Path)
-    parser.add_argument("--device-groups")
-    parser.add_argument("--hardware", choices=("h20", "ppu"), default="h20")
-    parser.add_argument("--workers", type=int, default=0)
-    args = parser.parse_args()
-    if args.command != "local" and (not args.session or not args.session_id):
-        parser.error("baseline/serve require --session and --session-id")
-    args.session_id = args.session_id or uuid.uuid4().hex
-    args.session = (
-        args.session or Path("tmp") / ("dispatch-" + args.session_id)
-    ).resolve()
-    if args.command == "local":
-        if not args.device_groups:
-            parser.error("local requires --device-groups")
-        return local(args)
-    if args.command == "baseline":
-        return baseline(args)
-    return serve(args.session, args.workers, args.session_id)
+
+    def cancel(signum: int, frame: Any) -> None:
+        """Unwind through owned process cleanup when GitHub cancels the job."""
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, cancel)
+    return dispatch(parser.parse_args())
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        sys.exit(main())
     except KeyboardInterrupt:
-        raise SystemExit(130) from None
+        sys.exit(130)
     except Exception:
         traceback.print_exc()
-        raise SystemExit(2) from None
+        sys.exit(2)

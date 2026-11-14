@@ -232,6 +232,12 @@ class hypothesis_settings(_settings):
         )
 
 
+def cpu_parallel(obj: Any) -> Any:
+    """Allow this test boundary to overlap other CPU groups in private checkouts."""
+    obj._ci_cpu_parallel = True
+    return obj
+
+
 def ci_resources(devices: int = 2, split: str = "module") -> Any:
     """Declare a test boundary that can run on a CI device group.
 

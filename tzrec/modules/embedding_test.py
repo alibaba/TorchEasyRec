@@ -55,6 +55,7 @@ from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     TestGraphType,
     ci_resources,
+    cpu_parallel,
     create_test_module,
     mark_ci_scope,
     parameterized_name_func,
@@ -277,6 +278,7 @@ class SequencePoolingTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(result).all())
 
 
+@cpu_parallel
 @ci_resources(devices=2, split="case")
 class EmbeddingGroupTest(unittest.TestCase):
     def tearDown(self):
@@ -2036,6 +2038,7 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["buy.sequence_length"].size(), (2,))
 
 
+@cpu_parallel
 @ci_resources(devices=2, split="case")
 @mark_ci_scope("gpu")
 class HardSearchEmbeddingGroupTest(unittest.TestCase):

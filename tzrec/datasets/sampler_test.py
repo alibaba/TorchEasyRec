@@ -34,8 +34,10 @@ from tzrec.datasets.sampler import (
 )
 from tzrec.protos import sampler_pb2
 from tzrec.utils import misc_util
+from tzrec.utils.test_util import cpu_parallel
 
 
+@cpu_parallel
 class SamplerTest(unittest.TestCase):
     def setUp(self):
         self._temp_files = []

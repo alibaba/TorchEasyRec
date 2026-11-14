@@ -44,7 +44,7 @@ jobs:
             -e PIP_CACHE_DIR=/root/.cache/pip \
             -v "$WORK_ROOT":/__w \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5-cpu \
-            bash -eo pipefail scripts/ci/ci_test_cpu.sh --report-dir "$REPORT_DIR"
+            bash -eo pipefail scripts/ci/ci_test_cpu.sh --parallel --workers 4 --session "$REPORT_DIR"
       - name: StopDockerContainer
         if: always()
         run: |

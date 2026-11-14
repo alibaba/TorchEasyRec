@@ -13,11 +13,8 @@ import importlib
 import io
 import os
 import shutil
-import socket
 import subprocess
 import sys
-import threading
-import time
 import unittest
 from functools import partial
 from pathlib import Path
@@ -25,9 +22,7 @@ from unittest import mock
 
 from parameterized import parameterized
 
-from tzrec.tests import ci_execution as execution
-from tzrec.tests import ci_protocol as wire
-from tzrec.tests import dispatch
+from tzrec.tests import dispatch, run
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
@@ -66,7 +61,7 @@ class DispatchTest(unittest.TestCase):
 
         case = Example("test_example")
         result = unittest.TextTestRunner(
-            stream=io.StringIO(), verbosity=2, resultclass=execution.RecordingResult
+            stream=io.StringIO(), verbosity=2, resultclass=run.RecordingResult
         ).run(unittest.TestSuite([case]))
         report = result.report([{"id": case.id()}])
         self.assertEqual(report["code"], 1)
@@ -84,7 +79,7 @@ class DispatchTest(unittest.TestCase):
 
         case = Example("test_example")
         result = unittest.TextTestRunner(
-            stream=io.StringIO(), resultclass=execution.RecordingResult
+            stream=io.StringIO(), resultclass=run.RecordingResult
         ).run(unittest.TestSuite([case]))
         report = result.report([{"id": case.id()}])
         self.assertEqual(report["code"], 0)
@@ -114,7 +109,7 @@ class DispatchTest(unittest.TestCase):
 
         cases = [Example("test_one"), Example("test_two")]
         result = unittest.TextTestRunner(
-            stream=io.StringIO(), verbosity=2, resultclass=execution.RecordingResult
+            stream=io.StringIO(), verbosity=2, resultclass=run.RecordingResult
         ).run(unittest.TestSuite(cases))
         report = result.report([{"id": c.id()} for c in cases])
         self.assertEqual(report["code"], code)
@@ -142,7 +137,7 @@ class DispatchTest(unittest.TestCase):
             runner = TZRecTestRunner(
                 stream=io.StringIO(),
                 resultclass=partial(
-                    execution.RecordingResult, test_dir=str(self.path.resolve())
+                    run.RecordingResult, test_dir=str(self.path.resolve())
                 ),
             )
             result = runner.run(
@@ -159,34 +154,6 @@ class DispatchTest(unittest.TestCase):
             for key in list(sys.modules):
                 if key == package or key.startswith(package + "."):
                     sys.modules.pop(key)
-
-    def test_duplicate_missing_wrong_digest_and_invalid_outcomes_fail(self):
-        manifest = {
-            "session_id": "test",
-            "digest": "sha",
-            "groups": [{"key": "a", "cases": [{"id": "a.one"}, {"id": "a.two"}]}],
-        }
-        report = {
-            "version": wire.VERSION,
-            "digest": "sha",
-            "group": "a",
-            "code": 0,
-            "fixtures": [],
-            "cases": [
-                {"id": "a.one", "outcome": "success"},
-                {"id": "a.two", "outcome": "success"},
-            ],
-        }
-        self.assertEqual(execution.verify(manifest, [report])["code"], 0)
-        for broken in (
-            dict(report, cases=report["cases"][:1]),
-            dict(report, cases=report["cases"] + report["cases"][:1]),
-            dict(report, digest="wrong"),
-            dict(report, code=True),
-            dict(report, cases=[dict(c, outcome="invented") for c in report["cases"]]),
-        ):
-            self.assertEqual(execution.verify(manifest, [broken])["code"], 2)
-        self.assertEqual(execution.verify(manifest, [report, report])["code"], 2)
 
     def test_grouping_keeps_unknown_modules_exclusive(self):
         cases = [
@@ -205,12 +172,12 @@ class DispatchTest(unittest.TestCase):
                 route="main",
             ),
         ]
-        groups = execution.group_cases(cases, {})
+        groups = dispatch.group_cases(cases)
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0]["devices"], "baseline")
         self.assertEqual(groups[0]["cases"], cases)
         cases[0]["split"] = "case"
-        self.assertEqual(len(execution.group_cases(cases, {})), 2)
+        self.assertEqual(len(dispatch.group_cases(cases)), 2)
 
     def test_discovery_reuses_scope_and_rejects_fixture_splitting(self):
         from tzrec.tests import run
@@ -231,7 +198,7 @@ class DispatchTest(unittest.TestCase):
             run, "_gather_test_cases", return_value=(suite, unittest.TestSuite())
         ):
             with self.assertRaisesRegex(ValueError, "class fixture"):
-                execution.discover("tzrec", "*_test.py", "gpu")
+                run.discover("tzrec", "*_test.py", "gpu")
 
     @parameterized.expand(
         [
@@ -253,51 +220,6 @@ class DispatchTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             dispatch.device_groups(value, ["0", "1", "2", "3"])
 
-    def test_framing_rejects_eof_and_oversize(self):
-        for raw in (b"", b"{}", b"[]\n", b"x" * (wire.MAX_MESSAGE + 1)):
-            with self.assertRaises(ValueError):
-                wire.receive(io.BytesIO(raw))
-
-    def test_coordinator_cli_needs_only_the_standard_library(self):
-        manifest = dict(
-            version=wire.VERSION,
-            session_id="stdlib",
-            deadline=time.time() + 30,
-            groups=[dict(key="baseline", devices="baseline", cases=[dict(id="one")])],
-        )
-        manifest["digest"] = wire.digest(manifest)
-        wire.write_json(self.path / "manifest.json", manifest)
-        wire.write_json(
-            self.path / "results/baseline.json",
-            dict(
-                version=wire.VERSION,
-                digest=manifest["digest"],
-                group="baseline",
-                code=0,
-                cases=[dict(id="one", outcome="success", seconds=0)],
-                fixtures=[],
-            ),
-        )
-        process = subprocess.run(
-            [
-                sys.executable,
-                "-S",
-                str(Path(dispatch.__file__).resolve()),
-                "serve",
-                "--session",
-                str(self.path),
-                "--session-id",
-                "stdlib",
-                "--workers",
-                "0",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertEqual(wire.read_json(self.path / "summary.json")["reported"], 1)
-
     def test_process_timeout_kills_group(self):
         pidfile = self.path / "child.pid"
         command = [
@@ -312,89 +234,55 @@ class DispatchTest(unittest.TestCase):
             str(pidfile),
         ]
         with self.assertRaises(subprocess.TimeoutExpired):
-            wire.run_process(command, timeout=1)
+            run.run_process(command, timeout=1)
         pid = int(pidfile.read_text())
         status = Path(f"/proc/{pid}/status")
         self.assertTrue(not status.exists() or "State:\tZ" in status.read_text())
 
-    @unittest.skipUnless(
-        sys.platform == "linux", "Unix socket integration uses Linux dirfds"
-    )
-    def test_coordinator_handles_workers_finishing_out_of_order(self):
-        groups = [
-            dict(key=str(i), devices=2, estimate=i, cases=[{"id": f"case.{i}"}])
-            for i in range(4)
-        ]
-        manifest = dict(
-            version=wire.VERSION,
-            session_id="session",
-            deadline=time.time() + 10,
-            groups=groups,
+    def test_missing_duplicate_stale_or_false_green_result_is_rejected(self):
+        group = dict(
+            session_id="session", key="group", cases=[dict(id="a"), dict(id="b")]
         )
-        manifest["digest"] = wire.digest(manifest)
-        sha = manifest["digest"]
-        wire.write_json(self.path / "manifest.json", manifest)
-        outcome = []
+        cases = [dict(id="a", outcome="success"), dict(id="b", outcome="skip")]
+        report = dict(
+            session_id="session", group="group", cases=cases, fixtures=[], code=0
+        )
+        dispatch.check_result(group, report, 0)
+        for broken in (
+            dict(report, session_id="stale"),
+            dict(report, cases=cases[:1]),
+            dict(report, cases=[cases[0], cases[0]]),
+            dict(report, cases=[cases[0], dict(id="b", outcome="failure")]),
+            dict(report, code=True),
+            dict(report, group="other"),
+        ):
+            with self.assertRaises(RuntimeError):
+                dispatch.check_result(group, broken, 0)
 
-        def coordinate():
-            outcome.append(dispatch.serve(self.path, 2, "session"))
+    def test_cpu_parallelism_is_opt_in_not_inferred_from_device_count(self):
+        class Example(unittest.TestCase):
+            _ci_resources = (2, "case")
 
-        server = threading.Thread(target=coordinate)
-        server.start()
-        for _ in range(100):
-            if (self.path / "dispatch.sock").exists():
-                break
-            time.sleep(0.01)
+            def test_example(self):
+                pass
 
-        def worker(slot):
-            # A dirfd keeps the Unix socket address below the kernel path limit.
-            sock = socket.socket(socket.AF_UNIX)
-            directory = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                sock.connect(f"/proc/self/fd/{directory}/dispatch.sock")
-            finally:
-                os.close(directory)
-            with sock, sock.makefile("rwb") as stream:
-                wire.send(
-                    stream,
-                    dict(
-                        kind="ready",
-                        version=wire.VERSION,
-                        session_id="session",
-                        digest=sha,
-                        slot=slot,
-                        devices=2,
-                    ),
-                )
-                while True:
-                    work = wire.receive(stream)
-                    if work["kind"] == "stop":
-                        return
-                    key = work["group"]
-                    time.sleep(0.02 * (slot + 1))
-                    wire.write_json(
-                        self.path / "results" / f"{key}.json",
-                        dict(
-                            version=wire.VERSION,
-                            digest=sha,
-                            group=key,
-                            code=0,
-                            fixtures=[],
-                            cases=[
-                                dict(id=f"case.{key}", outcome="success", seconds=1)
-                            ],
-                        ),
-                    )
-                    wire.send(stream, dict(kind="done", group=key, digest=sha))
+        suite = unittest.TestSuite([Example("test_example")])
+        with mock.patch.object(
+            run, "_gather_test_cases", return_value=(suite, unittest.TestSuite())
+        ):
+            self.assertEqual(run.discover("tzrec", "*", None)[0]["devices"], "baseline")
+            Example._ci_cpu_parallel = True
+            self.assertEqual(run.discover("tzrec", "*", None)[0]["devices"], 0)
 
-        workers = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
-        for thread in workers:
-            thread.start()
-        for thread in workers + [server]:
-            thread.join(timeout=12)
-            self.assertFalse(thread.is_alive())
-        self.assertEqual(outcome, [0])
-        self.assertEqual(wire.read_json(self.path / "summary.json")["reported"], 4)
+    def test_four_cpu_shards_keep_each_fixture_boundary_intact(self):
+        groups = [
+            dict(cases=[dict(id=f"{i}.one"), dict(id=f"{i}.two")]) for i in range(9)
+        ]
+        shards = dispatch.cpu_shards(groups, 4)
+        self.assertEqual(len(shards), 4)
+        for i, group in enumerate(groups):
+            self.assertTrue(all(c in shards[i % 4]["cases"] for c in group["cases"]))
+        self.assertEqual(sum(len(s["cases"]) for s in shards), 18)
 
 
 if __name__ == "__main__":
