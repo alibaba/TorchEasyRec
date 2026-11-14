@@ -277,7 +277,7 @@ class SequencePoolingTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(result).all())
 
 
-@ci_resources(devices=2, split="case")
+@ci_resources(slots=1)
 class EmbeddingGroupTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("INPUT_TILE", None)
@@ -2036,7 +2036,7 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["buy.sequence_length"].size(), (2,))
 
 
-@ci_resources(devices=2, split="case")
+@ci_resources(slots=1)
 @mark_ci_scope("gpu")
 class HardSearchEmbeddingGroupTest(unittest.TestCase):
     def _run_in_subprocess(self):

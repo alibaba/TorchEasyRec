@@ -45,7 +45,7 @@ _QUANT_EMBS = (
 )
 
 
-@ci_resources(devices=2, split="case")
+@ci_resources(slots=2, split="case")
 class RankIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False

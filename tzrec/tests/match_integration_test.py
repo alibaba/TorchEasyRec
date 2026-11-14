@@ -23,7 +23,7 @@ from tzrec.utils.test_util import (
 )
 
 
-@ci_resources(devices=2, split="case")
+@ci_resources(slots=2, split="case")
 class MatchIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False

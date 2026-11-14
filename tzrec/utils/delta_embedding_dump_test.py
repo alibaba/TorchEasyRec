@@ -1052,7 +1052,7 @@ class ModelDeltaTrackerPlainLookupTest(unittest.TestCase):
         self.assertEqual(tracker.store.append.call_count, 2)
 
 
-@ci_resources(devices=2)
+@ci_resources(slots=2)
 class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_missing_config_skips_runtime_validation(self):
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
@@ -3503,7 +3503,7 @@ class DynamicembTombstoneEvalInitializerTest(unittest.TestCase):
         )
 
 
-@ci_resources(devices=2)
+@ci_resources(slots=2)
 @unittest.skipUnless(
     has_dynamicemb and _HAS_EVICTED_ITEM_MODE,
     "dynamicemb without EvictedItemMode is not installed; skipping.",
@@ -3549,7 +3549,7 @@ class DynamicembUtilAutoRetainTest(unittest.TestCase):
             build_dynamicemb_constraints(self.dynamicemb_cfg, self.emb_config)
 
 
-@ci_resources(devices=2)
+@ci_resources(slots=2)
 class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
     def __init__(self, methodName="runTest") -> None:
         super().__init__(methodName)
@@ -3678,7 +3678,7 @@ class DeltaEmbeddingDumpShardedIntegrationTest(MultiProcessTestBase):
         )
 
 
-@ci_resources(devices=2)
+@ci_resources(slots=2)
 class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
     """End-to-end multi-process delta dump over a sharded dynamicemb model.
 
@@ -3812,7 +3812,7 @@ class DeltaEmbeddingDumpDynamicembIntegrationTest(unittest.TestCase):
             )
 
 
-@ci_resources(devices=2)
+@ci_resources(slots=2)
 class DeltaEmbeddingDumpZchIntegrationTest(unittest.TestCase):
     """End-to-end multi-process delta dump over a sharded ZCH model.
 

@@ -238,7 +238,7 @@ def _build_batch(
     ).to(device)
 
 
-@ci_resources(devices=2)
+@ci_resources(slots=1)
 @mark_ci_scope("gpu")
 class HSTUMatchTest(unittest.TestCase):
     @given(

@@ -33,14 +33,14 @@ jobs:
           docker run --rm --pull=always --name "ppu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
             --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
-            --device=/dev/alixpu_ppu0 --device=/dev/alixpu_ppu1 --device=/dev/alixpu_ppu2 --device=/dev/alixpu_ppu3 --device=/dev/alixpu_ppu4 --device=/dev/alixpu_ppu5 --device=/dev/alixpu_ppu6 --device=/dev/alixpu_ppu7 --device=/dev/alixpu_ppu8 --device=/dev/alixpu_ppu9 --device=/dev/alixpu_ppu10 --device=/dev/alixpu_ppu11 --device=/dev/alixpu_ppu12 --device=/dev/alixpu_ppu13 --device=/dev/alixpu_ppu14 --device=/dev/alixpu_ppu15 --device=/dev/alixpu --device=/dev/alixpu_ctl --cpus=152 --memory=1672g --shm-size=256g --ulimit memlock=-1 \
+            --device=/dev/alixpu_ppu0 --device=/dev/alixpu_ppu1 --device=/dev/alixpu_ppu2 --device=/dev/alixpu_ppu3 --device=/dev/alixpu_ppu4 --device=/dev/alixpu_ppu5 --device=/dev/alixpu_ppu6 --device=/dev/alixpu_ppu7 --device=/dev/alixpu_ppu8 --device=/dev/alixpu_ppu9 --device=/dev/alixpu_ppu10 --device=/dev/alixpu_ppu11 --device=/dev/alixpu_ppu12 --device=/dev/alixpu_ppu13 --device=/dev/alixpu_ppu14 --device=/dev/alixpu_ppu15 --device=/dev/alixpu --device=/dev/alixpu_ctl --cpus=108 --memory=1528g --shm-size=256g --ulimit memlock=-1 \
             -e GITHUB_ACTIONS=true -e CI=true \
             -e TRITON_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/triton \
             -e TORCHINDUCTOR_CACHE_DIR=/__w/TorchEasyRec/tzrec-ci-cache/inductor \
             -e TZREC_TEST_TIMEOUT_SCALE=4 \
             -v "$WORK_ROOT":/__w \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5-ppu \
-            bash -eo pipefail scripts/ci/ci_test_ppu.sh --parallel --scope gpu --session "$REPORT_DIR" --device-groups '0,1;2,3;4,5;6,7;8,9;10,11;12,13;14,15' --hardware ppu --timeout 86400
+            bash -eo pipefail scripts/ci/ci_test_ppu.sh --parallel --scope gpu --session "$REPORT_DIR" --capacity 16 --hardware ppu --timeout 86400
       - name: StopDockerContainer
         if: always()
         run: |

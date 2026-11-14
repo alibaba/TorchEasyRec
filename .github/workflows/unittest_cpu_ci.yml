@@ -38,13 +38,13 @@ jobs:
           docker run --rm --pull=always --name "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
             --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
-            --cpus=16 --memory=80g --shm-size=16g --ulimit memlock=-1 \
+            --cpus=64 --memory=256g --shm-size=64g --ulimit memlock=-1 \
             -e GITHUB_ACTIONS=true -e CI=true \
             -e ALIBABA_CLOUD_ECS_METADATA -e CI_ODPS_PROJECT_NAME -e ODPS_ENDPOINT -e CI_ALIKAFKA_INSTANCE_ID -e CI_ALIKAFKA_BROKERS -e CI_REGION -e CUDA_VISIBLE_DEVICES= -e NVIDIA_VISIBLE_DEVICES=void \
             -e PIP_CACHE_DIR=/root/.cache/pip \
             -v "$WORK_ROOT":/__w \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5-cpu \
-            bash -eo pipefail scripts/ci/ci_test_cpu.sh --parallel --workers 4 --session "$REPORT_DIR"
+            bash -eo pipefail scripts/ci/ci_test_cpu.sh --parallel --capacity 8 --session "$REPORT_DIR"
       - name: StopDockerContainer
         if: always()
         run: |

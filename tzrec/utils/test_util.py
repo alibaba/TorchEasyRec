@@ -232,20 +232,20 @@ class hypothesis_settings(_settings):
         )
 
 
-def ci_resources(devices: Optional[int] = None, split: str = "module") -> Any:
+def ci_resources(slots: Optional[int] = None, split: str = "module") -> Any:
     """Declare fixture boundaries and optional accelerator requirements for CI.
 
     Args:
-        devices: One or two devices for a pair slot; omit to keep the lane's
-            original accelerator view. CPU ignores this setting.
+        slots: One or two scheduling units. An accelerator unit is one card;
+            omit to preserve the original view. CPU batches reserve two units.
         split: Smallest independent fixture boundary: module, class, or case.
     """
-    if devices not in (None, 1, 2) or split not in ("module", "class", "case"):
+    if slots not in (None, 1, 2) or split not in ("module", "class", "case"):
         raise ValueError("invalid CI resource declaration")
 
     def decorate(obj: Any) -> Any:
         """Attach resource requirements to a test class or method."""
-        obj._ci_resources = (devices, split)
+        obj._ci_resources = (slots, split)
         return obj
 
     return decorate

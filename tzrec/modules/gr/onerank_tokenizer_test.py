@@ -145,7 +145,7 @@ def _build_func_tensor(
     return func, seq_offsets, max(seq_lengths + [1])
 
 
-@ci_resources(devices=2)
+@ci_resources(slots=1)
 @mark_ci_scope("h20", "gpu")
 class OneRankFuncTensorTest(unittest.TestCase):
     """Verify the NFUNC=5 encoding of the OneRank group layout."""
@@ -398,7 +398,7 @@ class OneRankSTULayerTest(unittest.TestCase):
             layer.cached_forward(x, num_targets)
 
 
-@ci_resources(devices=2)
+@ci_resources(slots=1)
 @mark_ci_scope("h20", "gpu")
 class OneRankComposeOutputTest(unittest.TestCase):
     """The transducer output must be the *task* slots of the groups.

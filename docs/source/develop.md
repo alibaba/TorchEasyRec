@@ -48,15 +48,15 @@ python -m tzrec.modules.fm_test FactorizationMachineTest.test_fm_0
 
 ### 并行CI测试
 
-三条lane各自在workflow中启动一个作业容器，镜像tag、设备、CPU/内存和共享内存参数直接写在`unittest*_ci.yml`。CPU在16核、80GiB的作业限额内使用4个并行槽位；GPU/PPU按双卡槽位分发：
+三条lane各自在workflow中启动一个作业容器，镜像tag、设备、CPU/内存和共享内存参数直接写在`unittest*_ci.yml`。CPU在64核、256GiB的限额内运行四个批次；H20/PPU按需分配一张或两张卡：
 
 ```bash
-bash scripts/ci/ci_test_cpu.sh --parallel --workers 4 --session ../report
-bash scripts/ci/ci_test.sh --parallel --hardware h20 --scope gpu --session ../report --device-groups '0,1;2,3;4,5;6,7'
-bash scripts/ci/ci_test_ppu.sh --parallel --scope gpu --hardware ppu --session ../report --device-groups '0,1;2,3;4,5;6,7;8,9;10,11;12,13;14,15'
+bash scripts/ci/ci_test_cpu.sh --parallel --capacity 8 --session ../report
+bash scripts/ci/ci_test.sh --parallel --hardware h20 --scope gpu --session ../report --capacity 8
+bash scripts/ci/ci_test_ppu.sh --parallel --scope gpu --hardware ppu --session ../report --capacity 16
 ```
 
-脚本准备一次依赖、proto和数据，`dispatch.py`直接启动`run.py --group-file`执行精确的测试ID。CPU默认将所有模块轮流分给四组。CPU和GPU都用`@ci_resources(split="class")`或`split="case"`声明更细的边界，CPU忽略设备数；GPU只有显式指定设备数才进入双卡队列。每组使用独立checkout。H20基线保留全卡视图，PPU基线保留双卡视图；随后每对卡动态领取下一组，执行前检查可见设备数。各槽位编译缓存独立并跨job复用。
+脚本准备一次依赖、proto和数据，`dispatch.py`直接启动`run.py --group-file`执行精确的测试ID。CPU默认将所有模块轮流分给四组。CPU和GPU都用`@ci_resources(split="class")`或`split="case"`声明更细的边界，容量用`capacity`表示，资源需求用`slots`表示，二者不改变测试的rank数。每组使用独立checkout。H20基线保留全卡视图，PPU基线保留双卡视图；随后按队列顺序从空闲卡池分配，执行前检查可见设备数。各槽位编译缓存独立并跨job复用。
 
 宿主的两个常驻runner均以root运行，各自使用独立注册目录和`_work`；容器使用镜像默认用户。GPU、CPU、PPU镜像分别使用`1.5`、`1.5-cpu`、`1.5-ppu`，每个job重新拉取；实际digest可在拉取日志中核对。工作目录沿用`/__w/TorchEasyRec/TorchEasyRec/run_<run_id>`，报告落在checkout旁的`report_<run_id>_<attempt>`。工作流在结束时清理本次checkout；报告上传成功后清理本地report，上传失败则留存排查。
 

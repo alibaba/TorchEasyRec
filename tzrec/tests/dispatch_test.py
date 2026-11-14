@@ -161,21 +161,24 @@ class DispatchTest(unittest.TestCase):
                 id="pkg.First.test_a",
                 module="pkg",
                 split="module",
-                devices=2,
+                slots=2,
                 route="main",
             ),
             dict(
                 id="pkg.Second.test_b",
                 module="pkg",
                 split="module",
-                devices="baseline",
+                slots=None,
                 route="main",
             ),
         ]
         groups = dispatch.group_cases(cases)
         self.assertEqual(len(groups), 1)
-        self.assertEqual(groups[0]["devices"], "baseline")
+        self.assertEqual(groups[0]["slots"], None)
         self.assertEqual(groups[0]["cases"], cases)
+        cases[1]["slots"] = 1
+        for ordered in (cases, cases[::-1]):
+            self.assertEqual(dispatch.group_cases(ordered)[0]["slots"], 2)
         cases[0]["split"] = "case"
         self.assertEqual(len(dispatch.group_cases(cases)), 2)
 
@@ -200,25 +203,17 @@ class DispatchTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "class fixture"):
                 run.discover("tzrec", "*_test.py", "gpu")
 
-    @parameterized.expand(
-        [
-            ("0,1;2,3", [["GPU-a", "GPU-b"], ["GPU-c", "GPU-d"]]),
-            ("2,3;0,1", [["GPU-c", "GPU-d"], ["GPU-a", "GPU-b"]]),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_device_mapping(self, value, expected):
-        self.assertEqual(
-            dispatch.device_groups(value, ["GPU-a", "GPU-b", "GPU-c", "GPU-d"]),
-            expected,
-        )
+    def test_visible_pool_preserves_parent_ids_and_order(self):
+        self.assertEqual(dispatch.visible_pool("GPU-b,GPU-a", 2, 2), ["GPU-b", "GPU-a"])
+        self.assertEqual(dispatch.visible_pool(None, 2, 2), ["0", "1"])
 
     @parameterized.expand(
-        [("0,1;1,2",), ("0,4",), ("-1,0",), ("0",)], name_func=parameterized_name_func
+        [("", 0, 2), ("1,1", 2, 2), ("1,3", 1, 2), ("1,", 2, 2)],
+        name_func=parameterized_name_func,
     )
-    def test_bad_device_mapping(self, value):
+    def test_invalid_visible_pool(self, mask, count, capacity):
         with self.assertRaises(ValueError):
-            dispatch.device_groups(value, ["0", "1", "2", "3"])
+            dispatch.visible_pool(mask, count, capacity)
 
     def test_process_timeout_kills_group(self):
         pidfile = self.path / "child.pid"
@@ -268,7 +263,7 @@ class DispatchTest(unittest.TestCase):
             def test_class(self):
                 pass
 
-            @ci_resources(devices=2, split="case")
+            @ci_resources(slots=2, split="case")
             def test_pair(self):
                 pass
 
@@ -276,22 +271,19 @@ class DispatchTest(unittest.TestCase):
         with mock.patch.object(
             run, "_gather_test_cases", return_value=(suite, unittest.TestSuite())
         ):
-            for scope, devices in [
-                (None, [0, 0, 0]),
-                ("gpu", ["baseline", "baseline", 2]),
-            ]:
+            for scope in (None, "gpu"):
                 cases = run.discover("tzrec", "*", scope)
                 self.assertEqual(
                     [c["split"] for c in cases], ["class", "module", "case"]
                 )
-                self.assertEqual([c["devices"] for c in cases], devices)
+                self.assertEqual([c["slots"] for c in cases], [None, None, 2])
 
     def test_cpu_module_stays_on_one_slot_across_execution_routes(self):
         cases = [
-            dict(id=name, module="pkg", split="module", devices=0, route=route)
+            dict(id=name, module="pkg", split="module", slots=None, route=route)
             for name, route in (("pkg.A.test_a", "main"), ("pkg.B.test_b", "subproc"))
         ]
-        self.assertEqual(dispatch.group_cases(cases), [dict(devices=0, cases=cases)])
+        self.assertEqual(dispatch.group_cases(cases), [dict(slots=None, cases=cases)])
 
     def test_four_cpu_shards_keep_each_fixture_boundary_intact(self):
         groups = [

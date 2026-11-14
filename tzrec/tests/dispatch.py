@@ -8,7 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dispatch exact unittest groups into isolated CPU slots or accelerator pairs."""
+"""Dispatch unittest groups to CPU batches or a pool of accelerator cards."""
 
 import argparse
 import importlib
@@ -40,11 +40,13 @@ def group_cases(cases: list[dict]) -> list[dict]:
             boundary = case["id"].rsplit(".", 1)[0]
         elif case["split"] == "case":
             boundary = case["id"]
-        key = (case["split"], boundary, case["route"] if case["devices"] != 0 else None)
-        group = groups.setdefault(key, dict(cases=[], devices=case["devices"]))
+        key = (case["split"], boundary)
+        group = groups.setdefault(key, dict(cases=[], slots=case["slots"]))
         group["cases"].append(case)
-        if case["devices"] == "baseline":
-            group["devices"] = "baseline"
+        if group["slots"] is not None:
+            group["slots"] = (
+                None if case["slots"] is None else max(group["slots"], case["slots"])
+            )
     return list(groups.values())
 
 
@@ -53,18 +55,22 @@ def cpu_shards(groups: list[dict], count: int) -> list[dict]:
     shards: list[list[dict]] = [[] for _ in range(count)]
     for index, group in enumerate(groups):
         shards[index % count].extend(group["cases"])
-    return [dict(cases=cases, devices=0) for cases in shards if cases]
+    return [dict(cases=cases, slots=2) for cases in shards if cases]
 
 
-def device_groups(value: str, visible: list[str]) -> list[list[str]]:
-    """Resolve disjoint pairs against the parent's allowed CUDA device view."""
-    groups = [[int(x) for x in group.split(",")] for group in value.split(";")]
-    flat = [x for group in groups for x in group]
-    if any(len(g) != 2 for g in groups) or len(flat) != len(set(flat)):
-        raise ValueError("device groups must be disjoint pairs")
-    if any(x < 0 or x >= len(visible) for x in flat):
-        raise ValueError("device index outside the parent's visible set")
-    return [[visible[i] for i in group] for group in groups]
+def visible_pool(mask: str | None, count: int, capacity: int) -> list[str]:
+    """Preserve the parent CUDA IDs; never widen an empty or restricted mask."""
+    cards = mask.split(",") if mask is not None else list(map(str, range(count)))
+    if (
+        count != capacity
+        or len(cards) != capacity
+        or len(set(cards)) != capacity
+        or not all(cards)
+    ):
+        raise ValueError(
+            f"expected {capacity} distinct visible cards, got {count}: {cards}"
+        )
+    return cards
 
 
 def check_result(group: dict, report: dict, code: int) -> None:
@@ -91,115 +97,155 @@ def check_result(group: dict, report: dict, code: int) -> None:
 
 def schedule(
     groups: list[dict],
-    slots: list[tuple[Path, dict]],
+    cards: list[str],
+    capacity: int,
+    env: dict,
+    directory: Path,
     session: Path,
     deadline: float,
     test_dir: str,
 ) -> list[dict]:
-    """Start run.py directly, assigning another group when a slot becomes free."""
+    """Lease slots in FIFO order and recycle them only after child cleanup."""
     queue = deque(groups)
-    active: dict[int, tuple] = {}
+    free = set(range(capacity))
+    active: dict[subprocess.Popen, tuple] = {}
     reports = []
     try:
         while queue or active:
             if time.monotonic() >= deadline:
                 raise TimeoutError("test job deadline exceeded")
-            for slot, (checkout, env) in enumerate(slots):
-                if slot in active:
-                    process, group, log = active[slot]
-                    code = process.poll()
-                    if code is None:
-                        continue
-                    run.terminate(process)
+            for process, (group, lease, log) in list(active.items()):
+                code = process.poll()
+                if code is None:
+                    continue
+                run.terminate(process)
+                log.close()
+                path = session / "results" / (group["key"] + ".json")
+                if not path.is_file():
+                    raise RuntimeError(
+                        f"group {group['key']} exited {code} without a result; "
+                        f"see {log.name}"
+                    )
+                report = run.read_json(path)
+                check_result(group, report, code)
+                reports.append(report)
+                del active[process]
+                free.update(lease)
+            while queue:
+                group = queue[0]
+                units = group["slots"] or capacity
+                if len(free) < units:
+                    break
+                queue.popleft()
+                lease = sorted(free)[:units]
+                free.difference_update(lease)
+                selected = [cards[i] for i in lease[: group["visible_devices"]]]
+                child_env = dict(env, CUDA_VISIBLE_DEVICES=",".join(selected))
+                checkout = Path.cwd()
+                if group["slots"] is not None:
+                    worker = lease[0]
+                    checkout = directory / str(worker)
+                    if not checkout.exists():
+                        shutil.copytree(
+                            Path.cwd(),
+                            checkout,
+                            symlinks=True,
+                            ignore=shutil.ignore_patterns(
+                                ".git",
+                                "tmp",
+                                "experiments",
+                                "__pycache__",
+                                ".hypothesis",
+                                ".ruff_cache",
+                            ),
+                        )
+                    for variable, kind in (
+                        ("TRITON_CACHE_DIR", "triton"),
+                        ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+                    ):
+                        cache = (
+                            Path(env.get(variable, str(directory / kind)))
+                            / f"worker-{worker}"
+                        )
+                        cache.mkdir(parents=True, exist_ok=True)
+                        child_env[variable] = str(cache.resolve())
+                group["assigned_devices"] = selected
+                group_file = session / "groups" / (group["key"] + ".json")
+                run.write_json(group_file, group)
+                log = (session / "logs" / (group["key"] + ".log")).open("w")
+                try:
+                    process = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "tzrec/tests/run.py",
+                            "--group-file",
+                            str(group_file),
+                            "--output",
+                            str(session / "results" / group_file.name),
+                            "--test_dir",
+                            test_dir,
+                        ],
+                        cwd=checkout,
+                        env=child_env,
+                        start_new_session=True,
+                        stdout=log,
+                        stderr=log,
+                    )
+                except BaseException:
                     log.close()
-                    del active[slot]
-                    path = session / "results" / (group["key"] + ".json")
-                    if not path.is_file():
-                        raise RuntimeError(
-                            f"group {group['key']} exited {code} without a result; "
-                            f"see {log.name}"
-                        )
-                    report = run.read_json(path)
-                    check_result(group, report, code)
-                    reports.append(report)
-                    print(f"Finished group {group['key']} (exit {code})", flush=True)
-                if queue:
-                    group = queue.popleft()
-                    group_file = session / "groups" / (group["key"] + ".json")
-                    output = session / "results" / group_file.name
-                    run.write_json(group_file, group)
-                    log = (session / "logs" / (group["key"] + ".log")).open("w")
-                    try:
-                        process = subprocess.Popen(
-                            [
-                                sys.executable,
-                                "tzrec/tests/run.py",
-                                "--group-file",
-                                str(group_file),
-                                "--output",
-                                str(output),
-                                "--test_dir",
-                                test_dir,
-                            ],
-                            cwd=checkout,
-                            env=env,
-                            start_new_session=True,
-                            stdout=log,
-                            stderr=log,
-                        )
-                    except BaseException:
-                        log.close()
-                        raise
-                    active[slot] = (process, group, log)
-                    print(f"Slot {slot}: starting group {group['key']}", flush=True)
+                    raise
+                active[process] = (group, lease, log)
+                print(
+                    f"Starting group {group['key']}: slots={lease} cards={selected}",
+                    flush=True,
+                )
             if active:
                 time.sleep(0.1)
-        return reports
     finally:
-        for process, _, _ in active.values():
+        for process in active:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        for process, _, log in active.values():
+        for process, (_, _, log) in active.items():
             run.terminate(process)
             log.close()
+    return reports
 
 
 def dispatch(args: argparse.Namespace) -> int:
-    """Dispatch CPU shards or run accelerator groups in their assigned views."""
+    """Discover once in the lane's original view, then schedule the full plan."""
     cpu = args.hardware == "cpu"
-    baseline_devices = 0
+    capacity = args.capacity
+    if capacity < 1 or (cpu and (args.scope or capacity % 2)):
+        raise ValueError(
+            "capacity must be positive; CPU uses two slots per full-suite batch"
+        )
+    env = dict(os.environ, PYTHONPATH=".")
+    cards = []
     if cpu:
-        if args.workers < 1 or args.device_groups or args.scope:
-            raise ValueError(
-                "CPU requires positive slots and full, device-free discovery"
-            )
-        pairs = [[] for _ in range(args.workers)]
+        env.update(
+            CUDA_VISIBLE_DEVICES="",
+            NVIDIA_VISIBLE_DEVICES="void",
+            OMP_NUM_THREADS="1",
+            MKL_NUM_THREADS="1",
+            OPENBLAS_NUM_THREADS="1",
+        )
     else:
         import torch
 
-        count = torch.cuda.device_count()
-        baseline_devices = 2 if args.hardware == "ppu" else count
-        visible = (
-            os.environ.get("CUDA_VISIBLE_DEVICES") or ",".join(map(str, range(count)))
-        ).split(",")[:count]
-        if not args.device_groups:
-            raise ValueError("accelerator lanes require disjoint device pairs")
-        pairs = device_groups(args.device_groups, visible)
+        cards = visible_pool(
+            env.get("CUDA_VISIBLE_DEVICES"), torch.cuda.device_count(), capacity
+        )
+    baseline_view = cards[:2] if args.hardware == "ppu" else cards
     session = args.session.resolve()
     session.mkdir(parents=True, exist_ok=True)
     if any(session.iterdir()):
         raise ValueError("use an empty report directory")
     (session / "logs").mkdir()
     (session / "results").mkdir()
-    deadline = time.monotonic() + args.timeout
     started = time.monotonic()
-    env = dict(os.environ, PYTHONPATH=".")
-    if cpu:
-        env.update(CUDA_VISIBLE_DEVICES="", NVIDIA_VISIBLE_DEVICES="void")
-    elif args.hardware == "ppu":
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(pairs[0])
+    deadline = started + args.timeout
     with tempfile.TemporaryDirectory() as temporary:
         output = Path(temporary) / "discovery.json"
         command = [
@@ -215,67 +261,47 @@ def dispatch(args: argparse.Namespace) -> int:
         if not cpu:
             command.extend(["--scope", args.scope or "gpu"])
         code = run.run_process(
-            command, timeout=max(0.01, deadline - time.monotonic()), env=env
+            command,
+            timeout=max(0.01, deadline - time.monotonic()),
+            env=dict(env, CUDA_VISIBLE_DEVICES=",".join(baseline_view)),
         )
         if code:
             raise RuntimeError(f"discovery exited with code {code}")
         cases = run.read_json(output)
     groups = group_cases(cases)
-    if cpu:
-        baseline = []
-        queued = cpu_shards(groups, len(pairs))
-    else:
-        baseline = [g for g in groups if g["devices"] == "baseline"]
-        queued = [g for g in groups if g["devices"] != "baseline"]
-    plan = baseline + queued
+    plan = (
+        cpu_shards(groups, capacity // 2)
+        if cpu
+        else sorted(groups, key=lambda g: g["slots"] is not None)
+    )
     identity = uuid.uuid4().hex
     for i, group in enumerate(plan):
+        if group["slots"] and group["slots"] > capacity:
+            raise ValueError("test group exceeds lane capacity")
         group.update(key=str(i), session_id=identity)
         group["visible_devices"] = (
-            baseline_devices if group["devices"] == "baseline" else (0 if cpu else 2)
+            (group["slots"] or len(baseline_view)) if cards else 0
         )
-    run.write_json(session / "plan.json", dict(session_id=identity, groups=plan))
-    reports = schedule(baseline, [(Path.cwd(), env)], session, deadline, args.test_dir)
-    if queued:
-        Path("tmp").mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            dir=Path("tmp").resolve(), prefix="ci-slots-"
-        ) as directory:
-            slots = []
-            for i, pair in enumerate(pairs[: len(queued)]):
-                checkout = Path(directory) / str(i)
-                shutil.copytree(
-                    Path.cwd(),
-                    checkout,
-                    symlinks=True,
-                    ignore=shutil.ignore_patterns(
-                        ".git",
-                        "tmp",
-                        "experiments",
-                        "__pycache__",
-                        ".hypothesis",
-                        ".ruff_cache",
-                    ),
-                )
-                slot_env = dict(env, CUDA_VISIBLE_DEVICES=",".join(pair))
-                if cpu:
-                    slot_env.update(
-                        OMP_NUM_THREADS="1",
-                        MKL_NUM_THREADS="1",
-                        OPENBLAS_NUM_THREADS="1",
-                    )
-                for variable, kind in (
-                    ("TRITON_CACHE_DIR", "triton"),
-                    ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
-                ):
-                    cache = (
-                        Path(env.get(variable, str(Path(directory) / kind)))
-                        / f"worker-{i}"
-                    )
-                    cache.mkdir(parents=True, exist_ok=True)
-                    slot_env[variable] = str(cache.resolve())
-                slots.append((checkout, slot_env))
-            reports += schedule(queued, slots, session, deadline, args.test_dir)
+    counts = Counter(str(g["slots"] or "baseline") for g in plan)
+    run.write_json(
+        session / "plan.json",
+        dict(session_id=identity, capacity=capacity, slot_counts=counts, groups=plan),
+    )
+    print(f"Capacity {capacity}, groups by slot demand: {dict(counts)}", flush=True)
+    Path("tmp").mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=Path("tmp").resolve(), prefix="ci-slots-"
+    ) as directory:
+        reports = schedule(
+            plan,
+            cards,
+            capacity,
+            env,
+            Path(directory),
+            session,
+            deadline,
+            args.test_dir,
+        )
     expected = Counter(c["id"] for c in cases)
     actual = Counter(c["id"] for report in reports for c in report["cases"])
     if actual != expected or any(n != 1 for n in expected.values()):
@@ -298,8 +324,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", type=Path, required=True)
     parser.add_argument("--hardware", choices=("cpu", "h20", "ppu"), required=True)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--device-groups")
+    parser.add_argument("--capacity", type=int, required=True)
     parser.add_argument("--test-dir", default="tzrec")
     parser.add_argument("--pattern", default="*_test.py")
     parser.add_argument("--scope", choices=("gpu", "h20"))

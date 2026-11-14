@@ -334,12 +334,11 @@ def discover(test_dir: str, pattern: str, scope: str | None) -> list[dict]:
         for case in leaves(suite):
             cls = type(case)
             method = getattr(case, case._testMethodName)
-            devices, split = getattr(
+            slots, split = getattr(
                 method,
                 "_ci_resources",
                 getattr(cls, "_ci_resources", (None, "module")),
             )
-            devices = 0 if scope is None else (devices or "baseline")
             module = sys.modules[case.__module__]
             if split != "module" and any(
                 hasattr(module, name) for name in ("setUpModule", "tearDownModule")
@@ -356,7 +355,7 @@ def discover(test_dir: str, pattern: str, scope: str | None) -> list[dict]:
                     id=case.id(),
                     route=route,
                     module=case.__module__,
-                    devices=devices,
+                    slots=slots,
                     split=split,
                     skip=static_skip(case),
                 )
