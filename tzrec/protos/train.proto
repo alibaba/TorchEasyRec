@@ -160,7 +160,8 @@ message DeltaEmbeddingDumpConfig {
 
 // Adds RocksDB-backed dynamicemb candidates to embedding planning. Each rank
 // shares one working database under root_dir across its offloaded tables.
-// A table with an explicit cache_load_factor stays in memory.
+// An explicit partial cache_load_factor also pins the RocksDB cache budget;
+// the 0.5 ceiling applies only to automatic search. CUSTOMIZED scores stay in memory.
 message RocksDBConfig {
     // storage root of the working databases on a local disk or an NFS-like
     // filesystem (NVMe, ESSD, Extreme NAS), never an OSS mount. Each rank

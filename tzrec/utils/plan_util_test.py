@@ -759,14 +759,44 @@ class RocksDBPlannerTest(unittest.TestCase):
             int(4.75 * GIB) - rocksdb_util.shared_storage(1).ddr,
         )
 
-    def test_overrides_stay_in_memory(self):
+    def test_rocksdb_preserves_explicit_cache_budget(self):
+        rows, dim = 1 << 24, 64
         tables = {
-            "b": (1 << 24, 64, {"cache_load_factor": 0.5}),
-            "c": (1 << 24, 64, {"score_strategy": "CUSTOMIZED"}),
-            "d": (1 << 24, 64, {}),
+            "pinned": (rows, dim, {"cache_load_factor": 0.8}),
+            "custom": (1 << 16, dim, {"score_strategy": "CUSTOMIZED"}),
         }
-        _, offloaded, _ = self._plan_with_ssd_room(tables, 4, 16)
-        self.assertEqual(set(offloaded), {"d"})
+        _, offloaded, planner = self._plan_with_ssd_room(tables, 8, 4.75)
+        expected = int(float(np.float32(0.8)) * rows * dim * 4)
+        self.assertEqual(
+            [
+                (o.name, o.dynamicemb_storage.local_hbm_for_values)
+                for o in planner.get_search_space()
+                if rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
+            ],
+            [("pinned", expected)],
+        )
+        self.assertEqual(set(offloaded), {"pinned"})
+        self.assertEqual(offloaded["pinned"].local_hbm_for_values, expected)
+
+    def test_explicit_rocksdb_cache_boundaries(self):
+        rows = 1 << 16
+        tables = {
+            "small": (rows, 64, {"cache_load_factor": 0.005}),
+            "below_batch": (rows, 64, {"cache_load_factor": 0.005}, 32),
+            "rounds_to_full": (1024, 64, {"cache_load_factor": 0.8}),
+            "host": (rows, 64, {"cache_load_factor": 0}),
+            "hbm": (rows, 64, {"cache_load_factor": 1}),
+        }
+        planner, model = self._planner(tables, 8, 16)
+        space = planner._enumerator.enumerate(model, plan_util.get_default_sharders())
+        self.assertEqual(
+            [
+                (o.name, o.dynamicemb_storage.local_hbm_for_values)
+                for o in space
+                if rocksdb_util.is_rocksdb_options(o.dynamicemb_options)
+            ],
+            [("small", int(float(np.float32(0.005)) * rows * 64 * 4))],
+        )
 
     @parameterized.expand(
         [
