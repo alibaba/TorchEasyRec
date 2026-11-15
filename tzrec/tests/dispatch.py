@@ -40,7 +40,10 @@ def group_cases(cases: list[dict]) -> list[dict]:
             dict(name=key, ids=[], slots=1, env=case["env"], timeout=case["timeout"]),
         )
         if (group["env"], group["timeout"]) != (case["env"], case["timeout"]):
-            raise ValueError(f"incompatible environment or timeout within {key}")
+            raise ValueError(
+                f"incompatible environment or timeout within {key}; "
+                "use matching settings or split independent cases with split='case'"
+            )
         group["slots"] = max(group["slots"], case["slots"])
         group["ids"].append(case["id"])
     return list(groups.values())
@@ -79,6 +82,8 @@ def schedule(
     active: dict[subprocess.Popen, tuple[int, list[int], TextIO, float]] = {}
     free = set(range(capacity))
     index = 0
+    job_end = started + timeout
+    job_timed_out = False
     with (
         tempfile.TemporaryDirectory(dir=Path("tmp").resolve(), prefix="ci-") as tmp,
         tempfile.TemporaryDirectory(dir="/tmp", prefix="tzrec-") as alias,
@@ -88,15 +93,44 @@ def schedule(
         short_tmp = Path(alias) / "groups"
         short_tmp.symlink_to(scratch, target_is_directory=True)
         failure_logs = scratch.parent / "ci-failures" / scratch.name
+
+        def collect(i: int, rc: int | None, reason: str | None = None) -> None:
+            """Account for a reaped group using its final process status."""
+            try:
+                if rc not in (0, 1):
+                    raise ValueError(reason or "abnormal process exit")
+                result = json.loads((scratch / f"{i}.counts").read_text())
+                fields = {
+                    "tests",
+                    "failures",
+                    "errors",
+                    "skipped",
+                    "expected failures",
+                    "unexpected successes",
+                }
+                if (
+                    not isinstance(result, dict)
+                    or result.keys() != fields
+                    or any(type(v) is not int or v < 0 for v in result.values())
+                ):
+                    raise ValueError("invalid unittest counts")
+                failed = any(
+                    result[k] for k in ("failures", "errors", "unexpected successes")
+                )
+                if rc != int(failed):
+                    raise ValueError("exit status disagrees with unittest")
+                counts.update(result)
+                if failed:
+                    failed_groups.add(i)
+            except (OSError, ValueError) as exc:
+                problems[i] = f"{groups[i]['name']}: {exc} (exit {rc})"
+
         try:
             while index < len(groups) or active:
-                if time.monotonic() >= started + timeout:
+                if time.monotonic() >= job_end:
+                    job_timed_out = True
                     if index < len(groups):
                         problems[index] = f"job timeout; {len(groups) - index} pending"
-                    for i, _, _, _ in active.values():
-                        problems[i] = (
-                            f"{groups[i]['name']}: interrupted at job deadline"
-                        )
                     break
                 for proc, (i, lease, log, end) in list(active.items()):
                     rc = proc.poll()
@@ -106,22 +140,17 @@ def schedule(
                     log.close()
                     del active[proc]
                     free.update(lease)
-                    try:
-                        if rc is None:
-                            raise ValueError(f"timed out after {groups[i]['timeout']}s")
-                        result = json.loads((scratch / f"{i}.counts").read_text())
-                        failed = any(
-                            result[k]
-                            for k in ("failures", "errors", "unexpected successes")
-                        )
-                        if rc != int(failed):
-                            raise ValueError("exit status disagrees with unittest")
-                        counts.update(result)
-                        if failed:
-                            failed_groups.add(i)
-                    except (OSError, ValueError, KeyError) as exc:
-                        problems[i] = f"{groups[i]['name']}: {exc} (exit {rc})"
-                while index < len(groups) and len(free) >= groups[index]["slots"]:
+                    reason = (
+                        f"timed out after {groups[i]['timeout']}s"
+                        if rc is None
+                        else None
+                    )
+                    collect(i, proc.returncode, reason)
+                while (
+                    index < len(groups)
+                    and len(free) >= groups[index]["slots"]
+                    and time.monotonic() < job_end
+                ):
                     i = index
                     group = groups[i]
                     index += 1
@@ -185,9 +214,11 @@ def schedule(
                     os.killpg(proc.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-            for proc, (_, _, log, _) in active.items():
+            for proc, (i, _, log, _) in active.items():
                 terminate(proc)
                 log.close()
+                if job_timed_out:
+                    collect(i, proc.returncode, "interrupted at job deadline")
 
             for i in sorted(failed_groups | problems.keys()):
                 log_path = scratch / f"{i}.log"

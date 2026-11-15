@@ -238,6 +238,9 @@ def ci_resources(
 ) -> Any:
     """Declare fixture boundaries and optional accelerator requirements for CI.
 
+    Cases in one group must have the same timeout and _run_env() values.
+    Put @ci_resources below @parameterized.expand so generated methods inherit it.
+
     Args:
         slots: One or two scheduling units. An accelerator unit is one card;
             CPU units budget concurrency without changing the test rank count.
@@ -268,10 +271,10 @@ def mark_ci_scope(*scopes: str) -> Any:
     own scope.
 
     Examples:
-        @mark_ci_scope("h20")
+        @mark_ci_scope("gpu")
         class FooTest(unittest.TestCase): ...
 
-        @mark_ci_scope("h20", "l20")
+        @mark_ci_scope("gpu")
         def test_bar(self): ...
     """
 

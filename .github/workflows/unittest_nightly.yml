@@ -36,4 +36,4 @@ jobs:
           PIP_CACHE_DIR=/root/.cache/pip \
           TRITON_CACHE_DIR="$CACHE_ROOT/triton" \
           TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/inductor" \
-          CUDA_HOME=/usr/local/cuda-13 bash scripts/ci/ci_test.sh --hardware gpu --capacity 2 --timeout 28800
+          CUDA_HOME=/usr/local/cuda-13 bash scripts/ci/ci_test.sh --hardware gpu --capacity 2 --timeout 25200
