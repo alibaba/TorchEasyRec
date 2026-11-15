@@ -471,7 +471,7 @@ class OdpsReader(BaseReader):
             batch_cost_size=batch_cost_size,
             **kwargs,
         )
-        self._pg = dist_util.get_dist_object_pg()
+        self._pg = dist_util.get_dataset_process_group()
         self._is_orderby_partition = is_orderby_partition
         self._init_session_threads = init_session_threads
         self._quota_name = quota_name
@@ -717,7 +717,9 @@ class OdpsWriter(BaseWriter):
     Args:
         output_path (str): data output path.
         quota_name (str): storage api quota name.
-        world_size (int, optional): number of ranks, each rank has a writer.
+        world_size (int, optional): number of ranks sharing a write session.
+            Defaults to WORLD_SIZE. Use 1 for rank-zero-only writing without
+            cross-rank communication.
     """
 
     def __init__(
@@ -728,7 +730,7 @@ class OdpsWriter(BaseWriter):
         **kwargs: Any,
     ) -> None:
         super().__init__(output_path)
-        self._pg = dist_util.get_dist_object_pg(world_size)
+        self._pg = dist_util.get_dataset_process_group(world_size)
         self._account, self._odps_endpoint = _create_odps_account()
         self._quota_name = quota_name
         os.environ["STORAGE_API_QUOTA_NAME"] = quota_name

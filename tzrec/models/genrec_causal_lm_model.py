@@ -20,9 +20,13 @@ forward has no ``logits_to_keep``, or which returns a legacy tuple cache, is
 not supported; Qwen2.5/Qwen3 are what CI covers.
 """
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from transformers import AttentionInterface
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
@@ -34,9 +38,118 @@ from tzrec.prompt.assembler import (
     MAX_SEQLEN,
     RESPONSE_LENGTHS,
 )
-from tzrec.prompt.types import CompiledPrompt
+from tzrec.prompt.types import CompiledPrompt, SlotSeg
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+
+
+@dataclass
+class _MultiTargetLayout:
+    """Training-only SID branches that share each row's packed prompt prefix.
+
+    Tokens keep the assembler's packed order. Every target is one attention
+    segment whose keys are its row's prefix followed by its own tokens, so
+    causal attention aligned to the last key isolates targets. A row's first
+    segment also holds its prefix queries, so only later targets copy keys.
+
+    Args:
+        position_ids: packed positions, restarting after the prefix per target.
+        cu_seqlens_q: int32 query boundaries of the segments.
+        cu_seqlens_k: int32 key boundaries of the same segments.
+        kv_indices: packed token behind every segment key/value.
+        max_seqlen: upper bound of any segment's query or key length.
+        label_indices: packed indices of target tokens, shaped (targets, levels).
+        score_indices: packed indices whose logits predict those labels.
+        target_weights: inverse target count of each target's row.
+        token_targets: target index of every packed token, -1 in a prefix.
+    """
+
+    position_ids: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    kv_indices: torch.Tensor
+    max_seqlen: int
+    label_indices: torch.Tensor
+    score_indices: torch.Tensor
+    target_weights: torch.Tensor
+    token_targets: torch.Tensor
+
+
+def _shared_prefix_attention(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Any,
+    scaling: Optional[float] = None,
+    dropout: float = 0.0,
+    *,
+    multi_target_layout: _MultiTargetLayout,
+    **kwargs: Any,
+) -> Tuple[torch.Tensor, None]:
+    """Run one FA2 varlen call over the prefix and target segments.
+
+    Every target segment reads its row's prefix keys before its own, so the
+    causal mask, aligned to the last key, hides the row's other targets.
+
+    Args:
+        module: the calling attention module; unused.
+        query: packed queries shaped (1, query heads, total tokens, head dim).
+        key: packed keys, retaining the backbone's grouped KV heads.
+        value: packed values with the same layout as keys.
+        attention_mask: required by the HF attention interface; always None
+            here, the segments carry the visibility.
+        scaling: backbone attention scale.
+        dropout: attention dropout probability, 0 outside training.
+        multi_target_layout: batch-local segments and key gather indices.
+        **kwargs: unused backbone attention options.
+
+    Returns:
+        Packed attention output and no attention weights.
+    """
+    from flash_attn import flash_attn_varlen_func
+
+    layout = multi_target_layout
+    # rotary embedding may promote q/k to fp32; v keeps the projection dtype
+    query, key = query.to(value.dtype), key.to(value.dtype)
+    output = flash_attn_varlen_func(
+        query[0].transpose(0, 1),
+        key[0].transpose(0, 1).index_select(0, layout.kv_indices),
+        value[0].transpose(0, 1).index_select(0, layout.kv_indices),
+        cu_seqlens_q=layout.cu_seqlens_q,
+        cu_seqlens_k=layout.cu_seqlens_k,
+        max_seqlen_q=layout.max_seqlen,
+        max_seqlen_k=layout.max_seqlen,
+        dropout_p=dropout,
+        softmax_scale=scaling,
+        causal=True,
+    )
+    return output.unsqueeze(0), None
+
+
+_SHARED_PREFIX_ATTENTION = "genrec_shared_prefix_fa2"
+AttentionInterface.register(_SHARED_PREFIX_ATTENTION, _shared_prefix_attention)
+
+
+def _padded_sdpa_attention(*args: Any, **kwargs: Any) -> Tuple[torch.Tensor, None]:
+    """Run HF's SDPA attention without cuDNN for a left-padded multi-target batch.
+
+    cuDNN's masked SDPA backward returns NaN dq at lengths that are odd
+    multiples of 64 (torch 2.14, cuDNN 9.24).
+
+    Args:
+        *args: HF attention interface arguments.
+        **kwargs: HF attention interface options.
+
+    Returns:
+        Attention output and no attention weights.
+    """
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+        return sdpa_attention_forward(*args, **kwargs)
+
+
+_PADDED_SDPA_ATTENTION = "genrec_padded_sdpa"
+AttentionInterface.register(_PADDED_SDPA_ATTENTION, _padded_sdpa_attention)
 
 
 class GenRecCausalLMModel(BaseGenRecModel):
@@ -70,6 +183,10 @@ class GenRecCausalLMModel(BaseGenRecModel):
         common = self._model_config.common
         self._generated_sids_key = common.generated_sids_key
         self._read_beam_config(common)
+        response = self._prompt.prompt_plan.response_segments
+        self._sid_only_response = len(response) == 1 and isinstance(
+            response[0], SlotSeg
+        )
 
     def _read_beam_config(self, common: GenRecModelConfig) -> None:
         """Parse the decode knobs; the schedule must match the codebook.
@@ -97,8 +214,180 @@ class GenRecCausalLMModel(BaseGenRecModel):
         embeds = self.build_input(batch)
         if self.is_inference:
             return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}
-        logits, labels = _fx_wrapped_forward(self, embeds, batch)
-        return {"logits": logits, "labels": labels}
+        predictions = _fx_wrapped_forward(self, embeds, batch)
+        keys = ("logits", "labels")
+        if self._sid_only_response:
+            keys += ("target_weights",)
+        return {key: predictions[key] for key in keys}
+
+    def _multi_target_predictions(
+        self, embeds: torch.Tensor, batch: Batch
+    ) -> Dict[str, torch.Tensor]:
+        """Score independent SID branches over one prompt per row.
+
+        FA2 keeps the batch packed; other kernels run left-padded SDPA whose
+        per-row mask hides each target from its siblings.
+
+        Args:
+            embeds: packed embeddings, retaining one prefix per row.
+            batch: existing assembler row boundaries and response lengths.
+
+        Returns:
+            Per-target logits and labels, and each target's row weight.
+        """
+        infos = batch.additional_infos
+        layout = self._build_multi_target_layout(
+            infos[CU_SEQLENS],
+            infos[RESPONSE_LENGTHS],
+            embeds.shape[0],
+        )
+        if self._attn_kernel == "flash_attention_2":
+            attention, attention_mask = _SHARED_PREFIX_ATTENTION, None
+            inputs_embeds = embeds.unsqueeze(0)
+            position_ids = layout.position_ids.unsqueeze(0)
+            token_mask = None
+        else:
+            attention = _PADDED_SDPA_ATTENTION
+            inputs_embeds, padding_mask = _left_pad(
+                embeds, infos[CU_SEQLENS], layout.max_seqlen
+            )
+            token_mask = padding_mask.bool()
+            position_ids = torch.zeros_like(padding_mask)
+            position_ids[token_mask] = layout.position_ids
+            # -2 marks left padding, which causality keeps attending to itself
+            targets = torch.full_like(padding_mask, -2)
+            targets[token_mask] = layout.token_targets
+            key_targets = targets[:, None, :]
+            attention_mask = (
+                ((key_targets == -1) | (key_targets == targets[:, :, None]))
+                .tril()
+                .unsqueeze(1)
+            )
+        previous_attention = self.lm.config._attn_implementation
+        self.lm.set_attn_implementation(attention)
+        hidden = self.lm.base_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask={"full_attention": attention_mask},
+            position_ids=position_ids,
+            use_cache=False,
+            multi_target_layout=layout,
+        ).last_hidden_state
+        self.lm.set_attn_implementation(previous_attention)
+        hidden = hidden[0] if token_mask is None else hidden[token_mask]
+        return {
+            "logits": self.lm.get_output_embeddings()(hidden[layout.score_indices]),
+            "labels": infos[INPUT_IDS][layout.label_indices],
+            "target_weights": layout.target_weights,
+        }
+
+    def _build_multi_target_layout(
+        self,
+        cu_seqlens: torch.Tensor,
+        response_lengths: torch.Tensor,
+        num_tokens: int,
+    ) -> _MultiTargetLayout:
+        """Split each packed row into its shared prefix and independent SID targets.
+
+        Args:
+            cu_seqlens: packed row boundaries from the assembler.
+            response_lengths: supervised SID token count of each row.
+            num_tokens: packed token count, equal to ``cu_seqlens[-1]``.
+
+        Returns:
+            Positions, attention segments and scoring indices over packed tokens.
+        """
+        num_levels = self._prompt.sid_space.num_levels
+        device = cu_seqlens.device
+        cu_seqlens = cu_seqlens.to(torch.int64)
+        row_lengths = torch.diff(cu_seqlens)
+        prefix_lengths = row_lengths - response_lengths
+        target_counts = response_lengths // num_levels
+        # the first target shares its row's prefix segment
+        segment_counts = target_counts.clamp(min=1)
+        # one host read sizes every repeat below
+        num_targets, num_segments, num_keys, max_seqlen = torch.stack(
+            (
+                target_counts.sum(),
+                segment_counts.sum(),
+                (prefix_lengths * segment_counts + response_lengths).sum(),
+                row_lengths.max(),
+            )
+        ).tolist()
+        row_ids = torch.arange(row_lengths.numel(), device=device)
+
+        segment_ids = torch.arange(num_segments, device=device)
+        segment_rows = torch.repeat_interleave(
+            row_ids, segment_counts, output_size=num_segments
+        )
+        # i for a row's i-th target; segment 0 also holds the prefix
+        segment_ranks = (
+            segment_ids - (segment_counts.cumsum(0) - segment_counts)[segment_rows]
+        )
+        segment_prefix_lengths = prefix_lengths[segment_rows]
+        key_lengths = segment_prefix_lengths + num_levels * (
+            target_counts[segment_rows] > 0
+        )
+        query_lengths = torch.where(segment_ranks > 0, num_levels, key_lengths)
+        cu_seqlens_q = torch.nn.functional.pad(query_lengths.cumsum(0), (1, 0))
+        cu_seqlens_k = torch.nn.functional.pad(key_lengths.cumsum(0), (1, 0))
+
+        token_segments = torch.repeat_interleave(
+            segment_ids, query_lengths, output_size=num_tokens
+        )
+        # a query's position counts the keys before it in its segment
+        position_ids = (
+            torch.arange(num_tokens, device=device)
+            - (cu_seqlens_q[:-1] + query_lengths - key_lengths)[token_segments]
+        )
+        segment_targets = (target_counts.cumsum(0) - target_counts)[
+            segment_rows
+        ] + segment_ranks
+        token_targets = torch.where(
+            position_ids < segment_prefix_lengths[token_segments],
+            -1,
+            segment_targets[token_segments],
+        )
+
+        key_segments = torch.repeat_interleave(
+            segment_ids, key_lengths, output_size=num_keys
+        )
+        key_offsets = torch.arange(num_keys, device=device) - cu_seqlens_k[key_segments]
+        key_rows = segment_rows[key_segments]
+        # past the prefix, a target's own keys skip the row's earlier targets
+        kv_indices = (
+            cu_seqlens[key_rows]
+            + key_offsets
+            + (key_offsets >= prefix_lengths[key_rows])
+            * segment_ranks[key_segments]
+            * num_levels
+        )
+
+        target_rows = torch.repeat_interleave(
+            row_ids, target_counts, output_size=num_targets
+        )
+        # rows without targets still own a prefix segment
+        target_segments = (
+            torch.arange(num_targets, device=device)
+            + (target_counts == 0).cumsum(0)[target_rows]
+        )
+        # a target's tokens close its segment
+        label_indices = cu_seqlens_q[target_segments + 1, None] - torch.arange(
+            num_levels, 0, -1, device=device
+        )
+        score_indices = label_indices - 1
+        score_indices[:, 0] = cu_seqlens[target_rows] + prefix_lengths[target_rows] - 1
+
+        return _MultiTargetLayout(
+            position_ids=position_ids,
+            cu_seqlens_q=cu_seqlens_q.to(torch.int32),
+            cu_seqlens_k=cu_seqlens_k.to(torch.int32),
+            kv_indices=kv_indices,
+            max_seqlen=max_seqlen,
+            label_indices=label_indices,
+            score_indices=score_indices,
+            target_weights=target_counts[target_rows].float().reciprocal(),
+            token_targets=token_targets,
+        )
 
     def _forward(
         self, embeds: torch.Tensor, batch: Batch
@@ -330,11 +619,13 @@ def generate_codes(
 @torch.fx.wrap
 def _fx_wrapped_forward(
     model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Hide the packed forward from FX.
+) -> Dict[str, torch.Tensor]:
+    """Hide the packed forward and its per-batch routing from FX.
 
     ``TrainPipelineSparseDist`` symbolically traces the model whenever a
     sharded module exists, and the LM call reads ``max_seqlen`` as a host int.
+    A SID-only response whose batch has a row with several SIDs takes the
+    multi-target forward; every other batch keeps the response window.
 
     Args:
         model: the model whose response window to compute.
@@ -342,9 +633,30 @@ def _fx_wrapped_forward(
         batch: the batch being scored.
 
     Returns:
-        The response-window logits and labels.
+        Logits and labels, plus per-target row weights for a SID-only
+        response.
+
+    Raises:
+        ValueError: no valid SID targets remain after masking incomplete responses.
     """
-    return model._forward(embeds, batch)
+    if not model._sid_only_response:
+        logits, labels = model._forward(embeds, batch)
+        return {"logits": logits, "labels": labels}
+    num_levels = model._prompt.sid_space.num_levels
+    lengths = batch.additional_infos[RESPONSE_LENGTHS]
+    lengths = lengths.masked_fill(lengths % num_levels != 0, 0)
+    batch.additional_infos[RESPONSE_LENGTHS] = lengths
+    max_length = int(lengths.max())
+    if max_length == 0:
+        raise ValueError("No valid SID targets remain in this batch.")
+    if max_length > num_levels:
+        return model._multi_target_predictions(embeds, batch)
+    logits, labels = model._forward(embeds, batch)
+    return {
+        "logits": logits,
+        "labels": labels,
+        "target_weights": (lengths > 0).float(),
+    }
 
 
 @torch.fx.wrap

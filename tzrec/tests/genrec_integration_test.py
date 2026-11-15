@@ -18,8 +18,10 @@ import unittest
 from typing import Optional
 from unittest import mock
 
+import pyarrow as pa
 import torch
 from google.protobuf import text_format
+from parameterized import parameterized
 from pyarrow import parquet as pq
 
 from tzrec.datasets.data_parser import DataParser
@@ -44,6 +46,7 @@ from tzrec.utils.test_util import (
     make_test_dir,
     mark_ci_scope,
     nv_gpu_unavailable,
+    parameterized_name_func,
 )
 
 _MOCK_CONFIG = "tzrec/tests/configs/genrec_causal_lm_model_mock.config"
@@ -317,6 +320,61 @@ class GenRecIntegrationTest(unittest.TestCase):
                     self.assertTrue(
                         all(0 <= c < n for c, n in zip(beam, _CODEBOOK)), beam
                     )
+
+    @parameterized.expand(
+        [
+            [1, "sdpa"],
+            [2, "flash_attention_2"],
+        ],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipIf(*nv_gpu_unavailable)
+    @mark_ci_scope("gpu")
+    def test_genrec_multi_target_train_eval(self, world_size, attn_kernel):
+        if torch.cuda.device_count() < world_size:
+            self.skipTest(f"Requires {world_size} GPUs")
+        patcher = mock.patch.dict(os.environ, {"TEST_NPROC_PER_NODE": str(world_size)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        if attn_kernel == "flash_attention_2" and flash_attn_unavailable[0]:
+            self.skipTest(flash_attn_unavailable[1])
+        config_path = self._prepare_config(attn_kernel)
+        config = config_util.load_pipeline_config(config_path)
+        # half the rows of the first file get a second SID
+        for file_index, path in enumerate(sorted(glob.glob(self.data_glob))):
+            table = pq.read_table(path)
+            targets = table.column("answer").to_pylist()
+            targets = [
+                target
+                + [
+                    ((code - offset + 1) % 4) + offset
+                    for code, offset in zip(target, (0, 4, 8))
+                ]
+                if file_index == 0 and index < len(targets) // 2
+                else target
+                for index, target in enumerate(targets)
+            ]
+            table = table.set_column(
+                table.schema.get_field_index("answer"),
+                "answer",
+                pa.array(targets, type=pa.list_(pa.int64())),
+            )
+            table = pa.concat_tables([table] * 32)
+            pq.write_table(table, path)
+        config.train_config.num_steps = 5
+        config.train_config.num_epochs = 0
+        config.train_config.gradient_accumulation_steps = 2
+        if attn_kernel == "flash_attention_2":
+            config.train_config.mixed_precision = "BF16"
+        config_util.save_message(config, config_path)
+        pythonpath = os.environ.get("PYTHONPATH", ".")
+        self.success = utils.test_train_eval(
+            config_path, self.test_dir, pythonpath=pythonpath
+        )
+        self.assertTrue(self.success)
+        trained = os.path.join(self.test_dir, "pipeline.config")
+        self.success = utils.test_eval(trained, self.test_dir, pythonpath=pythonpath)
+        self.assertTrue(self.success)
 
     @unittest.skipIf(*nv_gpu_unavailable)
     @unittest.skipIf(*flash_attn_unavailable)

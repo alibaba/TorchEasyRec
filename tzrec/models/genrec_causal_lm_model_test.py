@@ -23,6 +23,7 @@ from tzrec.datasets.utils import Batch
 from tzrec.models.genrec_causal_lm_model import (
     GenRecCausalLMModel,
     _left_pad,
+    _padded_sdpa_attention,
     generate_codes,
 )
 from tzrec.prompt.assembler import (
@@ -77,6 +78,13 @@ class PaddedForwardTest(unittest.TestCase):
         torch.testing.assert_close(padded[0, :3], torch.zeros(3, 2))
         torch.testing.assert_close(padded[1, :2], torch.zeros(2, 2))
         torch.testing.assert_close(padded[:, -1], torch.stack([embeds[3], embeds[8]]))
+
+    def test_padded_sdpa_attention_disables_cudnn(self) -> None:
+        with mock.patch(
+            "tzrec.models.genrec_causal_lm_model.sdpa_attention_forward",
+            side_effect=lambda *args, **kwargs: torch.backends.cuda.cudnn_sdp_enabled(),
+        ):
+            self.assertFalse(_padded_sdpa_attention())
 
 
 class _CapturingLM(nn.Module):
@@ -334,13 +342,14 @@ _TWO_ROWS = (
 class LayoutInvarianceTest(unittest.TestCase):
     """Neither batching nor the kernel may change what a row scores.
 
-    Two invariants, one fixture. Row isolation: a row must not attend into the
+    Three invariants, one fixture. Row isolation: a row must not attend into the
     row before it, which the kernels avoid by different means -- the varlen
     kernel is handed ``cu_seq_lens``, every other kernel left-padded rows.
     Rewriting row 0 to different codes of the same width leaves row 1 at the
     same offsets, so its logits have to stay bit identical either way. Layout
     equivalence: the two arms must then agree with each other, which comparing
-    each against its own solo runs never establishes.
+    each against its own solo runs never establishes. Target isolation: a row
+    carrying several SIDs must score each target as its own row would.
     """
 
     def setUp(self) -> None:
@@ -363,6 +372,69 @@ class LayoutInvarianceTest(unittest.TestCase):
         )
         return model.to(device).eval(), compiled_prompt
 
+    def test_layout_of_two_targets_one_target_and_none(self) -> None:
+        model, _ = self._eval_model(
+            "qwen2", "sdpa", torch.device("cpu"), GenRecModelConfig.FP32
+        )
+        # rows: 2-token prompt + 2 SIDs, 4-token prompt + 1 SID, 3-token prompt
+        layout = model._build_multi_target_layout(
+            torch.tensor([0, 8, 15, 18], dtype=torch.int32),
+            torch.tensor([6, 3, 0]),
+            num_tokens=18,
+        )
+        self.assertEqual(
+            layout.position_ids.tolist(),
+            [0, 1, 2, 3, 4, 2, 3, 4] + [0, 1, 2, 3, 4, 5, 6] + [0, 1, 2],
+        )
+        self.assertEqual(
+            layout.token_targets.tolist(),
+            [-1, -1, 0, 0, 0, 1, 1, 1, -1, -1, -1, -1, 2, 2, 2, -1, -1, -1],
+        )
+        self.assertEqual(layout.max_seqlen, 8)
+        self.assertEqual(
+            layout.label_indices.tolist(), [[2, 3, 4], [5, 6, 7], [12, 13, 14]]
+        )
+        # a target's first level is scored from the last prompt token
+        self.assertEqual(
+            layout.score_indices.tolist(), [[1, 2, 3], [1, 5, 6], [11, 12, 13]]
+        )
+        self.assertEqual(layout.target_weights.tolist(), [0.5, 0.5, 1.0])
+        # a row's first target shares its prefix segment; later ones copy keys
+        self.assertEqual(layout.cu_seqlens_q.tolist(), [0, 5, 8, 15, 18])
+        self.assertEqual(layout.cu_seqlens_k.tolist(), [0, 5, 10, 17, 20])
+        self.assertEqual(
+            layout.kv_indices.tolist(),
+            [0, 1, 2, 3, 4, 0, 1, 5, 6, 7] + list(range(8, 15)) + [15, 16, 17],
+        )
+        # the FA2 segments, causal from the last key, must give exactly this:
+        # same row, causal, and the key is prompt or in the query's target
+        rows = torch.repeat_interleave(torch.arange(3), torch.tensor([8, 7, 3]))
+        query, key = torch.arange(18)[:, None], torch.arange(18)[None, :]
+        targets = layout.token_targets
+        expected = (
+            (rows[query] == rows[key])
+            & (key <= query)
+            & ((targets[key] < 0) | (targets[key] == targets[query]))
+        )
+        from_segments = torch.zeros(18, 18, dtype=torch.bool)
+        cu_q = layout.cu_seqlens_q.tolist()
+        cu_k = layout.cu_seqlens_k.tolist()
+        for segment in range(len(cu_q) - 1):
+            keys = layout.kv_indices[cu_k[segment] : cu_k[segment + 1]]
+            queries = cu_q[segment + 1] - cu_q[segment]
+            for row in range(queries):
+                visible = keys[: keys.numel() - queries + row + 1]
+                from_segments[cu_q[segment] + row, visible] = True
+        torch.testing.assert_close(from_segments, expected)
+
+    def test_all_incomplete_responses_are_rejected(self) -> None:
+        model, compiled = self._eval_model(
+            "qwen2", "sdpa", torch.device("cpu"), GenRecModelConfig.FP32
+        )
+        batch = _packed_batch(compiled, [GENREC_HIST_CODES], [GENREC_ANSWER_CODES[:2]])
+        with self.assertRaisesRegex(ValueError, "No valid SID targets remain"):
+            model.predict(batch)
+
     def _assert_rows_match_solo_runs(
         self,
         model_type: str,
@@ -375,32 +447,35 @@ class LayoutInvarianceTest(unittest.TestCase):
             model_type, attn_kernel, device, lm_parameter_dtype
         )
         hist_rows, answer_rows = _TWO_ROWS
+        hist_rows = hist_rows + [hist_rows[0]]
+        answer_rows = answer_rows + [GENREC_ANSWER_CODES[:2]]
         packed_batch = _packed_batch(compiled_prompt, hist_rows, answer_rows).to(device)
 
         packed = model.predict(packed_batch)
+        self.assertEqual(packed["target_weights"].tolist(), [1.0, 1.0, 0.0])
         with torch.no_grad():
             solos = [
                 model.predict(
                     _packed_batch(compiled_prompt, [hist], [answer]).to(device)
                 )
-                for hist, answer in zip(hist_rows, answer_rows)
+                for hist, answer in zip(hist_rows[:2], answer_rows[:2])
             ]
             changed = model.predict(
                 _packed_batch(
                     compiled_prompt,
-                    [_REWRITTENGENREC_HIST_CODES, hist_rows[1]],
+                    [_REWRITTENGENREC_HIST_CODES] + hist_rows[1:],
                     answer_rows,
                 ).to(device)
             )
 
         torch.testing.assert_close(
-            packed["logits"],
+            packed["logits"][:2],
             torch.cat([result["logits"] for result in solos]),
             atol=1e-2,
             rtol=1e-2,
         )
         torch.testing.assert_close(
-            packed["labels"], torch.cat([result["labels"] for result in solos])
+            packed["labels"][:2], torch.cat([result["labels"] for result in solos])
         )
         torch.testing.assert_close(
             packed["logits"][1], changed["logits"][1], atol=0, rtol=0
@@ -408,6 +483,15 @@ class LayoutInvarianceTest(unittest.TestCase):
 
         loss = model.loss(packed, packed_batch)["ce_loss"]
         self.assertTrue(bool(torch.isfinite(loss)))
+        torch.testing.assert_close(
+            loss,
+            ForCausalLMLoss(
+                packed["logits"],
+                labels=packed["labels"],
+                vocab_size=model.lm.config.vocab_size,
+                ignore_index=model._ignore_index,
+            ),
+        )
         loss.backward()
         grad = model.lm.get_input_embeddings().weight.grad
         self.assertIsNotNone(grad)
@@ -469,6 +553,107 @@ class LayoutInvarianceTest(unittest.TestCase):
         torch.testing.assert_close(
             packed["logits"], padded["logits"], atol=1e-2, rtol=1e-2
         )
+
+    def _assert_targets_match_independent_rows(
+        self,
+        model_type: str,
+        attn_kernel: str,
+        device: torch.device,
+        lm_parameter_dtype: "GenRecModelConfig.ParamDtype",
+    ) -> None:
+        """Run the multi-target invariant under one kernel.
+
+        Row 0 carries two SIDs and row 1 one. Each target must score as its own
+        row would, with a row's loss split evenly over its targets, and must not
+        see its sibling.
+        """
+        tolerance = (
+            {"atol": 3e-5, "rtol": 3e-4}
+            if lm_parameter_dtype == GenRecModelConfig.FP32
+            else {"atol": 8e-3, "rtol": 3e-2}
+        )
+        model, compiled_prompt = self._eval_model(
+            model_type, attn_kernel, device, lm_parameter_dtype
+        )
+        hist_rows, _ = _TWO_ROWS
+        expanded = _packed_batch(
+            compiled_prompt,
+            [hist_rows[0], hist_rows[0], hist_rows[1]],
+            [GENREC_ANSWER_CODES, _OTHERGENREC_ANSWER_CODES, GENREC_ANSWER_CODES],
+        ).to(device)
+        reference = model.predict(expanded)
+        # a single-target window starts at the token before the response
+        reference_logits = reference["logits"][:, :-1]
+        reference_labels = reference["labels"][:, 1:]
+        losses = (
+            nn.functional.cross_entropy(
+                reference_logits.float().flatten(0, 1),
+                reference_labels.flatten(),
+                reduction="none",
+            )
+            .view(3, -1)
+            .mean(-1)
+        )
+        reference_loss = ((losses[0] + losses[1]) / 2 + losses[2]) / 2
+        reference_loss.backward()
+        gradients = {
+            name: parameter.grad.clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        model.zero_grad(set_to_none=True)
+
+        def grouped(first_row_answer):
+            return _packed_batch(
+                compiled_prompt,
+                [hist_rows[0]] + hist_rows,
+                [GENREC_ANSWER_CODES + [2], first_row_answer, GENREC_ANSWER_CODES],
+            ).to(device)
+
+        batch = grouped(GENREC_ANSWER_CODES + _OTHERGENREC_ANSWER_CODES)
+        predictions = model.predict(batch)
+        self.assertEqual(model.lm.config._attn_implementation, attn_kernel)
+        loss = model.loss(predictions, batch)["ce_loss"]
+        torch.testing.assert_close(predictions["logits"], reference_logits, **tolerance)
+        torch.testing.assert_close(predictions["labels"], reference_labels)
+        torch.testing.assert_close(loss, reference_loss, **tolerance)
+        loss.backward()
+        for name, parameter in model.named_parameters():
+            if name in gradients:
+                torch.testing.assert_close(
+                    parameter.grad, gradients[name], msg=name, **tolerance
+                )
+
+        baseline = predictions["logits"].detach()
+        rewritten = model.predict(
+            grouped(_REWRITTENGENREC_HIST_CODES + _OTHERGENREC_ANSWER_CODES)
+        )
+        torch.testing.assert_close(
+            rewritten["logits"][1:], baseline[1:], atol=0, rtol=0
+        )
+
+    @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
+    def test_sdpa_targets_match_independent_rows(self, model_type: str) -> None:
+        self._assert_targets_match_independent_rows(
+            model_type, "sdpa", torch.device("cpu"), GenRecModelConfig.FP32
+        )
+
+    @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
+    @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skipIf(*flash_attn_unavailable)
+    @mark_ci_scope("gpu")
+    def test_flash_targets_match_independent_rows(self, model_type: str) -> None:
+        # the varlen kernel keeps every batch packed, so nothing may pad
+        with mock.patch(
+            "tzrec.models.genrec_causal_lm_model._left_pad",
+            side_effect=AssertionError("padded backbone"),
+        ):
+            self._assert_targets_match_independent_rows(
+                model_type,
+                "flash_attention_2",
+                torch.device("cuda"),
+                GenRecModelConfig.BF16,
+            )
 
 
 if __name__ == "__main__":

@@ -36,9 +36,13 @@ feature_configs {
 }
 ```
 
-- **max_capacity**: 最大的id数，Id数超过后会根据Id的驱逐策略进行淘汰
+- **max_capacity**: 最大的id数，Id数超过后会根据Id的驱逐策略进行淘汰。每个分片的建表容量会按有效 `bucket_capacity` 向上对齐，因此实际容量可能略高于配置值。
 
-- **cache_load_factor**: （可选）缓存在 GPU 显存（HBM）中的 embedding 行数比例，取值范围为 `(0, 1]`。未设置时，分片规划器会在 `0.1、0.2、...、1.0` 中自动选择；显式设置后，规划器固定使用该比例，不再搜索其他比例。例如 `cache_load_factor: 0.25` 表示将 25% 的 embedding 行缓存在 HBM 中；设置为 `1.0` 时使用 HBM_ONLY，全部 embedding 行驻留显存。
+- **cache_load_factor**: （可选）显存规划请求的值预算比例，取值 [0, 1]。不配置时由规划器自动搜索合适的比例；若配置了 `unique_id_factor`，规划器会结合 local batch size 估算工作集。参见[如何从训练数据测量 unique_id_factor](../usage/train.md#pooling-factor)。配置后的语义：
+
+  - `0`：零显存值预算
+  - `1`：满显存值预算
+  - `(0, 1)` 之间的值：非缓存候选保留请求比例。
 
 - **score_strategy**: Id驱逐策略，默认为 STEP，目前支持 TIMESTAMP | STEP | LFU | NO_EVICTION
 
@@ -60,7 +64,7 @@ feature_configs {
 
 - **eval_initializer_args**: （可选）评估时的初始化方式，默认是 CONSTANT，value=0
 
-- **init_capacity_per_rank**: （可选）初始的每个Rank上的id数，默认等于max_capacity。如需显式配置，建议不小于单个Batch在每个Rank上的新增Id数，过小会导致首个Batch部分Id插入失败，其embedding未初始化，训练loss为nan。单个Batch的去重Id数可以用`tzrec.tools.add_pooling_factor_to_config`测得的`unique_id_factor`乘以`batch_size`来估计（见[pooling_factor与unique_id_factor](../usage/train.md#pooling-factor)）
+- **init_capacity_per_rank**: （可选）初始的每个Rank上的id数，默认等于max_capacity。如需显式配置，建议不小于单个Batch在每个Rank上的新增Id数，过小会导致首个Batch部分Id插入失败，其embedding未初始化，训练loss为nan。每个Rank的工作集可以用`tzrec.tools.add_pooling_factor_to_config`测得的`unique_id_factor`乘以 local `batch_size`来估计（见[pooling_factor与unique_id_factor](../usage/train.md#pooling-factor)）
 
 - **admission_strategy**: (可选) 特征准入策略，默认不开启，目前支持 frequency_admission_strategy 和 probabilistic_admission_strategy
 
