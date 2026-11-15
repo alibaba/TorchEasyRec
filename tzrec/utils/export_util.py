@@ -122,36 +122,37 @@ def _has_dynamicemb_in_pipeline_config(
     return False
 
 
-def _has_dynamicemb_in_model(model: BaseModule) -> bool:
-    """Whether any feature or embedding table on ``model`` uses ``dynamicemb``."""
-    for feature in getattr(model, "features", None) or ():
-        config = getattr(feature, "config", None)
-        if (
-            config is not None
-            and hasattr(config, "dynamicemb")
-            and config.HasField("dynamicemb")
-        ):
-            return True
-    bag_infos, embedding_infos = _get_sparse_table_to_embedding_info(model)
-    return any(
-        getattr(info, "use_dynamicemb", False)
-        for info in (*bag_infos.values(), *embedding_infos.values())
-    )
-
-
 def ensure_input_tile_for_distributed_embedding(
     pipeline_config: Optional[EasyRecConfig] = None,
 ) -> None:
-    """Ensure distributed embedding export uses INPUT_TILE=3."""
+    """Ensure distributed embedding export uses INPUT_TILE=3.
+
+    When ``pipeline_config`` contains any feature configured with ``dynamicemb``
+    and RTP export is not active, automatically sets
+    ``USE_DISTRIBUTED_EMBEDDING=1`` before enforcing ``INPUT_TILE=3``. Passing
+    ``pipeline_config=None`` skips dynamicemb detection.
+
+    Args:
+        pipeline_config: Optional pipeline config to inspect for ``dynamicemb``
+            features.
+    """
     if (
         not acc_utils.use_distributed_embedding()
-        and not env_util.use_rtp()
         and _has_dynamicemb_in_pipeline_config(pipeline_config)
+        and not env_util.use_rtp()
     ):
-        logger.info(
-            "Detected dynamicemb feature in pipeline_config; "
-            "automatically enabling USE_DISTRIBUTED_EMBEDDING=1."
-        )
+        current_dist_emb = os.environ.get("USE_DISTRIBUTED_EMBEDDING")
+        if current_dist_emb is None:
+            logger.info(
+                "Detected dynamicemb feature in pipeline_config; "
+                "automatically enabling USE_DISTRIBUTED_EMBEDDING=1."
+            )
+        else:
+            logger.warning(
+                "dynamicemb requires USE_DISTRIBUTED_EMBEDDING=1, "
+                f"got USE_DISTRIBUTED_EMBEDDING={current_dist_emb}. "
+                "Overriding to 1."
+            )
         os.environ["USE_DISTRIBUTED_EMBEDDING"] = "1"
 
     if not acc_utils.use_distributed_embedding():
@@ -204,10 +205,28 @@ def export_model(
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
 ) -> None:
-    """Export a EasyRec model, may be a part of model in PipelineConfig.
+    """Export an EasyRec model, or a sub-module of a model in PipelineConfig.
 
-    `data_input_path` (optional): override for the predict-mode dataloader
-    input path; falls back to `pipeline_config.train_input_path` when None.
+    If ``pipeline_config`` configures any ``dynamicemb`` feature and RTP export
+    is not active, ``USE_DISTRIBUTED_EMBEDDING=1`` (and ``INPUT_TILE=3``) is
+    automatically enabled via ``ensure_input_tile_for_distributed_embedding``.
+
+    Args:
+        pipeline_config: Full pipeline configuration.
+        model: Inference-wrapped model or sub-module to export.
+        checkpoint_path: Optional checkpoint directory to restore from.
+        save_dir: Local or remote output directory for exported artifacts.
+        assets: Optional extra asset file paths to copy into ``save_dir``.
+        additional_export_config: Optional extra key/value pairs written into
+            ``model_acc.json``.
+        data_input_path: Optional override for the predict-mode dataloader input
+            path; falls back to ``pipeline_config.train_input_path`` when None.
+
+    Raises:
+        ValueError: If ``dlrm_hstu``/``ultra_hstu`` is missing ``cand_seq_pk``,
+            if ``dynamicemb`` is used with RTP export, or if
+            ``export_config.dynamic_embedding`` is configured with RTP export or
+            without ``USE_DISTRIBUTED_EMBEDDING=1``.
     """
     model_type = pipeline_config.model_config.WhichOneof("model")
     if model_type in ("dlrm_hstu", "ultra_hstu") and (
@@ -219,21 +238,12 @@ def export_model(
         )
 
     use_rtp = env_util.use_rtp()
-    has_dynemb = _has_dynamicemb_in_pipeline_config(
-        pipeline_config
-    ) or _has_dynamicemb_in_model(model)
-    if has_dynemb and not use_rtp and not acc_utils.use_distributed_embedding():
-        logger.info(
-            "Detected dynamicemb feature; automatically enabling "
-            "USE_DISTRIBUTED_EMBEDDING=1."
-        )
-        os.environ["USE_DISTRIBUTED_EMBEDDING"] = "1"
-        ensure_input_tile_for_distributed_embedding()
-    use_dist_embedding = acc_utils.use_distributed_embedding()
-    if has_dynemb and (use_rtp or not use_dist_embedding):
+    if _has_dynamicemb_in_pipeline_config(pipeline_config) and use_rtp:
         raise ValueError(
-            "dynamicemb requires USE_DISTRIBUTED_EMBEDDING=1 and a non-RTP export"
+            "feature config uses dynamicemb, which is not supported for RTP export"
         )
+    ensure_input_tile_for_distributed_embedding(pipeline_config)
+    use_dist_embedding = acc_utils.use_distributed_embedding()
     if pipeline_config.export_config.HasField("dynamic_embedding"):
         if use_rtp or not use_dist_embedding:
             raise ValueError(
