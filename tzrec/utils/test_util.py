@@ -232,24 +232,28 @@ class hypothesis_settings(_settings):
         )
 
 
-def ci_resources(slots: int = 1, split: str = "module") -> Any:
+def ci_resources(
+    slots: int = 1, split: str = "module", timeout: Optional[int] = None
+) -> Any:
     """Declare fixture boundaries and optional accelerator requirements for CI.
 
     Args:
         slots: One or two scheduling units. An accelerator unit is one card;
             CPU units budget concurrency without changing the test rank count.
         split: Smallest independent fixture boundary: module, class, or case.
+        timeout: Optional time limit for the group, in seconds.
     """
     if (
         type(slots) is not int
         or slots not in (1, 2)
         or split not in ("module", "class", "case")
+        or (timeout is not None and timeout <= 0)
     ):
         raise ValueError("invalid CI resource declaration")
 
     def decorate(obj: Any) -> Any:
         """Attach resource requirements to a test class or method."""
-        obj._ci_resources = (slots, split)
+        obj._ci_resources = (slots, split, timeout)
         return obj
 
     return decorate

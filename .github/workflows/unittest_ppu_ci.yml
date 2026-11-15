@@ -40,7 +40,7 @@ jobs:
             -e TZREC_TEST_TIMEOUT_SCALE=4 \
             -v "$WORK_ROOT":/__w \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5-ppu \
-            bash -eo pipefail scripts/ci/ci_test_ppu.sh --parallel --scope gpu --session "$REPORT_DIR" --capacity 16 --hardware ppu --timeout 86400
+            bash -eo pipefail scripts/ci/ci_test_ppu.sh --scope gpu --session "$REPORT_DIR" --capacity 16 --hardware ppu --timeout 86400
       - name: StopDockerContainer
         if: always()
         run: |

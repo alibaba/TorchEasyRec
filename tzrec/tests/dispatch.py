@@ -8,10 +8,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dispatch unittest groups against a common slot budget on CPU and accelerators."""
+"""Allocate slots and collect native unittest results in discovery order."""
 
-import argparse
-import importlib
+import json
 import os
 import shutil
 import signal
@@ -19,278 +18,229 @@ import subprocess
 import sys
 import tempfile
 import time
-import traceback
-import uuid
-from collections import Counter, deque
+from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING or __package__:
-    from tzrec.tests import run
-else:
-    run = importlib.import_module("run")
+from typing import TextIO
 
 
 def group_cases(cases: list[dict]) -> list[dict]:
-    """Group at certified fixture boundaries, retaining discovery order."""
-    groups: dict[tuple, dict] = {}
+    """Keep each declared fixture boundary together and reserve its peak slots."""
+    groups: dict[str, dict] = {}
     for case in cases:
-        boundary = case["module"]
-        if case["split"] == "class":
-            boundary = case["id"].rsplit(".", 1)[0]
-        elif case["split"] == "case":
-            boundary = case["id"]
-        key = (case["split"], boundary)
-        group = groups.setdefault(key, dict(cases=[], slots=case["slots"]))
-        group["cases"].append(case)
+        split = case["split"]
+        key = (
+            case["module"]
+            if split == "module"
+            else case["id"].rsplit(".", 1)[0]
+            if split == "class"
+            else case["id"]
+        )
+        group = groups.setdefault(
+            key,
+            dict(name=key, ids=[], slots=1, env=case["env"], timeout=case["timeout"]),
+        )
+        if (group["env"], group["timeout"]) != (case["env"], case["timeout"]):
+            raise ValueError(f"incompatible environment or timeout within {key}")
         group["slots"] = max(group["slots"], case["slots"])
+        group["ids"].append(case["id"])
     return list(groups.values())
 
 
-def visible_pool(mask: str | None, count: int, capacity: int) -> list[str]:
-    """Preserve the parent CUDA IDs; never widen an empty or restricted mask."""
-    cards = mask.split(",") if mask is not None else list(map(str, range(count)))
-    if (
-        count != capacity
-        or len(cards) != capacity
-        or len(set(cards)) != capacity
-        or not all(cards)
-    ):
-        raise ValueError(
-            f"expected {capacity} distinct visible cards, got {count}: {cards}"
-        )
-    return cards
-
-
-def check_result(group: dict, report: dict, code: int) -> None:
-    """Require exactly one valid outcome per planned case and a matching exit."""
-    expected = Counter(c["id"] for c in group["cases"])
-    observed = Counter(c["id"] for c in report["cases"])
-    outcomes = {c["outcome"] for c in report["cases"]}
-    failures = {"failure", "error", "unexpected_success", "blocked_by_fixture"}
-    failed = bool(outcomes & failures) or any(
-        e["outcome"] != "skip" for e in report["fixtures"]
-    )
-    if (
-        type(report["code"]) is not int
-        or code != report["code"]
-        or code != int(failed)
-        or report["group"] != group["key"]
-        or report["session_id"] != group["session_id"]
-        or not outcomes <= failures | {"success", "skip", "expected_failure"}
-        or expected != observed
-        or any(n != 1 for n in expected.values())
-    ):
-        raise RuntimeError(f"incomplete or inconsistent group: {group['key']}")
+def terminate(process: subprocess.Popen) -> None:
+    """Reap an owned process group, including subprocesses left by a test."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=10)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
 
 
 def schedule(
-    groups: list[dict],
-    cards: list[str],
+    cases: list[dict],
     capacity: int,
-    env: dict,
-    directory: Path,
+    cards: list[str],
     session: Path,
-    deadline: float,
     test_dir: str,
-) -> list[dict]:
-    """Lease slots in FIFO order and recycle them only after child cleanup."""
-    queue = deque(groups)
+    started: float,
+    timeout: float,
+) -> int:
+    """Run groups FIFO, then print their failures and one suite-wide summary."""
+    groups = group_cases(cases)
+    if any(g["slots"] > capacity for g in groups):
+        raise ValueError("test group exceeds lane capacity")
+    counts: Counter[str] = Counter()
+    problems: dict[int, str] = {}
+    active: dict[subprocess.Popen, tuple[int, list[int], TextIO, float]] = {}
     free = set(range(capacity))
-    active: dict[subprocess.Popen, tuple] = {}
-    reports = []
-    try:
-        while queue or active:
-            if time.monotonic() >= deadline:
-                raise TimeoutError("test job deadline exceeded")
-            for process, (group, lease, log) in list(active.items()):
-                code = process.poll()
-                if code is None:
-                    continue
-                run.terminate(process)
-                log.close()
-                path = session / "results" / (group["key"] + ".json")
-                if not path.is_file():
-                    raise RuntimeError(
-                        f"group {group['key']} exited {code} without a result; "
-                        f"see {log.name}"
-                    )
-                report = run.read_json(path)
-                check_result(group, report, code)
-                reports.append(report)
-                del active[process]
-                free.update(lease)
-            while queue:
-                group = queue[0]
-                units = group["slots"]
-                if len(free) < units:
-                    break
-                queue.popleft()
-                lease = sorted(free)[:units]
-                free.difference_update(lease)
-                selected = [cards[i] for i in lease] if cards else []
-                child_env = dict(env, CUDA_VISIBLE_DEVICES=",".join(selected))
-                checkout = directory / str(lease[0])
-                if not checkout.exists():
-                    shutil.copytree(
-                        Path.cwd(),
-                        checkout,
-                        symlinks=True,
-                        ignore=shutil.ignore_patterns(
-                            ".git",
-                            "tmp",
-                            "experiments",
-                            "__pycache__",
-                            ".hypothesis",
-                            ".ruff_cache",
-                        ),
-                    )
-                group["assigned_devices"] = selected
-                group_file = session / "groups" / (group["key"] + ".json")
-                run.write_json(group_file, group)
-                log = (session / "logs" / (group["key"] + ".log")).open("w")
-                try:
-                    process = subprocess.Popen(
-                        [
-                            sys.executable,
-                            "tzrec/tests/run.py",
-                            "--group-file",
-                            str(group_file),
-                            "--output",
-                            str(session / "results" / group_file.name),
-                            "--test_dir",
-                            test_dir,
-                        ],
-                        cwd=checkout,
-                        env=child_env,
-                        start_new_session=True,
-                        stdout=log,
-                        stderr=log,
-                    )
-                except BaseException:
-                    log.close()
-                    raise
-                active[process] = (group, lease, log)
-                print(
-                    f"Starting group {group['key']}: slots={lease} cards={selected}",
-                    flush=True,
-                )
-            if active:
-                time.sleep(0.1)
-    finally:
-        for process in active:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        for process, (_, _, log) in active.items():
-            run.terminate(process)
-            log.close()
-    return reports
-
-
-def dispatch(args: argparse.Namespace) -> int:
-    """Discover in the dispatcher's device view, then schedule the full plan."""
-    cpu = args.hardware == "cpu"
-    capacity = args.capacity
-    if capacity < 1 or (cpu and args.scope):
-        raise ValueError(
-            "capacity must be positive; the CPU lane discovers the full suite"
-        )
-    cards = []
-    if cpu:
-        os.environ.update(CUDA_VISIBLE_DEVICES="", NVIDIA_VISIBLE_DEVICES="void")
-    else:
-        import torch
-
-        cards = visible_pool(
-            os.environ.get("CUDA_VISIBLE_DEVICES"), torch.cuda.device_count(), capacity
-        )
-    env = dict(os.environ, PYTHONPATH=".")
-    session = args.session.resolve()
-    session.mkdir(parents=True, exist_ok=True)
-    if any(session.iterdir()):
-        raise ValueError("use an empty report directory")
-    (session / "logs").mkdir()
-    (session / "results").mkdir()
-    started = time.monotonic()
-    deadline = started + args.timeout
-    # A stalled test-module import must not outlive the job deadline.
-    signal.setitimer(signal.ITIMER_REAL, max(0.01, deadline - time.monotonic()))
-    try:
-        cases = run.discover(
-            args.test_dir, args.pattern, None if cpu else args.scope or "gpu"
-        )
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-    plan = group_cases(cases)
-    identity = uuid.uuid4().hex
-    for i, group in enumerate(plan):
-        if group["slots"] > capacity:
-            raise ValueError("test group exceeds lane capacity")
-        group.update(key=str(i), session_id=identity)
-        group["visible_devices"] = group["slots"] if cards else 0
-    counts = Counter(str(g["slots"]) for g in plan)
-    run.write_json(
-        session / "plan.json",
-        dict(session_id=identity, capacity=capacity, slot_counts=counts, groups=plan),
-    )
-    print(f"Capacity {capacity}, groups by slot demand: {dict(counts)}", flush=True)
-    Path("tmp").mkdir(exist_ok=True)
+    index = 0
     with tempfile.TemporaryDirectory(
         dir=Path("tmp").resolve(), prefix="ci-slots-"
-    ) as directory:
-        reports = schedule(
-            plan,
-            cards,
-            capacity,
-            env,
-            Path(directory),
-            session,
-            deadline,
-            args.test_dir,
+    ) as tmp:
+        scratch = Path(tmp)
+        try:
+            while index < len(groups) or active:
+                if time.monotonic() >= started + timeout:
+                    if index < len(groups):
+                        problems[index] = f"job timeout; {len(groups) - index} pending"
+                    for i, _, _, _ in active.values():
+                        problems[i] = (
+                            f"{groups[i]['name']}: interrupted at job deadline"
+                        )
+                    break
+                for proc, (i, lease, log, end) in list(active.items()):
+                    rc = proc.poll()
+                    if rc is None and time.monotonic() < end:
+                        continue
+                    terminate(proc)
+                    log.close()
+                    del active[proc]
+                    free.update(lease)
+                    try:
+                        if rc is None:
+                            raise ValueError(f"timed out after {groups[i]['timeout']}s")
+                        result = json.loads((scratch / f"{i}.counts").read_text())
+                        failed = any(
+                            result[k]
+                            for k in ("failures", "errors", "unexpected successes")
+                        )
+                        if rc != int(failed):
+                            raise ValueError("exit status disagrees with unittest")
+                        counts.update(result)
+                    except (OSError, ValueError, KeyError) as exc:
+                        problems[i] = f"{groups[i]['name']}: {exc} (exit {rc})"
+                while index < len(groups) and len(free) >= groups[index]["slots"]:
+                    i = index
+                    group = groups[i]
+                    index += 1
+                    lease = sorted(free)[: group["slots"]]
+                    checkout = scratch / str(lease[0])
+                    if not checkout.exists():
+                        shutil.copytree(
+                            Path.cwd(),
+                            checkout,
+                            symlinks=True,
+                            ignore=shutil.ignore_patterns(
+                                ".git",
+                                "tmp",
+                                "experiments",
+                                "__pycache__",
+                                ".hypothesis",
+                                ".ruff_cache",
+                            ),
+                        )
+                    devices = [cards[j] for j in lease] if cards else []
+                    env = dict(os.environ, **group["env"])
+                    env.update(PYTHONPATH=".", CUDA_VISIBLE_DEVICES=",".join(devices))
+                    request = scratch / f"{i}.group"
+                    request.write_text(
+                        json.dumps(
+                            dict(
+                                ids=group["ids"],
+                                test_dir=test_dir,
+                                devices=len(devices),
+                            )
+                        )
+                    )
+                    log = (session / f"{i}.log").open("w")
+                    try:
+                        proc = subprocess.Popen(
+                            [
+                                sys.executable,
+                                str(Path(__file__).with_name("run_group.py").resolve()),
+                                str(request),
+                            ],
+                            cwd=checkout,
+                            env=env,
+                            start_new_session=True,
+                            stdout=log,
+                            stderr=log,
+                        )
+                    except OSError as exc:
+                        log.close()
+                        problems[i] = f"{group['name']}: could not start: {exc}"
+                        continue
+                    free.difference_update(lease)
+                    active[proc] = (
+                        i,
+                        lease,
+                        log,
+                        time.monotonic() + (group["timeout"] or timeout),
+                    )
+                    print(
+                        f"Group {i}: {group['name']} slots={lease} cards={devices}",
+                        flush=True,
+                    )
+                if active:
+                    time.sleep(0.1)
+        finally:
+            for proc in active:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            for proc, (_, _, log, _) in active.items():
+                terminate(proc)
+                log.close()
+
+        return _print_summary(session, scratch, len(groups), counts, problems, started)
+
+
+def _print_summary(
+    session: Path,
+    scratch: Path,
+    group_count: int,
+    counts: Counter[str],
+    problems: dict[int, str],
+    started: float,
+) -> int:
+    """Replay native failure blocks and report totals for completed groups."""
+    with (session / "summary.txt").open("w") as output:
+        for i in range(group_count + 1):
+            if i in problems:
+                print(f"GROUP ERROR: {problems[i]}", file=output)
+                path = session / f"{i}.log"
+            else:
+                path = scratch / f"{i}.errors"
+            if path.exists():
+                with path.open(errors="replace") as stream:
+                    shutil.copyfileobj(stream, output)
+        failed = bool(
+            problems
+            or counts["errors"]
+            or counts["failures"]
+            or counts["unexpected successes"]
         )
-    expected = Counter(c["id"] for c in cases)
-    actual = Counter(c["id"] for report in reports for c in report["cases"])
-    if actual != expected or any(n != 1 for n in expected.values()):
-        raise RuntimeError("missing, unexpected or duplicate case results")
-    code = max(report["code"] for report in reports)
-    summary = dict(
-        session_id=identity,
-        planned=sum(expected.values()),
-        reported=sum(actual.values()),
-        code=code,
-        outcomes=dict(Counter(c["outcome"] for r in reports for c in r["cases"])),
-        seconds=time.monotonic() - started,
-    )
-    run.write_json(session / "summary.json", summary)
-    return code
-
-
-def main() -> int:
-    """Run all selected tests within one job-wide deadline."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--session", type=Path, required=True)
-    parser.add_argument("--hardware", choices=("cpu", "h20", "ppu"), required=True)
-    parser.add_argument("--capacity", type=int, required=True)
-    parser.add_argument("--test-dir", default="tzrec")
-    parser.add_argument("--pattern", default="*_test.py")
-    parser.add_argument("--scope", choices=("gpu", "h20"))
-    parser.add_argument("--timeout", type=float, default=21600)
-
-    def cancel(signum: int, frame: Any) -> None:
-        """Unwind through owned process cleanup when GitHub cancels the job."""
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGTERM, cancel)
-    return dispatch(parser.parse_args())
-
-
-if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except Exception:
-        traceback.print_exc()
-        sys.exit(2)
+        if problems:
+            counts["group errors"] = len(problems)
+        stats = ", ".join(
+            f"{k}={counts[k]}"
+            for k in (
+                "failures",
+                "errors",
+                "skipped",
+                "expected failures",
+                "unexpected successes",
+                "group errors",
+            )
+            if counts[k]
+        )
+        n = counts["tests"]
+        elapsed = time.monotonic() - started
+        print("-" * 70, file=output)
+        print(
+            f"Ran {n} test{'s' if n != 1 else ''} in {elapsed:.3f}s\n",
+            file=output,
+        )
+        print(
+            ("FAILED" if failed else "OK") + (f" ({stats})" if stats else ""),
+            file=output,
+        )
+    with (session / "summary.txt").open() as summary:
+        shutil.copyfileobj(summary, sys.stderr)
+    return int(failed)

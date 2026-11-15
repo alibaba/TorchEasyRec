@@ -1,17 +1,14 @@
 # CI测试分组
 
-每个CPU、H20或PPU作业在一个容器中运行，`dispatch.py`发现并计划用例，直接调用`run.py --group-file`执行。CPU和加速器是同一节点上的两个独立作业。A10 Nightly仍运行原串行入口。
-
-## 运行
-
-在已准备好的匹配环境中，例如：
+本地和CI统一使用`run.py`。默认容量为2，按scope筛选后为每个组启动一个独立解释器；不传scope时发现全量测试。A10 Nightly继续使用原A10 runner，容量2，不过滤scope。
 
 ```bash
-PYTHONPATH=. python tzrec/tests/dispatch.py --hardware cpu --capacity 32 --session tmp/cpu-report
-PYTHONPATH=. python tzrec/tests/dispatch.py --hardware h20 --scope gpu --capacity 8 --session tmp/gpu-report
+PYTHONPATH=. python tzrec/tests/run.py --list_tests
+PYTHONPATH=. python tzrec/tests/run.py --hardware cpu --capacity 32 --session tmp/cpu-report
+PYTHONPATH=. python tzrec/tests/run.py --hardware h20 --scope gpu --capacity 8 --session tmp/gpu-report
 ```
 
-`--session`必须是新建或空目录。`--pattern`可缩小本地验收范围；正式CPU CI不传scope或pattern，仍发现全部测试。串行对照使用`python tzrec/tests/run.py --report-dir tmp/serial-report`。
+`--list_tests`只打印测试ID，不创建报告或启动执行器。`--session`需要空目录，省略时在`tmp/`生成独立目录。
 
 ## 分组规则
 
@@ -20,6 +17,6 @@ PYTHONPATH=. python tzrec/tests/dispatch.py --hardware h20 --scope gpu --capacit
 - H20/PPU：容量分别为8和16，1个单位对应一张可见卡。`@mark_ci_scope("gpu")`选择用例。普通用例默认1，无需装饰器；只有双卡需求才标`slots=2`，仅按case拆可写`@ci_resources(split="case")`。所有组按队列顺序领取1或2张空闲卡，双卡组不会被后续单卡组插队。组内资源取最大值，没有全池独占或串行基线。调度进程发现用例时可见容器内全部设备；只有测试组启动后才占用分配的卡。父进程设备数量与容量不符直接报错。设备映射和任意卡对通信在机型或镜像变更时验收。
 - H20加速器容器116核，PPU为108核，均为1528GiB内存；CPU和加速器同时运行仍为宿主预留4核、16GiB。上述内存包含各容器使用的共享内存。
 
-调度端以`plan.json`记录完整计划，`groups/`保存交给各子进程的用例ID及静态skip决策；`results/`与`logs/`分别保存结果和输出。每组退出码和用例终态必须一致，缺失、重复、异常退出不允许报绿。`summary.json`记录总耗时、计划/上报数量及结果统计。比较串并行时应在相同镜像、资源、数据及凭据下对齐逐例ID和结果；不能只比较测试数。取消时清理本作业启动的进程组，workflow兜底清理本作业容器。
+每组的stdout和stderr独立保存。所有组结束后，终端和`summary.txt`按发现顺序集中输出原生unittest失败堆栈、实际运行数、跳过数和总耗时。一个组测试失败不妨碍其他组继续；进程崩溃、超时或缺少结果会附上组名和日志，作业返回非零。没有逐例结果JSON或恢复日志。
 
-实例、代理、常驻runner和安全排空仍由TorchEasyRec-addons维护。三个workflow直接启动带节点/槽位标签的容器，从工作区路径上传报告。
+需要隔离的类用`@ci_resources(split="case", timeout=600)`标记，每个参数化case由调度器直接启动，不嵌套运行器。timeout只约束对应组，不改变其他集成测试的总作业期限。实例、代理和常驻runner仍由TorchEasyRec-addons维护。

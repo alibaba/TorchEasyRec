@@ -16,8 +16,10 @@ import pyarrow as pa
 
 from tzrec.tools.tdm.gen_tree.tree_builder import TDMTreeNode, TreeBuilder
 from tzrec.tools.tdm.gen_tree.tree_search_util import LevelOrderIter
+from tzrec.utils.test_util import ci_resources
 
 
+@ci_resources(split="case", timeout=600)
 class TreeBuilderTest(unittest.TestCase):
     def gen_ids_codes(self) -> List[TDMTreeNode]:
         leaf_nodes = []
