@@ -190,24 +190,23 @@ def schedule(
 
 
 def dispatch(args: argparse.Namespace) -> int:
-    """Discover once in the lane's original view, then schedule the full plan."""
+    """Discover in the dispatcher's device view, then schedule the full plan."""
     cpu = args.hardware == "cpu"
     capacity = args.capacity
     if capacity < 1 or (cpu and args.scope):
         raise ValueError(
             "capacity must be positive; the CPU lane discovers the full suite"
         )
-    env = dict(os.environ, PYTHONPATH=".")
     cards = []
     if cpu:
-        env.update(CUDA_VISIBLE_DEVICES="", NVIDIA_VISIBLE_DEVICES="void")
+        os.environ.update(CUDA_VISIBLE_DEVICES="", NVIDIA_VISIBLE_DEVICES="void")
     else:
         import torch
 
         cards = visible_pool(
-            env.get("CUDA_VISIBLE_DEVICES"), torch.cuda.device_count(), capacity
+            os.environ.get("CUDA_VISIBLE_DEVICES"), torch.cuda.device_count(), capacity
         )
-    discovery_view = cards[:2] if args.hardware == "ppu" else cards
+    env = dict(os.environ, PYTHONPATH=".")
     session = args.session.resolve()
     session.mkdir(parents=True, exist_ok=True)
     if any(session.iterdir()):
@@ -216,28 +215,14 @@ def dispatch(args: argparse.Namespace) -> int:
     (session / "results").mkdir()
     started = time.monotonic()
     deadline = started + args.timeout
-    with tempfile.TemporaryDirectory() as temporary:
-        output = Path(temporary) / "discovery.json"
-        command = [
-            sys.executable,
-            "tzrec/tests/run.py",
-            "--discover-to",
-            str(output),
-            "--pattern",
-            args.pattern,
-            "--test_dir",
-            args.test_dir,
-        ]
-        if not cpu:
-            command.extend(["--scope", args.scope or "gpu"])
-        code = run.run_process(
-            command,
-            timeout=max(0.01, deadline - time.monotonic()),
-            env=dict(env, CUDA_VISIBLE_DEVICES=",".join(discovery_view)),
+    # A stalled test-module import must not outlive the job deadline.
+    signal.setitimer(signal.ITIMER_REAL, max(0.01, deadline - time.monotonic()))
+    try:
+        cases = run.discover(
+            args.test_dir, args.pattern, None if cpu else args.scope or "gpu"
         )
-        if code:
-            raise RuntimeError(f"discovery exited with code {code}")
-        cases = run.read_json(output)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
     plan = group_cases(cases)
     identity = uuid.uuid4().hex
     for i, group in enumerate(plan):

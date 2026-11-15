@@ -630,9 +630,6 @@ def main() -> int:
         "--report-dir", help="write CI results and a durable outcome journal"
     )
     parser.add_argument(
-        "--discover-to", type=Path, help="write the exact cases for dispatch"
-    )
-    parser.add_argument(
         "--group-file", type=Path, help="execute only these discovered case IDs"
     )
     parser.add_argument(
@@ -640,9 +637,6 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.discover_to:
-        write_json(args.discover_to, discover(args.test_dir, args.pattern, args.scope))
-        return 0
     if args.group_file or args.output:
         if not args.group_file or not args.output:
             parser.error("--group-file and --output must be used together")
