@@ -53,7 +53,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - INPUT_TILE_3_ONLINE: 配合INPUT_TILE=3使用，对User侧序列特征使用在线推理模式，序列特征在线模型服务中推理性能更好，但导出的模型无法用于离线预测
   - **INPUT_TILE_3_ONLINE=1**：启用序列特征的在线推理模式
 - USE_DISTRIBUTED_EMBEDDING: 开启分布式 embedding 导出模式，导出 dense graph 与分片 sparse embedding 参数；该模式会自动使用 `INPUT_TILE=3`
-  - **USE_DISTRIBUTED_EMBEDDING=1**：启用分布式 embedding 导出；配置了 `dynamicemb` 的特征会在非 RTP 导出时自动开启该模式（`dynamicemb` 不支持 `USE_RTP=1` 导出）
+  - **USE_DISTRIBUTED_EMBEDDING=1**：启用分布式 embedding 导出；配置了 `dynamicemb` 的特征会在非 RTP 导出时自动开启该模式
   - 普通 sparse、ZCH 和原生 dynemb 模型使用统一导出流程；`dynamic_embedding` 仅调整 dynemb 读取和上传参数
   - 配置了 zch 的特征会自动转换为动态表导出，详见 [零冲突Hash Embedding](../feature/zch.md) 的分布式 Embedding 导出章节
   - PYTORCH dense 图使用 CPU 导出，TRITON/CUTLASS dense 图需要 CUDA；导出目录保留 full/dense graph 调试文件，不再生成 `graph/gm_sparse.graph`

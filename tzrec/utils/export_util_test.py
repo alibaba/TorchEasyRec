@@ -4078,11 +4078,11 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 os.environ,
                 {"USE_DISTRIBUTED_EMBEDDING": "0", "INPUT_TILE": "0", "USE_RTP": "1"},
             ),
-            mock.patch.object(export_util, "url_to_fs") as resolve_output,
-            self.assertRaisesRegex(
-                ValueError,
-                "feature config uses dynamicemb, which is not supported for RTP export",
-            ),
+            mock.patch.object(export_util, "export_rtp_model") as rtp_export,
+            mock.patch.object(
+                export_util, "export_distributed_embedding"
+            ) as dist_export,
+            mock.patch.object(export_util, "export_model_normal") as normal_export,
         ):
             export_util.export_model(
                 self.pipeline_config,
@@ -4090,7 +4090,11 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 self.checkpoint_dir,
                 self.export_dir,
             )
-        resolve_output.assert_not_called()
+            self.assertEqual(os.environ["USE_DISTRIBUTED_EMBEDDING"], "0")
+            self.assertEqual(os.environ["INPUT_TILE"], "0")
+            rtp_export.assert_called_once()
+            dist_export.assert_not_called()
+            normal_export.assert_not_called()
 
 
 if __name__ == "__main__":

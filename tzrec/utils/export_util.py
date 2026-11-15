@@ -223,10 +223,9 @@ def export_model(
             path; falls back to ``pipeline_config.train_input_path`` when None.
 
     Raises:
-        ValueError: If ``dlrm_hstu``/``ultra_hstu`` is missing ``cand_seq_pk``,
-            if ``dynamicemb`` is used with RTP export, or if
-            ``export_config.dynamic_embedding`` is configured with RTP export or
-            without ``USE_DISTRIBUTED_EMBEDDING=1``.
+        ValueError: If ``dlrm_hstu``/``ultra_hstu`` is missing ``cand_seq_pk``, or
+            if ``export_config.dynamic_embedding`` is configured with RTP export
+            or without ``USE_DISTRIBUTED_EMBEDDING=1``.
     """
     model_type = pipeline_config.model_config.WhichOneof("model")
     if model_type in ("dlrm_hstu", "ultra_hstu") and (
@@ -238,10 +237,6 @@ def export_model(
         )
 
     use_rtp = env_util.use_rtp()
-    if _has_dynamicemb_in_pipeline_config(pipeline_config) and use_rtp:
-        raise ValueError(
-            "feature config uses dynamicemb, which is not supported for RTP export"
-        )
     ensure_input_tile_for_distributed_embedding(pipeline_config)
     use_dist_embedding = acc_utils.use_distributed_embedding()
     if pipeline_config.export_config.HasField("dynamic_embedding"):
