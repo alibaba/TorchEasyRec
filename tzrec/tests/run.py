@@ -86,32 +86,22 @@ def main() -> int:
     parser.add_argument("--test-dir", "--test_dir", default="tzrec")
     parser.add_argument("--pattern", default="*_test.py")
     parser.add_argument("--scope", choices=("gpu", "h20"))
-    parser.add_argument("--hardware", choices=("cpu", "h20", "ppu", "gpu"))
+    parser.add_argument(
+        "--hardware", choices=("cpu", "gpu"), help="default: auto-detect locally"
+    )
     parser.add_argument("--capacity", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=21600)
     args = parser.parse_args()
     if args.capacity < 1 or args.timeout <= 0:
         parser.error("capacity and timeout must be positive")
+    device_ids = []
     if args.hardware == "cpu":
         os.environ.update(CUDA_VISIBLE_DEVICES="", NVIDIA_VISIBLE_DEVICES="void")
-    started = time.monotonic()
-    signal.setitimer(signal.ITIMER_REAL, args.timeout)
-    try:
-        with redirect_stdout(sys.stderr):
-            cases = discover(args.test_dir, args.pattern, args.scope)
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-    if args.list_tests:
-        for case in cases:
-            print(case["id"])
-        return 0
-
-    device_ids = []
-    if args.hardware != "cpu":
+    else:
         import torch
 
         count = torch.cuda.device_count()
-        if args.hardware or count:
+        if args.hardware == "gpu" or count:
             if args.hardware is None:
                 args.capacity = min(args.capacity, count)
             mask = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -123,13 +113,24 @@ def main() -> int:
                 or len(visible) != count
                 or not all(visible)
                 or len(set(visible)) != count
-                or (args.hardware in ("h20", "ppu") and count != args.capacity)
             ):
                 parser.error(
                     f"capacity {args.capacity} incompatible with {count} devices: "
                     f"{visible}"
                 )
             device_ids = visible[: args.capacity]
+
+    started = time.monotonic()
+    signal.setitimer(signal.ITIMER_REAL, args.timeout)
+    try:
+        with redirect_stdout(sys.stderr):
+            cases = discover(args.test_dir, args.pattern, args.scope)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    if args.list_tests:
+        for case in cases:
+            print(case["id"])
+        return 0
 
     Path("tmp").mkdir(exist_ok=True)
     return dispatch.schedule(

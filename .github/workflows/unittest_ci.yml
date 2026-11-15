@@ -41,7 +41,7 @@ jobs:
             -e PIP_CACHE_DIR=/root/.cache/pip \
             -v "$WORK_ROOT":/__w \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5 \
-            bash -eo pipefail scripts/ci/ci_test.sh --scope gpu --capacity 8 --hardware h20 --timeout 21600
+            bash -eo pipefail scripts/ci/ci_test.sh --scope gpu --capacity 8 --hardware gpu --timeout 21600
       - name: StopDockerContainer
         if: always()
         run: |
