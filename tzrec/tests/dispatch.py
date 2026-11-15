@@ -64,7 +64,7 @@ def terminate(process: subprocess.Popen) -> None:
 def schedule(
     cases: list[dict],
     capacity: int,
-    cards: list[str],
+    device_ids: list[str],
     session: Path,
     test_dir: str,
     started: float,
@@ -134,16 +134,21 @@ def schedule(
                                 ".ruff_cache",
                             ),
                         )
-                    devices = [cards[j] for j in lease] if cards else []
+                    assigned_device_ids = (
+                        [device_ids[j] for j in lease] if device_ids else []
+                    )
                     env = dict(os.environ, **group["env"])
-                    env.update(PYTHONPATH=".", CUDA_VISIBLE_DEVICES=",".join(devices))
+                    env.update(
+                        PYTHONPATH=".",
+                        CUDA_VISIBLE_DEVICES=",".join(assigned_device_ids),
+                    )
                     request = scratch / f"{i}.group"
                     request.write_text(
                         json.dumps(
                             dict(
                                 ids=group["ids"],
                                 test_dir=test_dir,
-                                devices=len(devices),
+                                device_count=len(assigned_device_ids),
                             )
                         )
                     )
@@ -173,7 +178,8 @@ def schedule(
                         time.monotonic() + (group["timeout"] or timeout),
                     )
                     print(
-                        f"Group {i}: {group['name']} slots={lease} cards={devices}",
+                        f"Group {i}: {group['name']} slots={lease} "
+                        f"device_ids={assigned_device_ids}",
                         flush=True,
                     )
                 if active:

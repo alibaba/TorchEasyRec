@@ -108,7 +108,7 @@ def main() -> int:
             print(case["id"])
         return 0
 
-    cards = []
+    device_ids = []
     if args.hardware != "cpu":
         import torch
 
@@ -128,10 +128,10 @@ def main() -> int:
                 or (args.hardware in ("h20", "ppu") and count != args.capacity)
             ):
                 parser.error(
-                    f"capacity {args.capacity} incompatible with {count} cards: "
+                    f"capacity {args.capacity} incompatible with {count} devices: "
                     f"{visible}"
                 )
-            cards = visible[: args.capacity]
+            device_ids = visible[: args.capacity]
 
     Path("tmp").mkdir(exist_ok=True)
     session = args.session or Path(tempfile.mkdtemp(dir="tmp", prefix="ci-report-"))
@@ -142,7 +142,7 @@ def main() -> int:
     return dispatch.schedule(
         cases,
         args.capacity,
-        cards,
+        device_ids,
         session.resolve(),
         args.test_dir,
         started,

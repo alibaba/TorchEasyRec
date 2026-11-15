@@ -20,10 +20,10 @@ def main(request: Path) -> int:
     """Run exact IDs and return native failure blocks and group-level counts."""
     group = json.loads(request.read_text())
     sys.path.insert(0, str(Path(group["test_dir"]).resolve()))
-    if group["devices"]:
+    if group["device_count"]:
         import torch
 
-        if torch.cuda.device_count() != group["devices"]:
+        if torch.cuda.device_count() != group["device_count"]:
             raise RuntimeError("wrong device view for test group")
 
     loader = unittest.TestLoader()
