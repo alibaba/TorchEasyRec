@@ -15,7 +15,6 @@ import importlib
 import os
 import signal
 import sys
-import tempfile
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -89,7 +88,6 @@ def main() -> int:
     parser.add_argument("--scope", choices=("gpu", "h20"))
     parser.add_argument("--hardware", choices=("cpu", "h20", "ppu", "gpu"))
     parser.add_argument("--capacity", type=int, default=2)
-    parser.add_argument("--session", type=Path)
     parser.add_argument("--timeout", type=float, default=21600)
     args = parser.parse_args()
     if args.capacity < 1 or args.timeout <= 0:
@@ -134,16 +132,10 @@ def main() -> int:
             device_ids = visible[: args.capacity]
 
     Path("tmp").mkdir(exist_ok=True)
-    session = args.session or Path(tempfile.mkdtemp(dir="tmp", prefix="ci-report-"))
-    session.mkdir(parents=True, exist_ok=True)
-    if any(session.iterdir()):
-        parser.error("use an empty report directory")
-    print(f"Test logs: {session.resolve()}", flush=True)
     return dispatch.schedule(
         cases,
         args.capacity,
         device_ids,
-        session.resolve(),
         args.test_dir,
         started,
         args.timeout,

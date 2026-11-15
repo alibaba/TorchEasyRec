@@ -199,9 +199,10 @@ def cleanup_cuda_memory() -> None:
 
 
 def make_test_dir(prefix: str = "tzrec_") -> str:
-    """Create a fresh, world-readable ``./tmp/<prefix>*`` dir; return its path."""
-    os.makedirs("./tmp", exist_ok=True)
-    test_dir = tempfile.mkdtemp(prefix=prefix, dir="./tmp")
+    """Create a fresh directory under the group temp root (locally, ./tmp)."""
+    root = os.environ.get("TZREC_TEST_TMPDIR", "./tmp")
+    os.makedirs(root, exist_ok=True)
+    test_dir = tempfile.mkdtemp(prefix=prefix, dir=root)
     os.chmod(test_dir, 0o755)
     return test_dir
 

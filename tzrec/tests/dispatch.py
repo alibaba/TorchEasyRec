@@ -65,7 +65,6 @@ def schedule(
     cases: list[dict],
     capacity: int,
     device_ids: list[str],
-    session: Path,
     test_dir: str,
     started: float,
     timeout: float,
@@ -75,14 +74,20 @@ def schedule(
     if any(g["slots"] > capacity for g in groups):
         raise ValueError("test group exceeds lane capacity")
     counts: Counter[str] = Counter()
+    failed_groups: set[int] = set()
     problems: dict[int, str] = {}
     active: dict[subprocess.Popen, tuple[int, list[int], TextIO, float]] = {}
     free = set(range(capacity))
     index = 0
-    with tempfile.TemporaryDirectory(
-        dir=Path("tmp").resolve(), prefix="ci-slots-"
-    ) as tmp:
+    with (
+        tempfile.TemporaryDirectory(dir=Path("tmp").resolve(), prefix="ci-") as tmp,
+        tempfile.TemporaryDirectory(dir="/tmp", prefix="tzrec-") as alias,
+    ):
         scratch = Path(tmp)
+        # multiprocessing creates Unix sockets under TMPDIR with a short path limit.
+        short_tmp = Path(alias) / "groups"
+        short_tmp.symlink_to(scratch, target_is_directory=True)
+        failure_logs = scratch.parent / "ci-failures" / scratch.name
         try:
             while index < len(groups) or active:
                 if time.monotonic() >= started + timeout:
@@ -112,6 +117,8 @@ def schedule(
                         if rc != int(failed):
                             raise ValueError("exit status disagrees with unittest")
                         counts.update(result)
+                        if failed:
+                            failed_groups.add(i)
                     except (OSError, ValueError, KeyError) as exc:
                         problems[i] = f"{groups[i]['name']}: {exc} (exit {rc})"
                 while index < len(groups) and len(free) >= groups[index]["slots"]:
@@ -119,27 +126,16 @@ def schedule(
                     group = groups[i]
                     index += 1
                     lease = sorted(free)[: group["slots"]]
-                    checkout = scratch / str(lease[0])
-                    if not checkout.exists():
-                        shutil.copytree(
-                            Path.cwd(),
-                            checkout,
-                            symlinks=True,
-                            ignore=shutil.ignore_patterns(
-                                ".git",
-                                "tmp",
-                                "experiments",
-                                "__pycache__",
-                                ".hypothesis",
-                                ".ruff_cache",
-                            ),
-                        )
+                    group_tmp = scratch / str(i)
+                    group_tmp.mkdir()
                     assigned_device_ids = (
                         [device_ids[j] for j in lease] if device_ids else []
                     )
                     env = dict(os.environ, **group["env"])
                     env.update(
                         PYTHONPATH=".",
+                        TZREC_TEST_TMPDIR=str(group_tmp),
+                        TMPDIR=str(short_tmp / str(i)),
                         CUDA_VISIBLE_DEVICES=",".join(assigned_device_ids),
                     )
                     request = scratch / f"{i}.group"
@@ -152,7 +148,7 @@ def schedule(
                             )
                         )
                     )
-                    log = (session / f"{i}.log").open("w")
+                    log = (scratch / f"{i}.log").open("w")
                     try:
                         proc = subprocess.Popen(
                             [
@@ -160,7 +156,6 @@ def schedule(
                                 str(Path(__file__).with_name("run_group.py").resolve()),
                                 str(request),
                             ],
-                            cwd=checkout,
                             env=env,
                             start_new_session=True,
                             stdout=log,
@@ -194,11 +189,28 @@ def schedule(
                 terminate(proc)
                 log.close()
 
-        return _print_summary(session, scratch, len(groups), counts, problems, started)
+            for i in sorted(failed_groups | problems.keys()):
+                log_path = scratch / f"{i}.log"
+                if not log_path.exists():
+                    continue
+                failure_logs.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a") as stream:
+                    if i in problems:
+                        print(f"\nGROUP ERROR: {problems[i]}", file=stream)
+                    else:
+                        with (scratch / f"{i}.errors").open() as errors:
+                            shutil.copyfileobj(errors, stream)
+                log_path.replace(failure_logs / f"{i}.log")
+            if failure_logs.exists():
+                print(f"Failed group logs: {failure_logs}", file=sys.stderr)
+
+        return _print_summary(
+            failure_logs, scratch, len(groups), counts, problems, started
+        )
 
 
 def _print_summary(
-    session: Path,
+    failure_logs: Path,
     scratch: Path,
     group_count: int,
     counts: Counter[str],
@@ -206,47 +218,45 @@ def _print_summary(
     started: float,
 ) -> int:
     """Replay native failure blocks and report totals for completed groups."""
-    with (session / "summary.txt").open("w") as output:
-        for i in range(group_count + 1):
-            if i in problems:
-                print(f"GROUP ERROR: {problems[i]}", file=output)
-                path = session / f"{i}.log"
-            else:
-                path = scratch / f"{i}.errors"
-            if path.exists():
-                with path.open(errors="replace") as stream:
-                    shutil.copyfileobj(stream, output)
-        failed = bool(
-            problems
-            or counts["errors"]
-            or counts["failures"]
-            or counts["unexpected successes"]
+    for i in range(group_count + 1):
+        if i in problems:
+            path = failure_logs / f"{i}.log"
+            if not path.exists():
+                print(f"GROUP ERROR: {problems[i]}", file=sys.stderr)
+        else:
+            path = scratch / f"{i}.errors"
+        if path.exists():
+            with path.open(errors="replace") as stream:
+                shutil.copyfileobj(stream, sys.stderr)
+    failed = bool(
+        problems
+        or counts["errors"]
+        or counts["failures"]
+        or counts["unexpected successes"]
+    )
+    if problems:
+        counts["group errors"] = len(problems)
+    stats = ", ".join(
+        f"{k}={counts[k]}"
+        for k in (
+            "failures",
+            "errors",
+            "skipped",
+            "expected failures",
+            "unexpected successes",
+            "group errors",
         )
-        if problems:
-            counts["group errors"] = len(problems)
-        stats = ", ".join(
-            f"{k}={counts[k]}"
-            for k in (
-                "failures",
-                "errors",
-                "skipped",
-                "expected failures",
-                "unexpected successes",
-                "group errors",
-            )
-            if counts[k]
-        )
-        n = counts["tests"]
-        elapsed = time.monotonic() - started
-        print("-" * 70, file=output)
-        print(
-            f"Ran {n} test{'s' if n != 1 else ''} in {elapsed:.3f}s\n",
-            file=output,
-        )
-        print(
-            ("FAILED" if failed else "OK") + (f" ({stats})" if stats else ""),
-            file=output,
-        )
-    with (session / "summary.txt").open() as summary:
-        shutil.copyfileobj(summary, sys.stderr)
+        if counts[k]
+    )
+    n = counts["tests"]
+    elapsed = time.monotonic() - started
+    print("-" * 70, file=sys.stderr)
+    print(
+        f"Ran {n} test{'s' if n != 1 else ''} in {elapsed:.3f}s\n",
+        file=sys.stderr,
+    )
+    print(
+        ("FAILED" if failed else "OK") + (f" ({stats})" if stats else ""),
+        file=sys.stderr,
+    )
     return int(failed)

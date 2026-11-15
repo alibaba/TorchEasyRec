@@ -34,7 +34,7 @@ jobs:
           CI_REGION: ${{ secrets.CI_REGION }}
         run: |
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
-          REPORT_DIR="../report_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}/tmp/ci-failures"
           docker run --rm --pull=always --name "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
             --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
@@ -45,27 +45,21 @@ jobs:
             -e PIP_CACHE_DIR=/root/.cache/pip \
             -v "$WORK_ROOT":/__w \
             mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5-cpu \
-            bash -eo pipefail scripts/ci/ci_test_cpu.sh --capacity 32 --session "$REPORT_DIR"
+            bash -eo pipefail scripts/ci/ci_test_cpu.sh --capacity 32
       - name: StopDockerContainer
         if: always()
         run: |
           docker stop --timeout=30 "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
           docker rm -f "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
-      - name: Retain test evidence
+      - name: Upload failed group logs
         id: artifacts
-        if: always() && steps.tests.outcome != 'skipped'
+        if: failure() && steps.tests.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: cpu-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/report_${{ github.run_id }}_${{ github.run_attempt }}
+          path: ${{ github.workspace }}/run_${{ github.run_id }}/tmp/ci-failures/*/*.log
           retention-days: 14
-          if-no-files-found: error
-      - name: Clean job directories
-        if: always()
-        env:
-          ARTIFACT_OUTCOME: ${{ steps.artifacts.outcome }}
-        run: |
-          rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}"
-          if [ "$ARTIFACT_OUTCOME" = success ]; then
-            rm -rf -- "${GITHUB_WORKSPACE:?}/report_${GITHUB_RUN_ID:?}_${GITHUB_RUN_ATTEMPT:?}"
-          fi
+          if-no-files-found: ignore
+      - name: Clean checkout
+        if: always() && (steps.artifacts.outcome == 'success' || steps.artifacts.outcome == 'skipped')
+        run: rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}"

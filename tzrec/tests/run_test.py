@@ -19,8 +19,9 @@ from pathlib import Path
 
 class TestRunnerTest(unittest.TestCase):
     def setUp(self):
-        Path("tmp").mkdir(exist_ok=True)
-        tmp = tempfile.TemporaryDirectory(dir="tmp")
+        parent = Path(os.environ.get("TZREC_TEST_TMPDIR", "tmp"))
+        parent.mkdir(exist_ok=True)
+        tmp = tempfile.TemporaryDirectory(dir=parent)
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name).resolve()
         self.tests = self.root / "suite"
@@ -49,6 +50,7 @@ class TestRunnerTest(unittest.TestCase):
             "import unittest\n"
             "class One(unittest.TestCase):\n"
             " def test_fail(self):\n"
+            "  print('first group output')\n"
             "  with self.subTest(a=1): self.fail('first failure')\n"
             " def test_skipped(self): self.skipTest('optional')\n"
             " @unittest.expectedFailure\n"
@@ -63,10 +65,14 @@ class TestRunnerTest(unittest.TestCase):
             "class Two(unittest.TestCase):\n"
             " def test_error(self): raise ValueError('second error')\n"
         )
+        (self.tests / "pass_test.py").write_text(
+            "import unittest\nclass Passing(unittest.TestCase):\n"
+            " def test_ok(self): print('successful group output')\n"
+        )
         r = self.cli()
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertEqual(r.stderr.count("Ran "), 1)
-        self.assertIn("Ran 4 tests", r.stderr)
+        self.assertIn("Ran 5 tests", r.stderr)
         for message in (
             "AssertionError: first failure",
             "RuntimeError: fixture failed",
@@ -80,9 +86,23 @@ class TestRunnerTest(unittest.TestCase):
             "FAILED (failures=1, errors=2, skipped=1, unexpected successes=1)", r.stderr
         )
 
+        logs = sorted((self.root / "tmp").rglob("*.log"))
+        self.assertEqual(len(logs), 2)
+        text = "".join(log.read_text() for log in logs)
+        for fragment in (
+            "first group output",
+            "AssertionError: first failure",
+            "RuntimeError: fixture failed",
+            "ValueError: second error",
+        ):
+            self.assertIn(fragment, text)
+        self.assertNotIn("successful group output", text)
+        self.assertFalse(list(self.root.rglob("summary.txt")))
+
     def test_case_isolation_and_pre_import_environment(self):
         (self.tests / "case_test.py").write_text(
-            "import os, time, unittest\nfrom pathlib import Path\n"
+            "import os, subprocess, sys, tempfile, time, unittest\n"
+            "from pathlib import Path\n"
             "value=os.getenv('CASE_BOOT_ENV')\nprint('import diagnostic')\n"
             "class Isolated(unittest.TestCase):\n"
             " _ci_resources=(1,'case',15)\n"
@@ -90,7 +110,16 @@ class TestRunnerTest(unittest.TestCase):
             " def record(self):\n"
             "  self.assertEqual(value,'ready')\n"
             f"  root = Path({str(self.root)!r})\n"
-            "  (root/str(os.getpid())).touch()\n"
+            "  self.assertEqual(Path.cwd(),root)\n"
+            "  private=Path(os.environ['TZREC_TEST_TMPDIR'])\n"
+            "  self.assertTrue(Path(tempfile.gettempdir()).samefile(private))\n"
+            "  from multiprocessing.connection import Listener\n"
+            "  with Listener(family='AF_UNIX'): pass\n"
+            '  child="import tempfile;from pathlib import Path;'
+            "Path(tempfile.gettempdir(), 'same-name').touch(exist_ok=False)\"\n"
+            "  subprocess.run([sys.executable,'-c',child],check=True)\n"
+            "  self.assertTrue((private/'same-name').is_file())\n"
+            "  (root/str(os.getpid())).write_text(str(private))\n"
             "  until=time.monotonic()+5\n"
             "  while len(list(root.glob('[0-9]*')))<2:\n"
             "   self.assertLess(time.monotonic(),until);time.sleep(.02)\n"
@@ -103,7 +132,12 @@ class TestRunnerTest(unittest.TestCase):
         r = self.cli()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Ran 2 tests", r.stderr)
-        self.assertEqual(len([p for p in self.root.iterdir() if p.name.isdecimal()]), 2)
+        private_dirs = {
+            p.read_text() for p in self.root.iterdir() if p.name.isdecimal()
+        }
+        self.assertEqual(len(private_dirs), 2)
+        self.assertTrue(all(not Path(p).exists() for p in private_dirs))
+        self.assertEqual(list((self.root / "tmp").iterdir()), [])
 
     def test_infrastructure_failure_does_not_hide_other_groups(self):
         (self.tests / "crash_test.py").write_text(
@@ -121,6 +155,9 @@ class TestRunnerTest(unittest.TestCase):
         self.assertIn("timed out after 1s", r.stderr)
         self.assertIn("Ran 0 tests", r.stderr)
         self.assertIn("FAILED (group errors=2)", r.stderr)
+        logs = list((self.root / "tmp/ci-failures").rglob("*.log"))
+        self.assertEqual(len(logs), 2)
+        self.assertTrue(all("GROUP ERROR:" in log.read_text() for log in logs))
 
     def test_import_error_not_filtered_out_by_scope(self):
         (self.tests / "bad_test.py").write_text("raise ImportError('bad import')\n")
