@@ -173,7 +173,7 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
         self, model_type: str, beam_widths: List[int]
     ) -> None:
         from tzrec.modules.beam_cache import (
-            create_shared_prompt_beam_cache,
+            create_beam_cache,
         )
 
         device = torch.device("cuda")
@@ -195,7 +195,7 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
             lm,
             ids,
             pairs,
-            initial_cache=create_shared_prompt_beam_cache(lm),
+            initial_cache=create_beam_cache(lm),
             **options,
         )
         self.assertTrue(torch.equal(shared, ordinary))

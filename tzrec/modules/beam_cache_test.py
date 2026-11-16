@@ -17,7 +17,7 @@ from parameterized import parameterized
 
 from tzrec.modules.beam_cache import (
     SharedPromptBeamCache,
-    create_shared_prompt_beam_cache,
+    create_beam_cache,
 )
 from tzrec.utils.test_util import (
     create_tiny_causal_lm,
@@ -44,7 +44,7 @@ class SharedPromptBeamCacheTest(unittest.TestCase):
                 layers=[SimpleNamespace(self_attn=SimpleNamespace(**attention_attrs))]
             ),
         )
-        cache = create_shared_prompt_beam_cache(model)
+        cache = create_beam_cache(model)
         if shared:
             self.assertIsInstance(cache, SharedPromptBeamCache)
         else:
@@ -132,7 +132,7 @@ class SharedPromptBeamCacheTest(unittest.TestCase):
         with torch.no_grad(), torch.autocast("cuda", dtype=compute_dtype):
             reference = forward(ids)
             ordinary = reference.past_key_values
-            shared = create_shared_prompt_beam_cache(lm)
+            shared = create_beam_cache(lm)
             actual = forward(ids, shared)
             torch.testing.assert_close(actual.logits, reference.logits, atol=0, rtol=0)
             parents = torch.arange(batch, device="cuda").repeat_interleave(2)

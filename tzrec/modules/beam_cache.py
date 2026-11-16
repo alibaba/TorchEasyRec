@@ -141,7 +141,7 @@ class SharedPromptBeamCache(Cache):
             )
 
 
-def create_shared_prompt_beam_cache(
+def create_beam_cache(
     model: nn.Module,
 ) -> Optional[SharedPromptBeamCache]:
     """Select shared KV storage for full FlashAttention 2 prediction.

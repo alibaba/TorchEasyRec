@@ -31,7 +31,7 @@ from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.genrec_model import BaseGenRecModel
-from tzrec.modules.beam_cache import create_shared_prompt_beam_cache
+from tzrec.modules.beam_cache import create_beam_cache
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
@@ -600,7 +600,7 @@ def generate_codes(
         mask,
         capped_widths,
         bands,
-        initial_cache=create_shared_prompt_beam_cache(lm),
+        initial_cache=create_beam_cache(lm),
     )
     # a band starts at base_vocab_size + level_offset, so this undoes both shifts
     codes = tokens - tokens.new_tensor([lo for lo, _ in bands])
