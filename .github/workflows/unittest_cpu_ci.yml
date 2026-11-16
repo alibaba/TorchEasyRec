@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   ci-test:
-    runs-on: [tzrec-ci-dsw, tzrec-cpu-runner]
+    runs-on: [tzrec-ci-dsw, tzrec-ci-cpu]
     timeout-minutes: 360
     steps:
       - name: FetchCommit
