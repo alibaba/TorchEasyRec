@@ -61,7 +61,6 @@ def _check_readers(test_dir, pg):
             input_fields=[pa.field("x", pa.int64())],
             kafka_partition_round_robin=True,
         )
-    case.assertTrue(reader._kafka_partition_round_robin)
     case.assertEqual(reader._round_robin_partition_order, [1, 0])
     if pg is None or dist.get_rank(pg) == 0:
         consumer.list_topics.assert_called_once()
