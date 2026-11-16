@@ -74,8 +74,8 @@ def make_sample_table_schema(
 ) -> pa.Schema:
     """Schema of a raw batch travelling through the sample pool.
 
-    Sources without event time only carry position metadata; Kafka declares
-    ``DATA_TIMESTAMP`` explicitly.
+    Sources without event time only carry position metadata; sources that
+    declare event time add ``DATA_TIMESTAMP`` explicitly.
     """
     fields = list(reader_schema) + [
         pa.field(CKPT_SOURCE_ID, pa.string()),
@@ -612,7 +612,7 @@ class Coordinator:
             except queue.Empty:
                 return
             blocking = False
-            kind, _, consumer_id = msg
+            kind, consumer_id = msg
             if kind == _CANCEL:
                 self._cancel_event.set()
                 return
@@ -680,13 +680,11 @@ class Coordinator:
 
         while self._request_order:
             consumer_id = self._request_order[0]
-            num_rows: Optional[int] = None
+            num_rows = self._batch_size
             drain = False
             end = False
-            if self._plan.planned_rows is not None:
-                remaining = self._remaining
-                assert remaining is not None
-                if remaining == 0:
+            if self._remaining is not None:
+                if self._remaining == 0:
                     if self._verified:
                         end = True
                     else:
@@ -696,8 +694,8 @@ class Coordinator:
                 else:
                     # all rows read (verified) or still arriving: the request
                     # size is the same, only capacity and drain differ
-                    num_rows = min(self._batch_size, remaining)
-                    drain = self._verified or remaining < self._capacity_rows
+                    num_rows = min(self._batch_size, self._remaining)
+                    drain = self._verified or self._remaining < self._capacity_rows
             elif self._verified:
                 # unknown row count: drain what is left, applying the tail rule
                 available = self._pool.total_rows
@@ -710,8 +708,6 @@ class Coordinator:
                         end = True
                     else:
                         drain = True
-            else:
-                num_rows = self._batch_size
 
             if end:
                 self._response_queues[consumer_id].put_nowait((_END, None))
@@ -722,7 +718,6 @@ class Coordinator:
                     self._pool.discard()
                 self._request_order.popleft()
                 continue
-            assert num_rows is not None
             batch = self._pool.emit(num_rows, drain)
             if batch is None:
                 break
@@ -786,12 +781,11 @@ class Coordinator:
                 if self._error is not None:
                     break
                 if self._pool_has_room():
-                    if all(p.is_alive() for p in self._readers):
+                    # a dead reader's input may end mid-frame; never read it
+                    # again, fail the service instead
+                    self._check_readers()
+                    if self._error is None:
                         self._service_input(_LOOP_TICK_SECS)
-                    else:
-                        # a dead reader's input may end mid-frame; never read
-                        # it again, fail the service instead
-                        self._check_readers()
                 elif not self._request_order:
                     # consumers are busy processing their batches; block until
                     # the next request instead of polling and adding latency
@@ -876,7 +870,6 @@ class SampleShuffleHandle:
         world_size: int,
     ) -> None:
         validate_sample_shuffle_config(data_config)
-        self._rank = rank
         self._num_consumers = max(num_workers, 1)
         self._batch_size = data_config.batch_size
         self._min_batch_size = reader._min_batch_size
@@ -910,7 +903,6 @@ class SampleShuffleHandle:
         self._fatal_event = self._ctx.Event()
         self._cancel_event = self._ctx.Event()
         self._proc: Optional[Any] = None
-        self._stopped = False
 
     def _put_request(self, msg: Tuple) -> bool:
         """Queue a protocol message unless the service is stopping.
@@ -939,7 +931,7 @@ class SampleShuffleHandle:
         finished = False
         try:
             while True:
-                if not self._put_request((_GET, self._rank, consumer_id)):
+                if not self._put_request((_GET, consumer_id)):
                     return
                 while True:
                     try:
@@ -964,17 +956,13 @@ class SampleShuffleHandle:
                     # kind == _ERROR
                     raise RuntimeError(payload)
         finally:
-            if (
-                not finished
-                and not self._stop_event.is_set()
-                and not self._cancel_event.is_set()
-            ):
+            if not finished:
                 # the pass was abandoned; stop the whole rank's service
-                self._put_request((_CANCEL, self._rank, consumer_id))
+                self._put_request((_CANCEL, consumer_id))
 
     def start(self) -> None:
         """Spawn the coordinator; idempotent."""
-        if self._proc is not None or self._stopped:
+        if self._proc is not None or self._stop_event.is_set():
             return
         logger.info(
             f"sample-shuffle service starting: "
@@ -1039,9 +1027,8 @@ class SampleShuffleHandle:
 
     def stop(self) -> None:
         """Stop the coordinator and its readers; idempotent."""
-        if self._stopped:
+        if self._stop_event.is_set():
             return
-        self._stopped = True
         # wake consumers even when the coordinator was never started (e.g. a
         # dataloader creation failure between the eager iter and start)
         self._stop_event.set()

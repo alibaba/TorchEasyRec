@@ -782,7 +782,12 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
     """End-to-end exercise of the dynamicemb planner integration."""
 
     def _enumerate(
-        self, with_plain_table=False, rows=4096, factor=None, optimizer=None
+        self,
+        with_plain_table=False,
+        rows=4096,
+        factor=None,
+        optimizer=None,
+        world_size=2,
     ):
         from tzrec.utils.plan_util import get_default_sharders as dynamicemb_sharders
 
@@ -792,7 +797,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             name="table_de",
             feature_names=["feat_de"],
         )
-        with mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}):
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": str(world_size)}):
             constraint = build_dynamicemb_constraints(
                 feature_pb2.DynamicEmbedding(max_capacity=rows), table
             )
@@ -812,7 +817,7 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             model.sparse.ebc.embedding_bags["table_de"].weight._optimizer_classes = [
                 optimizer
             ]
-        topology = Topology(world_size=2, compute_device="cuda")
+        topology = Topology(world_size=world_size, compute_device="cuda")
         enumerator = EmbeddingEnumerator(
             topology=topology,
             batch_size=128,
@@ -820,11 +825,14 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
         )
         return enumerator.enumerate(model, dynamicemb_sharders()), topology
 
-    def test_normalized_shards_and_converted_budgets(self):
+    @parameterized.expand([(2,), (4,)], name_func=parameterized_name_func)
+    def test_normalized_shards_and_converted_budgets(self, world_size):
         from torchrec.distributed.planner import planners
 
-        options, topology = self._enumerate(rows=8001, factor=3.2)
-        # Both partial modes start at the 2048-row working set per 4096-row shard.
+        options, topology = self._enumerate(
+            rows=world_size * 4000 + 1, factor=3.2, world_size=world_size
+        )
+        # Local batch 128 requires 2048 rows, without another rank division.
         self.assertEqual(
             min(
                 o.cache_params.load_factor
@@ -834,8 +842,8 @@ class PlanUtilDynamicEmbE2ETest(unittest.TestCase):
             0.5,
         )
         noncache = [o for o in options if not o.dynamicemb_options.caching]
-        for opt, requested in ((noncache[0], 0), (noncache[1], 0.5), (noncache[-1], 1)):
-            self.assertEqual(opt.tensor.shape[0], 8192)
+        for opt, requested in ((noncache[0], 0), (noncache[1], 0.1), (noncache[-1], 1)):
+            self.assertEqual(opt.tensor.shape[0], world_size * 4096)
             for rank, shard in enumerate(opt.shards):
                 self.assertEqual(shard.size[0], 4096)
                 if requested == 1:
@@ -1004,38 +1012,22 @@ class DynamicEmbPlannerTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("unmeasured", None, [*np.geomspace(0.1, 0.5, 5), 0.6, 0.7, 0.8, 0.9], 3),
-            (
-                "measured_zero",
-                0,
-                [1 / 4096, *np.geomspace(1 / 4096, 0.5, 5)[2:], 0.6, 0.7, 0.8, 0.9],
-                3,
-            ),
-            (
-                "below_one_percent",
-                0.001,
-                [1 / 4096, *np.geomspace(1 / 4096, 0.5, 5)[2:], 0.6, 0.7, 0.8, 0.9],
-                3,
-            ),
-            (
-                "small_working_set",
-                0.1,
-                [*np.geomspace(64 / 4096, 0.5, 5), 0.6, 0.7, 0.8, 0.9],
-                3,
-            ),
-            (
-                "above_default",
-                1.92,
-                [*np.geomspace(1229 / 4096, 0.5, 5), 0.6, 0.7, 0.8, 0.9],
-                2,
-            ),
-            ("half", 3.2, [0.5, 0.6, 0.7, 0.8, 0.9], 2),
-            ("above_half", 4.8, [0.75, 0.8, 0.9], 1),
-            ("full", 6.4, [], 0),
+            ("unmeasured", None, 0.1, 0.1, 3),
+            ("measured_zero", 0, 1 / 4096, 0.1, 3),
+            ("below_one_percent", 0.001, 1 / 4096, 0.1, 3),
+            ("small_working_set", 0.1, 64 / 4096, 0.1, 3),
+            ("above_default", 1.92, 0.1, 1229 / 4096, 2),
+            ("half", 3.2, 0.1, 0.5, 2),
+            ("above_half", 4.8, 0.1, 0.75, 1),
+            ("full", 6.4, 0.1, None, 0),
+            ("overfull", 12.8, 0.1, None, 0),
         ],
         name_func=parameterized_name_func,
     )
-    def test_auto_grid(self, _, factor, partial_ratios, ncache):
+    def test_auto_grid(self, _, factor, hybrid_start, cache_start, ncache):
+        partial_ratios = [*np.geomspace(hybrid_start, 0.5, 5), 0.6, 0.7, 0.8, 0.9]
+        if hybrid_start == 1 / 4096:
+            del partial_ratios[1]  # Same physical storage as the first point.
         opts = self._options(factor)
         noncache = [o for o in opts if not o.dynamicemb_options.caching]
         cache = [o for o in opts if o.dynamicemb_options.caching]
@@ -1048,7 +1040,7 @@ class DynamicEmbPlannerTest(unittest.TestCase):
         if cache:
             self.assertEqual(
                 cache[0].dynamicemb_storage.local_hbm_for_values,
-                int(partial_ratios[0] * full_bytes),
+                int(cache_start * full_bytes),
             )
 
     @parameterized.expand(

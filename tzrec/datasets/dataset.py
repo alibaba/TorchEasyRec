@@ -12,6 +12,7 @@
 import copy
 import os
 import random
+import weakref
 from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -1002,18 +1003,33 @@ def create_dataloader(
             sample_shuffle.stop()
         raise
 
+    # stop the service when the dataset is released; the eager iter() above
+    # forked the workers, so only the trainer process registers it. The
+    # callback holds the handle, never the dataset.
+    sample_shuffle_finalizer = (
+        weakref.finalize(dataset, sample_shuffle.stop)
+        if sample_shuffle is not None
+        else None
+    )
+    # the dataloader owns the iterator helpers, so they must not own it:
+    # a strong reference here would keep the dataset (and its finalizer)
+    # alive until a cyclic GC pass
+    dataloader_ref = weakref.ref(dataloader)
+
     def get_iterator() -> Iterator[Batch]:
         # return the eager iterator first (keeps its prefetch), then fresh ones
         nonlocal first_iterator
         if first_iterator is not None:
             it, first_iterator = first_iterator, None
             return it
-        return iter(dataloader)
+        loader = dataloader_ref()
+        assert loader is not None
+        return iter(loader)
 
     def close() -> None:
         """Stop the sample-shuffle service; a no-op for paths without one."""
-        if sample_shuffle is not None:
-            sample_shuffle.stop()
+        if sample_shuffle_finalizer is not None:
+            sample_shuffle_finalizer()
 
     dataloader.get_iterator = get_iterator  # pyre-ignore[16]
     dataloader.close = close  # pyre-ignore[16]
