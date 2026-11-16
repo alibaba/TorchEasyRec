@@ -1050,7 +1050,6 @@ class GenRecExportModelTest(unittest.TestCase):
         self.pipeline_config = EasyRecConfig()
         self.common = self.pipeline_config.model_config.genrec_causal_lm_model.common
         self.common.beam_widths.extend([2, 2, 2])
-        self.common.num_return_sequences = 2
 
     def tearDown(self) -> None:
         shutil.rmtree(self.export_dir, ignore_errors=True)
@@ -1089,13 +1088,9 @@ class GenRecExportModelTest(unittest.TestCase):
             SLOT_EMBEDS: slot_embeds,
         }
 
-    @parameterized.expand([[False, None], [True, 6]], name_func=parameterized_name_func)
-    def test_decodes_like_generate_codes(
-        self, with_slots, num_return_sequences
-    ) -> None:
-        self.common.ClearField("num_return_sequences")
-        if num_return_sequences is not None:
-            self.common.num_return_sequences = num_return_sequences
+    @parameterized.expand([[False, 2], [True, 6]], name_func=parameterized_name_func)
+    def test_decodes_like_generate_codes(self, with_slots, final_width) -> None:
+        self.common.beam_widths[-1] = final_width
         streams = self._streams(with_slots)
         model = self._model(streams)
         _, band_lo, band_hi = sid_bands([4, 4, 4], 40)
@@ -1120,7 +1115,7 @@ class GenRecExportModelTest(unittest.TestCase):
         self.assertTrue(torch.equal(out["generated_sids"], expected))
 
     def test_reads_the_exports_pipeline_config(self) -> None:
-        self.common.num_return_sequences = 1
+        self.common.beam_widths[-1] = 1
         config_util.save_message(
             self.pipeline_config, os.path.join(self.export_dir, "pipeline.config")
         )

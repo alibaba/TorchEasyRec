@@ -109,8 +109,7 @@ model_config {
             attn_kernel: "sdpa"
             beam_widths: 10
             beam_widths: 20
-            beam_widths: 50
-            num_return_sequences: 5
+            beam_widths: 5
         }
     }
 }
@@ -172,14 +171,13 @@ answer = [1, 8194, 16387, 4, 8197, 16390]
 
 ### genrec_causal_lm_model
 
-| 参数                          | 说明                                                                                                           |
-| ----------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `hf_model_name_or_path`       | 可选，预训练骨干模型的 HuggingFace 模型 ID 或本地目录，默认 `Qwen/Qwen2.5-0.5B`                                |
-| `common.lm_parameter_dtype`   | 可选，LM 参数精度，`FP32`、`BF16` 或 `FP16`，默认 `FP32`；计算的混合精度由 `train_config.mixed_precision` 控制 |
-| `common.attn_kernel`          | 可选，注意力计算方式，默认 `"sdpa"`，也可使用 `"flash_attention_2"`                                            |
-| `common.beam_widths`          | 必填，长度等于码本层数，各项至少为 `1`；每层均为全局保留数，末层决定返回的 SID 数量                            |
-| `common.num_return_sequences` | 可选，至少为 `1`；设置时覆盖 `beam_widths` 最后一项，候选不足时返回现有候选                                    |
-| `common.generated_sids_key`   | 可选，预测输出列名，默认 `"generated_sids"`                                                                    |
+| 参数                        | 说明                                                                                                           |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `hf_model_name_or_path`     | 可选，预训练骨干模型的 HuggingFace 模型 ID 或本地目录，默认 `Qwen/Qwen2.5-0.5B`                                |
+| `common.lm_parameter_dtype` | 可选，LM 参数精度，`FP32`、`BF16` 或 `FP16`，默认 `FP32`；计算的混合精度由 `train_config.mixed_precision` 控制 |
+| `common.attn_kernel`        | 可选，注意力计算方式，默认 `"sdpa"`，也可使用 `"flash_attention_2"`                                            |
+| `common.beam_widths`        | 必填，长度等于码本层数，各项至少为 `1`；每层均为全局保留数，末层决定返回的 SID 数量；候选不足时返回现有候选    |
+| `common.generated_sids_key` | 可选，预测输出列名，默认 `"generated_sids"`                                                                    |
 
 `hf_model_name_or_path` 指定模型 ID 时，所需配置和预训练权重会自动下载并缓存。
 

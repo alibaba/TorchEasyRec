@@ -37,7 +37,6 @@ def _decode(
     beam_widths=None,
     attention_mask=None,
     initial_cache=None,
-    num_return_sequences=None,
 ):
     """Run the kernel over ``pairs`` of inclusive per-level (lo, hi) band edges.
 
@@ -47,8 +46,6 @@ def _decode(
     """
     if beam_widths is None:
         beam_widths = [width] * len(pairs)
-    if num_return_sequences is not None:
-        beam_widths = [*beam_widths[:-1], num_return_sequences]
     return dynamic_beam_search(
         lm,
         lm.get_input_embeddings()(ids),
@@ -101,25 +98,24 @@ def _bruteforce_scores(lm, input_ids, attention_mask, pairs):
 class DynamicBeamSearchTest(unittest.TestCase):
     @parameterized.expand(
         [
-            [[(20, 23)], [1], 8],
-            [[(20, 21), (5, 7), (25, 28)], [2, 6, 1], 8],
-            [[(20, 21), (5, 7), (25, 28)], [2, 6, 1], 30],
+            [[(20, 23)], [8]],
+            [[(20, 21), (5, 7), (25, 28)], [2, 6, 8]],
+            [[(20, 21), (5, 7), (25, 28)], [2, 6, 30]],
         ],
         name_func=parameterized_name_func,
     )
     def test_final_global_topk_matches_exhaustive_reference(
-        self, pairs, beam_widths, num_return_sequences
+        self, pairs, beam_widths
     ) -> None:
         lm = create_tiny_causal_lm(vocab_size=30)
         ids = torch.tensor([[5, 6, 7, 8]])
         ref = _bruteforce_scores(lm, ids, torch.ones_like(ids), pairs)
-        expected = sorted(ref, key=ref.__getitem__, reverse=True)[:num_return_sequences]
+        expected = sorted(ref, key=ref.__getitem__, reverse=True)[: beam_widths[-1]]
         out = _decode(
             lm,
             ids,
             pairs,
             beam_widths=beam_widths,
-            num_return_sequences=num_return_sequences,
         )
         self.assertEqual([tuple(row) for row in out.tolist()], expected)
 
@@ -166,8 +162,8 @@ class DynamicBeamSearchTest(unittest.TestCase):
 class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
     @parameterized.expand(
         [
-            ["qwen2", [50, 50, 50]],
-            ["qwen3", [50, 50, 50]],
+            ["qwen2", [50, 50, 200]],
+            ["qwen3", [50, 50, 200]],
             ["qwen2", [20, 20, 200]],
             ["qwen3", [20, 20, 200]],
         ],
@@ -176,7 +172,7 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
     def test_final_top200_matches_shared_fa2_cache(
         self, model_type: str, beam_widths: List[int]
     ) -> None:
-        from tzrec.modules.shared_prompt_beam_cache import (
+        from tzrec.modules.beam_cache import (
             create_shared_prompt_beam_cache,
         )
 
@@ -193,7 +189,6 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
         options = dict(
             beam_widths=beam_widths,
             attention_mask=attention_mask,
-            num_return_sequences=200,
         )
         ordinary = _decode(lm, ids, pairs, **options)
         shared = _decode(

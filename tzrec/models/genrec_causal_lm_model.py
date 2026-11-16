@@ -31,8 +31,8 @@ from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.genrec_model import BaseGenRecModel
+from tzrec.modules.beam_cache import create_shared_prompt_beam_cache
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
-from tzrec.modules.shared_prompt_beam_cache import create_shared_prompt_beam_cache
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
     INPUT_IDS,
@@ -527,7 +527,7 @@ def resolve_beam_config(
         codebook: vocabulary size per SID level.
 
     Returns:
-        The capped global width per level, with the optional return override.
+        The capped global width per SID level.
     """
     beam_widths = list(common.beam_widths)
     if not beam_widths:
@@ -540,12 +540,6 @@ def resolve_beam_config(
             f"beam_widths has {len(beam_widths)} entries but the codebook has "
             f"{len(codebook)} levels; give one width per level."
         )
-    if common.HasField("num_return_sequences"):
-        if common.num_return_sequences < 1:
-            raise ValueError(
-                f"num_return_sequences must be >= 1, got {common.num_return_sequences}."
-            )
-        beam_widths[-1] = common.num_return_sequences
     if any(width < 1 for width in beam_widths):
         raise ValueError(f"beam_widths must be >= 1, got {beam_widths}.")
     return capped_beam_widths(beam_widths, codebook)

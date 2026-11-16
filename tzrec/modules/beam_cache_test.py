@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.shared_prompt_beam_cache import (
+from tzrec.modules.beam_cache import (
     SharedPromptBeamCache,
     create_shared_prompt_beam_cache,
 )

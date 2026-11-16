@@ -264,33 +264,26 @@ class GenRecCausalLMModelTest(unittest.TestCase):
     def _beam_model(
         self,
         beam_widths=(2, 2, 2),
-        num_return_sequences=None,
     ) -> GenRecCausalLMModel:
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model._prompt = self.compiled_prompt
         common = GenRecModelConfig()
-        if num_return_sequences is not None:
-            common.num_return_sequences = num_return_sequences
         common.beam_widths.extend(beam_widths)
         model._read_beam_config(common)
         return model
 
     @parameterized.expand(
         [
-            [[2, 3, 4], None, [2, 3, 4]],
-            [[2, 3, 4], 100, [2, 3, 12]],
-            [[6, 12, 12], 100, [4, 12, 48]],
-            [[2, 2, 2], 100, [2, 2, 8]],
+            [[2, 3, 4], [2, 3, 4]],
+            [[2, 3, 100], [2, 3, 12]],
+            [[6, 12, 100], [4, 12, 48]],
+            [[2, 2, 100], [2, 2, 8]],
         ],
         name_func=parameterized_name_func,
     )
-    def test_beam_widths_are_capped_once_at_init(
-        self, beam_widths, num_return_sequences, expected
-    ) -> None:
-        model = self._beam_model(
-            beam_widths=beam_widths, num_return_sequences=num_return_sequences
-        )
+    def test_beam_widths_are_capped_once_at_init(self, beam_widths, expected) -> None:
+        model = self._beam_model(beam_widths=beam_widths)
         self.assertEqual(model._capped_widths, expected)
         space = self.compiled_prompt.sid_space
         self.assertEqual(model._bands, list(zip(space.band_lo, space.band_hi)))
@@ -299,17 +292,14 @@ class GenRecCausalLMModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "beam_widths is required"):
             self._beam_model(beam_widths=())
 
-    def test_rejects_fewer_than_one_returned_sequence(self) -> None:
-        with self.assertRaisesRegex(ValueError, "num_return_sequences must be >= 1"):
-            self._beam_model(num_return_sequences=0)
-
     def test_rejects_a_schedule_that_does_not_match_the_codebook(self) -> None:
         with self.assertRaisesRegex(ValueError, "entries but the codebook has"):
             self._beam_model(beam_widths=(2, 2))
 
-    def test_rejects_a_non_positive_beam_width(self) -> None:
+    @parameterized.expand([[(2, 0, 2)], [(2, 2, 0)]], name_func=parameterized_name_func)
+    def test_rejects_a_non_positive_beam_width(self, beam_widths) -> None:
         with self.assertRaisesRegex(ValueError, "must be >= 1"):
-            self._beam_model(beam_widths=(2, 0, 2))
+            self._beam_model(beam_widths=beam_widths)
 
 
 # a second answer, and a rewrite of GENREC_HIST_CODES that keeps its width
