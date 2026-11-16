@@ -36,7 +36,7 @@ jobs:
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
           rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}/tmp/ci-failures"
           docker run --rm --pull=always --name "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
+            --label "tzrec-ci.node=${TZREC_CI_NODE:?}" --label "tzrec-ci.role=${TZREC_CI_ROLE:?}" \
             --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
             --cpus=64 --memory=256g --shm-size=64g --ulimit memlock=-1 \
             -e GITHUB_ACTIONS=true -e CI=true \

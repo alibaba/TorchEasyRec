@@ -31,7 +31,7 @@ jobs:
           CACHE_ROOT="$RUNNER_WORKSPACE/tzrec-ci-cache"
           mkdir -p "$CACHE_ROOT/triton" "$CACHE_ROOT/inductor"
           docker run --rm --pull=always --name "ppu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
+            --label "tzrec-ci.node=${TZREC_CI_NODE:?}" --label "tzrec-ci.role=${TZREC_CI_ROLE:?}" \
             --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
             --device=/dev/alixpu_ppu0 --device=/dev/alixpu_ppu1 --device=/dev/alixpu_ppu2 --device=/dev/alixpu_ppu3 --device=/dev/alixpu_ppu4 --device=/dev/alixpu_ppu5 --device=/dev/alixpu_ppu6 --device=/dev/alixpu_ppu7 --device=/dev/alixpu_ppu8 --device=/dev/alixpu_ppu9 --device=/dev/alixpu_ppu10 --device=/dev/alixpu_ppu11 --device=/dev/alixpu_ppu12 --device=/dev/alixpu_ppu13 --device=/dev/alixpu_ppu14 --device=/dev/alixpu_ppu15 --device=/dev/alixpu --device=/dev/alixpu_ctl --cpus=108 --memory=1528g --shm-size=256g --ulimit memlock=-1 \
             -e GITHUB_ACTIONS=true -e CI=true \

@@ -31,7 +31,7 @@ jobs:
           CACHE_ROOT="$RUNNER_WORKSPACE/tzrec-ci-cache"
           mkdir -p "$CACHE_ROOT/triton" "$CACHE_ROOT/inductor"
           docker run --rm --pull=always --name "gpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --label "tzci.node=$TZCI_NODE" --label "tzci.role=$TZCI_ROLE" \
+            --label "tzrec-ci.node=${TZREC_CI_NODE:?}" --label "tzrec-ci.role=${TZREC_CI_ROLE:?}" \
             --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
             --gpus all --cpus=116 --memory=1528g --shm-size=512g --ulimit memlock=-1 \
             -e GITHUB_ACTIONS=true -e CI=true \
