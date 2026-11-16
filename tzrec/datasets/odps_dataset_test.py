@@ -28,8 +28,14 @@ from torch import distributed as dist
 from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
-from tzrec.datasets import odps_dataset
+from tzrec.datasets import odps_dataset, sample_shuffle_readers
+from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _create_odps_account
+from tzrec.datasets.utils import (
+    CKPT_ROW_IDX,
+    CKPT_SOURCE_ID,
+    calc_remaining_intervals,
+)
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 from tzrec.utils import test_util
@@ -204,6 +210,89 @@ class OdpsDatasetTest(unittest.TestCase):
                 ],
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
+
+    @unittest.skipIf(
+        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
+        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
+        "odps config not found",
+    )
+    def test_odps_dataset_sample_shuffle_epochs(self):
+        account, odps_endpoint = _create_odps_account()
+        self.o = ODPS(
+            account=account, project=self.test_project, endpoint=odps_endpoint
+        )
+        feature_cfgs = self._create_test_table_and_feature_cfgs()
+        features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
+        cfg = data_pb2.DataConfig(
+            batch_size=4096,
+            dataset_type=data_pb2.DatasetType.OdpsDataset,
+            fg_mode=FgMode.FG_DAG,
+            label_fields=["label"],
+            odps_data_quota_name=self.test_quota,
+            shuffle=True,
+            shuffle_mode="SAMPLE_ROLLING",
+            shuffle_buffer_size=2,
+            num_workers=2,
+        )
+        path = (
+            f"odps://{self.test_project}/tables/"
+            f"test_odps_dataset_{self.test_suffix}/dt=20240319&dt=20240320"
+        )
+        dataloader = create_dataloader(cfg, features, path, mode=Mode.TRAIN)
+        iterator = None
+        state = {}
+        try:
+            iterator = dataloader.get_iterator()
+            sizes = []
+            for batch in iterator:
+                sizes.append(len(batch.labels["label"]))
+                self.assertIsNotNone(batch.checkpoint_info)
+                update_dataloder_state(state, batch.checkpoint_info)
+            # 20000 rows -> four full batches plus a 3616-row tail
+            self.assertEqual(sorted(sizes), [3616] + [4096] * 4)
+            self.assertTrue(state)
+        finally:
+            dataloader.close()
+            if iterator is not None:
+                iterator._shutdown_workers()
+
+        # resume with a three-row tail left in every source interval
+        tail_state = {k: v - 3 for k, v in state.items()}
+        expected_rows = 0
+        for prefix in {k.rsplit(":", 1)[0] for k in state}:
+            prefix_state = {
+                k: v for k, v in tail_state.items() if k.rsplit(":", 1)[0] == prefix
+            }
+            expected_rows += sum(
+                end - start
+                for start, end in calc_remaining_intervals(prefix_state, prefix, 20000)
+            )
+        dataloader = create_dataloader(
+            cfg, features, path, mode=Mode.TRAIN, checkpoint_state=tail_state
+        )
+        iterator = None
+        try:
+            iterator = dataloader.get_iterator()
+            resumed_sizes = []
+            resumed_state = {}
+            for batch in iterator:
+                resumed_sizes.append(len(batch.labels["label"]))
+                update_dataloder_state(resumed_state, batch.checkpoint_info)
+            self.assertEqual(sum(resumed_sizes), expected_rows)
+            for key, value in resumed_state.items():
+                if key in tail_state:
+                    self.assertGreater(value, tail_state[key])
+
+            # the next pass ignores the consumed checkpoint and reads it all
+            iterator = dataloader.get_iterator()
+            sizes = []
+            for batch in iterator:
+                sizes.append(len(batch.labels["label"]))
+            self.assertEqual(sorted(sizes), [3616] + [4096] * 4)
+        finally:
+            dataloader.close()
+            if iterator is not None:
+                iterator._shutdown_workers()
 
     @parameterized.expand([[False], [True]])
     @unittest.skipIf(
@@ -940,6 +1029,125 @@ class OdpsDatasetConfigTest(unittest.TestCase):
         self.assertEqual(m_reader.call_args.kwargs["shuffle_buffer_size"], 64)
 
 
+class OdpsSamplePlanTest(unittest.TestCase):
+    """The rank plan is built from sessions without contacting odps."""
+
+    input_paths = ["odps://p/tables/t/dt=1", "odps://p/tables/t2/dt=2"]
+
+    def _reader(self):
+        reader = odps_dataset.OdpsReader.__new__(odps_dataset.OdpsReader)
+        reader._input_path = ",".join(self.input_paths)
+        reader._input_to_sess = {
+            self.input_paths[0]: [
+                SessionRequest(session_id="s0"),
+                SessionRequest(session_id="s1"),
+            ],
+            self.input_paths[1]: [SessionRequest(session_id="s2")],
+        }
+        reader._sess_row_counts = {"s0": 100, "s1": 50, "s2": 30}
+        reader._batch_size = 8
+        reader._is_orderby_partition = False
+        reader._equalize_rank_steps = True
+        reader._min_batch_size = 0
+        reader._checkpoint_state = None
+        reader._ordered_cols = ["id", "label"]
+        reader._schema = pa.schema(
+            [pa.field("id", pa.int64()), pa.field("label", pa.int64())]
+        )
+        reader._quota_name = "pay-as-you-go"
+        reader._compression = odps_dataset.Compression.LZ4_FRAME
+        return reader
+
+    @parameterized.expand(
+        [
+            param("normal", world_size=2, num_readers=2),
+            param("more_readers", world_size=1, num_readers=4),
+            param("resume", world_size=2, num_readers=2, consumed={0: 39, 1: 9, 2: 19}),
+        ],
+        name_func=test_util.parameterized_name_func,
+    )
+    def test_plan(self, _name, world_size, num_readers, consumed=None):
+        reader = self._reader()
+        sources = reader._sources()
+        if consumed:
+            reader._checkpoint_state = {
+                f"{sources[index][0]}:0": value for index, value in consumed.items()
+            }
+        expected = set()
+        for index, (prefix, rows, _, _, _) in enumerate(sources):
+            expected |= {
+                (prefix, pos)
+                for pos in range(consumed[index] + 1 if consumed else 0, rows)
+            }
+        plans = [
+            reader.create_read_plan(rank, world_size, num_readers)
+            for rank in range(world_size)
+        ]
+        self.assertEqual(sum(p.planned_rows or 0 for p in plans), len(expected))
+        covered = set()
+        for plan in plans:
+            self.assertTrue(plan.is_finite)
+            self.assertEqual(
+                plan.schema.names, ["id", "label", CKPT_SOURCE_ID, CKPT_ROW_IDX]
+            )
+            assert plan.planned_rows is not None
+            self.assertEqual(
+                divmod(plan.planned_rows, reader._batch_size),
+                divmod(len(expected) // world_size, reader._batch_size),
+            )
+            rows = 0
+            for task in plan.tasks:
+                self.assertLess(task.reader_id, num_readers)
+                self.assertIn("session_id", task.kwargs)
+                prefix = task.kwargs["source_prefix"]
+                for start, end in task.kwargs["intervals"]:
+                    rows += end - start
+                    positions = {(prefix, pos) for pos in range(start, end)}
+                    self.assertTrue(covered.isdisjoint(positions))
+                    covered |= positions
+            self.assertEqual(rows, plan.planned_rows)
+        self.assertEqual(covered, expected)
+        if num_readers > 2:
+            self.assertGreater(len(plans[0].tasks), 1)
+
+
+class OdpsReaderClientCacheTest(unittest.TestCase):
+    def tearDown(self):
+        sample_shuffle_readers._ODPS_CLIENTS.clear()
+        sample_shuffle_readers._ODPS_ACCOUNT = None
+
+    def test_separates_table_identities(self):
+        clients = [object(), object(), object()]
+        with (
+            mock.patch.object(
+                odps_dataset,
+                "_create_odps_account",
+                return_value=(object(), "endpoint"),
+            ) as m_account,
+            mock.patch.object(
+                odps_dataset,
+                "_create_storage_client",
+                side_effect=[(object(), client) for client in clients],
+            ) as m_client,
+        ):
+            project_a = sample_shuffle_readers._get_odps_client(
+                "odps://p/tables/t/dt=1", "q"
+            )
+            project_b = sample_shuffle_readers._get_odps_client(
+                "odps://p2/tables/t/dt=1", "q"
+            )
+            schema_b = sample_shuffle_readers._get_odps_client(
+                "odps://p/tables/s2.t/dt=1", "q"
+            )
+            project_a_again = sample_shuffle_readers._get_odps_client(
+                "odps://p/tables/t/dt=2", "q"
+            )
+        self.assertIs(project_a, project_a_again)
+        self.assertEqual(len({id(project_a), id(project_b), id(schema_b)}), 3)
+        m_account.assert_called_once()
+        self.assertEqual(m_client.call_count, 3)
+
+
 @ci_resources(split="case", timeout=600)
 class OdpsRestoreSessionsTest(unittest.TestCase):
     input_path = "odps://p/tables/t/dt=1&dt=2&dt=3"
@@ -951,6 +1159,7 @@ class OdpsRestoreSessionsTest(unittest.TestCase):
         }
         reader._table_to_cli = {"t": _StubScanClient()}
         reader._sess_row_counts = {"new0": 100, "new1": 0, "new2": 100}
+        reader._sess_id_to_cli = {}
         return reader
 
     def test_restore_keeps_partition_position(self):
@@ -968,6 +1177,8 @@ class OdpsRestoreSessionsTest(unittest.TestCase):
             ["old0", "new1", "old2"],
         )
         self.assertEqual(reader._sess_row_counts["old2"], 100)
+        # restored sessions join the refresh daemon like fresh ones
+        self.assertEqual(set(reader._sess_id_to_cli), {"old0", "old2"})
 
     def test_restore_skips_unknown_input_path(self):
         reader = self._reader()

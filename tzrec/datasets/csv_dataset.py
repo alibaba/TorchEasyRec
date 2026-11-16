@@ -22,6 +22,7 @@ from pyarrow import csv
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.sample_shuffle import ReadPlan, ReadTask
 from tzrec.datasets.utils import (
     FIELD_TYPE_TO_PA,
     get_input_fields_proto,
@@ -153,6 +154,60 @@ class CsvReader(BaseReader):
     def schema(self) -> pa.Schema:
         """Table schema."""
         return self._schema
+
+    def create_read_plan(
+        self, rank: int, world_size: int, num_readers: int
+    ) -> ReadPlan:
+        """Build the single-rank CSV read plan.
+
+        Files are assigned to the actual reader slots with a stride, like
+        the BATCH path. Their row count is unknown before reading, so the
+        coordinator drains the pool after EOF instead of enforcing a quota.
+
+        Args:
+            rank: this process's rank; must be 0.
+            world_size: number of ranks; CSV only supports one.
+            num_readers: number of reader processes on this rank.
+
+        Returns:
+            a finite read plan without a planned row count.
+
+        Raises:
+            ValueError: when more than one rank is used.
+        """
+        if world_size != 1 or rank != 0:
+            raise ValueError(
+                "sample-level shuffle supports CsvDataset only on a single "
+                f"rank, got rank {rank} of {world_size}"
+            )
+        from tzrec.datasets.sample_shuffle_readers import read_csv
+
+        tasks = []
+        for reader_id in range(num_readers):
+            input_files = self._input_files[reader_id::num_readers]
+            if not input_files:
+                continue
+            tasks.append(
+                ReadTask(
+                    fn=read_csv,
+                    kwargs=dict(
+                        input_files=input_files,
+                        batch_size=self._batch_size,
+                        columns=self._ordered_cols,
+                        csv_fmt=self._csv_fmt,
+                    ),
+                    reader_id=reader_id,
+                )
+            )
+        return ReadPlan(
+            tasks=tasks,
+            # CSV has no checkpoint metadata: the row order of a file set is
+            # not stable enough to resume from, matching the BATCH path
+            schema=self._schema,
+            is_finite=True,
+            planned_rows=None,
+            num_readers=num_readers,
+        )
 
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None

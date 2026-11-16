@@ -12,11 +12,14 @@
 
 import io
 import os
+import signal
 import time
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pyarrow as pa
 from alibabacloud_alikafka20190916 import models as alikafka_models
 from alibabacloud_alikafka20190916.client import Client as AliKafkaClient
@@ -28,6 +31,7 @@ from parameterized import param, parameterized
 from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
+from tzrec.datasets import kafka_dataset
 from tzrec.datasets.kafka_dataset import (
     KafkaDataset,
     KafkaReader,
@@ -35,8 +39,10 @@ from tzrec.datasets.kafka_dataset import (
     _offsets_for_times_batched,
     _parse_kafka_uri,
 )
+from tzrec.datasets.utils import DATA_TIMESTAMP
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
+from tzrec.tests import utils
 from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.logging_util import logger
 from tzrec.utils.misc_util import random_name
@@ -417,29 +423,43 @@ class KafkaReaderDecodedMessageLogTest(unittest.TestCase):
     def test_counter_resets_per_reader_iteration(self):
         consumer = mock.Mock()
         consumer.consume.return_value = [_msg(0, 0, 1)]
-        reader = self._make_reader(consumer, kafka_log_every_n_messages=100)
-        for _ in range(2):
-            gen = reader._reader(0, 1)
-            self.addCleanup(gen.close)
-            next(gen)
-            self.assertEqual(reader._decoded_message_count, 1)
-            self.assertEqual(reader._decoded_partition_counts, {"topic:0": 1})
-            gen.close()
+        reader = self._make_reader(consumer, kafka_log_every_n_messages=2)
+        with mock.patch("tzrec.datasets.kafka_dataset.logger") as mock_logger:
+            for _ in range(2):
+                gen = reader._reader(0, 1)
+                self.addCleanup(gen.close)
+                next(gen)
+                next(gen)
+                gen.close()
+            self.assertEqual(
+                _decoded_logs(mock_logger),
+                [
+                    "KafkaReader[rank-0|worker-0] decoded_messages=2 "
+                    "partitions={'topic:0': 2}",
+                    "KafkaReader[rank-0|worker-0] decoded_messages=2 "
+                    "partitions={'topic:0': 2}",
+                ],
+            )
 
     def test_rebalance_preserves_counters(self):
         consumer = mock.Mock()
         consumer.consume.return_value = [_msg(0, 0, 1)]
-        reader = self._make_reader(consumer, kafka_log_every_n_messages=100)
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        next(gen)
-        on_assign = consumer.subscribe.call_args.kwargs["on_assign"]
-        on_assign(consumer, [TopicPartition("topic", 0)])
-        self.assertEqual(reader._decoded_message_count, 1)
-        self.assertEqual(reader._decoded_partition_counts, {"topic:0": 1})
-        next(gen)
-        self.assertEqual(reader._decoded_message_count, 2)
-        self.assertEqual(reader._decoded_partition_counts, {"topic:0": 2})
+        reader = self._make_reader(consumer, kafka_log_every_n_messages=2)
+        with mock.patch("tzrec.datasets.kafka_dataset.logger") as mock_logger:
+            gen = reader._reader(0, 1)
+            self.addCleanup(gen.close)
+            next(gen)
+            on_assign = consumer.subscribe.call_args.kwargs["on_assign"]
+            on_assign(consumer, [TopicPartition("topic", 0)])
+            self.assertEqual(_decoded_logs(mock_logger), [])
+            next(gen)
+            self.assertEqual(
+                _decoded_logs(mock_logger),
+                [
+                    "KafkaReader[rank-0|worker-0] decoded_messages=2 "
+                    "partitions={'topic:0': 2}"
+                ],
+            )
 
 
 class OffsetsForTimesBatchedTest(unittest.TestCase):
@@ -720,7 +740,8 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         self.assertEqual(dataset._reader._shuffle, expected_shuffle)
         self.assertEqual(dataset._reader._shuffle_buffer_size, 64)
         self.assertEqual(
-            dataset._reader._kafka_partition_round_robin, bool(round_robin)
+            dataset._reader._round_robin_partition_order,
+            [0, 1] if round_robin else None,
         )
         self.assertEqual(
             dataset._reader._log_every_n_messages, log_every_n_messages or 0
@@ -1198,5 +1219,305 @@ class KafkaDatasetTest(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
+_FAKE_ID_BASE = 10**9
+
+
+class FakeKafkaConsumer:
+    """Deterministic fake consumer; ``fake.*`` URI params configure it.
+
+    Partition p is served to reader r iff p % num_readers == r. Message (p, o)
+    carries ``rows_per_msg`` rows with ids p * 10**9 + o * rows_per_msg + i and
+    an event time of o + 1 seconds.
+    """
+
+    def __init__(self, config, reader_id=0, num_readers=1):
+        self._num_partitions = int(config.get("fake.num_partitions", "2"))
+        self._rows_per_msg = int(config.get("fake.rows_per_msg", "3"))
+        self._id_mod = int(config.get("fake.id_mod", "0"))
+        self._reader_id = reader_id
+        self._num_readers = num_readers
+        self._positions = {}
+        self._assignment = []
+        self._topic = None
+        self._trace_path = os.environ.get("TZREC_FAKE_KAFKA_TRACE")
+
+    def subscribe(self, topics, on_assign=None):
+        self._topic = topics[0]
+        parts = [
+            p
+            for p in range(self._num_partitions)
+            if p % self._num_readers == self._reader_id
+        ]
+        if on_assign is not None and parts:
+            on_assign(self, [TopicPartition(self._topic, p) for p in parts])
+
+    def assign(self, partitions):
+        for tp in partitions:
+            # unset offsets (OFFSET_INVALID) resolve like auto.offset.reset=earliest
+            self._positions[tp.partition] = max(tp.offset, 0)
+        self._assignment = [(tp.topic, tp.partition) for tp in partitions]
+
+    def assignment(self):
+        return [TopicPartition(t, p) for t, p in self._assignment]
+
+    def pause(self, partitions):
+        pass
+
+    def resume(self, partitions):
+        pass
+
+    def poll(self, timeout=0):
+        return None
+
+    def consume(self, num_messages, timeout=1.0):
+        parts = sorted(self._positions)
+        if not parts:
+            time.sleep(timeout)
+            return []
+        out = []
+        for idx in range(num_messages):
+            p = parts[idx % len(parts)]
+            o = self._positions[p]
+            rpm = self._rows_per_msg
+            ids = np.arange(rpm, dtype=np.int64) + p * _FAKE_ID_BASE + o * rpm
+            if self._id_mod > 0:
+                ids = ids % self._id_mod
+            rb = pa.RecordBatch.from_arrays(
+                [pa.array(ids), pa.array(ids % 2)], names=["id", "label"]
+            )
+            payload = rb.serialize().to_pybytes()
+            out.append(
+                SimpleNamespace(
+                    error=lambda: None,
+                    value=lambda payload=payload: payload,
+                    partition=lambda p=p: p,
+                    offset=lambda o=o: o,
+                    timestamp=lambda o=o: (1, (o + 1) * 1000),
+                )
+            )
+            self._trace_read(p, o)
+            self._positions[p] = o + 1
+        return out
+
+    def _trace_read(self, partition, offset):
+        if self._trace_path is None:
+            return
+        fd = os.open(self._trace_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, f"{partition} {offset}\n".encode())
+        finally:
+            os.close(fd)
+
+    def list_topics(self, topic=None, timeout=60.0):
+        return SimpleNamespace(
+            topics={
+                topic: SimpleNamespace(
+                    partitions={
+                        p: SimpleNamespace(leader=p % 2)
+                        for p in range(self._num_partitions)
+                    },
+                    error=None,
+                )
+            }
+        )
+
+    def close(self):
+        pass
+
+
+def _fake_uri(**params):
+    qs = "&".join(f"fake.{k}={v}" for k, v in params.items())
+    return (
+        f"kafka://fake:9092/topic?group.id=tzrec_test&auto.offset.reset=earliest&{qs}"
+    )
+
+
+def _data_config(**overrides):
+    cfg = utils.sample_data_config(
+        data_pb2.DatasetType.KafkaDataset,
+        overrides.pop("shuffle_mode", "SAMPLE_ROLLING"),
+        overrides.pop("num_workers", 2),
+        **overrides,
+    )
+    cfg.input_fields.extend(
+        [
+            data_pb2.Field(input_name="id", input_type=data_pb2.INT64),
+            data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
+        ]
+    )
+    return cfg
+
+
+def _features():
+    return create_features(
+        [feature_pb2.FeatureConfig(id_feature=feature_pb2.IdFeature(feature_name="id"))]
+    )
+
+
+def _ids_of(batch):
+    return batch.to_dict()["id.values"].tolist()
+
+
+class ReaderDispatchTest(unittest.TestCase):
+    """KafkaReader.create_read_plan uses the per-worker BATCH path."""
+
+    @parameterized.expand(
+        [("subscribe", False), ("round_robin", True)],
+        name_func=parameterized_name_func,
+    )
+    def test_read_plan_uses_global_reader_ids(self, _name, round_robin):
+        with mock.patch.object(
+            kafka_dataset, "_default_consumer_factory", FakeKafkaConsumer
+        ):
+            reader = kafka_dataset.KafkaReader(
+                _fake_uri(),
+                batch_size=8,
+                shuffle=True,
+                shuffle_buffer_size=2,
+                input_fields=[
+                    pa.field("id", pa.int64()),
+                    pa.field("label", pa.int64()),
+                ],
+                kafka_partition_round_robin=round_robin,
+                kafka_log_every_n_messages=7,
+            )
+            reader.load_state_dict({"topic:0": 12})
+            plan = reader.create_read_plan(1, 2, 2)
+        self.assertEqual(plan.num_readers, 2)
+        self.assertEqual([t.reader_id for t in plan.tasks], [0, 1])
+        # consumers of every rank share one global group
+        self.assertEqual([t.kwargs["reader_id"] for t in plan.tasks], [2, 3])
+        self.assertEqual([t.kwargs["num_readers"] for t in plan.tasks], [4, 4])
+        for task in plan.tasks:
+            self.assertEqual(task.kwargs["kafka_log_every_n_messages"], 7)
+            self.assertEqual(
+                task.kwargs["round_robin_partition_order"],
+                [0, 1] if round_robin else None,
+            )
+            self.assertEqual(task.kwargs["checkpoint_state"], {"topic:0": 12})
+        self.assertFalse(plan.is_finite)
+        # Kafka is the source that declares event time to the pool
+        self.assertIn(DATA_TIMESTAMP, plan.schema.names)
+
+
+class SampleShuffleEndToEndTest(unittest.TestCase):
+    """Full stack: create_dataloader + spawned coordinator + fake consumers."""
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            kafka_dataset, "_default_consumer_factory", FakeKafkaConsumer
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._client = None
+
+    def tearDown(self):
+        if self._client is not None:
+            self._client.stop()
+
+    def _dataloader(self, cfg_kwargs=None, uri_kwargs=None, checkpoint_state=None):
+        from tzrec.datasets.dataset import create_dataloader
+
+        cfg = _data_config(**(cfg_kwargs or {}))
+        uri = _fake_uri(
+            **(
+                uri_kwargs
+                if uri_kwargs is not None
+                else dict(num_partitions=max(cfg.num_workers, 1))
+            )
+        )
+        return create_dataloader(
+            cfg,
+            _features(),
+            uri,
+            mode=Mode.TRAIN,
+            checkpoint_state=checkpoint_state,
+        )
+
+    @contextmanager
+    def _iterator(self, cfg_kwargs, uri_kwargs, checkpoint_state=None, timeout=60.0):
+        def _alarm(signum, frame):
+            raise TimeoutError("timed out waiting for batches")
+
+        dataloader = self._dataloader(cfg_kwargs, uri_kwargs, checkpoint_state)
+        self._client = dataloader.dataset._sample_shuffle
+        it = dataloader.get_iterator()
+        old_handler = signal.signal(signal.SIGALRM, _alarm)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        try:
+            yield it
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            try:
+                utils.stop_sample(dataloader, it)
+                dataloader.close()
+            finally:
+                signal.signal(signal.SIGALRM, old_handler)
+
+    @parameterized.expand(
+        [
+            param("rolling", checkpoint=5),
+            param("window", mode="SAMPLE_WINDOW"),
+            param(
+                "rolling_round_robin_no_workers_split_message",
+                num_workers=0,
+                num_partitions=1,
+                rows_per_msg=12,
+                n_batches=2,
+                round_robin=True,
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_batches_flow(
+        self,
+        _name,
+        mode="SAMPLE_ROLLING",
+        num_workers=2,
+        num_partitions=2,
+        rows_per_msg=3,
+        n_batches=4,
+        round_robin=False,
+        checkpoint=0,
+    ):
+        checkpoint_state = (
+            {f"topic:{p}": checkpoint for p in range(num_partitions)}
+            if checkpoint
+            else None
+        )
+        with self._iterator(
+            dict(
+                shuffle_mode=mode,
+                num_workers=num_workers,
+                kafka_partition_round_robin=round_robin,
+            ),
+            dict(num_partitions=num_partitions, rows_per_msg=rows_per_msg),
+            checkpoint_state,
+        ) as it:
+            batches = [next(it) for _ in range(n_batches)]
+        seen = set()
+        msg_batches = {}
+        for index, b in enumerate(batches):
+            ids = _ids_of(b)
+            self.assertEqual(len(ids), 8)
+            seen.update(ids)
+            expected = {}
+            expected_ts = -1.0
+            for i in ids:
+                source = f"topic:{i // _FAKE_ID_BASE}"
+                off = (i % _FAKE_ID_BASE) // rows_per_msg
+                self.assertGreaterEqual(off, checkpoint + 1 if checkpoint else 0)
+                expected[source] = max(expected.get(source, -1), off)
+                expected_ts = max(expected_ts, off + 1.0)
+                msg_batches.setdefault((source, off), set()).add(index)
+            # checkpoint_info must equal each partition's max offset present
+            self.assertEqual(b.checkpoint_info, expected)
+            self.assertEqual(b.data_timestamp, expected_ts)
+        # no duplicates across batches when every offset is served once
+        self.assertEqual(len(seen), 8 * len(batches))
+        if rows_per_msg > 8:
+            # the pool holds 16 rows of a 12-row message: both batches see it
+            self.assertTrue(any(len(v) > 1 for v in msg_batches.values()))
+        # the context manager's explicit close is idempotent and stops it
+        self.assertIsNone(self._client._proc)
+        self.assertTrue(self._client._stop_event.is_set())

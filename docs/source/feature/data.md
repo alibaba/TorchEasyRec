@@ -373,7 +373,7 @@ pipeline.global-job-parameters: |
 
 ### kafka_partition_round_robin
 
-- 仅对KafkaDataset生效，默认为false；开启后启动时按leader排序分区并分发到各worker（有效全局worker数为`world_size * max(data_config.num_workers, 1)`），每个worker为自己负责的分区各创建一个consumer，每次一条Kafka消息，轮流分区读取，当前分区没有消息时持续等待
+- 仅对KafkaDataset生效，默认为false；开启后启动时按leader排序分区并分发到各worker（有效全局worker数为`world_size * max(data_config.num_workers, 1)`），每个worker为自己负责的分区各创建一个consumer，每次一条Kafka消息，轮流分区读取，当前分区没有消息时持续等待；分区不足时启动失败，不要求分区数整除worker数
 - 分区归属依据启动时的leader排序，运行期间固定；每个worker的consumer数量等于其负责的分区数
 
 ### kafka_log_every_n_messages
@@ -396,7 +396,7 @@ pipeline.global-job-parameters: |
   - `SAMPLE_WINDOW`：样本级打散。同一rank内所有读取单元把原始样本汇入一个共享池，填满后冻结为一个窗口，窗口内样本全排列后连续切成完整batch输出；窗口输出期间到达的新样本进入下一窗口
   - `SAMPLE_ROLLING`：样本级打散。共享池填满后，每次随机抽取`batch_size`条样本输出并移出池，补满后再抽下一批
 - 仅训练（`Mode.TRAIN`）且`shuffle=true`时生效；评估、预测不生效
-- 支持的训练数据源：`ParquetDataset`；其他数据源启动时报错
+- 支持的训练数据源：`KafkaDataset`、`ParquetDataset`、`OdpsDataset`，以及单rank的`CsvDataset`；其他数据源启动时报错
 - 每个rank独立维护一个样本池，样本只在本rank内混洗；不同rank之间不交换样本
 
 样本级打散配置示例：
