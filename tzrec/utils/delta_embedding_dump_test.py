@@ -242,7 +242,9 @@ class _FakeDynamicTables:
 
 def _fake_publish_lookup(module, keys, table_id):
     result = module.tables.find(keys, torch.full_like(keys, table_id), "EMBEDDING")
-    return keys.cpu(), result[5].cpu(), result[7].cpu()
+    found = result[5]
+    dim = module._dynamicemb_options[table_id].dim
+    return keys[found].cpu(), result[7][found, :dim].cpu(), keys[~found].cpu()
 
 
 def _build_sharded_delta_dump_model(rank: int, world_size: int, ctx):
@@ -3010,9 +3012,10 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 },
             )
 
+    @parameterized.expand([("forward", False), ("tier_order", True)])
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
     @mark_ci_scope("gpu")
-    def test_append_dynamic_rows_publishes_found_rows_only(self):
+    def test_append_dynamic_rows_publishes_found_rows_only(self, name, reverse):
         torch.cuda.set_device(0)
         dumper = self._eviction_dumper()
         fake_tables = _FakeDynamicTables()
@@ -3024,9 +3027,17 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         )
         table_chunks = []
 
+        def lookup(module, keys, table_id):
+            hit_ids, values, missing = _fake_publish_lookup(module, keys, table_id)
+            return (
+                (hit_ids.flip(0), values.flip(0), missing)
+                if reverse
+                else (hit_ids, values, missing)
+            )
+
         with mock.patch(
             "tzrec.utils.delta_embedding_dump.lookup_publish_embeddings",
-            side_effect=_fake_publish_lookup,
+            side_effect=lookup,
         ):
             num_rows = dumper._append_dynamic_rows(
                 table_chunks,
@@ -3044,8 +3055,10 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         torch.testing.assert_close(fake_tables.ids.cpu(), torch.tensor([101, 102, 103]))
         torch.testing.assert_close(fake_tables.table_ids.cpu(), torch.tensor([0, 0, 0]))
         table = pa.concat_tables(table_chunks)
-        self.assertEqual(table["key_id"].to_pylist(), [101, 103])
-        self.assertEqual(table["embedding"].to_pylist(), [[1.0, 2.0], [5.0, 6.0]])
+        self.assertEqual(
+            dict(zip(table["key_id"].to_pylist(), table["embedding"].to_pylist())),
+            {101: [1.0, 2.0], 103: [5.0, 6.0]},
+        )
         self.assertEqual(
             table["source"].to_pylist(),
             ["model_delta_tracker", "model_delta_tracker"],

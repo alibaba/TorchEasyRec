@@ -407,11 +407,11 @@ def lookup_publish_embeddings(
     these operations on the same stream, so no device-wide synchronization is
     needed. Callers using separate mutation streams must establish equivalent
     dependencies. Input keys stay on the GPU for cache and built-in lookups.
-    Returns CPU keys, a CPU found mask and CPU embeddings in input order;
-    only found rows are valid. RocksDB misses are resolved on the CPU.
-    Keep the pinned DynamicEmb state-level APIs here: training lookups can
-    update scores, and eval_lookup initializes misses instead of returning
-    a mask.
+    Returns CPU hit keys, their embeddings and keys missing from every tier.
+    Hit rows are concatenated in tier order, with cache values taking priority.
+    RocksDB misses are resolved on the CPU. Keep the pinned DynamicEmb
+    state-level APIs here: training lookups can update scores, and eval_lookup
+    initializes misses instead of returning a mask.
     """
     from dynamicemb.key_value_table import (
         DynamicEmbStorage,
@@ -435,52 +435,48 @@ def lookup_publish_embeddings(
         if not isinstance(storage, RocksDBStorage):
             raise TypeError(f"No read-only delta lookup for {type(storage).__name__}")
 
-    keys_cpu = keys.cpu()
     dim = storage.embedding_dim(table_id)
-    output_device = torch.device("cpu") if external else keys.device
-    found = torch.zeros(keys.numel(), dtype=torch.bool, device=output_device)
-    values = torch.empty(
-        (keys.numel(), dim), dtype=storage.embedding_dtype(), device=output_device
-    )
-    positions = torch.arange(keys.numel(), device=output_device)
+    hit_keys, hit_values = [], []
     for state in states:
         tids = torch.full_like(keys, table_id, dtype=torch.int64)
-        nmiss, missing_keys, missing_pos, _, _, hits, scores, slots = _find_keys(
+        nmiss, missing_keys, _, _, _, hits, scores, slots = _find_keys(
             state, keys, tids, const_lookup=True
         )
-        rows = _flat_row_indices_for_value_load(state, hits, scores, slots)
-        if external:
-            if not nmiss:
-                block = load_from_flat(state, rows, tids, CopyMode.EMBEDDING)
-                return keys_cpu, hits.cpu(), block[:, :dim].cpu()
-            hits_cpu = hits.cpu()
-            hit_positions = positions[hits_cpu]
-            if nmiss < keys.numel():
-                block = load_from_flat(state, rows, tids, CopyMode.EMBEDDING)
-                values.index_copy_(0, hit_positions, block[hits, :dim].cpu())
-            found[hit_positions] = True
-            next_positions = positions[~hits_cpu]
-        else:
+        if nmiss < keys.numel():
+            rows = _flat_row_indices_for_value_load(state, hits, scores, slots)
             block = load_from_flat(state, rows, tids, CopyMode.EMBEDDING)
-            values[positions] = block[:, :dim]
-            found[positions] = hits
-            next_positions = positions[missing_pos]
-        if not nmiss:
-            return keys_cpu, found.cpu(), values.cpu()
-        positions = next_positions
+            tier_keys = keys[hits] if nmiss else keys
+            tier_values = block[hits, :dim] if nmiss else block[:, :dim]
+            hit_keys.append(tier_keys.cpu() if external else tier_keys)
+            hit_values.append(tier_values.cpu() if external else tier_values)
         keys = missing_keys
+        if not nmiss:
+            break
 
-    if external and positions.numel():
-        missing_keys_cpu = keys_cpu[positions]
-        tids = torch.full_like(missing_keys_cpu, table_id, dtype=torch.int64)
-        _, _, _, _, _, hits, _, block = storage.find(
-            missing_keys_cpu, tids, CopyMode.EMBEDDING
+    missing_cpu = keys.cpu()
+    if external and missing_cpu.numel():
+        tids = torch.full_like(missing_cpu, table_id, dtype=torch.int64)
+        nmiss, _, _, _, _, hits, _, block = storage.find(
+            missing_cpu, tids, CopyMode.EMBEDDING
         )
-        if positions.numel() == keys_cpu.numel():
-            return keys_cpu, hits, block[:, :dim]
-        values.index_copy_(0, positions, block[:, :dim])
-        found.index_copy_(0, positions, hits)
-    return keys_cpu, found.cpu(), values.cpu()
+        if nmiss < missing_cpu.numel():
+            if nmiss:
+                hit_rows = torch.nonzero(hits).flatten()
+                hit_keys.append(missing_cpu.index_select(0, hit_rows))
+                hit_values.append(block[:, :dim].index_select(0, hit_rows))
+            else:
+                hit_keys.append(missing_cpu)
+                hit_values.append(block[:, :dim])
+        missing_cpu = missing_cpu[~hits]
+    if not hit_keys:
+        return (
+            missing_cpu.new_empty(0),
+            torch.empty((0, dim), dtype=storage.embedding_dtype(), device="cpu"),
+            missing_cpu,
+        )
+    if len(hit_keys) == 1:
+        return hit_keys[0].cpu(), hit_values[0].cpu(), missing_cpu
+    return torch.cat(hit_keys).cpu(), torch.cat(hit_values).cpu(), missing_cpu
 
 
 def _get_optimizer_multipler(

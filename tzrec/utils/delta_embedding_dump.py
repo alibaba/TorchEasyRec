@@ -1525,35 +1525,32 @@ class DeltaEmbeddingDumper:
         if dump_evicted_tombstones:
             evicted = self._pop_evicted_key_ids(fqn, dynamic_module, table_name)
             if evicted is not None and evicted.numel() > 0:
-                evicted_ids = evicted.to(device=device, dtype=torch.int64)
-                ids = torch.cat([ids, evicted_ids])
+                evicted_ids = evicted.cpu().to(torch.int64)
+                ids = torch.cat([ids, evicted_ids.to(device=device)])
         ids = ids.unique(sorted=True)
         if ids.numel() == 0:
             return 0
-        evicted_mask = torch.isin(ids, evicted_ids) if evicted_ids is not None else None
         feature_name = _feature_name(self._tracker.fqn_to_feature_names.get(fqn, []))
         num_rows = 0
         num_never_admitted = 0
         for start in range(0, ids.numel(), _FIND_BATCH_ROWS):
-            batch_ids, founds_cpu, values_cpu = lookup_publish_embeddings(
+            hit_ids, values_cpu, missing_ids = lookup_publish_embeddings(
                 dynamic_module, ids[start : start + _FIND_BATCH_ROWS], table_id
             )
-            missing_cpu = ~founds_cpu
-            if evicted_mask is not None:
-                batch_evicted = evicted_mask[start : start + _FIND_BATCH_ROWS].cpu()
-                tombstone_ids = batch_ids[missing_cpu & batch_evicted]
-                num_never_admitted += int((missing_cpu & ~batch_evicted).sum())
+            if evicted_ids is not None:
+                missing_evicted = torch.isin(missing_ids, evicted_ids)
+                tombstone_ids = missing_ids[missing_evicted]
+                num_never_admitted += int((~missing_evicted).sum())
             else:
-                tombstone_ids = batch_ids.new_empty(0)
-                num_never_admitted += int(missing_cpu.sum())
-            found_positions = torch.nonzero(founds_cpu).flatten()
+                tombstone_ids = missing_ids.new_empty(0)
+                num_never_admitted += missing_ids.numel()
             num_rows += self._append_table_chunk(
                 table_chunks,
                 global_step=global_step,
                 feature_name=feature_name,
                 table_fqn=fqn,
-                key_ids=batch_ids.index_select(0, found_positions),
-                embeddings=values_cpu.index_select(0, found_positions)[:, :emb_dim],
+                key_ids=hit_ids,
+                embeddings=values_cpu,
                 source="model_delta_tracker",
             )
             num_rows += self._append_tombstone_chunks(
