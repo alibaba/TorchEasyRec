@@ -140,6 +140,12 @@ message DataConfig {
     // especially when the performance of models is not good.
     optional uint32 shuffle_buffer_size  = 23 [default = 32];
 
+    // shuffle mode: "BATCH", "SAMPLE_WINDOW" or "SAMPLE_ROLLING". For the
+    // sample modes, raw samples are gathered into a per-rank shared pool of
+    // batch_size * shuffle_buffer_size samples, shuffled at sample level,
+    // then grouped into batches. For Training only.
+    optional string shuffle_mode = 21 [default = "BATCH"];
+
     // maxcompute storage api data compression type, LZ4_FRAME | ZSTD | UNCOMPRESSED
     optional string odps_data_compression = 24 [default = "LZ4_FRAME"];
 

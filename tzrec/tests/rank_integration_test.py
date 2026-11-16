@@ -13,6 +13,7 @@ import glob
 import json
 import os
 import shutil
+import sys
 import unittest
 
 import numpy as np
@@ -22,10 +23,13 @@ from pyarrow import dataset as ds
 from tzrec.acc import trt_utils
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import create_dataloader
+from tzrec.datasets.utils import calc_remaining_intervals
 from tzrec.main import _create_features
 from tzrec.optim.optimizer import has_fbgemm_ftrl
+from tzrec.protos import data_pb2
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.tests import utils
-from tzrec.utils import checkpoint_util, config_util, dynamicemb_util
+from tzrec.utils import checkpoint_util, config_util, dynamicemb_util, misc_util
 from tzrec.utils.test_util import (
     ci_resources,
     cutlass_hstu_unavailable,
@@ -1355,6 +1359,125 @@ class RankIntegrationTest(unittest.TestCase):
                 additional_export_config='{"cand_seq_pk": "cand_seq"}',
             )
         self.assertTrue(self.success)
+
+
+_SAMPLE_SHUFFLE_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
+_SAMPLE_SHUFFLE_TRAIN_EVAL = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "train_eval.py")
+)
+_SAMPLE_SHUFFLE_STEPS = 20
+_SAMPLE_SHUFFLE_RESUME_STEPS = 5
+# 32 batches per rank keep both runs inside one pass
+_SAMPLE_SHUFFLE_ROWS_PER_RANK = 32 * 128
+
+
+def _sample_shuffle_run_torchrun(
+    config_path: str, log_path: str, continue_train: bool = False
+) -> bool:
+    torchrun = os.path.join(os.path.dirname(sys.executable), "torchrun")
+    cmd = (
+        f"PYTHONPATH=. {torchrun} {utils._standalone()} --nnodes=1 "
+        f"--nproc-per-node={utils._get_nproc_per_node()} "
+        f"--log_dir {os.path.join(os.path.dirname(log_path), 'log_train_eval')} "
+        f"-r 3 -t 3 {_SAMPLE_SHUFFLE_TRAIN_EVAL} "
+        f"--pipeline_config_path {config_path}"
+    )
+    if continue_train:
+        cmd += " --continue_train"
+    return misc_util.run_cmd(cmd, log_path, timeout=utils._t(600))
+
+
+@unittest.skipIf(*gpu_unavailable)
+@mark_ci_scope("h20", "gpu")
+@ci_resources(slots=2, split="case")
+class SampleShuffleIntegrationTest(unittest.TestCase):
+    """Distributed sample shuffle: train, save and resume on Parquet."""
+
+    def setUp(self):
+        self.success = False
+        self.test_dir = make_test_dir()
+
+    def tearDown(self):
+        # keep the directory on failure so the torchrun log survives
+        if self.success:
+            shutil.rmtree(self.test_dir, True)
+
+    def _prepare_config(self) -> tuple[EasyRecConfig, int]:
+        config = config_util.load_pipeline_config(
+            os.path.join(_SAMPLE_SHUFFLE_CONFIG_DIR, "multi_tower_din_mock.config")
+        )
+        config.model_dir = os.path.join(self.test_dir, "model")
+        config.train_config.ClearField("num_epochs")
+        config.train_config.num_steps = _SAMPLE_SHUFFLE_STEPS
+        config.train_config.save_checkpoints_steps = 10
+        config.train_config.log_step_count_steps = 10
+        data_config = config.data_config
+        data_config.batch_size = 128
+        data_config.num_workers = 1
+        data_config.fg_mode = data_pb2.FG_NONE
+        data_config.shuffle = True
+        data_config.shuffle_mode = "SAMPLE_ROLLING"
+        data_config.shuffle_buffer_size = 4
+        features = _create_features(list(config.feature_configs), data_config)
+        nproc = utils._get_nproc_per_node()
+        total_rows = nproc * _SAMPLE_SHUFFLE_ROWS_PER_RANK
+        config.train_input_path, _ = utils.create_mock_data(
+            os.path.join(self.test_dir, "train_data"),
+            utils.build_mock_input_fg_encoded(features),
+            list(data_config.label_fields),
+            num_rows=total_rows,
+            num_parts=nproc,
+        )
+        return config, total_rows
+
+    def _assert_resumed_positions(
+        self, before: dict, after: dict, prefix: str, total_rows: int
+    ) -> None:
+        """New reads must start inside the ranges left by the checkpoint."""
+        remaining = calc_remaining_intervals(before, prefix, total_rows)
+        new_keys = [
+            key for key in after if key not in before and key.startswith(prefix + ":")
+        ]
+        self.assertTrue(new_keys)
+        for key in new_keys:
+            start = int(key.rsplit(":", 1)[1])
+            self.assertTrue(
+                any(begin <= start < end for begin, end in remaining),
+                f"resumed read at {key} is outside {remaining}",
+            )
+
+    def test_train_save_resume(self):
+        config, total_rows = self._prepare_config()
+        train_input_path = config.train_input_path
+        log_path = os.path.join(self.test_dir, "log_train_eval.txt")
+
+        config_path = os.path.join(self.test_dir, "pipeline.config")
+        config_util.save_message(config, config_path)
+        ok = _sample_shuffle_run_torchrun(config_path, log_path)
+        self.assertTrue(ok, "initial training run failed; see log_train_eval.txt")
+        ckpt = f"{self.test_dir}/model/model.ckpt-{_SAMPLE_SHUFFLE_STEPS - 1}"
+        self.assertTrue(os.path.exists(os.path.join(ckpt, "_SUCCESS")))
+        state = checkpoint_util.restore_dataloader_state(ckpt) or {}
+        keys = {key for key in state if ":" in key}
+        self.assertTrue(keys, state)
+        epochs = state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
+
+        resume_steps = _SAMPLE_SHUFFLE_STEPS + _SAMPLE_SHUFFLE_RESUME_STEPS
+        final_step = resume_steps - 1
+        config.train_config.num_steps = resume_steps
+        config_util.save_message(config, config_path)
+        ok = _sample_shuffle_run_torchrun(config_path, log_path, continue_train=True)
+        self.assertTrue(ok, "resume training run failed; see log_train_eval.txt")
+        ckpt = f"{self.test_dir}/model/model.ckpt-{final_step}"
+        self.assertTrue(os.path.exists(os.path.join(ckpt, "_SUCCESS")))
+        resumed_state = checkpoint_util.restore_dataloader_state(ckpt) or {}
+        resumed_epochs = resumed_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
+        self.assertEqual(resumed_epochs, epochs)
+        self.assertTrue(keys <= resumed_state.keys())
+        self._assert_resumed_positions(
+            state, resumed_state, train_input_path, total_rows
+        )
+        self.success = True
 
 
 if __name__ == "__main__":

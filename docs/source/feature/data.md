@@ -389,6 +389,31 @@ pipeline.global-job-parameters: |
 
 - 最多缓存多少个batch用于打散数据，默认为32
 
+### shuffle_mode
+
+- 打散模式，默认为`BATCH`
+  - `BATCH`：每个读取worker各自缓存若干完整batch并随机输出，batch内样本组合不变
+  - `SAMPLE_WINDOW`：样本级打散。同一rank内所有读取单元把原始样本汇入一个共享池，填满后冻结为一个窗口，窗口内样本全排列后连续切成完整batch输出；窗口输出期间到达的新样本进入下一窗口
+  - `SAMPLE_ROLLING`：样本级打散。共享池填满后，每次随机抽取`batch_size`条样本输出并移出池，补满后再抽下一批
+- 仅训练（`Mode.TRAIN`）且`shuffle=true`时生效；评估、预测不生效
+- 支持的训练数据源：`ParquetDataset`；其他数据源启动时报错
+- 每个rank独立维护一个样本池，样本只在本rank内混洗；不同rank之间不交换样本
+
+样本级打散配置示例：
+
+```protobuf
+data_config {
+    batch_size: 512
+    num_workers: 16
+    shuffle: true
+    shuffle_buffer_size: 98
+    shuffle_mode: "SAMPLE_ROLLING"
+}
+```
+
+- 此例中每个rank的样本池容量为 512 x 98 = 50176 条样本; `num_workers=0`时读取仍在后台读取单元进行，主进程直接领取组好的batch完成特征处理
+- 池未满时会等待填满才出批，低流量场景下调小`shuffle_buffer_size`可让首个batch更快产出
+
 ### fg_encoded_multival_sep
 
 - fg_mode=FG_NONE 数据已经被FG编码好 时，数据的多值分割符，默认为chr(3)

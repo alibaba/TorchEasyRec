@@ -12,8 +12,12 @@
 import multiprocessing as mp
 import os
 import shutil
+import signal
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import pyarrow as pa
@@ -24,10 +28,18 @@ from torch import distributed as dist
 from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
+from tzrec.datasets import sample_shuffle
 from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetReader, ParquetWriter
+from tzrec.datasets.utils import CKPT_SOURCE_ID, DATA_TIMESTAMP
 from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
+from tzrec.tests.utils import (
+    drain_sample,
+    raw_c_features,
+    sample_data_config,
+    stop_sample,
+)
 from tzrec.utils import misc_util
 from tzrec.utils.checkpoint_util import EPOCHS_COMPLETED, update_dataloder_state
 from tzrec.utils.test_util import ci_resources, make_test_dir, parameterized_name_func
@@ -641,6 +653,191 @@ class ParquetWriterTest(unittest.TestCase):
         table = parquet.read_table(os.path.join(self.test_dir, "part-0.parquet"))
         self.assertEqual(table.num_rows, 5)
         self.assertEqual(table.column("int_a").to_pylist(), [1, 2, 3, 4, 5])
+
+
+def _write_unique_parquet(test_dir: str, num_rows: int) -> None:
+    t = pa.Table.from_arrays(
+        [
+            pa.array([float(i) for i in range(num_rows)]),
+            pa.array([i % 2 for i in range(num_rows)]),
+        ],
+        names=["raw_c", "label"],
+    )
+    ds.write_dataset(
+        t,
+        test_dir,
+        format="parquet",
+        max_rows_per_file=37,
+        max_rows_per_group=17,
+    )
+
+
+class ParquetSampleShuffleTest(unittest.TestCase):
+    """Sample-level shuffle on real parquet files."""
+
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+        _write_unique_parquet(self.test_dir, 101)
+        self.path = f"{self.test_dir}/*.parquet"
+
+    def _dataloader(
+        self,
+        mode="SAMPLE_ROLLING",
+        num_workers=2,
+        checkpoint_state=None,
+        **overrides,
+    ):
+        return create_dataloader(
+            sample_data_config(
+                data_pb2.DatasetType.ParquetDataset, mode, num_workers, **overrides
+            ),
+            raw_c_features(),
+            self.path,
+            mode=Mode.TRAIN,
+            checkpoint_state=checkpoint_state,
+        )
+
+    @parameterized.expand(
+        [
+            ["SAMPLE_ROLLING", 2, {}, 101],
+            ["SAMPLE_WINDOW", 2, {}, 101],
+            ["SAMPLE_ROLLING", 0, {}, 101],
+            ["SAMPLE_ROLLING", 2, {"min_batch_size": 6}, 96],
+            ["SAMPLE_ROLLING", 2, {"drop_remainder": True}, 96],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sample_shuffle_epochs(self, mode, num_workers, overrides, expected_rows):
+        dataloader = self._dataloader(mode, num_workers, **overrides)
+        iterator = None
+        try:
+            for _ in range(2):
+                iterator = dataloader.get_iterator()
+                sizes, values, state = drain_sample(iterator)
+                self.assertEqual(
+                    sorted(sizes), ([5] if expected_rows == 101 else []) + [8] * 12
+                )
+                self.assertEqual(sorted(values), list(range(expected_rows)))
+                self.assertTrue(state)
+        finally:
+            stop_sample(dataloader, iterator)
+
+    @parameterized.expand([[3], [0]], name_func=parameterized_name_func)
+    def test_sample_shuffle_resume(self, leftover_rows_per_source):
+        resume_state = {
+            f"{self.path}:0": 49 - leftover_rows_per_source,
+            f"{self.path}:50": 100 - leftover_rows_per_source,
+        }
+        dataloader = self._dataloader(checkpoint_state=resume_state)
+        iterator = None
+        try:
+            iterator = dataloader.get_iterator()
+            _, values, _ = drain_sample(iterator)
+            expected = list(range(50 - leftover_rows_per_source, 50)) + list(
+                range(101 - leftover_rows_per_source, 101)
+            )
+            self.assertEqual(sorted(values), expected)
+            iterator = dataloader.get_iterator()
+            _, values, _ = drain_sample(iterator)
+            self.assertEqual(sorted(values), list(range(101)))
+        finally:
+            stop_sample(dataloader, iterator)
+
+    def test_sample_shuffle_multi_rank_plan(self):
+        dataset = ParquetDataset(
+            sample_data_config(
+                data_pb2.DatasetType.ParquetDataset, "SAMPLE_ROLLING", 2
+            ),
+            raw_c_features(),
+            self.path,
+            mode=Mode.TRAIN,
+        )
+        plans = [dataset._reader.create_read_plan(rank, 2, 2) for rank in range(2)]
+        self.assertNotIn(DATA_TIMESTAMP, plans[0].schema.names)
+        self.assertIn(CKPT_SOURCE_ID, plans[0].schema.names)
+        self.assertEqual([p.planned_rows for p in plans], [51, 50])
+        covered = []
+        for plan in plans:
+            rows = 0
+            for task in plan.tasks:
+                start, end = task.kwargs["start"], task.kwargs["end"]
+                self.assertLess(task.reader_id, 2)
+                self.assertEqual(task.kwargs["source_id"], f"{self.path}:{start}")
+                rows += end - start
+                covered.extend(range(start, end))
+            self.assertEqual(rows, plan.planned_rows)
+        self.assertEqual(sorted(covered), list(range(101)))
+
+    def test_start_failure_cleanup(self):
+        """A post-spawn start failure stops and joins the coordinator."""
+        real_start = sample_shuffle.SampleShuffleHandle.start
+        spawned = []
+
+        def _start_then_fail(handle):
+            real_start(handle)
+            spawned.append(handle._proc)
+            raise RuntimeError("boom")
+
+        with mock.patch.object(
+            sample_shuffle.SampleShuffleHandle, "start", _start_then_fail
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                self._dataloader()
+        self.assertFalse(spawned[0].is_alive())
+
+    def test_process_exit_does_not_hang(self):
+        """Interpreter exit stops the non-daemon coordinator by itself."""
+        script = os.path.join(self.test_dir, "exit_with_dataloader.py")
+        with open(script, "w") as f:
+            f.write("""\
+import sys
+from tzrec.constant import Mode
+from tzrec.datasets.dataset import create_dataloader
+from tzrec.protos import data_pb2
+from tzrec.tests.utils import raw_c_features, sample_data_config
+
+def main():
+    dataloader = create_dataloader(
+        sample_data_config(
+            data_pb2.DatasetType.ParquetDataset, "SAMPLE_ROLLING", 2
+        ),
+        raw_c_features(),
+        sys.argv[1],
+        mode=Mode.TRAIN,
+    )
+    next(dataloader.get_iterator())
+
+
+if __name__ == "__main__":
+    main()
+""")
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
+        subprocess.run(
+            [sys.executable, script, self.path], check=True, env=env, timeout=120
+        )
+
+    def test_coordinator_death_propagates(self):
+        def _alarm(signum, frame):
+            raise TimeoutError("timed out waiting for batches")
+
+        dataloader = self._dataloader(num_workers=1)
+        iterator = dataloader.get_iterator()
+        old_handler = signal.signal(signal.SIGALRM, _alarm)
+        signal.setitimer(signal.ITIMER_REAL, 30.0)
+        try:
+            next(iterator)
+            dataloader.dataset._sample_shuffle._proc.terminate()
+            with self.assertRaisesRegex(
+                RuntimeError, "coordinator exited unexpectedly"
+            ):
+                while True:
+                    next(iterator)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+            stop_sample(dataloader, iterator)
 
 
 if __name__ == "__main__":

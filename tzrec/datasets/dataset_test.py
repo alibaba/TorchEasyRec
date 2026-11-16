@@ -24,7 +24,7 @@ from parameterized import param, parameterized
 from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
-from tzrec.datasets.dataset import BaseDataset, BaseReader
+from tzrec.datasets.dataset import BaseDataset, BaseReader, create_dataloader
 from tzrec.datasets.utils import (
     BASE_DATA_GROUP,
     CAND_POS_LENGTHS,
@@ -174,6 +174,27 @@ class DatasetTest(unittest.TestCase):
         utils.SERVER_LAUNCHED = False
         del utils.STATS_DICT
         utils.STATS_DICT = []
+
+    def test_sample_shuffle_requires_reader_support(self):
+        reader = _TestReader("", 4)
+        with self.assertRaisesRegex(NotImplementedError, "_TestReader"):
+            reader.create_read_plan(0, 1, 1)
+
+    @parameterized.expand(
+        [
+            ("SAMPLE_BOGUS", True, "shuffle_mode must be one of"),
+            ("SAMPLE_ROLLING", False, "shuffle=true"),
+        ]
+    )
+    def test_sample_shuffle_config_validation(self, shuffle_mode, shuffle, error):
+        data_config = data_pb2.DataConfig(
+            batch_size=4,
+            dataset_type=data_pb2.DatasetType.ParquetDataset,
+            shuffle=shuffle,
+            shuffle_mode=shuffle_mode,
+        )
+        with self.assertRaisesRegex(ValueError, error):
+            create_dataloader(data_config, [], "", mode=Mode.TRAIN)
 
     @parameterized.expand([[False], [True]])
     def test_dataset(self, need_shuffle):
