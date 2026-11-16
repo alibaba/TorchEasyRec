@@ -1328,9 +1328,6 @@ class DeltaEmbeddingDumper:
             Number of rows appended.
         """
         num_rows = 0
-        if dynamic_modules:
-            # Finish prior prefetch and writeback before popping IDs or reading slots.
-            torch.cuda.synchronize()
         unique_rows_by_fqn = self._tracker.get_unique(_CONSUMER)
         fqns = list(unique_rows_by_fqn)
         if dump_evicted_tombstones:

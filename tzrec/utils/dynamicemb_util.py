@@ -402,8 +402,11 @@ def lookup_publish_embeddings(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Read rank-local embeddings without changing scores, admitting or writing rows.
 
-    The caller must fence prior GPU work and exclude model mutations until the
-    values are copied. Only found rows are valid. Keep the pinned DynamicEmb
+    Call on the training stream after the step's embedding updates, before
+    launching further cache mutations. The current training pipeline orders
+    these operations on the same stream, so no device-wide synchronization is
+    needed. Callers using separate mutation streams must establish equivalent
+    dependencies. Only found rows are valid. Keep the pinned DynamicEmb
     state-level APIs here: train-mode cache.lookup/storage.find can update
     scores, and eval_lookup initializes misses instead of returning a mask.
     """
