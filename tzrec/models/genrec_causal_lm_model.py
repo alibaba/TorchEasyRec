@@ -28,6 +28,7 @@ from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
 from tzrec.models.genrec_model import BaseGenRecModel
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
+from tzrec.modules.flash_attention_beam_cache import create_flash_attention_beam_cache
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
     INPUT_IDS,
@@ -316,18 +317,14 @@ def generate_codes(
         best first.
     """
     padded, mask = _left_pad(embeds, cu_seqlens, max_seqlen)
-    extra = {}
-    if (
-        lm.config._attn_implementation == "flash_attention_2"
-        and lm.config.model_type in ("qwen2", "qwen3")
-        and all(layer.self_attn.sliding_window is None for layer in lm.model.layers)
-    ):
-        from tzrec.modules.flash_attention_beam_cache import (
-            create_flash_attention_beam_cache,
-        )
-
-        extra["initial_cache"] = create_flash_attention_beam_cache(lm)
-    tokens = dynamic_beam_search(lm, padded, mask, capped_widths, bands, **extra)
+    tokens = dynamic_beam_search(
+        lm,
+        padded,
+        mask,
+        capped_widths,
+        bands,
+        initial_cache=create_flash_attention_beam_cache(lm),
+    )
     # a band starts at base_vocab_size + level_offset, so this undoes both shifts
     codes = tokens - tokens.new_tensor([lo for lo, _ in bands])
     codes = codes.view(padded.shape[0], -1, len(bands))

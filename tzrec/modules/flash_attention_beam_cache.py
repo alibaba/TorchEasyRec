@@ -141,20 +141,21 @@ class FlashAttentionBeamCache(Cache):
             )
 
 
-def create_flash_attention_beam_cache(model: nn.Module) -> FlashAttentionBeamCache:
-    """Create inference storage without replacing any attention-module forward.
+def create_flash_attention_beam_cache(
+    model: nn.Module,
+) -> Optional[FlashAttentionBeamCache]:
+    """Select shared KV storage for full FlashAttention 2 prediction.
 
     Args:
-        model: eval-mode Qwen2/Qwen3 causal LM using full FlashAttention 2.
+        model: eval-mode causal LM using the Hugging Face Cache protocol.
 
     Returns:
-        A request-local cache compatible with the normal model forward.
+        A request-local shared cache for full FlashAttention 2, or None to use
+        the backbone's ordinary cache.
     """
-    if model.config.model_type not in ("qwen2", "qwen3"):
-        raise ValueError("Shared FA2 beam decode supports Qwen2 and Qwen3")
     if model.config._attn_implementation != "flash_attention_2":
-        raise ValueError("Shared FA2 beam decode requires flash_attention_2")
+        return None
     attentions = [layer.self_attn for layer in model.model.layers]
-    if model.training or any(a.sliding_window is not None for a in attentions):
-        raise ValueError("Shared FA2 beam decode requires eval-mode full attention")
+    if any(a.sliding_window is not None for a in attentions):
+        return None
     return FlashAttentionBeamCache(len(attentions))

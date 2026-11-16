@@ -39,7 +39,6 @@ from tzrec.utils.test_util import (
     GENREC_LONG_HIST_CODES,
     create_genrec_test_model,
     create_genrec_test_prompt,
-    create_tiny_causal_lm,
     flash_attn_unavailable,
     make_test_dir,
     mark_ci_scope,
@@ -224,7 +223,8 @@ class GenerateCodesTest(unittest.TestCase):
         bands = [(100, 103), (104, 107), (108, 111)]
         local_codes = torch.tensor([[0, 1, 3], [3, 0, 2], [1, 3, 0], [2, 2, 1]])
         tokens = local_codes + torch.tensor([lo for lo, _ in bands])
-        lm = create_tiny_causal_lm(vocab_size=112)
+        lm = nn.Identity()
+        lm.config = SimpleNamespace(_attn_implementation="sdpa")
         with mock.patch(
             "tzrec.models.genrec_causal_lm_model.dynamic_beam_search",
             return_value=tokens,

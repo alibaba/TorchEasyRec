@@ -22,26 +22,6 @@ from transformers import PreTrainedModel
 from transformers.cache_utils import Cache
 
 
-def build_sid_prefix_masks(
-    allowed_sids: torch.Tensor, bands: Sequence[Tuple[int, int]]
-) -> List[torch.Tensor]:
-    """Compile a dense SID-membership mask into per-level legal-prefix masks.
-
-    Args:
-        allowed_sids: flat boolean mask indexed by mixed-radix local SID codes.
-        bands: inclusive token-band bounds, one pair per SID level.
-
-    Returns:
-        A flat boolean mask per depth on the input device. A prefix is legal
-        exactly when at least one allowed complete SID extends it. Build once
-        with the catalog, then reuse the masks across decode calls.
-    """
-    masks = [allowed_sids]
-    for lo, hi in reversed(bands[1:]):
-        masks.append(masks[-1].reshape(-1, hi - lo + 1).any(dim=-1))
-    return list(reversed(masks))
-
-
 def capped_beam_widths(
     beam_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
@@ -75,7 +55,6 @@ def dynamic_beam_search(
     attention_mask: torch.Tensor,
     capped_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
-    allowed_prefixes: Optional[Sequence[torch.Tensor]] = None,
     initial_cache: Optional[Cache] = None,
 ) -> torch.Tensor:
     """Decode SID answers with a caller-supplied per-level beam width.
@@ -88,9 +67,6 @@ def dynamic_beam_search(
         attention_mask: prompt mask ``(B, P)``.
         capped_widths: width per SID level, already capped to what its band and
             the surviving prefixes supply. The model derives it once at init.
-        allowed_prefixes: optional masks from ``build_sid_prefix_masks``.
-            Apply before TopK at every level, preserving the full-vocabulary
-            normalizer.
         initial_cache: optional cache supplied to prefill, for specialized
             inference storage that implements the same branching protocol.
         bands: inclusive ``(lo, hi)`` token-id edge per SID level. Host ints,
@@ -128,8 +104,6 @@ def dynamic_beam_search(
     )
     cache = outputs.past_key_values
     scores = _band_logp(outputs.logits[:, -1, :], 0)
-    if allowed_prefixes is not None:
-        scores = scores.masked_fill(~allowed_prefixes[0].reshape(1, -1), float("-inf"))
     beam_scores, band_idx = scores.topk(capped_widths[0], dim=-1)
     seq = (band_idx + bands[0][0]).reshape(-1, 1)
     beam_scores = beam_scores.reshape(-1)
@@ -158,14 +132,6 @@ def dynamic_beam_search(
         band_size = band_hi - band_lo + 1
         scores = _band_logp(outputs.logits[:, -1, :], level)
         scores = scores + beam_scores[:, None]
-        if allowed_prefixes is not None:
-            level_mask = allowed_prefixes[level]
-            prefix = seq[:, 0] - bands[0][0]
-            for previous_level in range(1, level):
-                lo, hi = bands[previous_level]
-                prefix = prefix * (hi - lo + 1) + seq[:, previous_level] - lo
-            allowed = level_mask.reshape(-1, band_size)[prefix]
-            scores = scores.masked_fill(~allowed, float("-inf"))
         if level + 1 == num_levels:
             local_k = capped_widths[level] // width
             local_scores, local_idx = scores.topk(local_k, dim=-1)
