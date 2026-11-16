@@ -223,12 +223,13 @@ class PackedForwardTest(unittest.TestCase):
 
 
 class GenerateCodesTest(unittest.TestCase):
-    def test_undoes_both_shifts_and_keeps_the_best_beams(self) -> None:
+    def test_undoes_both_shifts(self) -> None:
         # base_vocab_size 100, codebook [4, 4, 4]
         bands = [(100, 103), (104, 107), (108, 111)]
         local_codes = torch.tensor([[0, 1, 3], [3, 0, 2], [1, 3, 0], [2, 2, 1]])
         tokens = local_codes + torch.tensor([lo for lo, _ in bands])
         lm = nn.Identity()
+        lm.config = SimpleNamespace(_attn_implementation="sdpa")
         with mock.patch(
             "tzrec.models.genrec_causal_lm_model.dynamic_beam_search",
             return_value=tokens,
@@ -240,9 +241,11 @@ class GenerateCodesTest(unittest.TestCase):
                 3,
                 [2, 3, 4],
                 bands,
-                1,
             )
-        self.assertEqual(codes.tolist(), local_codes.reshape(2, 2, -1)[:, :1].tolist())
+        self.assertEqual(
+            codes.tolist(),
+            local_codes.reshape(2, 2, -1).tolist(),
+        )
         searched_lm, padded, mask, widths, searched_bands = beam_search.call_args.args
         self.assertIs(searched_lm, lm)
         self.assertEqual(padded.shape, (2, 3, 4))
@@ -259,12 +262,13 @@ class GenRecCausalLMModelTest(unittest.TestCase):
         self.compiled_prompt, _ = create_genrec_test_prompt(self.test_dir)
 
     def _beam_model(
-        self, beam_widths=(2, 2, 2), num_return_sequences=2
+        self,
+        beam_widths=(2, 2, 2),
     ) -> GenRecCausalLMModel:
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model._prompt = self.compiled_prompt
-        common = GenRecModelConfig(num_return_sequences=num_return_sequences)
+        common = GenRecModelConfig()
         common.beam_widths.extend(beam_widths)
         model._read_beam_config(common)
         return model
@@ -272,13 +276,14 @@ class GenRecCausalLMModelTest(unittest.TestCase):
     @parameterized.expand(
         [
             [[2, 3, 4], [2, 3, 4]],
-            [[6, 12, 12], [4, 12, 12]],
-            [[2, 2, 2], [2, 2, 2]],
+            [[2, 3, 100], [2, 3, 12]],
+            [[6, 12, 100], [4, 12, 48]],
+            [[2, 2, 100], [2, 2, 8]],
         ],
         name_func=parameterized_name_func,
     )
     def test_beam_widths_are_capped_once_at_init(self, beam_widths, expected) -> None:
-        model = self._beam_model(beam_widths=beam_widths, num_return_sequences=1)
+        model = self._beam_model(beam_widths=beam_widths)
         self.assertEqual(model._capped_widths, expected)
         space = self.compiled_prompt.sid_space
         self.assertEqual(model._bands, list(zip(space.band_lo, space.band_hi)))
@@ -287,24 +292,14 @@ class GenRecCausalLMModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "beam_widths is required"):
             self._beam_model(beam_widths=())
 
-    def test_rejects_fewer_than_one_returned_sequence(self) -> None:
-        with self.assertRaisesRegex(ValueError, "num_return_sequences must be >= 1"):
-            self._beam_model(num_return_sequences=0)
-
     def test_rejects_a_schedule_that_does_not_match_the_codebook(self) -> None:
         with self.assertRaisesRegex(ValueError, "entries but the codebook has"):
             self._beam_model(beam_widths=(2, 2))
 
-    def test_rejects_a_non_positive_beam_width(self) -> None:
+    @parameterized.expand([[(2, 0, 2)], [(2, 2, 0)]], name_func=parameterized_name_func)
+    def test_rejects_a_non_positive_beam_width(self, beam_widths) -> None:
         with self.assertRaisesRegex(ValueError, "must be >= 1"):
-            self._beam_model(beam_widths=(2, 0, 2))
-
-    def test_beam_config_uses_final_capped_capacity(self) -> None:
-        with self.assertRaisesRegex(ValueError, "final capped beam width \\(4\\)"):
-            self._beam_model(
-                beam_widths=(1, 1, 100),
-                num_return_sequences=5,
-            )
+            self._beam_model(beam_widths=beam_widths)
 
 
 # a second answer, and a rewrite of GENREC_HIST_CODES that keeps its width
