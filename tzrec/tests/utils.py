@@ -1548,7 +1548,7 @@ def raw_c_features() -> List[BaseFeature]:
 
 
 def sample_data_config(
-    dataset_type: Any, mode: Any, num_workers: int, **overrides: Any
+    dataset_type: Any, mode: str, num_workers: int, **overrides: Any
 ) -> data_pb2.DataConfig:
     """Sample-shuffle dataloader config with per-source overrides applied."""
     cfg = data_pb2.DataConfig(

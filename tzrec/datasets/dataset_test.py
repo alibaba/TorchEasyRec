@@ -178,16 +178,20 @@ class DatasetTest(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "_TestReader"):
             reader.create_read_plan(0, 1, 1)
 
-    def test_sample_shuffle_requires_shuffle_true(self):
+    @parameterized.expand(
+        [
+            ("SAMPLE_BOGUS", True, "shuffle_mode must be one of"),
+            ("SAMPLE_ROLLING", False, "shuffle=true"),
+        ]
+    )
+    def test_sample_shuffle_config_validation(self, shuffle_mode, shuffle, error):
         data_config = data_pb2.DataConfig(
             batch_size=4,
-            dataset_type=data_pb2.DatasetType.KafkaDataset,
-            label_fields=["label"],
-            shuffle=False,
-            shuffle_mode=data_pb2.ShuffleMode.SAMPLE_ROLLING,
-            shuffle_buffer_size=2,
+            dataset_type=data_pb2.DatasetType.ParquetDataset,
+            shuffle=shuffle,
+            shuffle_mode=shuffle_mode,
         )
-        with self.assertRaisesRegex(ValueError, "shuffle=true"):
+        with self.assertRaisesRegex(ValueError, error):
             create_dataloader(data_config, [], "", mode=Mode.TRAIN)
 
     @parameterized.expand([[False], [True]])

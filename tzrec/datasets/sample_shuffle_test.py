@@ -36,8 +36,8 @@ from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, DATA_TIMESTAMP
 from tzrec.protos import data_pb2
 from tzrec.utils.test_util import parameterized_name_func
 
-_WINDOW = data_pb2.SAMPLE_WINDOW
-_ROLLING = data_pb2.SAMPLE_ROLLING
+_WINDOW = "SAMPLE_WINDOW"
+_ROLLING = "SAMPLE_ROLLING"
 
 
 def make_batch(n, start_id=0):
@@ -466,15 +466,15 @@ class CoordinatorTest(unittest.TestCase):
         self.assertFalse(any(p.is_alive() for p in coord._readers))
 
 
-def _yield_rows(stop_event, n=10, chunk=4, start_id=0, reorder=False):
+def _yield_rows(n=10, chunk=4, start_id=0, reorder=False):
     """Module-level task; reorders columns to exercise conforming."""
     for start in range(start_id, start_id + n, chunk):
         k = min(chunk, start_id + n - start)
         yield _plan_batch(k, start, reorder)
 
 
-def _yield_then_raise(stop_event):
-    yield next(iter(_yield_rows(stop_event, n=2, chunk=2)))
+def _yield_then_raise():
+    yield next(iter(_yield_rows(n=2, chunk=2)))
     raise ValueError("task boom")
 
 

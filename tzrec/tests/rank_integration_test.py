@@ -1414,7 +1414,7 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
         data_config.num_workers = 1
         data_config.fg_mode = data_pb2.FG_NONE
         data_config.shuffle = True
-        data_config.shuffle_mode = data_pb2.SAMPLE_ROLLING
+        data_config.shuffle_mode = "SAMPLE_ROLLING"
         data_config.shuffle_buffer_size = 4
         features = _create_features(list(config.feature_configs), data_config)
         nproc = utils._get_nproc_per_node()

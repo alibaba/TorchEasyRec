@@ -407,7 +407,7 @@ data_config {
     num_workers: 16
     shuffle: true
     shuffle_buffer_size: 98
-    shuffle_mode: SAMPLE_ROLLING
+    shuffle_mode: "SAMPLE_ROLLING"
 }
 ```
 

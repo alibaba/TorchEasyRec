@@ -83,8 +83,7 @@ def sample_shuffle_enabled(data_config: data_pb2.DataConfig, mode: Mode) -> bool
     return (
         mode == Mode.TRAIN
         and data_config.shuffle
-        and data_config.shuffle_mode
-        in (data_pb2.ShuffleMode.SAMPLE_WINDOW, data_pb2.ShuffleMode.SAMPLE_ROLLING)
+        and data_config.shuffle_mode in ("SAMPLE_WINDOW", "SAMPLE_ROLLING")
     )
 
 
@@ -114,11 +113,10 @@ def validate_sample_shuffle_config(data_config: data_pb2.DataConfig) -> None:
 class ReadTask:
     """One module-level read function and its picklable parameters.
 
-    The reader process calls ``fn(stop_event=..., **kwargs)``; ``fn`` must be a
-    module-level generator function so that the plan can be pickled to the
-    spawned coordinator. It yields ``pa.RecordBatch`` objects and ends
-    normally when its data is exhausted. Event objects are supplied by the
-    reader process and never travel inside ``kwargs``.
+    The reader process calls ``fn(**kwargs)``; ``fn`` must be a module-level
+    generator function so that the plan can be pickled to the spawned
+    coordinator. It yields ``pa.RecordBatch`` objects and ends normally when
+    its data is exhausted.
 
     Args:
         fn: module-level read generator.
@@ -193,14 +191,14 @@ class SamplePool:
 
     Args:
         capacity_rows: pool capacity in samples.
-        mode: SAMPLE_WINDOW or SAMPLE_ROLLING.
+        mode: "SAMPLE_WINDOW" or "SAMPLE_ROLLING".
         rng: random source, injectable for tests.
     """
 
     def __init__(
         self,
         capacity_rows: int,
-        mode: int,
+        mode: str,
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         self.capacity_rows = capacity_rows
@@ -249,7 +247,7 @@ class SamplePool:
         Returns:
             a batch of exactly ``num_rows`` rows, or None.
         """
-        if self.mode == data_pb2.SAMPLE_WINDOW:
+        if self.mode == "SAMPLE_WINDOW":
             return self._emit_window(num_rows, drain)
         return self._emit_rolling(num_rows, drain)
 
@@ -430,7 +428,7 @@ def _reader_process_main(
             for task in tasks:
                 if _stopped():
                     return
-                for batch in task.fn(stop_event=reader_stop, **task.kwargs):
+                for batch in task.fn(**task.kwargs):
                     if _stopped():
                         return
                     if batch.num_rows == 0:
@@ -468,7 +466,7 @@ class Coordinator:
         response_queues: one capacity-1 response queue per consumer.
         stop_event: shared clean-stop signal; the coordinator exits when set.
         cancel_event: shared early-stop signal; set by a CANCEL message.
-        mode: SAMPLE_WINDOW or SAMPLE_ROLLING.
+        mode: "SAMPLE_WINDOW" or "SAMPLE_ROLLING".
         capacity_rows: pool capacity in samples.
         batch_size: training batch size.
         min_batch_size: tail batches smaller than this are dropped.
@@ -485,7 +483,7 @@ class Coordinator:
         response_queues: List[Any],
         stop_event: Any,
         cancel_event: Any,
-        mode: int,
+        mode: str,
         capacity_rows: int,
         batch_size: int,
         min_batch_size: int,
@@ -917,7 +915,7 @@ class SampleShuffleHandle:
             return
         logger.info(
             f"sample-shuffle service starting: "
-            f"mode={data_pb2.ShuffleMode.Name(self._mode)} "
+            f"mode={self._mode} "
             f"capacity={self._capacity_rows} rows, "
             f"consumers={self._num_consumers}, "
             f"finite={self._first_plan.is_finite}, "

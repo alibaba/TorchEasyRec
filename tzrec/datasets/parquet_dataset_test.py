@@ -680,7 +680,7 @@ class ParquetSampleShuffleTest(unittest.TestCase):
 
     def _dataloader(
         self,
-        mode=data_pb2.SAMPLE_ROLLING,
+        mode="SAMPLE_ROLLING",
         num_workers=2,
         checkpoint_state=None,
         **overrides,
@@ -697,11 +697,11 @@ class ParquetSampleShuffleTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [data_pb2.SAMPLE_ROLLING, 2, {}, 101],
-            [data_pb2.SAMPLE_WINDOW, 2, {}, 101],
-            [data_pb2.SAMPLE_ROLLING, 0, {}, 101],
-            [data_pb2.SAMPLE_ROLLING, 2, {"min_batch_size": 6}, 96],
-            [data_pb2.SAMPLE_ROLLING, 2, {"drop_remainder": True}, 96],
+            ["SAMPLE_ROLLING", 2, {}, 101],
+            ["SAMPLE_WINDOW", 2, {}, 101],
+            ["SAMPLE_ROLLING", 0, {}, 101],
+            ["SAMPLE_ROLLING", 2, {"min_batch_size": 6}, 96],
+            ["SAMPLE_ROLLING", 2, {"drop_remainder": True}, 96],
         ],
         name_func=parameterized_name_func,
     )
@@ -744,7 +744,7 @@ class ParquetSampleShuffleTest(unittest.TestCase):
     def test_sample_shuffle_multi_rank_plan(self):
         dataset = ParquetDataset(
             sample_data_config(
-                data_pb2.DatasetType.ParquetDataset, data_pb2.SAMPLE_ROLLING, 2
+                data_pb2.DatasetType.ParquetDataset, "SAMPLE_ROLLING", 2
             ),
             raw_c_features(),
             self.path,
@@ -758,9 +758,11 @@ class ParquetSampleShuffleTest(unittest.TestCase):
         for plan in plans:
             rows = 0
             for task in plan.tasks:
-                for start, end in task.kwargs["intervals"]:
-                    rows += end - start
-                    covered.extend(range(start, end))
+                start, end = task.kwargs["start"], task.kwargs["end"]
+                self.assertLess(task.reader_id, 2)
+                self.assertEqual(task.kwargs["source_id"], f"{self.path}:{start}")
+                rows += end - start
+                covered.extend(range(start, end))
             self.assertEqual(rows, plan.planned_rows)
         self.assertEqual(sorted(covered), list(range(101)))
 
@@ -795,7 +797,7 @@ from tzrec.tests.utils import raw_c_features, sample_data_config
 def main():
     dataloader = create_dataloader(
         sample_data_config(
-            data_pb2.DatasetType.ParquetDataset, data_pb2.SAMPLE_ROLLING, 2
+            data_pb2.DatasetType.ParquetDataset, "SAMPLE_ROLLING", 2
         ),
         raw_c_features(),
         sys.argv[1],

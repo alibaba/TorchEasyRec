@@ -898,12 +898,16 @@ def create_dataloader(
     Return:
         dataloader (dataloader): a DataLoader.
     """
+    if data_config.shuffle_mode not in ("BATCH", "SAMPLE_WINDOW", "SAMPLE_ROLLING"):
+        raise ValueError(
+            "shuffle_mode must be one of BATCH, SAMPLE_WINDOW or SAMPLE_ROLLING, "
+            f"got {data_config.shuffle_mode!r}"
+        )
     dataset_name = data_pb2.DatasetType.Name(data_config.dataset_type)
     if (
         mode == Mode.TRAIN
         and not data_config.shuffle
-        and data_config.shuffle_mode
-        in (data_pb2.ShuffleMode.SAMPLE_WINDOW, data_pb2.ShuffleMode.SAMPLE_ROLLING)
+        and data_config.shuffle_mode in ("SAMPLE_WINDOW", "SAMPLE_ROLLING")
     ):
         raise ValueError(
             "shuffle_mode=SAMPLE_WINDOW/SAMPLE_ROLLING requires shuffle=true; "
@@ -920,6 +924,8 @@ def create_dataloader(
         debug_level=debug_level,
         compiled_prompt=compiled_prompt,
     )
+    if checkpoint_state:
+        dataset.load_state_dict(dict(checkpoint_state))
 
     kwargs = {}
     if data_config.num_workers < 1:
@@ -947,8 +953,6 @@ def create_dataloader(
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = data_config.prefetch_factor
 
-    if checkpoint_state:
-        dataset.load_state_dict(dict(checkpoint_state))
     sample_shuffle = None
     if sample_shuffle_enabled(data_config, mode):
         rank, world_size = (
@@ -1002,8 +1006,6 @@ def create_dataloader(
         dataloader.close = weakref.finalize(
             dataset, sample_shuffle.stop
         )  # pyre-ignore[16]
-    else:
-        dataloader.close = lambda: None  # pyre-ignore[16]
     # Avoid a loader -> closure -> loader cycle that delays cleanup.
     dataloader_ref = weakref.ref(dataloader)
 

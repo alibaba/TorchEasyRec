@@ -264,8 +264,6 @@ class ParquetReader(BaseReader):
             raise ValueError(
                 "sample-level shuffle requires parquet rebalance to plan per-rank rows"
             )
-        from tzrec.datasets.sample_shuffle_readers import read_parquet
-
         tasks = []
         planned_rows = 0
         for reader_id in range(num_readers):
@@ -276,23 +274,23 @@ class ParquetReader(BaseReader):
                 world_size,
             )[0]
             planned_rows += sum(end - start for start, end in intervals)
-            if not intervals:
-                continue
-            tasks.append(
-                ReadTask(
-                    fn=read_parquet,
-                    kwargs=dict(
-                        input_files=self._input_files,
-                        batch_size=self._batch_size,
-                        parquet_metas=self._parquet_metas,
-                        columns=self._ordered_cols,
-                        intervals=intervals,
-                        source_prefix=self._input_path,
+            for start, end in intervals:
+                tasks.append(
+                    ReadTask(
+                        fn=_reader_iter,
+                        kwargs=dict(
+                            input_files=self._input_files,
+                            batch_size=self._batch_size,
+                            parquet_metas=self._parquet_metas,
+                            columns=self._ordered_cols,
+                            start=start,
+                            end=end,
+                            worker_id=reader_id,
+                            source_id=f"{self._input_path}:{start}",
+                        ),
                         reader_id=reader_id,
-                    ),
-                    reader_id=reader_id,
+                    )
                 )
-            )
         return ReadPlan(
             tasks=tasks,
             schema=make_sample_table_schema(self._schema),
