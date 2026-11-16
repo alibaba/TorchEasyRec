@@ -1050,7 +1050,6 @@ class GenRecExportModelTest(unittest.TestCase):
         self.pipeline_config = EasyRecConfig()
         self.common = self.pipeline_config.model_config.genrec_causal_lm_model.common
         self.common.beam_widths.extend([2, 2, 2])
-        self.common.num_return_sequences = 2
 
     def tearDown(self) -> None:
         shutil.rmtree(self.export_dir, ignore_errors=True)
@@ -1089,13 +1088,14 @@ class GenRecExportModelTest(unittest.TestCase):
             SLOT_EMBEDS: slot_embeds,
         }
 
-    @parameterized.expand([[False], [True]], name_func=parameterized_name_func)
-    def test_decodes_like_generate_codes(self, with_slots) -> None:
+    @parameterized.expand([[False, 2], [True, 6]], name_func=parameterized_name_func)
+    def test_decodes_like_generate_codes(self, with_slots, final_width) -> None:
+        self.common.beam_widths[-1] = final_width
         streams = self._streams(with_slots)
         model = self._model(streams)
         _, band_lo, band_hi = sid_bands([4, 4, 4], 40)
         bands = list(zip(band_lo, band_hi))
-        widths, num_return_sequences = resolve_beam_config(self.common, bands)
+        widths = resolve_beam_config(self.common, [4, 4, 4])
         with torch.no_grad():
             out = model(Batch(), None, torch.device("cpu"))
             embeds = self.lm.get_input_embeddings()(streams[INPUT_IDS])
@@ -1110,13 +1110,12 @@ class GenRecExportModelTest(unittest.TestCase):
                 5,
                 widths,
                 bands,
-                num_return_sequences,
             )
-        self.assertEqual(out["generated_sids"].shape, (2, 2, 3))
+        self.assertEqual(out["generated_sids"].shape, (2, widths[-1], 3))
         self.assertTrue(torch.equal(out["generated_sids"], expected))
 
     def test_reads_the_exports_pipeline_config(self) -> None:
-        self.common.num_return_sequences = 1
+        self.common.beam_widths[-1] = 1
         config_util.save_message(
             self.pipeline_config, os.path.join(self.export_dir, "pipeline.config")
         )

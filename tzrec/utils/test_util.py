@@ -493,7 +493,6 @@ def create_genrec_test_model(
     response: str = "{{answer}}",
     slots: Sequence[PromptSlot] = (),
     beam_widths: Sequence[int] = (2, 2, 2),
-    num_return_sequences: int = 2,
     lm_parameter_dtype: Optional["GenRecModelConfig.ParamDtype"] = None,
     attn_kernel: Optional[str] = None,
     model_type: str = "qwen2",
@@ -513,7 +512,6 @@ def create_genrec_test_model(
         response (str): the response template.
         slots (Sequence[PromptSlot]): explicit slot declarations.
         beam_widths (Sequence[int]): per-level beam widths.
-        num_return_sequences (int): sequences returned per sample.
         lm_parameter_dtype (optional): ``GenRecModelConfig.ParamDtype`` value.
         attn_kernel (optional): transformers attn_implementation name.
         model_type (str): hugging-face ``model_type`` of the backbone.
@@ -536,7 +534,6 @@ def create_genrec_test_model(
     lm_config = model_config.genrec_causal_lm_model
     lm_config.hf_model_name_or_path = backbone
     lm_config.common.beam_widths.extend(beam_widths)
-    lm_config.common.num_return_sequences = num_return_sequences
     if lm_parameter_dtype is not None:
         lm_config.common.lm_parameter_dtype = lm_parameter_dtype
     if attn_kernel is not None:

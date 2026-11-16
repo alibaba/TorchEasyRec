@@ -11,32 +11,33 @@
 
 """Band-restricted beam SID decode (no tzrec deps).
 
-The caller owns the width schedule; this module only enforces what each level
-can supply.
+The caller supplies a capped global beam width for each SID level.
 """
 
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 from transformers import PreTrainedModel
+from transformers.cache_utils import Cache
 
 
 def capped_beam_widths(
-    beam_widths: Sequence[int], bands: Sequence[Tuple[int, int]]
+    beam_widths: Sequence[int],
+    codebook: Sequence[int],
 ) -> List[int]:
-    """Cap each requested width to the candidates its band and prefixes supply.
+    """Cap each requested width to the candidates its codebook and prefixes supply.
 
     Args:
-        beam_widths: requested width per SID level.
-        bands: inclusive ``(lo, hi)`` token-id edge per level.
+        beam_widths: global width per SID level.
+        codebook: vocabulary size per SID level.
 
     Returns:
         The capped width per level.
     """
     capped: List[int] = []
     previous = 1
-    for requested, (band_lo, band_hi) in zip(beam_widths, bands):
-        capped.append(min(requested, previous * (band_hi - band_lo + 1)))
+    for requested, codebook_size in zip(beam_widths, codebook):
+        capped.append(min(requested, previous * codebook_size))
         previous = capped[-1]
     return capped
 
@@ -48,6 +49,7 @@ def dynamic_beam_search(
     attention_mask: torch.Tensor,
     capped_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
+    initial_cache: Optional[Cache] = None,
 ) -> torch.Tensor:
     """Decode SID answers with a caller-supplied per-level beam width.
 
@@ -59,6 +61,8 @@ def dynamic_beam_search(
         attention_mask: prompt mask ``(B, P)``.
         capped_widths: width per SID level, already capped to what its band and
             the surviving prefixes supply. The model derives it once at init.
+        initial_cache: optional cache supplied to prefill, for specialized
+            inference storage that implements the same branching protocol.
         bands: inclusive ``(lo, hi)`` token-id edge per SID level. Host ints,
             because every use of them is a host-side slice bound.
 
@@ -87,6 +91,7 @@ def dynamic_beam_search(
         position_ids=position_ids,
         use_cache=True,
         logits_to_keep=1,
+        past_key_values=initial_cache,
     )
     cache = outputs.past_key_values
     scores = _band_logp(outputs.logits[:, -1, :], 0)

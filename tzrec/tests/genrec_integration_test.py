@@ -314,7 +314,6 @@ class GenRecIntegrationTest(unittest.TestCase):
             sids = predicted.column("generated_sids").to_pylist()
             self.assertEqual(len(sids), 8)
             for row in sids:
-                # num_return_sequences beams of one local code per level
                 self.assertEqual([len(beam) for beam in row], [3, 3])
                 for beam in row:
                     self.assertTrue(

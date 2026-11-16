@@ -16,7 +16,10 @@ from typing import Any, Dict, List, Tuple
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
+from tzrec.modules.dynamic_beam import (
+    capped_beam_widths,
+    dynamic_beam_search,
+)
 from tzrec.utils.test_util import (
     create_tiny_causal_lm,
     flash_attn_unavailable,
@@ -26,7 +29,15 @@ from tzrec.utils.test_util import (
 )
 
 
-def _decode(lm, ids, pairs, width=8, beam_widths=None, attention_mask=None):
+def _decode(
+    lm,
+    ids,
+    pairs,
+    width=8,
+    beam_widths=None,
+    attention_mask=None,
+    initial_cache=None,
+):
     """Run the kernel over ``pairs`` of inclusive per-level (lo, hi) band edges.
 
     Defaults to a FLAT schedule: the kernel is policy-free, so only the cases
@@ -39,8 +50,11 @@ def _decode(lm, ids, pairs, width=8, beam_widths=None, attention_mask=None):
         lm,
         lm.get_input_embeddings()(ids),
         torch.ones_like(ids) if attention_mask is None else attention_mask,
-        capped_widths=capped_beam_widths(beam_widths, pairs),
+        capped_widths=capped_beam_widths(
+            beam_widths, [hi - lo + 1 for lo, hi in pairs]
+        ),
         bands=pairs,
+        initial_cache=initial_cache,
     )
 
 
@@ -84,13 +98,36 @@ def _bruteforce_scores(lm, input_ids, attention_mask, pairs):
 class DynamicBeamSearchTest(unittest.TestCase):
     @parameterized.expand(
         [
-            # every request satisfiable -> the schedule is honoured verbatim
+            [[(20, 23)], [8]],
+            [[(20, 21), (5, 7), (25, 28)], [2, 6, 8]],
+            [[(20, 21), (5, 7), (25, 28)], [2, 6, 30]],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_final_global_topk_matches_exhaustive_reference(
+        self, pairs, beam_widths
+    ) -> None:
+        lm = create_tiny_causal_lm(vocab_size=30)
+        ids = torch.tensor([[5, 6, 7, 8]])
+        ref = _bruteforce_scores(lm, ids, torch.ones_like(ids), pairs)
+        expected = sorted(ref, key=ref.__getitem__, reverse=True)[: beam_widths[-1]]
+        out = _decode(
+            lm,
+            ids,
+            pairs,
+            beam_widths=beam_widths,
+        )
+        self.assertEqual([tuple(row) for row in out.tolist()], expected)
+
+    @parameterized.expand(
+        [
+            # widths are capped by available expansions
             [[4, 8, 16], [(20, 27), (28, 34), (35, 40)], [4, 8, 16]],
             # capped by band x surviving prefixes, not by what was asked
             [[6, 12], [(20, 21), (22, 24)], [2, 6]],
             # a width-1 band collapses level 0 and bounds everything after it
             [[4, 8], [(20, 20), (21, 23)], [1, 3]],
-            # a flat (non-doubling) schedule is just as valid to the kernel
+            # a flat schedule retains the same global width at each level
             [[3, 3, 3], [(20, 27), (28, 34), (35, 40)], [3, 3, 3]],
         ],
         name_func=parameterized_name_func,
@@ -118,35 +155,59 @@ class DynamicBeamSearchTest(unittest.TestCase):
             solo = _decode(lm, solo_ids, pairs)
             self.assertTrue(torch.equal(out[i * width : (i + 1) * width], solo))
 
-    def test_exhaustive_matches_bruteforce_topk(self) -> None:
-        # widths [2, 6, 12] over 2*3*2 = 12 combinations -> no pruning at any
-        # level. Disjoint, non-monotonic bands also verify that each level uses
-        # its own bounds rather than assuming one contiguous SID layout.
-        pairs = [(20, 21), (5, 7), (25, 26)]
-        lm = create_tiny_causal_lm(vocab_size=30)
-        ids = torch.tensor([[5, 6, 7, 8]])
-        am = torch.ones_like(ids)
-        out = _decode(lm, ids, pairs, width=12)
-        got = [tuple(r) for r in out.tolist()]
-        ref = _bruteforce_scores(lm, ids, am, pairs)
-        self.assertEqual(set(got), set(ref))
-        self.assertEqual(len(got), len(ref))
-        scores = [ref[c] for c in got]
-        self.assertTrue(
-            all(scores[i] >= scores[i + 1] - 1e-4 for i in range(len(scores) - 1))
-        )
-        self.assertEqual(got[0], max(ref, key=lambda combo: ref[combo]))
-
 
 @mark_ci_scope("gpu")
 @unittest.skipIf(*nv_gpu_unavailable)
 @unittest.skipIf(*flash_attn_unavailable)
 class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
     @parameterized.expand(
+        [
+            ["qwen2", [50, 50, 200]],
+            ["qwen3", [50, 50, 200]],
+            ["qwen2", [20, 20, 200]],
+            ["qwen3", [20, 20, 200]],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_final_top200_matches_shared_fa2_cache(
+        self, model_type: str, beam_widths: List[int]
+    ) -> None:
+        from tzrec.modules.beam_cache import (
+            create_beam_cache,
+        )
+
+        device = torch.device("cuda")
+        lm = create_tiny_causal_lm(
+            768,
+            model_type=model_type,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+        ).to(device)
+        ids = torch.tensor([[5, 6, 7, 8], [0, 9, 10, 11]], device=device)
+        attention_mask = torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]], device=device)
+        pairs = [(0, 255), (256, 511), (512, 767)]
+        options = dict(
+            beam_widths=beam_widths,
+            attention_mask=attention_mask,
+        )
+        ordinary = _decode(lm, ids, pairs, **options)
+        shared = _decode(
+            lm,
+            ids,
+            pairs,
+            initial_cache=create_beam_cache(lm),
+            **options,
+        )
+        self.assertTrue(torch.equal(shared, ordinary))
+        self.assertEqual(tuple(shared.shape), (2 * 200, 3))
+
+    @parameterized.expand(
         [["qwen2"], ["qwen3"]],
         name_func=parameterized_name_func,
     )
     def test_ragged_batch_matches_solo_dynamic_cache(self, model_type: str) -> None:
+        from tzrec.models.genrec_causal_lm_model import generate_codes
+
         device = torch.device("cuda")
         lm = create_tiny_causal_lm(
             30,
@@ -165,6 +226,17 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
         )
 
         out = _decode(lm, ids, pairs, attention_mask=attention_mask)
+        with torch.no_grad():
+            codes = generate_codes(
+                lm,
+                lm.get_input_embeddings()(ids)[attention_mask.bool()],
+                torch.tensor([0, 4, 7], device=device),
+                4,
+                capped_beam_widths([8, 8, 8], [2, 3, 4]),
+                pairs,
+            )
+        expected = out.reshape(2, -1, 3) - ids.new_tensor([lo for lo, _ in pairs])
+        self.assertTrue(torch.equal(codes, expected))
         width = out.shape[0] // 2
         solos = [
             torch.tensor([[5, 6, 7, 8]], device=device),
