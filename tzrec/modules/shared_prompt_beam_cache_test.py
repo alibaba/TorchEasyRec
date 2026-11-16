@@ -14,9 +14,9 @@ import unittest
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.flash_attention_beam_cache import (
-    FlashAttentionBeamCache,
-    create_flash_attention_beam_cache,
+from tzrec.modules.shared_prompt_beam_cache import (
+    SharedPromptBeamCache,
+    create_shared_prompt_beam_cache,
 )
 from tzrec.utils.test_util import (
     create_tiny_causal_lm,
@@ -27,9 +27,9 @@ from tzrec.utils.test_util import (
 )
 
 
-class FlashAttentionBeamCacheTest(unittest.TestCase):
+class SharedPromptBeamCacheTest(unittest.TestCase):
     def test_prefill_keeps_original_layout_and_attention_compute_dtype(self):
-        cache = FlashAttentionBeamCache(1)
+        cache = SharedPromptBeamCache(1)
         key = torch.randn(3, 2, 257, 8)
         value = torch.randn_like(key).bfloat16()
         returned_key, returned_value = cache.update(key, value, 0)
@@ -45,7 +45,7 @@ class FlashAttentionBeamCacheTest(unittest.TestCase):
         self.assertEqual(cache._prefix_keys[0].shape[0], 3)
 
     def test_parent_selection_shares_prefixes_and_isolates_beam_tails(self):
-        cache = FlashAttentionBeamCache(1)
+        cache = SharedPromptBeamCache(1)
         key = torch.randn(2, 2, 513, 8).bfloat16()
         value = torch.randn_like(key)
         cache.update(key, value, 0)
@@ -110,7 +110,7 @@ class FlashAttentionBeamCacheTest(unittest.TestCase):
         with torch.no_grad(), torch.autocast("cuda", dtype=compute_dtype):
             reference = forward(ids)
             ordinary = reference.past_key_values
-            shared = create_flash_attention_beam_cache(lm)
+            shared = create_shared_prompt_beam_cache(lm)
             actual = forward(ids, shared)
             torch.testing.assert_close(actual.logits, reference.logits, atol=0, rtol=0)
             parents = torch.arange(batch, device="cuda").repeat_interleave(2)

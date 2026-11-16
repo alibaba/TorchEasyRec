@@ -18,7 +18,7 @@ from torch import nn
 from transformers.cache_utils import Cache
 
 
-class FlashAttentionBeamCache(Cache):
+class SharedPromptBeamCache(Cache):
     """Keep immutable prompt KV once and fork only the short beam suffix.
 
     Args:
@@ -32,7 +32,7 @@ class FlashAttentionBeamCache(Cache):
         self._prefix_values: Dict[int, torch.Tensor] = {}
         self._tail_keys: Dict[int, torch.Tensor] = {}
         self._tail_values: Dict[int, torch.Tensor] = {}
-        self._root_rows: Optional[torch.Tensor] = None
+        self._beam_to_prompt: Optional[torch.Tensor] = None
 
     @property
     def is_sliding(self) -> List[bool]:
@@ -64,7 +64,7 @@ class FlashAttentionBeamCache(Cache):
         Returns:
             Dense KV in the original HF layout, released after this layer.
         """
-        assert self._root_rows is not None
+        assert self._beam_to_prompt is not None
         prompt_width = prefix.shape[2]
         full = suffix.new_empty(
             (
@@ -74,7 +74,9 @@ class FlashAttentionBeamCache(Cache):
                 suffix.shape[3],
             )
         )
-        torch.index_select(prefix, 0, self._root_rows, out=full[:, :, :prompt_width])
+        torch.index_select(
+            prefix, 0, self._beam_to_prompt, out=full[:, :, :prompt_width]
+        )
         full[:, :, prompt_width:].copy_(suffix)
         return full
 
@@ -100,13 +102,13 @@ class FlashAttentionBeamCache(Cache):
             otherwise. Attention continues through the unmodified FA2 kernel.
         """
         if value_states.dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError("FlashAttention beam cache requires FP16 or BF16 compute")
+            raise ValueError("Shared prompt beam cache requires FP16 or BF16 compute")
         key = key_states.to(value_states.dtype)
         if layer_idx not in self._prefix_keys:
             self._prefix_keys[layer_idx] = key
             self._prefix_values[layer_idx] = value_states
-            if self._root_rows is None:
-                self._root_rows = torch.arange(
+            if self._beam_to_prompt is None:
+                self._beam_to_prompt = torch.arange(
                     key_states.shape[0], device=key_states.device
                 )
             return key_states, value_states
@@ -123,13 +125,13 @@ class FlashAttentionBeamCache(Cache):
         )
 
     def reorder_cache(self, beam_idx: torch.Tensor) -> None:
-        """Reindex root owners and fork suffix KV without duplicating prompt KV.
+        """Reindex prompt owners and fork suffix KV without duplicating prompt KV.
 
         Args:
             beam_idx: selected parent rows, including repetitions for branching.
         """
-        assert self._root_rows is not None
-        self._root_rows = self._root_rows.index_select(0, beam_idx)
+        assert self._beam_to_prompt is not None
+        self._beam_to_prompt = self._beam_to_prompt.index_select(0, beam_idx)
         for layer_idx in self._tail_keys:
             self._tail_keys[layer_idx] = self._tail_keys[layer_idx].index_select(
                 0, beam_idx
@@ -139,9 +141,9 @@ class FlashAttentionBeamCache(Cache):
             )
 
 
-def create_flash_attention_beam_cache(
+def create_shared_prompt_beam_cache(
     model: nn.Module,
-) -> Optional[FlashAttentionBeamCache]:
+) -> Optional[SharedPromptBeamCache]:
     """Select shared KV storage for full FlashAttention 2 prediction.
 
     Args:
@@ -156,4 +158,4 @@ def create_flash_attention_beam_cache(
     attentions = [layer.self_attn for layer in model.model.layers]
     if any(a.sliding_window is not None for a in attentions):
         return None
-    return FlashAttentionBeamCache(len(attentions))
+    return SharedPromptBeamCache(len(attentions))
