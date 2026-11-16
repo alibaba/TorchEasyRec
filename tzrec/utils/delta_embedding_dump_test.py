@@ -3068,8 +3068,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             fqn_to_feature_names={self._DYN_TABLE_FQN: ["user_id"]}
         )
         dumper._warned_no_retain_tables = set()
-        dumper._pending_evicted = {}
-        dumper._pending_tracked = {}
         return dumper
 
     def _eviction_module(self, evicted_keys, founds=None, values=None, rows=None):
@@ -3083,50 +3081,6 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 return_value={table_name: torch.tensor(evicted_keys, dtype=torch.int64)}
             ),
         )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
-    @mark_ci_scope("gpu")
-    def test_retry_keeps_drained_ids_until_uploader_accepts_delta(self):
-        dumper = self._eviction_dumper()
-        dumper._dump_evicted_tombstones = True
-        dumper._feature_store_enabled = True
-        dumper._retain_local_dump = False
-        dumper._uploader = mock.Mock()
-        dumper._uploader.submit.side_effect = [
-            RuntimeError("submit failed"),
-            None,
-            None,
-        ]
-        fqn = self._DYN_TABLE_FQN
-        dumper._tracker.get_unique = mock.Mock(
-            side_effect=[{fqn: SimpleNamespace(ids=torch.tensor([9, 10]))}, {}, {}]
-        )
-        module = self._eviction_module([], rows={7: [0.0, 0.0], 9: [3.0, 4.0]})
-        module.pop_evicted_keys.side_effect = [
-            {"dyn_table": torch.tensor(ids, dtype=torch.int64)}
-            for ids in ([7, 8], [], [])
-        ]
-        with (
-            mock.patch.object(dumper, "_collect_table_weights", return_value={}),
-            mock.patch.object(
-                dumper, "_collect_dynamic_modules", return_value={fqn: module}
-            ),
-            mock.patch(
-                "tzrec.utils.delta_embedding_dump.lookup_publish_embeddings",
-                side_effect=_fake_publish_lookup,
-            ),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "submit failed"):
-                dumper.dump(5)
-            dumper.dump(5)
-            table = dumper._uploader.submit.call_args.args[1]
-            self.assertEqual(table["key_id"].to_pylist(), [7, 9, 8])
-            self.assertEqual(
-                table["source"].to_pylist(),
-                ["model_delta_tracker", "model_delta_tracker", "dynamicemb_evicted"],
-            )
-            dumper.dump(6)
-            self.assertEqual(dumper._uploader.submit.call_args.args[1].num_rows, 0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
     @mark_ci_scope("gpu")

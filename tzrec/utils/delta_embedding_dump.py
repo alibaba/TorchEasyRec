@@ -847,9 +847,6 @@ class DeltaEmbeddingDumper:
         self._config = config
         self._quant_type = config.quant_type
         self._dump_evicted_tombstones = bool(config.dump_evicted_tombstones)
-        # Drains advance cursors; retain their IDs until write/submit succeeds.
-        self._pending_evicted: Dict[str, torch.Tensor] = {}
-        self._pending_tracked: Dict[str, torch.Tensor] = {}
         self._schema = (
             _DELTA_DUMP_QUANT_SCHEMA
             if self._quant_type == DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8
@@ -986,8 +983,6 @@ class DeltaEmbeddingDumper:
         reason.
         """
         self._tracker.clear(_CONSUMER)
-        self._pending_evicted = {}
-        self._pending_tracked = {}
         if not self._dump_evicted_tombstones:
             return
         popped_module_ids: Set[int] = set()
@@ -1266,8 +1261,6 @@ class DeltaEmbeddingDumper:
                 if table_chunks
                 else self._schema.empty_table(),
             )
-        self._pending_evicted = {}
-        self._pending_tracked = {}
         if num_rows == 0:
             if output_path is None:
                 logger.debug("No delta embedding rows to dump at step %s.", global_step)
@@ -1338,22 +1331,18 @@ class DeltaEmbeddingDumper:
         if dynamic_modules:
             # Finish prior prefetch and writeback before popping IDs or reading slots.
             torch.cuda.synchronize()
-        for fqn, rows in self._tracker.get_unique(_CONSUMER).items():
-            previous = self._pending_tracked.get(fqn)
-            self._pending_tracked[fqn] = (
-                rows.ids
-                if previous is None
-                else torch.cat([previous, rows.ids]).unique()
-            )
-        fqns = list(self._pending_tracked)
+        unique_rows_by_fqn = self._tracker.get_unique(_CONSUMER)
+        fqns = list(unique_rows_by_fqn)
         if dump_evicted_tombstones:
-            fqns += [fqn for fqn in dynamic_modules if fqn not in self._pending_tracked]
+            fqns += [fqn for fqn in dynamic_modules if fqn not in unique_rows_by_fqn]
         for fqn in fqns:
-            ids = self._pending_tracked.get(fqn)
+            unique_rows = unique_rows_by_fqn.get(fqn)
             dynamic_module = dynamic_modules.get(fqn)
             if dynamic_module is not None:
                 tracker_ids = (
-                    ids if ids is not None else torch.empty(0, dtype=torch.int64)
+                    unique_rows.ids
+                    if unique_rows is not None
+                    else torch.empty(0, dtype=torch.int64)
                 )
                 num_rows += self._append_dynamic_rows(
                     table_chunks,
@@ -1364,9 +1353,9 @@ class DeltaEmbeddingDumper:
                     dump_evicted_tombstones=dump_evicted_tombstones,
                 )
                 continue
-            if ids is None or ids.numel() == 0:
+            if unique_rows is None or unique_rows.ids.numel() == 0:
                 continue
-            ids = ids.unique(sorted=True)
+            ids = unique_rows.ids.unique(sorted=True)
             embeddings, key_ids = self._lookup_embeddings(fqn, ids, table_weights)
             num_rows += self._append_table_chunk(
                 table_chunks,
@@ -1538,15 +1527,7 @@ class DeltaEmbeddingDumper:
         if dump_evicted_tombstones:
             evicted = self._pop_evicted_key_ids(fqn, dynamic_module, table_name)
             if evicted is not None and evicted.numel() > 0:
-                new_ids = evicted.cpu().to(torch.int64)
-                previous = self._pending_evicted.get(fqn)
-                self._pending_evicted[fqn] = (
-                    new_ids
-                    if previous is None
-                    else torch.cat([previous, new_ids]).unique()
-                )
-            evicted_ids = self._pending_evicted.get(fqn)
-            if evicted_ids is not None:
+                evicted_ids = evicted.cpu().to(torch.int64)
                 ids = torch.cat([ids, evicted_ids])
         ids = ids.unique(sorted=True)
         if ids.numel() == 0:
