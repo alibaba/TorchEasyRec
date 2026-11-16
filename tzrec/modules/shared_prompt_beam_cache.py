@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared-prefix KV storage that preserves Hugging Face's FA2 attention path."""
+"""Shared prompt KV storage that preserves Hugging Face's FA2 attention path."""
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,10 +28,10 @@ class SharedPromptBeamCache(Cache):
     def __init__(self, num_layers: int) -> None:
         super().__init__(layers=[])
         self.num_layers = num_layers
-        self._prefix_keys: Dict[int, torch.Tensor] = {}
-        self._prefix_values: Dict[int, torch.Tensor] = {}
-        self._tail_keys: Dict[int, torch.Tensor] = {}
-        self._tail_values: Dict[int, torch.Tensor] = {}
+        self._prompt_keys: Dict[int, torch.Tensor] = {}
+        self._prompt_values: Dict[int, torch.Tensor] = {}
+        self._beam_keys: Dict[int, torch.Tensor] = {}
+        self._beam_values: Dict[int, torch.Tensor] = {}
         self._beam_to_prompt: Optional[torch.Tensor] = None
 
     @property
@@ -40,12 +40,12 @@ class SharedPromptBeamCache(Cache):
         return [False] * self.num_layers
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
-        """Return the padded prefix length plus this layer's appended tokens."""
-        if layer_idx not in self._prefix_keys:
+        """Return the padded prompt length plus this layer's appended tokens."""
+        if layer_idx not in self._prompt_keys:
             return 0
-        tail = self._tail_keys.get(layer_idx)
-        return self._prefix_keys[layer_idx].shape[2] + (
-            tail.shape[2] if tail is not None else 0
+        generated = self._beam_keys.get(layer_idx)
+        return self._prompt_keys[layer_idx].shape[2] + (
+            generated.shape[2] if generated is not None else 0
         )
 
     def get_mask_sizes(self, query_length: int, layer_idx: int) -> Tuple[int, int]:
@@ -53,31 +53,31 @@ class SharedPromptBeamCache(Cache):
         return self.get_seq_length(layer_idx) + query_length, 0
 
     def _build_beam_kv(
-        self, prefix: torch.Tensor, suffix: torch.Tensor
+        self, prompt: torch.Tensor, generated: torch.Tensor
     ) -> torch.Tensor:
         """Construct only the current attention layer's dense KV input.
 
         Args:
-            prefix: immutable prompt KV, shaped ``(B, Hkv, P, D)``.
-            suffix: current beam tails, shaped ``(Bbeam, Hkv, T, D)``.
+            prompt: immutable prompt KV, shaped ``(B, Hkv, P, D)``.
+            generated: per-beam generated KV, shaped ``(Bbeam, Hkv, T, D)``.
 
         Returns:
             Dense KV in the original HF layout, released after this layer.
         """
         assert self._beam_to_prompt is not None
-        prompt_width = prefix.shape[2]
-        full = suffix.new_empty(
+        prompt_width = prompt.shape[2]
+        full = generated.new_empty(
             (
-                suffix.shape[0],
-                suffix.shape[1],
-                prompt_width + suffix.shape[2],
-                suffix.shape[3],
+                generated.shape[0],
+                generated.shape[1],
+                prompt_width + generated.shape[2],
+                generated.shape[3],
             )
         )
         torch.index_select(
-            prefix, 0, self._beam_to_prompt, out=full[:, :, :prompt_width]
+            prompt, 0, self._beam_to_prompt, out=full[:, :, :prompt_width]
         )
-        full[:, :, prompt_width:].copy_(suffix)
+        full[:, :, prompt_width:].copy_(generated)
         return full
 
     def update(
@@ -104,24 +104,24 @@ class SharedPromptBeamCache(Cache):
         if value_states.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("Shared prompt beam cache requires FP16 or BF16 compute")
         key = key_states.to(value_states.dtype)
-        if layer_idx not in self._prefix_keys:
-            self._prefix_keys[layer_idx] = key
-            self._prefix_values[layer_idx] = value_states
+        if layer_idx not in self._prompt_keys:
+            self._prompt_keys[layer_idx] = key
+            self._prompt_values[layer_idx] = value_states
             if self._beam_to_prompt is None:
                 self._beam_to_prompt = torch.arange(
                     key_states.shape[0], device=key_states.device
                 )
             return key_states, value_states
-        if layer_idx in self._tail_keys:
-            key = torch.cat([self._tail_keys[layer_idx], key], dim=2)
+        if layer_idx in self._beam_keys:
+            key = torch.cat([self._beam_keys[layer_idx], key], dim=2)
             value_states = torch.cat(
-                [self._tail_values[layer_idx], value_states], dim=2
+                [self._beam_values[layer_idx], value_states], dim=2
             )
-        self._tail_keys[layer_idx] = key
-        self._tail_values[layer_idx] = value_states
+        self._beam_keys[layer_idx] = key
+        self._beam_values[layer_idx] = value_states
         return (
-            self._build_beam_kv(self._prefix_keys[layer_idx], key),
-            self._build_beam_kv(self._prefix_values[layer_idx], value_states),
+            self._build_beam_kv(self._prompt_keys[layer_idx], key),
+            self._build_beam_kv(self._prompt_values[layer_idx], value_states),
         )
 
     def reorder_cache(self, beam_idx: torch.Tensor) -> None:
@@ -132,11 +132,11 @@ class SharedPromptBeamCache(Cache):
         """
         assert self._beam_to_prompt is not None
         self._beam_to_prompt = self._beam_to_prompt.index_select(0, beam_idx)
-        for layer_idx in self._tail_keys:
-            self._tail_keys[layer_idx] = self._tail_keys[layer_idx].index_select(
+        for layer_idx in self._beam_keys:
+            self._beam_keys[layer_idx] = self._beam_keys[layer_idx].index_select(
                 0, beam_idx
             )
-            self._tail_values[layer_idx] = self._tail_values[layer_idx].index_select(
+            self._beam_values[layer_idx] = self._beam_values[layer_idx].index_select(
                 0, beam_idx
             )
 

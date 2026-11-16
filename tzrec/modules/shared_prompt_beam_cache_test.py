@@ -36,35 +36,35 @@ class SharedPromptBeamCacheTest(unittest.TestCase):
         self.assertIs(returned_key, key)
         self.assertIs(returned_value, value)
         self.assertEqual(cache.get_seq_length(), 257)
-        self.assertEqual(cache._prefix_keys[0].dtype, torch.bfloat16)
-        torch.testing.assert_close(cache._prefix_keys[0], key.bfloat16())
-        torch.testing.assert_close(cache._prefix_values[0], value)
-        prefix = cache._prefix_keys[0]
+        self.assertEqual(cache._prompt_keys[0].dtype, torch.bfloat16)
+        torch.testing.assert_close(cache._prompt_keys[0], key.bfloat16())
+        torch.testing.assert_close(cache._prompt_values[0], value)
+        prompt = cache._prompt_keys[0]
         cache.reorder_cache(torch.tensor([0, 0, 1, 1, 2, 2]))
-        self.assertIs(cache._prefix_keys[0], prefix)
-        self.assertEqual(cache._prefix_keys[0].shape[0], 3)
+        self.assertIs(cache._prompt_keys[0], prompt)
+        self.assertEqual(cache._prompt_keys[0].shape[0], 3)
 
-    def test_parent_selection_shares_prefixes_and_isolates_beam_tails(self):
+    def test_parent_selection_shares_prompt_and_isolates_beam_kv(self):
         cache = SharedPromptBeamCache(1)
         key = torch.randn(2, 2, 513, 8).bfloat16()
         value = torch.randn_like(key)
         cache.update(key, value, 0)
-        roots = cache._prefix_keys[0].clone()
+        prompt = cache._prompt_keys[0].clone()
         owners = torch.tensor([0, 0, 1, 1])
         cache.reorder_cache(owners)
-        tail = (
+        generated = (
             torch.arange(4, dtype=torch.bfloat16).reshape(4, 1, 1, 1).expand(4, 2, 1, 8)
         )
-        full_key, full_value = cache.update(tail, tail + 10, 0)
+        full_key, full_value = cache.update(generated, generated + 10, 0)
         torch.testing.assert_close(full_key[:, :, :513], key[owners])
         torch.testing.assert_close(full_value[:, :, :513], value[owners])
-        torch.testing.assert_close(full_key[:, :, 513:], tail)
+        torch.testing.assert_close(full_key[:, :, 513:], generated)
         parents = torch.tensor([1, 1, 0, 3, 2, 3])
         cache.reorder_cache(parents)
-        torch.testing.assert_close(cache._tail_keys[0], tail[parents])
-        cache._tail_keys[0][0].fill_(99)
-        self.assertEqual(float(cache._tail_keys[0][1, 0, 0, 0]), 1)
-        torch.testing.assert_close(cache._prefix_keys[0], roots)
+        torch.testing.assert_close(cache._beam_keys[0], generated[parents])
+        cache._beam_keys[0][0].fill_(99)
+        self.assertEqual(float(cache._beam_keys[0][1, 0, 0, 0]), 1)
+        torch.testing.assert_close(cache._prompt_keys[0], prompt)
         self.assertEqual(cache.get_seq_length(), 514)
 
     @parameterized.expand(
