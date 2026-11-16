@@ -158,6 +158,25 @@ message DeltaEmbeddingDumpConfig {
     optional uint32 sparse_dump_interval_minutes = 10;
 }
 
+// Adds RocksDB-backed dynamicemb candidates to embedding planning. Each rank
+// shares one working database under root_dir across its offloaded tables.
+// An explicit partial cache_load_factor also pins the RocksDB cache budget;
+// the 0.5 ceiling applies only to automatic search. CUSTOMIZED scores stay in memory.
+message RocksDBConfig {
+    // storage root of the working databases on a local disk or an NFS-like
+    // filesystem (NVMe, ESSD, Extreme NAS), never an OSS mount. Each rank
+    // uses <root_dir>/<model_dir id>/rank_<rank>/<mode>-<time>-<pid>.
+    required string root_dir = 1;
+    // Planning-time SSD capacity cap in bytes for all ranks sharing the volume
+    // behind root_dir. Observed free space also limits planning; unset uses
+    // free space alone. This is not an enforced runtime disk quota.
+    optional uint64 ssd_budget_bytes = 2;
+    // Whether all nodes share one storage volume behind root_dir.
+    // false: each node has its own volume, shared by that node's ranks.
+    // true: all ranks share one volume.
+    optional bool shared_across_nodes = 3 [default = false];
+}
+
 message TrainConfig {
     // embedding part optimizer
     required SparseOptimizer sparse_optimizer = 1;
@@ -216,5 +235,9 @@ message TrainConfig {
     optional DeltaEmbeddingDumpConfig delta_embedding_dump_config = 24;
     // profiler schedule and collection options, used when is_profiling=true
     optional ProfilerConfig profiler_config = 25;
+    // Allows offloading dynamicemb tables to RocksDB. With the backend available,
+    // enabling this reserves shared resources even if no table is offloaded.
+    // Planning fails if the shared reserve exceeds the available capacity.
+    optional RocksDBConfig rocksdb_config = 26;
     // TBD: qcomm config
 }

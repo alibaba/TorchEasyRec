@@ -50,6 +50,7 @@ from tzrec.optim.optimizer import (
     sparse_init_accumulator_value,
 )
 from tzrec.protos import feature_pb2
+from tzrec.utils import rocksdb_util
 from tzrec.utils.logging_util import logger
 
 _DYNAMICEMB_CACHING_X_EFF_BASE = 0.28
@@ -88,7 +89,7 @@ class DynamicEmbTableStorage(NamedTuple):
         *,
         ratio: float,
     ) -> "DynamicEmbTableStorage":
-        """Estimate the value budget and physical HBM and DDR bytes for one shard.
+        """Estimate the value budget and HBM, DDR and SSD costs for one shard.
 
         The options carry the aligned per-rank max_capacity; the tensor supplies
         the embedding width, dtype and optimizer. The caching mode comes from
@@ -103,7 +104,7 @@ class DynamicEmbTableStorage(NamedTuple):
         ratio * shard_rows * row_bytes to whole bytes and cap it at full_bytes - 1.
         The runtime splits rows using that byte budget divided by full_bytes.
 
-        Physical table storage uses the resulting bucket-rounded capacities::
+        Built-in table storage uses the resulting bucket-rounded capacities::
 
             physical_hbm_rows = resident_rows + overflow_rows
             storage.hbm = physical_hbm_rows * row_bytes + key_map_bytes_total
@@ -119,12 +120,17 @@ class DynamicEmbTableStorage(NamedTuple):
         include the resident cache plus three overflow buckets. Only resident rows
         count toward cache coverage.
 
-        Every tier's key map lives on HBM, including the host tier's. Each slot
+        Built-in tiers keep their key maps on HBM, including the host tier.
+        A RocksDB backing keeps its key map in the database instead. Each slot
         stores a key, digest, score words and reference counter; each bucket also
         has a size counter. LRU+LFU stores two score words (timestamp and frequency);
         other policies store one. The cache overflow has its own map. A full
         NO_EVICTION map stores the value row index in its score word and has twice
         as many slots as value rows.
+
+        RocksDB charges backing metadata to DDR and live records, eviction
+        indexes and cache-writeback versions to SSD. Temporary growth before
+        eviction uses the topology's SSD reserve rather than a batch-size term.
 
         For zero and full budgets, take the larger cost per field across the
         standalone endpoint and its placement in a fused HYBRID group. The
@@ -135,6 +141,7 @@ class DynamicEmbTableStorage(NamedTuple):
         and pipeline I/O separately.
         """
         caching = options.caching
+        rocksdb_backing = rocksdb_util.is_rocksdb_options(options)
         if not 0.0 <= ratio <= 1.0 or (caching and ratio in (0.0, 1.0)):
             raise ValueError(
                 f"invalid dynamicemb placement: caching={caching}, {ratio=}"
@@ -145,7 +152,8 @@ class DynamicEmbTableStorage(NamedTuple):
         multiplier = _get_optimizer_multipler(
             getattr(tensor, "_optimizer_classes", [None])[0], tensor.shape, tensor.dtype
         )
-        row_bytes = (dim + round(dim * multiplier)) * tensor.element_size()
+        optimizer_state_dim = round(dim * multiplier)
+        row_bytes = (dim + optimizer_state_dim) * tensor.element_size()
         width = options.bucket_capacity
         strategy = options.score_strategy
         score_words = score_policy_num_scores(get_score_policy(strategy).policy)
@@ -174,11 +182,11 @@ class DynamicEmbTableStorage(NamedTuple):
                 overflow = _DYNAMICEMB_CACHE_OVERFLOW_BUCKETS * cache_width
                 cache_words = 1 if no_eviction else score_words
                 hbm, host = resident + overflow, shard_rows
-                index = (
-                    full_index
-                    + _keymap_bytes(resident, cache_width, cache_words)
-                    + _keymap_bytes(overflow, overflow, cache_words)
-                )
+                index = _keymap_bytes(
+                    resident, cache_width, cache_words
+                ) + _keymap_bytes(overflow, overflow, cache_words)
+                if not rocksdb_backing:
+                    index += full_index
             else:
                 hbm = resident
                 host = _bucket_rounded_rows(
@@ -189,11 +197,31 @@ class DynamicEmbTableStorage(NamedTuple):
                 )
                 if ratio == 1:
                     index = max(index, full_index)
+        storage = Storage(hbm=hbm * row_bytes + index, ddr=host * row_bytes, ssd=0)
+        if rocksdb_backing:
+            from tzrec_ext.rocksdb import (
+                index_entry_bytes,
+                logical_row_bytes,
+                metadata_cache_bytes,
+            )
+
+            record_bytes = logical_row_bytes(
+                dim, optimizer_state_dim, tensor.element_size()
+            )
+            index_bytes = index_entry_bytes() if not no_eviction else 0
+            storage.ddr = metadata_cache_bytes(
+                shard_rows, record_bytes, not no_eviction
+            )
+            live_bytes = shard_rows * (record_bytes + index_bytes)
+            storage.ssd = (
+                math.ceil(rocksdb_util.SST_FACTOR * live_bytes)
+                + resident * record_bytes
+            )
         return cls(
             resident_rows=resident,
             backing_rows=host,
             local_hbm_for_values=budget,
-            storage=Storage(hbm=hbm * row_bytes + index, ddr=host * row_bytes, ssd=0),
+            storage=storage,
         )
 
 
@@ -304,6 +332,9 @@ def _dynamicemb_effective_bandwidth(
     fits, so this remains a per-table approximation. All cases scale the
     weighted bandwidth by 0.1. Bandwidth units follow the topology.
 
+    RocksDB-backed candidates use SSD bandwidth for the backing link in this
+    approximation; the topology's host-link bandwidth remains unchanged.
+
     Args:
         sharding_option: Candidate carrying DynamicEmb options and cache stats.
         topology: Hardware bandwidths used by the performance estimator.
@@ -330,9 +361,12 @@ def _dynamicemb_effective_bandwidth(
             else _DYNAMICEMB_HYBRID_X_EFF_BASE
         )
         weight = base + _DYNAMICEMB_X_EFF_TIEBREAK * x
-    return (
-        weight * topology.hbm_mem_bw + (1 - weight) * topology.hbm_to_ddr_mem_bw
-    ) / 10
+    backing_bw = (
+        topology.ssd_mem_bw
+        if rocksdb_util.is_rocksdb_options(options)
+        else topology.hbm_to_ddr_mem_bw
+    )
+    return (weight * topology.hbm_mem_bw + (1 - weight) * backing_bw) / 10
 
 
 def _log_dynamicemb_table_plan(
