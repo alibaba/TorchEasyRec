@@ -441,6 +441,68 @@ class OdpsDataset(BaseDataset):
         )
 
 
+# per reader process: one account and one client per table identity
+_ODPS_ACCOUNT: Optional[Any] = None
+_ODPS_CLIENTS: Dict[Tuple[str, Optional[str], str, str], Any] = {}
+
+
+def _get_odps_client(input_path: str, quota_name: str) -> Any:
+    """Create or reuse this process's storage client for a table and quota."""
+    global _ODPS_ACCOUNT
+    project, table_name, _, schema = _parse_table_path(input_path)
+    key = (project, schema, table_name, quota_name)
+    client = _ODPS_CLIENTS.get(key)
+    if client is not None:
+        return client
+    if _ODPS_ACCOUNT is None:
+        _ODPS_ACCOUNT = _create_odps_account()
+    account, endpoint = _ODPS_ACCOUNT
+    _, client = _create_storage_client(input_path, account, endpoint, quota_name)
+    _ODPS_CLIENTS[key] = client
+    return client
+
+
+def _read_sample_batches(
+    input_path: str,
+    quota_name: str,
+    session_id: str,
+    intervals: List[Tuple[int, int]],
+    source_prefix: str,
+    batch_size: int,
+    compression: Any,
+) -> Iterator[pa.RecordBatch]:
+    """Read assigned row intervals of one restored ODPS session.
+
+    The child process creates its own storage client and reuses the session
+    created (or restored) by the trainer process.
+
+    Args:
+        input_path: odps table path owning the session.
+        quota_name: storage api quota name.
+        session_id: batch scan session id.
+        intervals: absolute (start, end) row intervals of this task.
+        source_prefix: checkpoint source id prefix.
+        batch_size: rows per read request.
+        compression: storage api compression type.
+
+    Yields:
+        ODPS record batches with checkpoint metadata.
+    """
+    os.environ["STORAGE_API_QUOTA_NAME"] = quota_name
+    client = _get_odps_client(input_path, quota_name)
+    sess_req = SessionRequest(session_id=session_id)
+    for start, end in intervals:
+        yield from _reader_iter(
+            client,
+            sess_req,
+            batch_size,
+            compression,
+            start,
+            end,
+            f"{source_prefix}:{start}",
+        )
+
+
 class OdpsReader(BaseReader):
     """Odps(Maxcompute) reader class.
 
@@ -569,8 +631,6 @@ class OdpsReader(BaseReader):
         """
         sources = self._sources()
 
-        from tzrec.datasets.sample_shuffle_readers import read_odps
-
         tasks = []
         planned_rows = 0
         for reader_id in range(num_readers):
@@ -586,7 +646,7 @@ class OdpsReader(BaseReader):
                     continue
                 tasks.append(
                     ReadTask(
-                        fn=read_odps,
+                        fn=_read_sample_batches,
                         kwargs=dict(
                             input_path=input_path,
                             quota_name=self._quota_name,

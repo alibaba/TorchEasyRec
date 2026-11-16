@@ -28,7 +28,7 @@ from torch import distributed as dist
 from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
-from tzrec.datasets import odps_dataset, sample_shuffle_readers
+from tzrec.datasets import odps_dataset
 from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _create_odps_account
 from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID
@@ -1099,8 +1099,8 @@ class OdpsSamplePlanTest(unittest.TestCase):
 
 class OdpsReaderClientCacheTest(unittest.TestCase):
     def tearDown(self):
-        sample_shuffle_readers._ODPS_CLIENTS.clear()
-        sample_shuffle_readers._ODPS_ACCOUNT = None
+        odps_dataset._ODPS_CLIENTS.clear()
+        odps_dataset._ODPS_ACCOUNT = None
 
     def test_separates_table_identities(self):
         clients = [object(), object(), object()]
@@ -1116,16 +1116,10 @@ class OdpsReaderClientCacheTest(unittest.TestCase):
                 side_effect=[(object(), client) for client in clients],
             ) as m_client,
         ):
-            project_a = sample_shuffle_readers._get_odps_client(
-                "odps://p/tables/t/dt=1", "q"
-            )
-            project_b = sample_shuffle_readers._get_odps_client(
-                "odps://p2/tables/t/dt=1", "q"
-            )
-            schema_b = sample_shuffle_readers._get_odps_client(
-                "odps://p/tables/s2.t/dt=1", "q"
-            )
-            project_a_again = sample_shuffle_readers._get_odps_client(
+            project_a = odps_dataset._get_odps_client("odps://p/tables/t/dt=1", "q")
+            project_b = odps_dataset._get_odps_client("odps://p2/tables/t/dt=1", "q")
+            schema_b = odps_dataset._get_odps_client("odps://p/tables/s2.t/dt=1", "q")
+            project_a_again = odps_dataset._get_odps_client(
                 "odps://p/tables/t/dt=2", "q"
             )
         self.assertIs(project_a, project_a_again)

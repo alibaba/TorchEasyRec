@@ -747,6 +747,56 @@ def _default_consumer_factory(
     return Consumer(config)
 
 
+def _read_sample_batches(
+    input_path: str,
+    reader_id: int,
+    num_readers: int,
+    checkpoint_state: Optional[Dict[str, Any]],
+    reader_schema: pa.Schema,
+    full_schema: pa.Schema,
+    has_embedded_schema: bool,
+    batch_size: int,
+    consumer_factory: Optional[Any] = None,
+    round_robin_partition_order: Optional[List[int]] = None,
+    kafka_log_every_n_messages: int = 0,
+) -> Iterator[pa.RecordBatch]:
+    """Consume Kafka in a reader process for the sample-level shuffle plan.
+
+    Args:
+        input_path: kafka URI.
+        reader_id: global consumer slot passed to the consumer factory.
+        num_readers: global consumer slot count.
+        checkpoint_state: resume state {topic:partition: offset}; the
+            reader applies checkpoint, timestamp and reset offsets on assignment.
+        reader_schema: schema to project and cast each message to.
+        full_schema: full schema for schema-less messages.
+        has_embedded_schema: whether messages embed an IPC stream schema.
+        batch_size: target rows per consume round.
+        consumer_factory: consumer builder; the default builds real consumers.
+        round_robin_partition_order: parent-resolved partition order, or None
+            for ordinary consumer-group subscription.
+        kafka_log_every_n_messages: decoded-message log interval, 0 disables.
+
+    Yields:
+        decoded record batches with checkpoint metadata and event time.
+    """
+    yield from _consume_kafka(
+        input_path,
+        consumer_factory,
+        reader_id,
+        num_readers,
+        batch_size,
+        reader_schema,
+        full_schema,
+        has_embedded_schema,
+        checkpoint_state=checkpoint_state,
+        # this process was forked by the coordinator
+        orphan_pid=os.getppid(),
+        round_robin_partition_order=round_robin_partition_order,
+        kafka_log_every_n_messages=kafka_log_every_n_messages,
+    )
+
+
 class KafkaDataset(BaseDataset):
     """Dataset for reading data from Kafka (each message is a serialized Arrow batch).
 
@@ -1023,15 +1073,13 @@ class KafkaReader(BaseReader):
         Returns:
             a non-finite read plan with one task per reader.
         """
-        from tzrec.datasets.sample_shuffle_readers import read_kafka
-
         checkpoint_state = (
             dict(self._checkpoint_state) if self._checkpoint_state else None
         )
         global_num_readers = world_size * num_readers
         tasks = [
             ReadTask(
-                fn=read_kafka,
+                fn=_read_sample_batches,
                 kwargs=dict(
                     input_path=self._input_path,
                     reader_id=rank * num_readers + reader_id,

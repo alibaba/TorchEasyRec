@@ -33,6 +33,27 @@ from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
 
 
+def _reader_iter(
+    input_files: List[str],
+    batch_size: int,
+    columns: Optional[List[str]],
+    csv_fmt: Any,
+) -> Iterator[pa.RecordBatch]:
+    """Read the csv files assigned to one reader slot.
+
+    Args:
+        input_files: files assigned to this slot.
+        batch_size: scanner batch size.
+        columns: selected columns in output order, or None for all.
+        csv_fmt: the dataset's picklable csv scanner format.
+
+    Yields:
+        csv record batches.
+    """
+    dataset = ds.dataset(input_files, format=csv_fmt)
+    yield from dataset.to_batches(batch_size=batch_size, columns=columns)
+
+
 class CsvDataset(BaseDataset):
     """Dataset for reading data with csv format.
 
@@ -180,7 +201,6 @@ class CsvReader(BaseReader):
                 "sample-level shuffle supports CsvDataset only on a single "
                 f"rank, got rank {rank} of {world_size}"
             )
-        from tzrec.datasets.sample_shuffle_readers import read_csv
 
         tasks = []
         for reader_id in range(num_readers):
@@ -189,7 +209,7 @@ class CsvReader(BaseReader):
                 continue
             tasks.append(
                 ReadTask(
-                    fn=read_csv,
+                    fn=_reader_iter,
                     kwargs=dict(
                         input_files=input_files,
                         batch_size=self._batch_size,
@@ -217,11 +237,14 @@ class CsvReader(BaseReader):
         if self._shuffle:
             random.shuffle(input_files)
         if len(input_files) > 0:
-            dataset = ds.dataset(input_files, format=self._csv_fmt)
-            reader = dataset.to_batches(
-                batch_size=self._batch_size, columns=self._ordered_cols
+            yield from self._arrow_reader_iter(
+                _reader_iter(
+                    input_files,
+                    self._batch_size,
+                    self._ordered_cols,
+                    self._csv_fmt,
+                )
             )
-            yield from self._arrow_reader_iter(reader)
 
     def num_files(self) -> Optional[int]:
         """Get number of files in the dataset."""
