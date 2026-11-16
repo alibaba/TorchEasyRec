@@ -222,7 +222,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
             batch: carries the packed prompt and the padded width.
 
         Returns:
-            ``(B, num_return, num_levels)`` local codes, best first.
+            Up to ``num_return`` local codes per row, best first.
         """
         infos = batch.additional_infos
         return generate_codes(
@@ -248,7 +248,7 @@ def resolve_beam_config(
         bands: inclusive ``(lo, hi)`` token-id edge per SID level.
 
     Returns:
-        The capped width per level, and ``num_return_sequences``.
+        The capped width per level, and the requested maximum return count.
     """
     num_return_sequences = int(common.num_return_sequences)
     beam_widths = list(common.beam_widths)
@@ -269,11 +269,6 @@ def resolve_beam_config(
             f"num_return_sequences must be >= 1, got {num_return_sequences}."
         )
     capped_widths = capped_beam_widths(beam_widths, bands, common.final_topk_per_prefix)
-    if num_return_sequences > capped_widths[-1]:
-        raise ValueError(
-            f"num_return_sequences ({num_return_sequences}) must not exceed the "
-            f"final capped beam width ({capped_widths[-1]})."
-        )
     return capped_widths, num_return_sequences
 
 
@@ -324,12 +319,13 @@ def generate_codes(
         max_seqlen: the widest row.
         capped_widths: beam width per SID level, already capped.
         bands: inclusive ``(lo, hi)`` token-id edge per SID level.
-        num_return_sequences: beams to return per row.
+        num_return_sequences: maximum beams to return per row.
         final_topk_per_prefix: use a per-parent token limit at the last level.
         use_flash_attn_kvcache: share prompt KV storage during FA2 inference decode.
 
     Returns:
-        ``(rows, num_return_sequences, num_levels)`` local codes, best first.
+        ``(rows, min(num_return_sequences, final_width), num_levels)`` local
+        codes, best first. The requested count does not expand the beam pool.
     """
     padded, mask = _left_pad(embeds, cu_seqlens, max_seqlen)
     extra = {}

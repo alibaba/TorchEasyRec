@@ -16,7 +16,7 @@ message GenRecModelConfig {
     // REQUIRED. Beam width per SID level, one entry per level; [100, 200, 400]
     // is the escalating beam. Each entry is capped to what its band supplies.
     repeated uint32 beam_widths = 2;
-    // Must not exceed the final width after per-level candidate capping.
+    // Maximum sequences to return; a smaller beam pool is returned as-is.
     required uint32 num_return_sequences = 3;
 
     optional string generated_sids_key = 4 [default = "generated_sids"];
@@ -28,7 +28,7 @@ message GenRecModelConfig {
     optional string attn_kernel = 6 [default = "sdpa"];
 
     // Interpret the last beam width as TopK tokens per surviving prefix.
-    // num_return_sequences is bounded by their merged candidate capacity.
+    // The merged candidate capacity bounds the actual number returned.
     optional bool final_topk_per_prefix = 7 [default = false];
 
     // Predict-only shared-prefix KV storage for FlashAttention 2 beam decode.

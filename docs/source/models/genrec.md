@@ -164,7 +164,7 @@ model_config {
 | `common.use_flash_attn_kvcache` | 可选，默认 `false`；为原生 predict 启用 FlashAttention 2 共享前缀 beam KV 缓存                                 |
 | `common.beam_widths`            | 必填，每层一个 beam 宽度，长度必须等于码本层数，且每项至少为 `1`；可使用固定宽度或逐层递增宽度                 |
 | `common.final_topk_per_prefix`  | 可选，默认 `false`；设为 `true` 时末层宽度表示每个存活前缀的 token TopK                                        |
-| `common.num_return_sequences`   | 必填，返回的 SID 数量，至少为 `1`，不得超过最后一层实际可保留的 beam 数                                        |
+| `common.num_return_sequences`   | 必填，返回的 SID 数量上限，至少为 `1`；超过实际候选池容量时返回已有候选，不补齐                                |
 | `common.generated_sids_key`     | 可选，预测输出列名，默认 `"generated_sids"`                                                                    |
 
 `common.final_topk_per_prefix` 默认为 `false`，此时每层 `beam_widths` 都是全局保留数量。
@@ -172,7 +172,9 @@ model_config {
 合并这些候选后按完整序列累计分数排序，再返回 `num_return_sequences` 条 SID。
 例如 `[50, 50, 50]` 表示最多合并 `50×50=2500` 条末层候选，再全局取 Top200；
 `[20, 20, 20]` 对应最多 400 条候选，同样可以返回 Top200。
-候选池容量上限为上一层存活前缀数乘以末层 TopK 与该层 SID 词表大小的较小值，返回数量不能超过该上限。
+候选池容量上限为上一层存活前缀数乘以末层 TopK 与该层 SID 词表大小的较小值。
+`num_return_sequences` 可以超过该容量，实际返回数量取二者较小值，不扩充候选池。
+关闭 `final_topk_per_prefix` 时，末层仍执行全局 TopK；例如 `[50,50,50]` 即使请求返回200条，也最多生成50条SID。
 该数量仍是 SID 数，映射后的有效物品数需由调用方另行检查。候选不足时不补齐。
 
 ```protobuf
@@ -226,7 +228,7 @@ tokens = dynamic_beam_search(
 
 ## 模型输出
 
-默认输出列 `generated_sids` 的每行形状为 `(num_return_sequences, 码本层数)`，各 SID 按预测得分从高到低排列。例如 `[[3, 5, 7], [8, 4, 12], ...]`。**输出是每层从 0 开始的编码**，应与最终 SID 映射表的 `codebook` 列对齐；若使用 `offset_codebook` 做关联，需先加回层偏移。
+默认输出列 `generated_sids` 的每行形状为 `(实际返回数量, 码本层数)`，实际返回数量不超过 `num_return_sequences` 和候选池容量，各 SID 按预测得分从高到低排列。例如 `[[3, 5, 7], [8, 4, 12], ...]`。**输出是每层从 0 开始的编码**，应与最终 SID 映射表的 `codebook` 列对齐；若使用 `offset_codebook` 做关联，需先加回层偏移。
 
 生成 SID 的层数与码本层数一致。召回时需查询 SID 到物品的映射表，过滤没有对应物品的 SID，并展开同一 SID 对应的物品列表。
 
