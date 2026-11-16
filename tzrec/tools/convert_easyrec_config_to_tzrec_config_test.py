@@ -18,7 +18,7 @@ from google.protobuf import text_format
 
 from tzrec.protos import pipeline_pb2 as tzrec_pipeline_pb2
 from tzrec.tools.convert_easyrec_config_to_tzrec_config import ConvertConfig
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import ci_resources, make_test_dir
 
 FG_JSON = {
     "features": [
@@ -2000,6 +2000,7 @@ feature_configs {
 """
 
 
+@ci_resources(split="case", timeout=600)
 class ConvertConfigTest(unittest.TestCase):
     def setUp(self):
         self.maxDiff = None

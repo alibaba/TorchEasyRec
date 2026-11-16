@@ -1325,7 +1325,8 @@ def test_hitrate(
     """Run hitrate integration test."""
     log_dir = os.path.join(test_dir, "log_hitrate")
     cmd_str = (
-        f"OMP_NUM_THREADS=16 PYTHONPATH=. torchrun {_standalone()} "
+        f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '16')} "
+        f"PYTHONPATH=. torchrun {_standalone()} "
         f"--nnodes=1 --nproc-per-node={_get_nproc_per_node()} --log_dir {log_dir} "
         "-r 3 -t 3 tzrec/tools/hitrate.py "
         f"--user_gt_input {user_gt_input} "

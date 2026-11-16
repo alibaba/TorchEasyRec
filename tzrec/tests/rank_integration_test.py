@@ -31,6 +31,7 @@ from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.tests import utils
 from tzrec.utils import checkpoint_util, config_util, dynamicemb_util, misc_util
 from tzrec.utils.test_util import (
+    ci_resources,
     cutlass_hstu_unavailable,
     dfs_are_close,
     gpu_unavailable,
@@ -48,6 +49,7 @@ _QUANT_EMBS = (
 )
 
 
+@ci_resources(slots=2, split="case")
 class RankIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False
@@ -1167,7 +1169,6 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str="USE_DISTRIBUTED_EMBEDDING=1",
             )
         self.assertTrue(self.success)
         self.success = False
