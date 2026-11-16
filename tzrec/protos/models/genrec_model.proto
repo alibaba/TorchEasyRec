@@ -13,10 +13,10 @@ message GenRecModelConfig {
     // Label value outside the supervised span.
     optional int32 ignore_index = 1 [default = -100];
 
-    // REQUIRED. Beam width per SID level, one entry per level; [100, 200, 400]
-    // is the escalating beam. Each entry is capped to what its band supplies.
+    // REQUIRED. One width per SID level, capped to what its band supplies.
+    // Intermediate widths are global; the last is token TopK per prefix.
     repeated uint32 beam_widths = 2;
-    // Maximum sequences to return; a smaller beam pool is returned as-is.
+    // Return up to this many SIDs from the merged final candidates.
     required uint32 num_return_sequences = 3;
 
     optional string generated_sids_key = 4 [default = "generated_sids"];
@@ -27,12 +27,7 @@ message GenRecModelConfig {
 
     optional string attn_kernel = 6 [default = "sdpa"];
 
-    // Interpret the last beam width as TopK tokens per surviving prefix.
-    // The merged candidate capacity bounds the actual number returned.
-    optional bool final_topk_per_prefix = 7 [default = false];
-
-    // Predict-only shared-prefix KV storage for FlashAttention 2 beam decode.
-    optional bool use_flash_attn_kvcache = 8 [default = false];
+    reserved 7, 8;
 }
 
 message GenRecCausalLMModel {

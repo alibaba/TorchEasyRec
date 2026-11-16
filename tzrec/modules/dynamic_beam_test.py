@@ -37,7 +37,6 @@ def _decode(
     width=8,
     beam_widths=None,
     attention_mask=None,
-    final_topk_per_prefix=False,
     allowed_prefixes=None,
     initial_cache=None,
 ):
@@ -53,9 +52,8 @@ def _decode(
         lm,
         lm.get_input_embeddings()(ids),
         torch.ones_like(ids) if attention_mask is None else attention_mask,
-        capped_widths=capped_beam_widths(beam_widths, pairs, final_topk_per_prefix),
+        capped_widths=capped_beam_widths(beam_widths, pairs),
         bands=pairs,
-        final_topk_per_prefix=final_topk_per_prefix,
         allowed_prefixes=allowed_prefixes,
         initial_cache=initial_cache,
     )
@@ -147,7 +145,6 @@ class DynamicBeamSearchTest(unittest.TestCase):
             ids,
             pairs,
             beam_widths=[2, 6, 2],
-            final_topk_per_prefix=True,
             allowed_prefixes=build_sid_prefix_masks(allowed.flatten(), pairs),
         )
         self.assertEqual(
@@ -172,15 +169,12 @@ class DynamicBeamSearchTest(unittest.TestCase):
         pairs = [(20, 21), (5, 7), (25, 26)]
         lm = create_tiny_causal_lm(vocab_size=30)
         ids = torch.tensor([[5, 6, 7, 8]])
-        expected = _decode(
-            lm, ids, pairs, beam_widths=[2, 4, 2], final_topk_per_prefix=True
-        )
+        expected = _decode(lm, ids, pairs, beam_widths=[2, 4, 2])
         actual = _decode(
             lm,
             ids,
             pairs,
             beam_widths=[2, 4, 2],
-            final_topk_per_prefix=True,
             allowed_prefixes=build_sid_prefix_masks(
                 torch.ones(12, dtype=torch.bool), pairs
             ),
@@ -200,34 +194,12 @@ class DynamicBeamSearchTest(unittest.TestCase):
             ids,
             pairs,
             beam_widths=[3, 9, 3],
-            final_topk_per_prefix=True,
             allowed_prefixes=build_sid_prefix_masks(allowed.flatten(), pairs),
         )
         local = output - torch.tensor([lo for lo, _ in pairs])
         valid = local[allowed[local[:, 0], local[:, 1], local[:, 2]]]
         self.assertEqual(len(valid), len(paths))
         self.assertEqual({tuple(row) for row in valid.tolist()}, set(paths))
-
-    @parameterized.expand(
-        [
-            [[20, 20, 200]],
-            [[50, 50, 200]],
-            [[100, 100, 200]],
-            [[50, 100, 200]],
-            [[10, 10, 200]],
-            [[20, 50, 200]],
-            [[20, 20, 20]],
-            [[50, 50, 50]],
-            [[100, 100, 100]],
-            [[20, 50, 100]],
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_final_prefix_topk_capacity(self, widths) -> None:
-        pairs = [(0, 255), (256, 511), (512, 767)]
-        capped = capped_beam_widths(widths, pairs, True)
-        self.assertEqual(capped, [widths[0], widths[1], widths[1] * widths[2]])
-        self.assertGreaterEqual(capped[-1], 200)
 
     def test_final_prefix_topk_matches_exhaustive_reference(self) -> None:
         pairs = [(20, 21), (5, 7), (25, 26)]
@@ -240,12 +212,8 @@ class DynamicBeamSearchTest(unittest.TestCase):
             if parent not in by_parent or score > ref[by_parent[parent]]:
                 by_parent[parent] = seq
         expected = sorted(by_parent.values(), key=ref.__getitem__, reverse=True)
-        out = _decode(lm, ids, pairs, beam_widths=[2, 6, 1], final_topk_per_prefix=True)
+        out = _decode(lm, ids, pairs, beam_widths=[2, 6, 1])
         self.assertEqual([tuple(row) for row in out.tolist()], expected)
-
-    def test_final_prefix_topk_band_cap(self) -> None:
-        pairs = [(20, 21), (22, 24), (25, 26)]
-        self.assertEqual(capped_beam_widths([2, 6, 200], pairs, True), [2, 6, 12])
 
     def test_prefix_constraint_is_applied_before_final_local_topk(self) -> None:
         pairs = [(20, 21), (5, 7), (25, 26)]
@@ -266,55 +234,30 @@ class DynamicBeamSearchTest(unittest.TestCase):
             ids,
             pairs,
             beam_widths=[2, 6, 1],
-            final_topk_per_prefix=True,
             allowed_prefixes=build_sid_prefix_masks(allowed.flatten(), pairs),
         )
         self.assertEqual([tuple(row) for row in output.tolist()], expected)
 
-    def test_final_prefix_topk_keeps_global_top200_when_local_k_is_200(self) -> None:
-        pairs = [(0, 255), (256, 511), (512, 767)]
-        lm = create_tiny_causal_lm(vocab_size=768)
-        ids = torch.tensor([[5, 6, 7, 8]])
-        expected = _decode(lm, ids, pairs, beam_widths=[20, 20, 200])
-        actual = _decode(
-            lm,
-            ids,
-            pairs,
-            beam_widths=[20, 20, 200],
-            final_topk_per_prefix=True,
-        )
-        self.assertEqual(tuple(actual.shape), (4000, 3))
-        self.assertTrue(torch.equal(actual[:200], expected))
-
-    def test_final_prefix_topk_batch_matches_solo(self) -> None:
-        pairs = [(20, 21), (22, 24), (25, 28)]
+    def test_final_prefix_topk_preserves_global_topk(self) -> None:
+        pairs = [(20, 21), (5, 7), (25, 28)]
         lm = create_tiny_causal_lm(vocab_size=30)
-        ids = torch.tensor([[5, 6, 7, 8], [0, 9, 10, 11]])
-        mask = torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]])
-        out = _decode(
-            lm,
-            ids,
-            pairs,
-            beam_widths=[2, 4, 2],
-            attention_mask=mask,
-            final_topk_per_prefix=True,
-        ).reshape(2, 8, 3)
-        for index, solo in enumerate([ids[:1], ids[1:, 1:]]):
-            expected = _decode(
-                lm, solo, pairs, beam_widths=[2, 4, 2], final_topk_per_prefix=True
-            )
-            self.assertTrue(torch.equal(out[index], expected))
+        ids = torch.tensor([[5, 6, 7, 8]])
+        ref = _bruteforce_scores(lm, ids, torch.ones_like(ids), pairs)
+        expected = sorted(ref, key=ref.__getitem__, reverse=True)[:2]
+        actual = _decode(lm, ids, pairs, beam_widths=[2, 6, 2])
+        self.assertEqual(tuple(actual.shape), (12, 3))
+        self.assertEqual([tuple(row) for row in actual[:2].tolist()], expected)
 
     @parameterized.expand(
         [
-            # every request satisfiable -> the schedule is honoured verbatim
-            [[4, 8, 16], [(20, 27), (28, 34), (35, 40)], [4, 8, 16]],
+            # final token TopK is capped by the band size
+            [[4, 8, 16], [(20, 27), (28, 34), (35, 40)], [4, 8, 48]],
             # capped by band x surviving prefixes, not by what was asked
             [[6, 12], [(20, 21), (22, 24)], [2, 6]],
             # a width-1 band collapses level 0 and bounds everything after it
             [[4, 8], [(20, 20), (21, 23)], [1, 3]],
-            # a flat (non-doubling) schedule is just as valid to the kernel
-            [[3, 3, 3], [(20, 27), (28, 34), (35, 40)], [3, 3, 3]],
+            # a flat schedule expands each surviving prefix at the last level
+            [[3, 3, 3], [(20, 27), (28, 34), (35, 40)], [3, 3, 9]],
         ],
         name_func=parameterized_name_func,
     )
@@ -397,7 +340,6 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
         options = dict(
             beam_widths=beam_widths,
             attention_mask=attention_mask,
-            final_topk_per_prefix=True,
             allowed_prefixes=prefixes,
         )
         ordinary = _decode(lm, ids, pairs, **options)
@@ -420,6 +362,8 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_ragged_batch_matches_solo_dynamic_cache(self, model_type: str) -> None:
+        from tzrec.models.genrec_causal_lm_model import generate_codes
+
         device = torch.device("cuda")
         lm = create_tiny_causal_lm(
             30,
@@ -438,6 +382,18 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
         )
 
         out = _decode(lm, ids, pairs, attention_mask=attention_mask)
+        with torch.no_grad():
+            codes = generate_codes(
+                lm,
+                lm.get_input_embeddings()(ids)[attention_mask.bool()],
+                torch.tensor([0, 4, 7], device=device),
+                4,
+                capped_beam_widths([8, 8, 8], pairs),
+                pairs,
+                out.shape[0] // 2,
+            )
+        expected = out.reshape(2, -1, 3) - ids.new_tensor([lo for lo, _ in pairs])
+        self.assertTrue(torch.equal(codes, expected))
         width = out.shape[0] // 2
         solos = [
             torch.tensor([[5, 6, 7, 8]], device=device),

@@ -11,8 +11,8 @@
 
 """Band-restricted beam SID decode (no tzrec deps).
 
-The caller owns the width schedule; this module only enforces what each level
-can supply.
+Intermediate levels retain a global beam; the last level retains token TopK
+per surviving prefix and merges candidates by cumulative score.
 """
 
 from typing import List, Optional, Sequence, Tuple
@@ -45,14 +45,13 @@ def build_sid_prefix_masks(
 def capped_beam_widths(
     beam_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
-    final_topk_per_prefix: bool = False,
 ) -> List[int]:
     """Cap each requested width to the candidates its band and prefixes supply.
 
     Args:
-        beam_widths: requested width per SID level.
+        beam_widths: global width per intermediate SID level, and a per-parent
+            token TopK at the last level.
         bands: inclusive ``(lo, hi)`` token-id edge per level.
-        final_topk_per_prefix: treat the last width as a per-parent token limit.
 
     Returns:
         The capped width per level.
@@ -61,7 +60,7 @@ def capped_beam_widths(
     previous = 1
     for level, (requested, (band_lo, band_hi)) in enumerate(zip(beam_widths, bands)):
         band_size = band_hi - band_lo + 1
-        if final_topk_per_prefix and level + 1 == len(bands):
+        if level + 1 == len(bands):
             capped.append(previous * min(requested, band_size))
         else:
             capped.append(min(requested, previous * band_size))
@@ -76,7 +75,6 @@ def dynamic_beam_search(
     attention_mask: torch.Tensor,
     capped_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
-    final_topk_per_prefix: bool = False,
     allowed_prefixes: Optional[Sequence[torch.Tensor]] = None,
     initial_cache: Optional[Cache] = None,
 ) -> torch.Tensor:
@@ -95,8 +93,6 @@ def dynamic_beam_search(
             normalizer.
         initial_cache: optional cache supplied to prefill, for specialized
             inference storage that implements the same branching protocol.
-        final_topk_per_prefix: retain a local token TopK at the last level,
-            then merge all retained candidates in cumulative-score order.
         bands: inclusive ``(lo, hi)`` token-id edge per SID level. Host ints,
             because every use of them is a host-side slice bound.
 
@@ -170,7 +166,7 @@ def dynamic_beam_search(
                 prefix = prefix * (hi - lo + 1) + seq[:, previous_level] - lo
             allowed = level_mask.reshape(-1, band_size)[prefix]
             scores = scores.masked_fill(~allowed, float("-inf"))
-        if final_topk_per_prefix and level + 1 == num_levels:
+        if level + 1 == num_levels:
             local_k = capped_widths[level] // width
             local_scores, local_idx = scores.topk(local_k, dim=-1)
             beam_scores, merged_idx = local_scores.view(batch_size, -1).sort(

@@ -25,7 +25,6 @@ from tzrec.models.genrec_causal_lm_model import (
     _left_pad,
     generate_codes,
 )
-from tzrec.modules.dynamic_beam import capped_beam_widths
 from tzrec.prompt.assembler import (
     CU_SEQLENS,
     INPUT_IDS,
@@ -217,36 +216,15 @@ class PackedForwardTest(unittest.TestCase):
 
 
 class GenerateCodesTest(unittest.TestCase):
-    @parameterized.expand(
-        [[False, 200, 2], [True, 200, 8], [True, 3, 3]],
-        name_func=parameterized_name_func,
-    )
-    def test_return_limit_does_not_expand_or_pad_candidates(
-        self, per_prefix, requested, expected
+    @parameterized.expand([[1], [5]], name_func=parameterized_name_func)
+    def test_undoes_both_shifts_and_keeps_the_best_beams(
+        self, num_return_sequences
     ) -> None:
-        bands = [(100, 103), (104, 107), (108, 111)]
-        lm = create_tiny_causal_lm(vocab_size=112)
-        embeds = lm.get_input_embeddings()(torch.tensor([1, 2, 3, 4, 5]))
-        widths = capped_beam_widths([2, 4, 2], bands, per_prefix)
-        codes = generate_codes(
-            lm,
-            embeds,
-            torch.tensor([0, 2, 5]),
-            3,
-            widths,
-            bands,
-            requested,
-            final_topk_per_prefix=per_prefix,
-        )
-        self.assertEqual(tuple(codes.shape), (2, expected, 3))
-        self.assertTrue(torch.all((codes >= 0) & (codes < 4)))
-
-    def test_undoes_both_shifts_and_keeps_the_best_beams(self) -> None:
         # base_vocab_size 100, codebook [4, 4, 4]
         bands = [(100, 103), (104, 107), (108, 111)]
         local_codes = torch.tensor([[0, 1, 3], [3, 0, 2], [1, 3, 0], [2, 2, 1]])
         tokens = local_codes + torch.tensor([lo for lo, _ in bands])
-        lm = nn.Identity()
+        lm = create_tiny_causal_lm(vocab_size=112)
         with mock.patch(
             "tzrec.models.genrec_causal_lm_model.dynamic_beam_search",
             return_value=tokens,
@@ -258,13 +236,13 @@ class GenerateCodesTest(unittest.TestCase):
                 3,
                 [2, 3, 4],
                 bands,
-                1,
+                num_return_sequences,
             )
-        self.assertEqual(codes.tolist(), local_codes.reshape(2, 2, -1)[:, :1].tolist())
-        (searched_lm, padded, mask, widths, searched_bands, final_topk_per_prefix) = (
-            beam_search.call_args.args
+        self.assertEqual(
+            codes.tolist(),
+            local_codes.reshape(2, 2, -1)[:, :num_return_sequences].tolist(),
         )
-        self.assertFalse(final_topk_per_prefix)
+        searched_lm, padded, mask, widths, searched_bands = beam_search.call_args.args
         self.assertIs(searched_lm, lm)
         self.assertEqual(padded.shape, (2, 3, 4))
         self.assertEqual(mask.tolist(), [[0, 1, 1], [1, 1, 1]])
@@ -283,28 +261,27 @@ class GenRecCausalLMModelTest(unittest.TestCase):
         self,
         beam_widths=(2, 2, 2),
         num_return_sequences=2,
-        final_topk_per_prefix=False,
     ) -> GenRecCausalLMModel:
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model._prompt = self.compiled_prompt
         common = GenRecModelConfig(num_return_sequences=num_return_sequences)
-        common.final_topk_per_prefix = final_topk_per_prefix
         common.beam_widths.extend(beam_widths)
         model._read_beam_config(common)
         return model
 
     @parameterized.expand(
         [
-            [[2, 3, 4], [2, 3, 4]],
-            [[6, 12, 12], [4, 12, 12]],
-            [[2, 2, 2], [2, 2, 2]],
+            [[2, 3, 4], [2, 3, 12]],
+            [[6, 12, 12], [4, 12, 48]],
+            [[2, 2, 2], [2, 2, 4]],
         ],
         name_func=parameterized_name_func,
     )
     def test_beam_widths_are_capped_once_at_init(self, beam_widths, expected) -> None:
-        model = self._beam_model(beam_widths=beam_widths, num_return_sequences=1)
+        model = self._beam_model(beam_widths=beam_widths, num_return_sequences=100)
         self.assertEqual(model._capped_widths, expected)
+        self.assertEqual(model._num_return_sequences, 100)
         space = self.compiled_prompt.sid_space
         self.assertEqual(model._bands, list(zip(space.band_lo, space.band_hi)))
 
@@ -323,32 +300,6 @@ class GenRecCausalLMModelTest(unittest.TestCase):
     def test_rejects_a_non_positive_beam_width(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be >= 1"):
             self._beam_model(beam_widths=(2, 0, 2))
-
-    def test_beam_config_accepts_return_limit_above_capacity(self) -> None:
-        model = self._beam_model(
-            beam_widths=(1, 1, 100),
-            num_return_sequences=5,
-        )
-        self.assertEqual(model._capped_widths, [1, 1, 4])
-        self.assertEqual(model._num_return_sequences, 5)
-
-    def test_final_prefix_topk_decouples_return_count(self) -> None:
-        model = self._beam_model(
-            beam_widths=(2, 4, 2),
-            num_return_sequences=6,
-            final_topk_per_prefix=True,
-        )
-        self.assertEqual(model._capped_widths, [2, 4, 8])
-        self.assertEqual(model._num_return_sequences, 6)
-
-    def test_final_prefix_topk_accepts_return_limit_above_capacity(self) -> None:
-        model = self._beam_model(
-            beam_widths=(2, 4, 1),
-            num_return_sequences=5,
-            final_topk_per_prefix=True,
-        )
-        self.assertEqual(model._capped_widths, [2, 4, 4])
-        self.assertEqual(model._num_return_sequences, 5)
 
 
 # a second answer, and a rewrite of GENREC_HIST_CODES that keeps its width

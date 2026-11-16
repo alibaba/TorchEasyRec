@@ -82,12 +82,6 @@ class GenRecCausalLMModel(BaseGenRecModel):
         self._capped_widths, self._num_return_sequences = resolve_beam_config(
             common, self._bands
         )
-        self._final_topk_per_prefix = common.final_topk_per_prefix
-        self._use_flash_attn_kvcache = common.use_flash_attn_kvcache
-        if self._use_flash_attn_kvcache and self._attn_kernel != "flash_attention_2":
-            raise ValueError(
-                "use_flash_attn_kvcache requires attn_kernel=flash_attention_2"
-            )
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Run teacher-forced loss or inference decode over the assembled stream.
@@ -233,8 +227,6 @@ class GenRecCausalLMModel(BaseGenRecModel):
             self._capped_widths,
             self._bands,
             self._num_return_sequences,
-            self._final_topk_per_prefix,
-            self._use_flash_attn_kvcache,
         )
 
 
@@ -268,7 +260,7 @@ def resolve_beam_config(
         raise ValueError(
             f"num_return_sequences must be >= 1, got {num_return_sequences}."
         )
-    capped_widths = capped_beam_widths(beam_widths, bands, common.final_topk_per_prefix)
+    capped_widths = capped_beam_widths(beam_widths, bands)
     return capped_widths, num_return_sequences
 
 
@@ -307,8 +299,6 @@ def generate_codes(
     capped_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
     num_return_sequences: int,
-    final_topk_per_prefix: bool = False,
-    use_flash_attn_kvcache: bool = False,
 ) -> torch.Tensor:
     """Beam-search the SID answer of packed prompts.
 
@@ -320,24 +310,24 @@ def generate_codes(
         capped_widths: beam width per SID level, already capped.
         bands: inclusive ``(lo, hi)`` token-id edge per SID level.
         num_return_sequences: maximum beams to return per row.
-        final_topk_per_prefix: use a per-parent token limit at the last level.
-        use_flash_attn_kvcache: share prompt KV storage during FA2 inference decode.
 
     Returns:
-        ``(rows, min(num_return_sequences, final_width), num_levels)`` local
-        codes, best first. The requested count does not expand the beam pool.
+        ``(rows, min(num_return_sequences, capacity), num_levels)`` local codes,
+        best first.
     """
     padded, mask = _left_pad(embeds, cu_seqlens, max_seqlen)
     extra = {}
-    if use_flash_attn_kvcache:
+    if (
+        lm.config._attn_implementation == "flash_attention_2"
+        and lm.config.model_type in ("qwen2", "qwen3")
+        and all(layer.self_attn.sliding_window is None for layer in lm.model.layers)
+    ):
         from tzrec.modules.flash_attention_beam_cache import (
             create_flash_attention_beam_cache,
         )
 
         extra["initial_cache"] = create_flash_attention_beam_cache(lm)
-    tokens = dynamic_beam_search(
-        lm, padded, mask, capped_widths, bands, final_topk_per_prefix, **extra
-    )
+    tokens = dynamic_beam_search(lm, padded, mask, capped_widths, bands, **extra)
     # a band starts at base_vocab_size + level_offset, so this undoes both shifts
     codes = tokens - tokens.new_tensor([lo for lo, _ in bands])
     codes = codes.view(padded.shape[0], -1, len(bands))
