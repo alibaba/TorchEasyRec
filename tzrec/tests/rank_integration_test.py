@@ -1389,6 +1389,7 @@ def _sample_shuffle_run_torchrun(
 
 @unittest.skipIf(*gpu_unavailable)
 @mark_ci_scope("h20", "gpu")
+@ci_resources(slots=2, split="case")
 class SampleShuffleIntegrationTest(unittest.TestCase):
     """Distributed sample shuffle: train, save and resume on Parquet."""
 
