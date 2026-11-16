@@ -20,7 +20,7 @@ import tempfile
 import threading
 import weakref
 from dataclasses import replace
-from typing import Any, Container, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Container, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 import torch.distributed as dist
@@ -357,6 +357,10 @@ class CheckpointManager:
             (by eval metric) is always retained even if older than the kept window.
         eval_result_filename: eval result file (relative to ``model_dir``) used to
             locate the best checkpoint.
+        before_dynamicemb_load: optional callback invoked with the target
+            model immediately before a logical DynamicEmb import, so an
+            offloading backend can prepare its tables; discovery and
+            dense-only restores never call it.
     """
 
     def __init__(
@@ -365,8 +369,10 @@ class CheckpointManager:
         keep_checkpoint_max: int = 0,
         export_config: Optional[export_pb2.ExportConfig] = None,
         eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
+        before_dynamicemb_load: Optional[Callable[[nn.Module], None]] = None,
     ) -> None:
         self._model_dir = model_dir
+        self._before_dynamicemb_load = before_dynamicemb_load
         self._keep_checkpoint_max = keep_checkpoint_max
         self._export_config = export_config
         self._eval_result_filename = eval_result_filename
@@ -663,6 +669,7 @@ class CheckpointManager:
             ckpt_param_map_path,
             dense_ema=dense_ema,
             use_dense_ema=use_dense_ema,
+            before_dynamicemb_load=self._before_dynamicemb_load,
         )
         if lr_schedulers is not None:
             restore_lr_schedulers(ckpt_path, lr_schedulers)
@@ -996,6 +1003,7 @@ def restore_model(
     dense_ema: Optional[DenseEMA] = None,
     use_dense_ema: bool = False,
     load_dynamicemb: bool = True,
+    before_dynamicemb_load: Optional[Callable[[nn.Module], None]] = None,
 ) -> None:
     """Restore model state.
 
@@ -1010,6 +1018,9 @@ def restore_model(
         dense_ema: Dense EMA state to restore for continued training.
         use_dense_ema: Overlay Dense EMA parameters onto the restored model.
         load_dynamicemb: Restore native dynamic tables from the checkpoint.
+        before_dynamicemb_load: optional callback invoked with ``model``
+            immediately before a logical DynamicEmb import; a dense-only
+            restore or an absent dynamic checkpoint never calls it.
     """
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_local_rank_zero:
@@ -1140,6 +1151,11 @@ def restore_model(
                 f"RANK[{os.environ.get('RANK', 0)}] restoring dynamic embedding..."
             )
             try:
+                # Immediately before the logical import: an offloading
+                # backend prepares its tables here; the files themselves do
+                # not depend on which backend saved them.
+                if before_dynamicemb_load is not None:
+                    before_dynamicemb_load(model)
                 DynamicEmbLoad(
                     dynamicemb_load_path,
                     model,

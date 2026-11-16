@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import unittest
 import warnings
@@ -24,9 +25,13 @@ from torchrec.optim import optimizers, rowwise_adagrad
 
 from tzrec.optim.optimizer import FTRL, has_fbgemm_ftrl
 from tzrec.protos import feature_pb2
-from tzrec.utils import dynamicemb_util
+from tzrec.utils import dynamicemb_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import DynamicEmbTableStorage
-from tzrec.utils.test_util import mark_ci_scope, parameterized_name_func
+from tzrec.utils.test_util import (
+    make_test_dir,
+    mark_ci_scope,
+    parameterized_name_func,
+)
 
 
 def _table_options(rows, dim, **config):
@@ -656,6 +661,136 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
                 self.assertLessEqual(used, reserved)
         if ratios == (0, 1):
             self.assertEqual(self._allocated(build(options[::-1])), actual)
+
+
+def _has_rocksdb() -> bool:
+    try:
+        import tzrec_ext.rocksdb  # noqa: F401
+    except ImportError:
+        return False
+    return dynamicemb_util.has_dynamicemb
+
+
+@unittest.skipUnless(_has_rocksdb(), "tzrec_ext.rocksdb is not installed; skipping.")
+@mark_ci_scope("gpu")
+class RocksDBTableTest(unittest.TestCase):
+    """Constraints and storage estimates of tables the planner may offload."""
+
+    NUM_EMBEDDINGS = 1 << 20
+    EMBEDDING_DIM = 16
+
+    @parameterized.expand([("indexed", "STEP"), ("not_indexed", "NO_EVICTION")])
+    @mock.patch.dict(os.environ, {"WORLD_SIZE": "2"})
+    def test_storage_estimate(self, _name, strategy):
+        from tzrec_ext.rocksdb import (
+            BackendConfig,
+            index_entry_bytes,
+            logical_row_bytes,
+            metadata_cache_bytes,
+        )
+        from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+
+        rows, ratio = self.NUM_EMBEDDINGS // 2, 0.01
+        tensor = torch.empty(self.NUM_EMBEDDINGS, self.EMBEDDING_DIM)
+        options = _table_options(
+            self.NUM_EMBEDDINGS, self.EMBEDDING_DIM, score_strategy=strategy
+        )
+        options.caching = True
+        host_memory = DynamicEmbTableStorage.from_options(tensor, options, ratio=ratio)
+        options.external_storage = RocksDBStorageFactory(BackendConfig(0, 0, 0, 0), "")
+        memory = DynamicEmbTableStorage.from_options(tensor, options, ratio=ratio)
+        storages = dynamicemb_util.dynamicemb_calculate_shard_storages(
+            sharder_data=None,
+            sharding_type=ShardingType.ROW_WISE.value,
+            tensor=tensor,
+            compute_device="cuda",
+            compute_kernel=EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value,
+            shard_sizes=[[rows, self.EMBEDDING_DIM]] * 2,
+            batch_sizes=[16],
+            world_size=2,
+            local_world_size=2,
+            input_lengths=[1.0],
+            num_poolings=[1.0],
+            is_pooled=True,
+            input_data_type_size=4,
+            output_data_type_size=4,
+            dynamicemb_options=options,
+            dynamicemb_storage=memory,
+        )
+        row_bytes = logical_row_bytes(self.EMBEDDING_DIM, 0, 4)
+        indexed = strategy == "STEP"
+        index_bytes = index_entry_bytes() if indexed else 0
+        meta = metadata_cache_bytes(rows, row_bytes, indexed)
+        writeback = memory.resident_rows * row_bytes
+        live_bytes = math.ceil(
+            rocksdb_util.SST_FACTOR * rows * (row_bytes + index_bytes)
+        )
+        self.assertEqual(memory.storage.ddr, meta)
+        self.assertEqual(memory.storage.ssd, live_bytes + writeback)
+        for storage in storages:
+            # The GPU cache tier alone on HBM -- its values and key maps,
+            # without the backing table's map, which stays in the database
+            # -- the block cache's share on DDR, the table's growth on SSD.
+            self.assertGreaterEqual(storage.hbm, memory.storage.hbm)
+            self.assertLess(storage.hbm, host_memory.storage.hbm)
+            self.assertEqual(storage.ddr, meta)
+            self.assertEqual(storage.ssd, live_bytes + writeback)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required.")
+    def test_fused_cache_matches_the_plan(self):
+        # Tables of different widths planned at different ratios still
+        # fuse, and every table keeps the cache capacity its own planned
+        # budget buys -- the planner's DynamicEmbTableStorage estimate.
+        from dynamicemb import (
+            DynamicEmbPoolingMode,
+            DynamicEmbScoreStrategy,
+            DynamicEmbTableOptions,
+            EmbOptimType,
+        )
+        from dynamicemb.batched_dynamicemb_tables import (
+            BatchedDynamicEmbeddingTablesV2,
+        )
+        from tzrec_ext.rocksdb import BackendConfig, RocksDBSession
+        from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+
+        test_dir = make_test_dir()
+        config = BackendConfig(32 << 20, 32 << 20, 1 << 20, 64 << 20, io_threads=2)
+        session = RocksDBSession(config, os.path.join(test_dir, "db"))
+        ratios, tables = [0.01, 0.04], [(300_000, 16), (700_000, 48)]
+        options, estimates = [], []
+        for i, ((rows, dim), ratio) in enumerate(zip(tables, ratios)):
+            option = DynamicEmbTableOptions(
+                dim=dim,
+                max_capacity=rows,
+                index_type=torch.int64,
+                embedding_dtype=torch.float32,
+                device_id=0,
+                caching=True,
+                score_strategy=DynamicEmbScoreStrategy.STEP,
+                external_storage=RocksDBStorageFactory(config, f"m.t{i}", session),
+            )
+            # An Adam table carries 2 x dim optimizer state per row.
+            tensor = torch.empty(rows, dim)
+            tensor._optimizer_classes = [optimizers.Adam]
+            memory = DynamicEmbTableStorage.from_options(tensor, option, ratio=ratio)
+            option.local_hbm_for_values = memory.local_hbm_for_values
+            options.append(option)
+            estimates.append(memory.resident_rows)
+        self.assertEqual(options[0], options[1])
+        module = BatchedDynamicEmbeddingTablesV2(
+            table_options=options,
+            table_names=["t0", "t1"],
+            feature_table_map=[0, 1],
+            pooling_mode=DynamicEmbPoolingMode.SUM,
+            optimizer=EmbOptimType.ADAM,
+        )
+        try:
+            self.assertEqual(
+                list(module.cache._state.key_index_map.per_table_capacity_),
+                estimates,
+            )
+        finally:
+            session.close()
 
 
 if __name__ == "__main__":
