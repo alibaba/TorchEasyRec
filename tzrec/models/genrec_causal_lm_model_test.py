@@ -215,10 +215,7 @@ class PackedForwardTest(unittest.TestCase):
 
 
 class GenerateCodesTest(unittest.TestCase):
-    @parameterized.expand([[1], [5]], name_func=parameterized_name_func)
-    def test_undoes_both_shifts_and_keeps_the_best_beams(
-        self, num_return_sequences
-    ) -> None:
+    def test_undoes_both_shifts(self) -> None:
         # base_vocab_size 100, codebook [4, 4, 4]
         bands = [(100, 103), (104, 107), (108, 111)]
         local_codes = torch.tensor([[0, 1, 3], [3, 0, 2], [1, 3, 0], [2, 2, 1]])
@@ -236,11 +233,10 @@ class GenerateCodesTest(unittest.TestCase):
                 3,
                 [2, 3, 4],
                 bands,
-                num_return_sequences,
             )
         self.assertEqual(
             codes.tolist(),
-            local_codes.reshape(2, 2, -1)[:, :num_return_sequences].tolist(),
+            local_codes.reshape(2, 2, -1).tolist(),
         )
         searched_lm, padded, mask, widths, searched_bands = beam_search.call_args.args
         self.assertIs(searched_lm, lm)
@@ -260,28 +256,34 @@ class GenRecCausalLMModelTest(unittest.TestCase):
     def _beam_model(
         self,
         beam_widths=(2, 2, 2),
-        num_return_sequences=2,
+        num_return_sequences=None,
     ) -> GenRecCausalLMModel:
         model = GenRecCausalLMModel.__new__(GenRecCausalLMModel)
         nn.Module.__init__(model)
         model._prompt = self.compiled_prompt
-        common = GenRecModelConfig(num_return_sequences=num_return_sequences)
+        common = GenRecModelConfig()
+        if num_return_sequences is not None:
+            common.num_return_sequences = num_return_sequences
         common.beam_widths.extend(beam_widths)
         model._read_beam_config(common)
         return model
 
     @parameterized.expand(
         [
-            [[2, 3, 4], [2, 3, 12]],
-            [[6, 12, 12], [4, 12, 48]],
-            [[2, 2, 2], [2, 2, 4]],
+            [[2, 3, 4], None, [2, 3, 4]],
+            [[2, 3, 4], 100, [2, 3, 12]],
+            [[6, 12, 12], 100, [4, 12, 48]],
+            [[2, 2, 2], 100, [2, 2, 8]],
         ],
         name_func=parameterized_name_func,
     )
-    def test_beam_widths_are_capped_once_at_init(self, beam_widths, expected) -> None:
-        model = self._beam_model(beam_widths=beam_widths, num_return_sequences=100)
+    def test_beam_widths_are_capped_once_at_init(
+        self, beam_widths, num_return_sequences, expected
+    ) -> None:
+        model = self._beam_model(
+            beam_widths=beam_widths, num_return_sequences=num_return_sequences
+        )
         self.assertEqual(model._capped_widths, expected)
-        self.assertEqual(model._num_return_sequences, 100)
         space = self.compiled_prompt.sid_space
         self.assertEqual(model._bands, list(zip(space.band_lo, space.band_hi)))
 

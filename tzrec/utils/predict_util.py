@@ -1416,9 +1416,7 @@ class GenRecExportModel:
         )
         self._bands = list(zip(band_lo, band_hi))
         common = pipeline_config.model_config.genrec_causal_lm_model.common
-        self._capped_widths, self._num_return_sequences = resolve_beam_config(
-            common, sid_space["codebook"]
-        )
+        self._capped_widths = resolve_beam_config(common, sid_space["codebook"])
         self._generated_sids_key = common.generated_sids_key
         self._mixed_dtype = acc_utils.mixed_precision_to_dtype(
             acc_utils.mixed_precision_for_export(pipeline_config)
@@ -1478,7 +1476,7 @@ class GenRecExportModel:
             device: the device to predict on, one of the constructor devices.
 
         Returns:
-            ``generated_sids_key``: ``(B, num_return_sequences, num_levels)``
+            ``generated_sids_key``: ``(B, final_beam_width, num_levels)``
             local codes, best first.
         """
         frontend_outputs = self._frontend(batch, batch_size, device)
@@ -1503,7 +1501,6 @@ class GenRecExportModel:
                 int(torch.diff(cu_seqlens).max()),
                 self._capped_widths,
                 self._bands,
-                self._num_return_sequences,
             )
         return {self._generated_sids_key: codes}
 

@@ -37,6 +37,7 @@ def _decode(
     beam_widths=None,
     attention_mask=None,
     initial_cache=None,
+    num_return_sequences=None,
 ):
     """Run the kernel over ``pairs`` of inclusive per-level (lo, hi) band edges.
 
@@ -46,6 +47,8 @@ def _decode(
     """
     if beam_widths is None:
         beam_widths = [width] * len(pairs)
+    if num_return_sequences is not None:
+        beam_widths = [*beam_widths[:-1], num_return_sequences]
     return dynamic_beam_search(
         lm,
         lm.get_input_embeddings()(ids),
@@ -96,37 +99,40 @@ def _bruteforce_scores(lm, input_ids, attention_mask, pairs):
 
 
 class DynamicBeamSearchTest(unittest.TestCase):
-    @parameterized.expand([[1], [2], [8]], name_func=parameterized_name_func)
-    def test_final_prefix_topk_matches_exhaustive_reference(self, local_k) -> None:
-        pairs = [(20, 21), (5, 7), (25, 28)]
+    @parameterized.expand(
+        [
+            [[(20, 23)], [1], 8],
+            [[(20, 21), (5, 7), (25, 28)], [2, 6, 1], 8],
+            [[(20, 21), (5, 7), (25, 28)], [2, 6, 1], 30],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_final_global_topk_matches_exhaustive_reference(
+        self, pairs, beam_widths, num_return_sequences
+    ) -> None:
         lm = create_tiny_causal_lm(vocab_size=30)
         ids = torch.tensor([[5, 6, 7, 8]])
         ref = _bruteforce_scores(lm, ids, torch.ones_like(ids), pairs)
-        by_parent = {}
-        for seq in ref:
-            by_parent.setdefault(seq[:-1], []).append(seq)
-        expected = [
-            seq
-            for group in by_parent.values()
-            for seq in sorted(group, key=ref.__getitem__, reverse=True)[:local_k]
-        ]
-        expected.sort(key=ref.__getitem__, reverse=True)
-        out = _decode(lm, ids, pairs, beam_widths=[2, 6, local_k])
-        actual = [tuple(row) for row in out.tolist()]
-        self.assertEqual(actual, expected)
-        ranked = sorted(ref, key=ref.__getitem__, reverse=True)
-        self.assertEqual(actual[:local_k], ranked[:local_k])
+        expected = sorted(ref, key=ref.__getitem__, reverse=True)[:num_return_sequences]
+        out = _decode(
+            lm,
+            ids,
+            pairs,
+            beam_widths=beam_widths,
+            num_return_sequences=num_return_sequences,
+        )
+        self.assertEqual([tuple(row) for row in out.tolist()], expected)
 
     @parameterized.expand(
         [
-            # final token TopK is capped by the band size
-            [[4, 8, 16], [(20, 27), (28, 34), (35, 40)], [4, 8, 48]],
+            # widths are capped by available expansions
+            [[4, 8, 16], [(20, 27), (28, 34), (35, 40)], [4, 8, 16]],
             # capped by band x surviving prefixes, not by what was asked
             [[6, 12], [(20, 21), (22, 24)], [2, 6]],
             # a width-1 band collapses level 0 and bounds everything after it
             [[4, 8], [(20, 20), (21, 23)], [1, 3]],
-            # a flat schedule expands each surviving prefix at the last level
-            [[3, 3, 3], [(20, 27), (28, 34), (35, 40)], [3, 3, 9]],
+            # a flat schedule retains the same global width at each level
+            [[3, 3, 3], [(20, 27), (28, 34), (35, 40)], [3, 3, 3]],
         ],
         name_func=parameterized_name_func,
     )
@@ -184,7 +190,11 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
         ids = torch.tensor([[5, 6, 7, 8], [0, 9, 10, 11]], device=device)
         attention_mask = torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]], device=device)
         pairs = [(0, 255), (256, 511), (512, 767)]
-        options = dict(beam_widths=beam_widths, attention_mask=attention_mask)
+        options = dict(
+            beam_widths=beam_widths,
+            attention_mask=attention_mask,
+            num_return_sequences=200,
+        )
         ordinary = _decode(lm, ids, pairs, **options)
         shared = _decode(
             lm,
@@ -194,8 +204,7 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
             **options,
         )
         self.assertTrue(torch.equal(shared, ordinary))
-        capacity = beam_widths[1] * beam_widths[2]
-        self.assertEqual(tuple(shared.shape), (2 * capacity, 3))
+        self.assertEqual(tuple(shared.shape), (2 * 200, 3))
 
     @parameterized.expand(
         [["qwen2"], ["qwen3"]],
@@ -230,7 +239,6 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
                 4,
                 capped_beam_widths([8, 8, 8], [2, 3, 4]),
                 pairs,
-                out.shape[0] // 2,
             )
         expected = out.reshape(2, -1, 3) - ids.new_tensor([lo for lo, _ in pairs])
         self.assertTrue(torch.equal(codes, expected))

@@ -48,15 +48,13 @@ class FlashAttentionBeamCache(Cache):
             tail.shape[2] if tail is not None else 0
         )
 
-    def get_query_offset(self, layer_idx: int = 0) -> int:
-        """Match the ordinary dynamic cache's logical query offset."""
-        return self.get_seq_length(layer_idx)
-
     def get_mask_sizes(self, query_length: int, layer_idx: int) -> Tuple[int, int]:
         """Preserve the original mask extent, including left padding."""
         return self.get_seq_length(layer_idx) + query_length, 0
 
-    def _materialize(self, prefix: torch.Tensor, suffix: torch.Tensor) -> torch.Tensor:
+    def _build_beam_kv(
+        self, prefix: torch.Tensor, suffix: torch.Tensor
+    ) -> torch.Tensor:
         """Construct only the current attention layer's dense KV input.
 
         Args:
@@ -120,8 +118,8 @@ class FlashAttentionBeamCache(Cache):
         self._tail_keys[layer_idx] = key
         self._tail_values[layer_idx] = value_states
         return (
-            self._materialize(self._prefix_keys[layer_idx], key),
-            self._materialize(self._prefix_values[layer_idx], value_states),
+            self._build_beam_kv(self._prefix_keys[layer_idx], key),
+            self._build_beam_kv(self._prefix_values[layer_idx], value_states),
         )
 
     def reorder_cache(self, beam_idx: torch.Tensor) -> None:

@@ -1087,13 +1087,18 @@ class GenRecExportModelTest(unittest.TestCase):
             SLOT_EMBEDS: slot_embeds,
         }
 
-    @parameterized.expand([[False], [True]], name_func=parameterized_name_func)
-    def test_decodes_like_generate_codes(self, with_slots) -> None:
+    @parameterized.expand([[False, None], [True, 6]], name_func=parameterized_name_func)
+    def test_decodes_like_generate_codes(
+        self, with_slots, num_return_sequences
+    ) -> None:
+        self.common.ClearField("num_return_sequences")
+        if num_return_sequences is not None:
+            self.common.num_return_sequences = num_return_sequences
         streams = self._streams(with_slots)
         model = self._model(streams)
         _, band_lo, band_hi = sid_bands([4, 4, 4], 40)
         bands = list(zip(band_lo, band_hi))
-        widths, num_return_sequences = resolve_beam_config(self.common, [4, 4, 4])
+        widths = resolve_beam_config(self.common, [4, 4, 4])
         with torch.no_grad():
             out = model(Batch(), None, torch.device("cpu"))
             embeds = self.lm.get_input_embeddings()(streams[INPUT_IDS])
@@ -1108,9 +1113,8 @@ class GenRecExportModelTest(unittest.TestCase):
                 5,
                 widths,
                 bands,
-                num_return_sequences,
             )
-        self.assertEqual(out["generated_sids"].shape, (2, 2, 3))
+        self.assertEqual(out["generated_sids"].shape, (2, widths[-1], 3))
         self.assertTrue(torch.equal(out["generated_sids"], expected))
 
     def test_reads_the_exports_pipeline_config(self) -> None:

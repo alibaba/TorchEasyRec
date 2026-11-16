@@ -14,10 +14,10 @@ message GenRecModelConfig {
     optional int32 ignore_index = 1 [default = -100];
 
     // REQUIRED. One width per SID level, capped to what its band supplies.
-    // Intermediate widths are global; the last is token TopK per prefix.
+    // Widths are global; num_return_sequences optionally overrides the last.
     repeated uint32 beam_widths = 2;
-    // Return up to this many SIDs from the merged final candidates.
-    required uint32 num_return_sequences = 3;
+    // Optional override for the final global beam width.
+    optional uint32 num_return_sequences = 3;
 
     optional string generated_sids_key = 4 [default = "generated_sids"];
 

@@ -80,9 +80,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         """
         space = self._prompt.sid_space
         self._bands: List[Tuple[int, int]] = list(zip(space.band_lo, space.band_hi))
-        self._capped_widths, self._num_return_sequences = resolve_beam_config(
-            common, space.codebook
-        )
+        self._capped_widths = resolve_beam_config(common, space.codebook)
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Run teacher-forced loss or inference decode over the assembled stream.
@@ -227,13 +225,12 @@ class GenRecCausalLMModel(BaseGenRecModel):
             int(infos[MAX_SEQLEN]),
             self._capped_widths,
             self._bands,
-            self._num_return_sequences,
         )
 
 
 def resolve_beam_config(
     common: GenRecModelConfig, codebook: Sequence[int]
-) -> Tuple[List[int], int]:
+) -> List[int]:
     """Validate the decode knobs against the codebook and cap the beam widths.
 
     Args:
@@ -241,9 +238,8 @@ def resolve_beam_config(
         codebook: vocabulary size per SID level.
 
     Returns:
-        The capped width per level, and the requested maximum return count.
+        The capped global width per level, with the optional return override.
     """
-    num_return_sequences = int(common.num_return_sequences)
     beam_widths = list(common.beam_widths)
     if not beam_widths:
         raise ValueError(
@@ -255,14 +251,15 @@ def resolve_beam_config(
             f"beam_widths has {len(beam_widths)} entries but the codebook has "
             f"{len(codebook)} levels; give one width per level."
         )
+    if common.HasField("num_return_sequences"):
+        if common.num_return_sequences < 1:
+            raise ValueError(
+                f"num_return_sequences must be >= 1, got {common.num_return_sequences}."
+            )
+        beam_widths[-1] = common.num_return_sequences
     if any(width < 1 for width in beam_widths):
         raise ValueError(f"beam_widths must be >= 1, got {beam_widths}.")
-    if num_return_sequences < 1:
-        raise ValueError(
-            f"num_return_sequences must be >= 1, got {num_return_sequences}."
-        )
-    capped_widths = capped_beam_widths(beam_widths, codebook)
-    return capped_widths, num_return_sequences
+    return capped_beam_widths(beam_widths, codebook)
 
 
 def _left_pad(
@@ -299,7 +296,6 @@ def generate_codes(
     max_seqlen: int,
     capped_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
-    num_return_sequences: int,
 ) -> torch.Tensor:
     """Beam-search the SID answer of packed prompts.
 
@@ -310,11 +306,9 @@ def generate_codes(
         max_seqlen: the widest row.
         capped_widths: beam width per SID level, already capped.
         bands: inclusive ``(lo, hi)`` token-id edge per SID level.
-        num_return_sequences: maximum beams to return per row.
 
     Returns:
-        ``(rows, min(num_return_sequences, capacity), num_levels)`` local codes,
-        best first.
+        ``(rows, capped_widths[-1], num_levels)`` local codes, best first.
     """
     padded, mask = _left_pad(embeds, cu_seqlens, max_seqlen)
     tokens = dynamic_beam_search(
@@ -328,7 +322,7 @@ def generate_codes(
     # a band starts at base_vocab_size + level_offset, so this undoes both shifts
     codes = tokens - tokens.new_tensor([lo for lo, _ in bands])
     codes = codes.view(padded.shape[0], -1, len(bands))
-    return codes[:, :num_return_sequences, :]
+    return codes
 
 
 @torch.fx.wrap
