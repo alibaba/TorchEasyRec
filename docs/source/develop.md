@@ -37,8 +37,10 @@ pyrefly check
 ### 单元测试
 
 ```bash
-bash scripts/ci_test.sh
+bash scripts/ci/ci_test.sh
 ```
+
+默认运行全部单元测试，并发容量为 2 个 slot。可追加 `--capacity N` 调整容量，或用 `--scope gpu` 只运行标记为 GPU 的用例；`--list_tests` 只列出选中的用例，不执行测试。
 
 - 运行单个测试用例
 

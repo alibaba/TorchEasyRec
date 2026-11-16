@@ -32,6 +32,7 @@ from tzrec.main import (
     _create_train_profiler,
     _train_and_evaluate,
     evaluate,
+    export,
     predict,
     predict_checkpoint,
     train_and_evaluate,
@@ -42,6 +43,7 @@ from tzrec.optim.lr_scheduler import ExponentialDecayLR, LinearDecayLR
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.export_pb2 import ExportConfig
+from tzrec.protos.feature_pb2 import FeatureConfig, IdFeature
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.module_pb2 import MLP
 from tzrec.protos.optimizer_pb2 import DenseOptimizer, EMAConfig
@@ -109,11 +111,87 @@ class MainTest(unittest.TestCase):
         argv = ["tzrec.export", "--edit_config_json", edit]
         with (
             mock.patch.object(sys, "argv", argv),
-            mock.patch("tzrec.main.export", autospec=True) as export,
+            mock.patch("tzrec.main.export", autospec=True) as mock_export,
         ):
             runpy.run_module("tzrec.export", run_name="__main__")
-        export.assert_called_once()
-        self.assertEqual(export.call_args.kwargs["edit_config_json"], edit)
+        mock_export.assert_called_once()
+        self.assertEqual(mock_export.call_args.kwargs["edit_config_json"], edit)
+
+    def test_export_edit_config_dynamicemb_enables_dist_emb_before_features(
+        self,
+    ) -> None:
+        """edit_config_json dynamicemb enables dist embedding before feature build."""
+        config = EasyRecConfig(
+            model_dir=self.test_dir,
+            feature_configs=[
+                FeatureConfig(
+                    id_feature=IdFeature(
+                        feature_name="cat_a",
+                        expression="item:cat_a",
+                        embedding_dim=8,
+                        num_buckets=8,
+                    )
+                )
+            ],
+        )
+        ckpt_manager = mock.Mock()
+        ckpt_manager.latest_checkpoint.return_value = ("ckpt", 0)
+        env_at_calls = []
+
+        def check_features(*_args, **_kwargs):
+            env_at_calls.append(
+                (
+                    "features",
+                    os.environ.get("USE_DISTRIBUTED_EMBEDDING"),
+                    os.environ.get("INPUT_TILE"),
+                )
+            )
+            return []
+
+        def check_model(*_args, **_kwargs):
+            env_at_calls.append(
+                (
+                    "model",
+                    os.environ.get("USE_DISTRIBUTED_EMBEDDING"),
+                    os.environ.get("INPUT_TILE"),
+                )
+            )
+            return mock.Mock()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "RANK": "0",
+                    "USE_DISTRIBUTED_EMBEDDING": "0",
+                    "INPUT_TILE": "0",
+                    "USE_RTP": "0",
+                },
+            ),
+            mock.patch(
+                "tzrec.main.config_util.load_pipeline_config", return_value=config
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32_for_export"),
+            mock.patch(
+                "tzrec.main.checkpoint_util.CheckpointManager",
+                return_value=ckpt_manager,
+            ),
+            mock.patch("tzrec.main._create_features", side_effect=check_features),
+            mock.patch("tzrec.main._create_model", side_effect=check_model),
+            mock.patch("tzrec.main.ScriptWrapper", return_value=mock.Mock()),
+            mock.patch("tzrec.main.export_model") as mock_export_model,
+        ):
+            export(
+                pipeline_config_path="pipeline.config",
+                export_dir=os.path.join(self.test_dir, "export"),
+                edit_config_json='{"feature_configs[0].id_feature.dynamicemb.max_capacity":1024}',
+            )
+
+        self.assertEqual(
+            env_at_calls,
+            [("features", "1", "3"), ("model", "1", "3")],
+        )
+        mock_export_model.assert_called_once()
 
     def test_create_custom_model(self) -> None:
         """A custom model receives its unpacked protobuf configuration."""

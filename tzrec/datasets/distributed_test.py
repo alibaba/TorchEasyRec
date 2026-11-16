@@ -32,7 +32,12 @@ from tzrec.datasets.odps_dataset import OdpsReader
 from tzrec.datasets.parquet_dataset import ParquetReader
 from tzrec.datasets.sampler import _bootstrap
 from tzrec.utils import dist_util
-from tzrec.utils.test_util import make_test_dir, mark_ci_scope, parameterized_name_func
+from tzrec.utils.test_util import (
+    ci_resources,
+    make_test_dir,
+    mark_ci_scope,
+    parameterized_name_func,
+)
 
 
 def _check_readers(test_dir, pg):
@@ -188,6 +193,7 @@ def _dataset_worker(rank, backend, timeout_seconds, test_dir):
             dist.destroy_process_group()
 
 
+@ci_resources(slots=2)
 @mark_ci_scope("gpu")
 class DatasetProcessGroupTest(unittest.TestCase):
     @parameterized.expand(

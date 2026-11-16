@@ -8,252 +8,149 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run all unit tests."""
+"""Discover the requested tests and run them with a bounded slot budget."""
 
 import argparse
+import importlib
 import os
-import subprocess
+import signal
 import sys
 import time
 import unittest
-import warnings
-from unittest.runner import TextTestRunner
-from unittest.signals import registerResult
+from contextlib import redirect_stdout
+from pathlib import Path
+from typing import Any, Iterator
 
-SUBPROC_TEST_PATTERN = [
-    ".dataset_test.",
-    ".odps_dataset_test.",
-    ".parquet_dataset_test.",
-    ".sampler_test.",
-    ".tdm.gen_tree.",
-    ".convert_easyrec_config_to_tzrec_config_test.",
-]
+if __package__:
+    from . import dispatch
+else:
+    dispatch = importlib.import_module("dispatch")
 
 
-def _is_in_scope(test_case: unittest.TestCase, scope: str) -> bool:
-    method = getattr(test_case, test_case._testMethodName, None)
-    method_scopes = set(getattr(method, "_ci_scopes", ()) or ())
-    if scope in method_scopes:
-        return True
-    cls = type(test_case)
-    cls_scopes = set(getattr(cls, "_ci_scopes", ()) or ())
-    return scope in cls_scopes
-
-
-def _filter_in_scope(suite, scope: str) -> unittest.TestSuite:
-    """Prune tests not tagged with ``scope``; preserves nested suite layout.
-
-    Robust against ``_FailedTest`` placeholders (modules whose import
-    failed at discovery): they aren't iterable, so handle the leaf-case
-    first and just drop them from a scoped run.
-    """
-    new_suite = unittest.TestSuite()
+def leaves(suite: Any) -> Iterator[unittest.TestCase]:
+    """Visit each test in discovery order."""
     if isinstance(suite, unittest.TestCase):
-        if _is_in_scope(suite, scope):
-            new_suite.addTest(suite)
-        return new_suite
-    for child in suite:
-        if isinstance(child, unittest.TestCase):
-            if _is_in_scope(child, scope):
-                new_suite.addTest(child)
-        else:
-            filtered = _filter_in_scope(child, scope)
-            if filtered.countTestCases() > 0:
-                new_suite.addTest(filtered)
-    return new_suite
+        yield suite
+    else:
+        for child in suite:
+            yield from leaves(child)
 
 
-def _gather_test_cases(args):
-    test_dir = os.path.abspath(args.test_dir)
-    test_suite_main = unittest.TestSuite()
-    test_suite_subproc = unittest.TestSuite()
-    discover = unittest.defaultTestLoader.discover(
-        test_dir, pattern=args.pattern, top_level_dir=None
-    )
-    for suite_discovered in discover:
-        for test_case in suite_discovered:
-            if args.scope is not None:
-                test_case = _filter_in_scope(test_case, args.scope)
-                if test_case.countTestCases() == 0:
-                    continue
-            test_case_str = str(test_case)
-            is_subproc = False
-            for subp_pattern in SUBPROC_TEST_PATTERN:
-                if subp_pattern in test_case_str:
-                    is_subproc = True
-                    break
-            if not is_subproc or isinstance(test_case, unittest.TestCase):
-                test_suite_main.addTest(test_case)
-            else:
-                test_suite_subproc.addTest(test_case)
-
-            if hasattr(test_case, "__iter__"):
-                for subcase in test_case:
-                    if args.list_tests:
-                        print(subcase)
-            else:
-                if args.list_tests:
-                    print(test_case)
-    return test_suite_main, test_suite_subproc
-
-
-def _error_info_of_subproc_result(result):
-    start = False
-    endline = 0
-    error_info = ""
-    for line in result.stderr.splitlines():
-        if "====" in line:
-            start = True
-            endline = 0
-        if start:
-            error_info += line + "\n"
-            if "----" in line:
-                endline += 1
-            if endline == 2:
-                break
-    return error_info
-
-
-class TZRecTestRunner(TextTestRunner):
-    """Test Runner for TorchEasyRec."""
-
-    def _makeResult(self):
-        return self.resultclass(self.stream, self.descriptions, self.verbosity)
-
-    # pyrefly: ignore[bad-override]
-    def run(self, main_test, subproc_test):
-        """Run the given test case or test suite."""
-        result = self._makeResult()
-        registerResult(result)
-        result.failfast = self.failfast
-        result.buffer = self.buffer
-        result.tb_locals = self.tb_locals
-        with warnings.catch_warnings():
-            if self.warnings:
-                # if self.warnings is set, use it to filter all the warnings
-                warnings.simplefilter(self.warnings)
-                # if the filter is 'default' or 'always', special-case the
-                # warnings from the deprecated unittest methods to show them
-                # no more than once per module, because they can be fairly
-                # noisy.  The -Wd and -Wa flags can be used to bypass this
-                # only when self.warnings is None.
-                if self.warnings in ["default", "always"]:
-                    warnings.filterwarnings(
-                        "module",
-                        category=DeprecationWarning,
-                        message=r"Please use assert\w+ instead.",
-                    )
-            startTime = time.perf_counter()
-            startTestRun = getattr(result, "startTestRun", None)
-            if startTestRun is not None:
-                startTestRun()
-            try:
-                main_test(result)
-                # run subproc test in subprocess to prevent some global var fork problem
-                for subp_test_group in subproc_test:
-                    for one_subp_test in subp_test_group:
-                        subp_test_module = f"tzrec.{one_subp_test.__module__}"
-                        subp_test_name = f"{one_subp_test.__class__.__name__}.{one_subp_test._testMethodName}"  # NOQA
-                        try:
-                            run_env = {}
-                            if hasattr(one_subp_test, "_run_env"):
-                                run_env = one_subp_test._run_env()
-                            subp_result = subprocess.run(
-                                ["python", "-m", subp_test_module, subp_test_name],
-                                capture_output=True,
-                                text=True,
-                                timeout=600,
-                                env=dict(os.environ, **run_env),
-                            )
-                            if subp_result.returncode != 0:
-                                result.failures.append(
-                                    (
-                                        one_subp_test,
-                                        _error_info_of_subproc_result(subp_result),
-                                    )
-                                )
-                                self.stream.write("F")
-                            else:
-                                result.addSuccess(one_subp_test)
-                                self.stream.write(".")
-                        except subprocess.TimeoutExpired:
-                            result.failures.append((one_subp_test, "timeout"))
-                            self.stream.write("F")
-                        self.stream.flush()
-            finally:
-                stopTestRun = getattr(result, "stopTestRun", None)
-                if stopTestRun is not None:
-                    stopTestRun()
-
-            stopTime = time.perf_counter()
-        timeTaken = stopTime - startTime
-        result.printErrors()
-        if hasattr(result, "separator2"):
-            self.stream.writeln(result.separator2)
-        run = result.testsRun
-        self.stream.writeln(
-            "Ran %d test%s in %.3fs" % (run, run != 1 and "s" or "", timeTaken)
+def discover(test_dir: str, pattern: str, scope: str | None) -> list[dict]:
+    """Discover IDs, checking import errors before applying the scope filter."""
+    loader = unittest.TestLoader()
+    suite = loader.discover(test_dir, pattern=pattern)
+    if loader.errors:
+        raise ImportError("\n".join(map(str, loader.errors)))
+    cases = []
+    for case in leaves(suite):
+        cls = type(case)
+        method = getattr(case, case._testMethodName)
+        if scope and not any(
+            scope in getattr(x, "_ci_scopes", ()) for x in (cls, method)
+        ):
+            continue
+        slots, split, timeout = getattr(
+            method, "_ci_resources", getattr(cls, "_ci_resources", (1, "module", None))
         )
-        self.stream.writeln()
-
-        expectedFails = unexpectedSuccesses = skipped = 0
-        try:
-            results = map(
-                len,
-                (result.expectedFailures, result.unexpectedSuccesses, result.skipped),
+        if split != "module" and any(
+            hasattr(sys.modules[case.__module__], name)
+            for name in ("setUpModule", "tearDownModule")
+        ):
+            raise ValueError(f"{case.id()}: splitting crosses a module fixture")
+        if split == "case" and any(
+            getattr(getattr(cls, name), "__func__", None)
+            != getattr(unittest.TestCase, name).__func__
+            for name in ("setUpClass", "tearDownClass")
+        ):
+            raise ValueError(f"{case.id()}: splitting crosses a class fixture")
+        cases.append(
+            dict(
+                id=case.id(),
+                module=case.__module__,
+                slots=slots,
+                split=split,
+                timeout=timeout,
+                env=case._run_env() if hasattr(case, "_run_env") else {},
             )
-        except AttributeError:
-            pass
-        else:
-            expectedFails, unexpectedSuccesses, skipped = results
+        )
+    if not cases or len({c["id"] for c in cases}) != len(cases):
+        raise ValueError("empty or duplicate test discovery")
+    return cases
 
-        infos = []
-        if not result.wasSuccessful():
-            self.stream.write("FAILED")
-            failed, errored = len(result.failures), len(result.errors)
-            if failed:
-                infos.append("failures=%d" % failed)
-            if errored:
-                infos.append("errors=%d" % errored)
-        else:
-            self.stream.write("OK")
-        if skipped:
-            infos.append("skipped=%d" % skipped)
-        if expectedFails:
-            infos.append("expected failures=%d" % expectedFails)
-        if unexpectedSuccesses:
-            infos.append("unexpected successes=%d" % unexpectedSuccesses)
-        if infos:
-            self.stream.writeln(" (%s)" % (", ".join(infos),))
-        else:
-            self.stream.write("\n")
-        self.stream.flush()
-        return result
+
+def main() -> int:
+    """List tests or schedule the full selection, using two slots by default."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--list_tests", action="store_true")
+    parser.add_argument("--test-dir", "--test_dir", default="tzrec")
+    parser.add_argument("--pattern", default="*_test.py")
+    parser.add_argument("--scope", choices=("gpu", "h20"))
+    parser.add_argument(
+        "--hardware", choices=("cpu", "gpu"), help="default: auto-detect locally"
+    )
+    parser.add_argument("--capacity", type=int, default=2)
+    parser.add_argument("--timeout", type=float, default=21600)
+    args = parser.parse_args()
+    if args.capacity < 1 or args.timeout <= 0:
+        parser.error("capacity and timeout must be positive")
+    device_ids = []
+    if args.hardware == "cpu":
+        os.environ.update(CUDA_VISIBLE_DEVICES="", NVIDIA_VISIBLE_DEVICES="void")
+    else:
+        import torch
+
+        count = torch.cuda.device_count()
+        if args.hardware == "gpu" or count:
+            if args.hardware is None:
+                args.capacity = min(args.capacity, count)
+            mask = os.environ.get("CUDA_VISIBLE_DEVICES")
+            visible = (
+                mask.split(",") if mask is not None else list(map(str, range(count)))
+            )
+            if (
+                count < args.capacity
+                or len(visible) != count
+                or not all(visible)
+                or len(set(visible)) != count
+            ):
+                parser.error(
+                    f"capacity {args.capacity} incompatible with {count} devices: "
+                    f"{visible}"
+                )
+            device_ids = visible[: args.capacity]
+
+    started = time.monotonic()
+    signal.setitimer(signal.ITIMER_REAL, args.timeout)
+    try:
+        with redirect_stdout(sys.stderr):
+            cases = discover(args.test_dir, args.pattern, args.scope)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    if args.list_tests:
+        for case in cases:
+            print(case["id"])
+        return 0
+
+    Path("tmp").mkdir(exist_ok=True)
+    return dispatch.schedule(
+        cases,
+        args.capacity,
+        device_ids,
+        args.test_dir,
+        started,
+        args.timeout,
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test TorchEasyRec")
-    parser.add_argument("--list_tests", action="store_true", help="list all tests")
-    parser.add_argument(
-        "--pattern", type=str, default="*_test.py", help="test file pattern"
-    )
-    parser.add_argument(
-        "--test_dir", type=str, default="tzrec", help="directory to be tested"
-    )
-    parser.add_argument(
-        "--scope",
-        type=str,
-        default=None,
-        help="filter tests by CI scope marker (e.g. 'h20'); "
-        "default None runs the full suite",
-    )
-    args = parser.parse_args()
 
-    runner = TZRecTestRunner()
-    test_suite_main, test_suite_subproc = _gather_test_cases(args)
+    def cancel(signum: int, frame: Any) -> None:
+        """Interrupt the scheduler so it cleans up its active children."""
+        raise KeyboardInterrupt
 
-    if not args.list_tests:
-        runner_result = runner.run(test_suite_main, test_suite_subproc)
-        failed, errored = len(runner_result.failures), len(runner_result.errors)
-        if failed > 0 or errored > 0:
-            sys.exit(1)
+    signal.signal(signal.SIGTERM, cancel)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

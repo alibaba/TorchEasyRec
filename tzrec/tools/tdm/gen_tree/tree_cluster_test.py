@@ -19,8 +19,10 @@ from parameterized import parameterized
 
 from tzrec.tools.tdm.gen_tree.tree_cluster import TreeCluster
 from tzrec.tools.tdm.gen_tree.tree_search_util import LevelOrderIter
+from tzrec.utils.test_util import ci_resources
 
 
+@ci_resources(split="case", timeout=600)
 class TreeClusterTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_file = tempfile.NamedTemporaryFile(

@@ -20,9 +20,10 @@ from parameterized import parameterized
 
 from tzrec.tools.tdm.gen_tree.tree_cluster import TreeCluster
 from tzrec.tools.tdm.gen_tree.tree_search_util import TreeSearch
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import ci_resources, make_test_dir
 
 
+@ci_resources(split="case", timeout=600)
 class TreeSearchtest(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = make_test_dir()

@@ -15,7 +15,7 @@ import unittest
 
 from tzrec.tests import utils
 from tzrec.utils import filesystem_util
-from tzrec.utils.test_util import make_test_dir
+from tzrec.utils.test_util import ci_resources, make_test_dir
 
 
 class FileSystemUtilTest(unittest.TestCase):
@@ -45,6 +45,7 @@ class FileSystemUtilTest(unittest.TestCase):
         shutil.rmtree(f"file://{fsspec_sub}", ignore_errors=True)
         self.success = True
 
+    @ci_resources(slots=2)
     def test_local_fsspec_train_eval_export(self):
         self.success = utils.test_train_eval(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config",
