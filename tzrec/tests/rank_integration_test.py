@@ -1163,7 +1163,6 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str="USE_DISTRIBUTED_EMBEDDING=1",
             )
         self.assertTrue(self.success)
         self.success = False
