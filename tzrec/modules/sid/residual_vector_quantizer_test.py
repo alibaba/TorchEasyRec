@@ -24,7 +24,7 @@ from tzrec.modules.sid.residual_vector_quantizer import (
 )
 from tzrec.modules.sid.types import ResidualQuantizerOutput
 from tzrec.utils import misc_util
-from tzrec.utils.test_util import faiss_unavailable
+from tzrec.utils.test_util import ci_resources, faiss_unavailable
 
 
 def _candidate_output_config(topk: int = 3) -> dict:
@@ -352,6 +352,7 @@ class ResidualVectorQuantizerDistTest(unittest.TestCase):
     """2-rank test for the FAISS kmeans-init broadcast."""
 
     @unittest.skipIf(*faiss_unavailable)
+    @ci_resources(slots=2)
     def test_init_embed_broadcast(self) -> None:
         port = misc_util.get_free_port()
         ctx = mp.get_context("spawn")

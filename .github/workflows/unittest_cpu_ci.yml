@@ -5,24 +5,26 @@ on:
     types: [opened, reopened, synchronize]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: unittest-cpu-ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   ci-test:
-    runs-on: tzrec-cpu-runner
-    container:
-      image: mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5-cpu
-      options: --ipc host
+    runs-on: [tzrec-ci-dsw, tzrec-ci-cpu]
+    timeout-minutes: 360
     steps:
-      - name: FetchCommit ${{ github.event.pull_request.head.sha }}
+      - name: FetchCommit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
           path: run_${{ github.run_id }}
       - name: RunUnitTestCI
-        id: run_unittest_ci
+        id: tests
         env:
           ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
           CI_ODPS_PROJECT_NAME: ${{ secrets.CI_ODPS_PROJECT_NAME }}
@@ -31,5 +33,33 @@ jobs:
           CI_ALIKAFKA_BROKERS: ${{ secrets.CI_ALIKAFKA_BROKERS }}
           CI_REGION: ${{ secrets.CI_REGION }}
         run: |
-          cd run_${{ github.run_id }}
-          PIP_CACHE_DIR=/root/.cache/pip bash scripts/ci/ci_test_cpu.sh
+          WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
+          rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}/tmp/ci-failures"
+          docker run --rm --pull=always --name "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --label "tzrec-ci.node=${TZREC_CI_NODE:?}" --label "tzrec-ci.role=${TZREC_CI_ROLE:?}" \
+            --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
+            --cpus=64 --memory=256g --shm-size=64g --ulimit memlock=-1 \
+            -e GITHUB_ACTIONS=true -e CI=true \
+            -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -e ALIBABA_CLOUD_ECS_METADATA -e CI_ODPS_PROJECT_NAME -e ODPS_ENDPOINT -e CI_ALIKAFKA_INSTANCE_ID -e CI_ALIKAFKA_BROKERS -e CI_REGION -e CUDA_VISIBLE_DEVICES= -e NVIDIA_VISIBLE_DEVICES=void \
+            -e PIP_CACHE_DIR=/root/.cache/pip \
+            -v "$WORK_ROOT":/__w \
+            mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5-cpu \
+            bash -eo pipefail scripts/ci/ci_test_cpu.sh --capacity 32 --timeout 18000
+      - name: StopDockerContainer
+        if: always()
+        run: |
+          docker stop --timeout=30 "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+          docker rm -f "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+      - name: Upload failed group logs
+        id: artifacts
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/run_${{ github.run_id }}/tmp/ci-failures/*/*.log
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Clean checkout
+        if: always() && (steps.artifacts.outcome == 'success' || steps.artifacts.outcome == 'skipped')
+        run: rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}"

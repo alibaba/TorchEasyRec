@@ -35,8 +35,10 @@ from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
 from tzrec.utils import test_util
 from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.misc_util import get_free_port, random_name
+from tzrec.utils.test_util import ci_resources
 
 
+@ci_resources(split="case", timeout=600)
 class OdpsDatasetTest(unittest.TestCase):
     def setUp(self):
         self.o = None
@@ -700,6 +702,7 @@ class OdpsDatasetTest(unittest.TestCase):
         self._test_odps_dataset_with_sampler(id_type="bigint", schema="rec")
 
 
+@ci_resources(split="case", timeout=600)
 class OdpsWriterTest(unittest.TestCase):
     def setUp(self):
         self.o = None
@@ -900,6 +903,7 @@ class _StubScanClient:
         return SimpleNamespace(session_status=self.status, record_count=100)
 
 
+@ci_resources(split="case", timeout=600)
 class OdpsDatasetConfigTest(unittest.TestCase):
     """data_config fields reach the reader, without odps access."""
 
@@ -936,6 +940,7 @@ class OdpsDatasetConfigTest(unittest.TestCase):
         self.assertEqual(m_reader.call_args.kwargs["shuffle_buffer_size"], 64)
 
 
+@ci_resources(split="case", timeout=600)
 class OdpsRestoreSessionsTest(unittest.TestCase):
     input_path = "odps://p/tables/t/dt=1&dt=2&dt=3"
 
@@ -987,6 +992,7 @@ class OdpsRestoreSessionsTest(unittest.TestCase):
             reader._restore_sessions({f"{self.input_path}#3#old3:0": 9})
 
 
+@ci_resources(split="case", timeout=600)
 class OdpsStorageErrorLogTest(unittest.TestCase):
     def test_read_rows_arrow_logs_session_and_reraises(self):
         client = _FailingStorageClient()

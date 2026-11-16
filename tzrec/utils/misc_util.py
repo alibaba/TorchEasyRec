@@ -10,11 +10,10 @@
 # limitations under the License.
 
 import os
-import random
+import secrets
 import socket
 import string
 import subprocess
-from datetime import datetime
 
 from alibabacloud_credentials.provider import EcsRamRoleCredentialsProvider
 
@@ -23,10 +22,8 @@ RUN_CMD_RETRY_NUM = 3
 
 def random_name(length: int = 8) -> str:
     """Generate a random name with ascii_letters and digits."""
-    random.seed(int(datetime.now().timestamp()))
-    return "".join(
-        [random.choice(string.ascii_letters + string.digits) for i in range(length)]
-    )
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 # pyre-ignore [2, 3]

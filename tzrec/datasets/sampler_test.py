@@ -34,8 +34,10 @@ from tzrec.datasets.sampler import (
 )
 from tzrec.protos import sampler_pb2
 from tzrec.utils import misc_util
+from tzrec.utils.test_util import ci_resources
 
 
+@ci_resources(split="case", timeout=600)
 class SamplerTest(unittest.TestCase):
     def setUp(self):
         self._temp_files = []
