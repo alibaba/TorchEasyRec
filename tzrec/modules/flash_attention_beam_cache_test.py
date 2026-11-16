@@ -27,7 +27,7 @@ from tzrec.utils.test_util import (
 )
 
 
-class FlashAttentionBeamPrefixTest(unittest.TestCase):
+class FlashAttentionBeamCacheTest(unittest.TestCase):
     def test_prefill_keeps_original_layout_and_attention_compute_dtype(self):
         cache = FlashAttentionBeamCache(1)
         key = torch.randn(3, 2, 257, 8)
@@ -67,11 +67,6 @@ class FlashAttentionBeamPrefixTest(unittest.TestCase):
         torch.testing.assert_close(cache._prefix_keys[0], roots)
         self.assertEqual(cache.get_seq_length(), 514)
 
-
-@mark_ci_scope("gpu")
-@unittest.skipIf(*nv_gpu_unavailable)
-@unittest.skipIf(*flash_attn_unavailable)
-class FlashAttentionBeamDecodeTest(unittest.TestCase):
     @parameterized.expand(
         [
             ["qwen2", torch.bfloat16, torch.bfloat16, [5, 8]],
@@ -82,6 +77,9 @@ class FlashAttentionBeamDecodeTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
+    @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skipIf(*flash_attn_unavailable)
+    @mark_ci_scope("gpu")
     def test_two_branching_steps_match_ordinary_fa2(
         self, model_type, parameter_dtype, compute_dtype, lengths
     ):
@@ -98,24 +96,22 @@ class FlashAttentionBeamDecodeTest(unittest.TestCase):
             mask[row, -length:] = 1
         positions = (mask.cumsum(-1) - 1).clamp(min=0)
         originals = [layer.self_attn.forward for layer in lm.model.layers]
-        with torch.no_grad(), torch.autocast("cuda", dtype=compute_dtype):
-            reference = lm(
-                input_ids=ids,
+
+        def forward(tokens, cache=None):
+            return lm(
+                input_ids=tokens,
                 attention_mask=mask,
                 position_ids=positions,
+                past_key_values=cache,
                 use_cache=True,
                 logits_to_keep=1,
             )
+
+        with torch.no_grad(), torch.autocast("cuda", dtype=compute_dtype):
+            reference = forward(ids)
             ordinary = reference.past_key_values
             shared = create_flash_attention_beam_cache(lm)
-            actual = lm(
-                input_ids=ids,
-                attention_mask=mask,
-                position_ids=positions,
-                past_key_values=shared,
-                use_cache=True,
-                logits_to_keep=1,
-            )
+            actual = forward(ids, shared)
             torch.testing.assert_close(actual.logits, reference.logits, atol=0, rtol=0)
             parents = torch.arange(batch, device="cuda").repeat_interleave(2)
             for step in range(2):
@@ -127,22 +123,8 @@ class FlashAttentionBeamDecodeTest(unittest.TestCase):
                 tokens = (torch.arange(len(parents), device="cuda") + 17 + step)[
                     :, None
                 ]
-                reference = lm(
-                    input_ids=tokens,
-                    attention_mask=mask,
-                    position_ids=positions,
-                    past_key_values=ordinary,
-                    use_cache=True,
-                    logits_to_keep=1,
-                )
-                actual = lm(
-                    input_ids=tokens,
-                    attention_mask=mask,
-                    position_ids=positions,
-                    past_key_values=shared,
-                    use_cache=True,
-                    logits_to_keep=1,
-                )
+                reference = forward(tokens, ordinary)
+                actual = forward(tokens, shared)
                 torch.testing.assert_close(
                     actual.logits, reference.logits, atol=0, rtol=0
                 )

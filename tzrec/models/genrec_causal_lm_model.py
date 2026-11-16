@@ -81,7 +81,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         space = self._prompt.sid_space
         self._bands: List[Tuple[int, int]] = list(zip(space.band_lo, space.band_hi))
         self._capped_widths, self._num_return_sequences = resolve_beam_config(
-            common, self._bands
+            common, space.codebook
         )
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
@@ -232,13 +232,13 @@ class GenRecCausalLMModel(BaseGenRecModel):
 
 
 def resolve_beam_config(
-    common: GenRecModelConfig, bands: Sequence[Tuple[int, int]]
+    common: GenRecModelConfig, codebook: Sequence[int]
 ) -> Tuple[List[int], int]:
     """Validate the decode knobs against the codebook and cap the beam widths.
 
     Args:
         common: the shared model config.
-        bands: inclusive ``(lo, hi)`` token-id edge per SID level.
+        codebook: vocabulary size per SID level.
 
     Returns:
         The capped width per level, and the requested maximum return count.
@@ -250,10 +250,10 @@ def resolve_beam_config(
             "beam_widths is required; give one width per SID level, e.g. "
             "[50, 50, 50] or [100, 200, 400]."
         )
-    if len(beam_widths) != len(bands):
+    if len(beam_widths) != len(codebook):
         raise ValueError(
             f"beam_widths has {len(beam_widths)} entries but the codebook has "
-            f"{len(bands)} levels; give one width per level."
+            f"{len(codebook)} levels; give one width per level."
         )
     if any(width < 1 for width in beam_widths):
         raise ValueError(f"beam_widths must be >= 1, got {beam_widths}.")
@@ -261,7 +261,7 @@ def resolve_beam_config(
         raise ValueError(
             f"num_return_sequences must be >= 1, got {num_return_sequences}."
         )
-    capped_widths = capped_beam_widths(beam_widths, bands)
+    capped_widths = capped_beam_widths(beam_widths, codebook)
     return capped_widths, num_return_sequences
 
 

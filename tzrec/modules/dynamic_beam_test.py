@@ -50,7 +50,9 @@ def _decode(
         lm,
         lm.get_input_embeddings()(ids),
         torch.ones_like(ids) if attention_mask is None else attention_mask,
-        capped_widths=capped_beam_widths(beam_widths, pairs),
+        capped_widths=capped_beam_widths(
+            beam_widths, [hi - lo + 1 for lo, hi in pairs]
+        ),
         bands=pairs,
         initial_cache=initial_cache,
     )
@@ -94,29 +96,26 @@ def _bruteforce_scores(lm, input_ids, attention_mask, pairs):
 
 
 class DynamicBeamSearchTest(unittest.TestCase):
-    def test_final_prefix_topk_matches_exhaustive_reference(self) -> None:
-        pairs = [(20, 21), (5, 7), (25, 26)]
-        lm = create_tiny_causal_lm(vocab_size=30)
-        ids = torch.tensor([[5, 6, 7, 8]])
-        ref = _bruteforce_scores(lm, ids, torch.ones_like(ids), pairs)
-        by_parent = {}
-        for seq, score in ref.items():
-            parent = seq[:-1]
-            if parent not in by_parent or score > ref[by_parent[parent]]:
-                by_parent[parent] = seq
-        expected = sorted(by_parent.values(), key=ref.__getitem__, reverse=True)
-        out = _decode(lm, ids, pairs, beam_widths=[2, 6, 1])
-        self.assertEqual([tuple(row) for row in out.tolist()], expected)
-
-    def test_final_prefix_topk_preserves_global_topk(self) -> None:
+    @parameterized.expand([[1], [2], [8]], name_func=parameterized_name_func)
+    def test_final_prefix_topk_matches_exhaustive_reference(self, local_k) -> None:
         pairs = [(20, 21), (5, 7), (25, 28)]
         lm = create_tiny_causal_lm(vocab_size=30)
         ids = torch.tensor([[5, 6, 7, 8]])
         ref = _bruteforce_scores(lm, ids, torch.ones_like(ids), pairs)
-        expected = sorted(ref, key=ref.__getitem__, reverse=True)[:2]
-        actual = _decode(lm, ids, pairs, beam_widths=[2, 6, 2])
-        self.assertEqual(tuple(actual.shape), (12, 3))
-        self.assertEqual([tuple(row) for row in actual[:2].tolist()], expected)
+        by_parent = {}
+        for seq in ref:
+            by_parent.setdefault(seq[:-1], []).append(seq)
+        expected = [
+            seq
+            for group in by_parent.values()
+            for seq in sorted(group, key=ref.__getitem__, reverse=True)[:local_k]
+        ]
+        expected.sort(key=ref.__getitem__, reverse=True)
+        out = _decode(lm, ids, pairs, beam_widths=[2, 6, local_k])
+        actual = [tuple(row) for row in out.tolist()]
+        self.assertEqual(actual, expected)
+        ranked = sorted(ref, key=ref.__getitem__, reverse=True)
+        self.assertEqual(actual[:local_k], ranked[:local_k])
 
     @parameterized.expand(
         [
@@ -153,25 +152,6 @@ class DynamicBeamSearchTest(unittest.TestCase):
         for i, solo_ids in enumerate(solos):
             solo = _decode(lm, solo_ids, pairs)
             self.assertTrue(torch.equal(out[i * width : (i + 1) * width], solo))
-
-    def test_exhaustive_matches_bruteforce_topk(self) -> None:
-        # widths [2, 6, 12] over 2*3*2 = 12 combinations -> no pruning at any
-        # level. Disjoint, non-monotonic bands also verify that each level uses
-        # its own bounds rather than assuming one contiguous SID layout.
-        pairs = [(20, 21), (5, 7), (25, 26)]
-        lm = create_tiny_causal_lm(vocab_size=30)
-        ids = torch.tensor([[5, 6, 7, 8]])
-        am = torch.ones_like(ids)
-        out = _decode(lm, ids, pairs, width=12)
-        got = [tuple(r) for r in out.tolist()]
-        ref = _bruteforce_scores(lm, ids, am, pairs)
-        self.assertEqual(set(got), set(ref))
-        self.assertEqual(len(got), len(ref))
-        scores = [ref[c] for c in got]
-        self.assertTrue(
-            all(scores[i] >= scores[i + 1] - 1e-4 for i in range(len(scores) - 1))
-        )
-        self.assertEqual(got[0], max(ref, key=lambda combo: ref[combo]))
 
 
 @mark_ci_scope("gpu")
@@ -248,7 +228,7 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
                 lm.get_input_embeddings()(ids)[attention_mask.bool()],
                 torch.tensor([0, 4, 7], device=device),
                 4,
-                capped_beam_widths([8, 8, 8], pairs),
+                capped_beam_widths([8, 8, 8], [2, 3, 4]),
                 pairs,
                 out.shape[0] // 2,
             )

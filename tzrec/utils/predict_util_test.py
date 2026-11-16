@@ -1093,7 +1093,7 @@ class GenRecExportModelTest(unittest.TestCase):
         model = self._model(streams)
         _, band_lo, band_hi = sid_bands([4, 4, 4], 40)
         bands = list(zip(band_lo, band_hi))
-        widths, num_return_sequences = resolve_beam_config(self.common, bands)
+        widths, num_return_sequences = resolve_beam_config(self.common, [4, 4, 4])
         with torch.no_grad():
             out = model(Batch(), None, torch.device("cpu"))
             embeds = self.lm.get_input_embeddings()(streams[INPUT_IDS])

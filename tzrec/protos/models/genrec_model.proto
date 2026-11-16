@@ -26,8 +26,6 @@ message GenRecModelConfig {
     optional ParamDtype lm_parameter_dtype = 5 [default = FP32];
 
     optional string attn_kernel = 6 [default = "sdpa"];
-
-    reserved 7, 8;
 }
 
 message GenRecCausalLMModel {

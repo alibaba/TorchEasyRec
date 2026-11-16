@@ -1417,7 +1417,7 @@ class GenRecExportModel:
         self._bands = list(zip(band_lo, band_hi))
         common = pipeline_config.model_config.genrec_causal_lm_model.common
         self._capped_widths, self._num_return_sequences = resolve_beam_config(
-            common, self._bands
+            common, sid_space["codebook"]
         )
         self._generated_sids_key = common.generated_sids_key
         self._mixed_dtype = acc_utils.mixed_precision_to_dtype(

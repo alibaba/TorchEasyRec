@@ -24,26 +24,26 @@ from transformers.cache_utils import Cache
 
 def capped_beam_widths(
     beam_widths: Sequence[int],
-    bands: Sequence[Tuple[int, int]],
+    codebook: Sequence[int],
 ) -> List[int]:
-    """Cap each requested width to the candidates its band and prefixes supply.
+    """Cap each requested width to the candidates its codebook and prefixes supply.
 
     Args:
         beam_widths: global width per intermediate SID level, and a per-parent
             token TopK at the last level.
-        bands: inclusive ``(lo, hi)`` token-id edge per level.
+        codebook: vocabulary size per SID level.
 
     Returns:
         The capped width per level.
     """
     capped: List[int] = []
     previous = 1
-    for level, (requested, (band_lo, band_hi)) in enumerate(zip(beam_widths, bands)):
-        band_size = band_hi - band_lo + 1
-        if level + 1 == len(bands):
-            capped.append(previous * min(requested, band_size))
+    last_level = len(codebook) - 1
+    for level, (requested, codebook_size) in enumerate(zip(beam_widths, codebook)):
+        if level == last_level:
+            capped.append(previous * min(requested, codebook_size))
         else:
-            capped.append(min(requested, previous * band_size))
+            capped.append(min(requested, previous * codebook_size))
         previous = capped[-1]
     return capped
 
@@ -91,16 +91,13 @@ def dynamic_beam_search(
         return logits[:, band_lo : band_hi + 1].float() - log_z
 
     position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
-    cache_kwargs = (
-        {"past_key_values": initial_cache} if initial_cache is not None else {}
-    )
     outputs = model(
         inputs_embeds=prompt_embeds,
         attention_mask=attention_mask,
         position_ids=position_ids,
         use_cache=True,
         logits_to_keep=1,
-        **cache_kwargs,
+        past_key_values=initial_cache,
     )
     cache = outputs.past_key_values
     scores = _band_logp(outputs.logits[:, -1, :], 0)
