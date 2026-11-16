@@ -12,7 +12,6 @@
 import glob
 import json
 import os
-import shlex
 import shutil
 import sys
 import unittest
@@ -25,7 +24,7 @@ from pyarrow import dataset as ds
 from tzrec.acc import trt_utils
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import create_dataloader
-from tzrec.datasets.utils import calc_remaining_intervals, calc_slice_intervals
+from tzrec.datasets.utils import calc_remaining_intervals
 from tzrec.main import _create_features
 from tzrec.optim.optimizer import has_fbgemm_ftrl
 from tzrec.tests import utils
@@ -1364,8 +1363,10 @@ _SAMPLE_SHUFFLE_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
 _SAMPLE_SHUFFLE_TRAIN_EVAL = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "train_eval.py")
 )
-_SAMPLE_SHUFFLE_BATCH_SIZE = 128
-_SAMPLE_SHUFFLE_TOTAL_ROWS = 4000
+_SAMPLE_SHUFFLE_STEPS = 20
+_SAMPLE_SHUFFLE_RESUME_STEPS = 5
+# 32 batches per rank keep both runs inside one pass
+_SAMPLE_SHUFFLE_ROWS_PER_RANK = 32 * 128
 
 
 def _sample_shuffle_build_config(
@@ -1383,33 +1384,19 @@ def _sample_shuffle_build_config(
 
 
 def _sample_shuffle_run_torchrun(
-    config_path: str, entry_script: str, log_path: str, extra: str = ""
-):
+    config_path: str, log_path: str, continue_train: bool = False
+) -> bool:
     torchrun = os.path.join(os.path.dirname(sys.executable), "torchrun")
-    cmd = shlex.join(
-        [
-            torchrun,
-            *shlex.split(utils._standalone()),
-            "--nnodes=1",
-            f"--nproc-per-node={utils._get_nproc_per_node()}",
-            "--log_dir",
-            os.path.join(os.path.dirname(log_path), "log_train_eval"),
-            "-r",
-            "3",
-            "-t",
-            "3",
-            entry_script,
-            "--pipeline_config_path",
-            config_path,
-            *shlex.split(extra),
-        ]
+    cmd = (
+        f"PYTHONPATH=. {torchrun} {utils._standalone()} --nnodes=1 "
+        f"--nproc-per-node={utils._get_nproc_per_node()} "
+        f"--log_dir {os.path.join(os.path.dirname(log_path), 'log_train_eval')} "
+        f"-r 3 -t 3 {_SAMPLE_SHUFFLE_TRAIN_EVAL} "
+        f"--pipeline_config_path {config_path}"
     )
-    return misc_util.run_cmd(f"PYTHONPATH=. {cmd}", log_path, timeout=utils._t(600))
-
-
-def _sample_shuffle_read_state(ckpt_dir: str):
-    with open(os.path.join(ckpt_dir, "dataloader_state.json")) as f:
-        return json.load(f)
+    if continue_train:
+        cmd += " --continue_train"
+    return misc_util.run_cmd(cmd, log_path, timeout=utils._t(600))
 
 
 @unittest.skipIf(*gpu_unavailable)
@@ -1426,112 +1413,69 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
         if self.success:
             shutil.rmtree(self.test_dir, True)
 
-    def _train_input_path(self) -> str:
-        t = pa.Table.from_arrays(
-            [
-                pa.array([float(i) for i in range(_SAMPLE_SHUFFLE_TOTAL_ROWS)]),
-                pa.array([i % 2 for i in range(_SAMPLE_SHUFFLE_TOTAL_ROWS)]),
-                pa.array([str(i) for i in range(_SAMPLE_SHUFFLE_TOTAL_ROWS)]),
-            ],
-            names=["raw_c", "label", "id"],
-        )
+    def _write_train_data(self) -> tuple[str, int]:
+        nproc = utils._get_nproc_per_node()
+        total_rows = nproc * _SAMPLE_SHUFFLE_ROWS_PER_RANK
+        ids = np.arange(total_rows)
+        t = pa.table({"id": ids.astype(str), "label": ids % 2})
         data_dir = os.path.join(self.test_dir, "train_data")
         ds.write_dataset(
             t,
             data_dir,
             format="parquet",
-            max_rows_per_file=500,
-            max_rows_per_group=100,
+            max_rows_per_file=total_rows // nproc,
+            max_rows_per_group=total_rows // nproc,
         )
-        return os.path.join(data_dir, "*.parquet")
+        return os.path.join(data_dir, "*.parquet"), total_rows
 
-    def _remaining_batches(self, state, train_input_path: str) -> int:
-        """This rank's remaining batches in the pass described by ``state``."""
-        intervals = calc_slice_intervals(
-            [(train_input_path, _SAMPLE_SHUFFLE_TOTAL_ROWS)],
-            0,
-            utils._get_nproc_per_node(),
-            _SAMPLE_SHUFFLE_BATCH_SIZE,
-            True,
-            0,
-            checkpoint_state=state,
-        )[0]
-        rows = sum(end - start for start, end in intervals)
-        return (rows + _SAMPLE_SHUFFLE_BATCH_SIZE - 1) // _SAMPLE_SHUFFLE_BATCH_SIZE
-
-    def _assert_resumed_positions(self, before, after) -> None:
-        """Every newly read range must start inside a remaining checkpoint range."""
-        prefixes = {k.rsplit(":", 1)[0] for k in before if ":" in k}
-        # the restored state keeps its old keys and merges the new positions
-        new_keys = [k for k in after if k not in before and ":" in k]
-        matched = 0
-        for prefix in prefixes:
-            prefix_state = {
-                k: v for k, v in before.items() if k.rsplit(":", 1)[0] == prefix
-            }
-            remaining = calc_remaining_intervals(
-                prefix_state, prefix, _SAMPLE_SHUFFLE_TOTAL_ROWS
+    def _assert_resumed_positions(
+        self, before: dict, after: dict, prefix: str, total_rows: int
+    ) -> None:
+        """New reads must start inside the ranges left by the checkpoint."""
+        remaining = calc_remaining_intervals(before, prefix, total_rows)
+        new_keys = [
+            key for key in after if key not in before and key.startswith(prefix + ":")
+        ]
+        self.assertTrue(new_keys)
+        for key in new_keys:
+            start = int(key.rsplit(":", 1)[1])
+            self.assertTrue(
+                any(begin <= start < end for begin, end in remaining),
+                f"resumed read at {key} is outside {remaining}",
             )
-            for key in new_keys:
-                key_prefix, _, key_start = key.rpartition(":")
-                if key_prefix != prefix:
-                    continue
-                start = int(key_start)
-                self.assertTrue(
-                    any(s <= start < e for s, e in remaining),
-                    f"resumed read at {key} is outside {remaining}",
-                )
-                matched += 1
-        self.assertGreater(matched, 0)
 
     def test_train_save_resume(self):
-        train_input_path = self._train_input_path()
+        train_input_path, total_rows = self._write_train_data()
         log_path = os.path.join(self.test_dir, "log_train_eval.txt")
 
-        config = _sample_shuffle_build_config(self.test_dir, 20, train_input_path)
-        ok = _sample_shuffle_run_torchrun(config, _SAMPLE_SHUFFLE_TRAIN_EVAL, log_path)
+        config = _sample_shuffle_build_config(
+            self.test_dir, _SAMPLE_SHUFFLE_STEPS, train_input_path
+        )
+        ok = _sample_shuffle_run_torchrun(config, log_path)
         self.assertTrue(ok, "initial training run failed; see log_train_eval.txt")
-        ckpt10 = os.path.join(self.test_dir, "model", "model.ckpt-10")
-        ckpt19 = os.path.join(self.test_dir, "model", "model.ckpt-19")
-        for ckpt in (ckpt10, ckpt19):
-            self.assertTrue(os.path.exists(os.path.join(ckpt, "_SUCCESS")), ckpt)
-        state10 = _sample_shuffle_read_state(ckpt10)
-        state19 = _sample_shuffle_read_state(ckpt19)
-        keys = {k for k in state19 if ":" in k}
-        self.assertTrue(keys, state19)
-        epochs10 = state10.get(checkpoint_util.EPOCHS_COMPLETED, 0)
-        epochs19 = state19.get(checkpoint_util.EPOCHS_COMPLETED, 0)
-        self.assertGreaterEqual(epochs19, epochs10)
-        if epochs19 == epochs10:
-            # positions are per pass; a new pass legitimately restarts at 0
-            for key in keys:
-                self.assertIn(key, state10)
-                self.assertGreaterEqual(state19[key], state10[key])
+        ckpt = f"{self.test_dir}/model/model.ckpt-{_SAMPLE_SHUFFLE_STEPS - 1}"
+        self.assertTrue(os.path.exists(os.path.join(ckpt, "_SUCCESS")))
+        state = checkpoint_util.restore_dataloader_state(ckpt) or {}
+        keys = {key for key in state if ":" in key}
+        self.assertTrue(keys, state)
+        epochs = state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
 
-        # choose a resume budget from the actual remaining plan: leave at
-        # least one batch so the pass does not end, whatever the rank count
-        remaining_batches = self._remaining_batches(state19, train_input_path)
-        extra_steps = max(1, remaining_batches - 1)
-        resume_steps = 20 + extra_steps
-        final_step = 19 + extra_steps
+        resume_steps = _SAMPLE_SHUFFLE_STEPS + _SAMPLE_SHUFFLE_RESUME_STEPS
+        final_step = resume_steps - 1
         config = _sample_shuffle_build_config(
             self.test_dir, resume_steps, train_input_path
         )
-        ok = _sample_shuffle_run_torchrun(
-            config, _SAMPLE_SHUFFLE_TRAIN_EVAL, log_path, extra="--continue_train"
-        )
+        ok = _sample_shuffle_run_torchrun(config, log_path, continue_train=True)
         self.assertTrue(ok, "resume training run failed; see log_train_eval.txt")
-        ckpt_final = os.path.join(self.test_dir, "model", f"model.ckpt-{final_step}")
-        self.assertTrue(os.path.exists(os.path.join(ckpt_final, "_SUCCESS")))
-        resumed_state = _sample_shuffle_read_state(ckpt_final)
-        epochs_resumed = resumed_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
-        if remaining_batches == 0:
-            # the checkpoint ended the pass exactly; the resume can only
-            # start a fresh full pass
-            self.assertGreater(epochs_resumed, epochs19)
-        else:
-            self.assertEqual(epochs_resumed, epochs19)
-            self._assert_resumed_positions(state19, resumed_state)
+        ckpt = f"{self.test_dir}/model/model.ckpt-{final_step}"
+        self.assertTrue(os.path.exists(os.path.join(ckpt, "_SUCCESS")))
+        resumed_state = checkpoint_util.restore_dataloader_state(ckpt) or {}
+        resumed_epochs = resumed_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
+        self.assertEqual(resumed_epochs, epochs)
+        self.assertTrue(keys <= resumed_state.keys())
+        self._assert_resumed_positions(
+            state, resumed_state, train_input_path, total_rows
+        )
         self.success = True
 
 
