@@ -24,9 +24,10 @@ import torch
 
 from tzrec.tests import utils
 from tzrec.utils import config_util
-from tzrec.utils.test_util import make_test_dir, mark_ci_scope
+from tzrec.utils.test_util import ci_resources, make_test_dir, mark_ci_scope
 
 
+@ci_resources(split="case")
 class SidIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.success = False

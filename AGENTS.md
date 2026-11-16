@@ -21,7 +21,7 @@ Use the gitignored `experiments/` directory at the repo root for scratch scripts
 - Framework: `unittest`; tests live next to the code as `<module>_test.py`.
 - Full suite: `python tzrec/tests/run.py` (`--list_tests`, `--scope gpu|h20`). Single test: `python -m tzrec.modules.fm_test FactorizationMachineTest.test_fm_0`.
 - Parameterize case tables with `@parameterized.expand(..., name_func=parameterized_name_func)` from `tzrec/utils/test_util.py`; create scratch dirs with its `make_test_dir()`.
-- Declare CI lanes with `@mark_ci_scope("gpu")` / `@mark_ci_scope("h20", "gpu")` at class or method level only; module-level tagging is unsupported.
+- Select tests for the GPU PR workflows with `@mark_ci_scope("gpu")` at class or method level only; module-level tagging is unsupported.
 
 ## Linting and Type Checking
 

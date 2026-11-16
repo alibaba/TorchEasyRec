@@ -29,7 +29,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 注：
 
 - 该预测方式预测的模型前向逻辑已经固化在导出模型中，预测结果不受模型代码的变更影响
-- DynamicEmb 等模型需用分布式 embedding 模式导出（`USE_DISTRIBUTED_EMBEDDING=1`）后预测，见下文 [预测分布式 embedding 导出模型](#predict-distributed-embedding)
+- DynamicEmb 模型导出时会自动启用分布式 embedding 模式（`USE_DISTRIBUTED_EMBEDDING=1`），其导出产物的预测方式见下文 [预测分布式 embedding 导出模型](#predict-distributed-embedding)
 
 (predict-distributed-embedding)=
 
