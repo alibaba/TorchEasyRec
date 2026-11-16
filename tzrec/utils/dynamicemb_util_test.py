@@ -476,6 +476,7 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
         [
             ("cache_lfu", "CACHING", "LFU"),
             ("rocksdb", "CACHING", "LFU"),
+            ("rocksdb_half", "CACHING", "LFU"),
             ("overflow", "CACHING", "LFU"),
             ("hybrid", "HYBRID", "TIMESTAMP"),
             ("flat_row", "HBM_ONLY", "NO_EVICTION"),
@@ -495,15 +496,17 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
         from fbgemm_gpu.split_embedding_configs import EmbOptimType
 
         opt = _table_options(8192, 8, score_strategy=strategy)
-        opt.dim, opt.embedding_dtype, opt.index_type = 8, torch.float32, torch.int64
+        dtype = torch.float16 if name == "rocksdb_half" else torch.float32
+        is_rocksdb = name.startswith("rocksdb")
+        opt.dim, opt.embedding_dtype, opt.index_type = 8, dtype, torch.int64
         opt.init_capacity = opt.max_capacity
         opt.caching = layout == "CACHING"
         opt.local_hbm_for_values = (
             {"HOST_ONLY": 0, "HBM_ONLY": 8192, "CACHING": 1024, "HYBRID": 1024}[layout]
             * 8
-            * 4
+            * dtype.itemsize
         )
-        if name == "rocksdb":
+        if is_rocksdb:
             from tzrec_ext.rocksdb import BackendConfig, RocksDBSession
             from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
 
@@ -518,11 +521,11 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
             device=torch.device("cuda", torch.cuda.current_device()),
             optimizer=EmbOptimType.EXACT_SGD,
         )
-        keys = torch.tensor([73, 18, 91], device="cuda")
+        keys = torch.tensor([-73, 2**62 + 18, 91], device="cuda")
         tids = torch.zeros_like(keys)
-        a, b = torch.ones(2, 8, device="cuda").chunk(2)
+        a, b = torch.ones(2, 8, device="cuda", dtype=dtype).chunk(2)
         b = b * 2
-        if name == "rocksdb":
+        if is_rocksdb:
             module.tables.bind_cache(module.cache)
         else:
             module.tables.set_score(3)
@@ -543,7 +546,7 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
                 self.assertGreaterEqual(slots.item(), cap)
             store_to_flat(cache._state, slots, tids[:1], a)
             states = [cache._state]
-            if name != "rocksdb":
+            if not is_rocksdb:
                 states.append(module.tables._state)
         elif layout == "HYBRID":
             states = [module.tables._hbm, module.tables._host]
@@ -563,19 +566,48 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
             return score[found]
 
         before = [scores(state) for state in states]
-        found, values = dynamicemb_util.lookup_publish_embeddings(module, keys, 0)
+        cpu_keys, found, values = dynamicemb_util.lookup_publish_embeddings(
+            module, keys, 0
+        )
+        self.assertEqual(
+            (cpu_keys.device.type, found.device.type, values.device.type),
+            ("cpu", "cpu", "cpu"),
+        )
+        torch.testing.assert_close(cpu_keys, keys.cpu())
         self.assertEqual(found.tolist(), [True, True, False])
-        torch.testing.assert_close(values[found], torch.cat([a, b]))
+        torch.testing.assert_close(values[found], torch.cat([a, b]).cpu())
+        if is_rocksdb:
+            original_find = module.tables.find
+
+            def cpu_find(query_keys, table_ids, mode):
+                self.assertEqual(query_keys.device.type, "cpu")
+                self.assertEqual(table_ids.device.type, "cpu")
+                return original_find(query_keys, table_ids, mode)
+
+            with mock.patch.object(module.tables, "find", side_effect=cpu_find):
+                _, misses, backing = dynamicemb_util.lookup_publish_embeddings(
+                    module, keys[1:], 0
+                )
+                self.assertEqual(misses.tolist(), [True, False])
+                torch.testing.assert_close(backing[misses], b.cpu())
+            # All cache hits require no storage access.
+            with mock.patch.object(module.tables, "find", side_effect=AssertionError):
+                cpu_keys, hits, cached = dynamicemb_util.lookup_publish_embeddings(
+                    module, keys[:1], 0
+                )
+                torch.testing.assert_close(cpu_keys, keys[:1].cpu())
+                self.assertTrue(hits.all())
+                torch.testing.assert_close(cached, a.cpu())
         for state, previous in zip(states, before):
             torch.testing.assert_close(scores(state), previous)
         if layout == "CACHING":
             # Reading the newer cache row did not overwrite the backing copy.
-            _, stored = dynamicemb_util.lookup_publish_embeddings(
+            _, _, stored = dynamicemb_util.lookup_publish_embeddings(
                 SimpleNamespace(cache=None, tables=module.tables),
                 keys[:1],
                 0,
             )
-            torch.testing.assert_close(stored, b)
+            torch.testing.assert_close(stored, b.cpu())
 
     def _shard_storages(self, dynamicemb_options):
         rows = dynamicemb_options.max_capacity

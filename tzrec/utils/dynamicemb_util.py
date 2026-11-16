@@ -399,16 +399,19 @@ def _log_dynamicemb_table_plan(
 @torch.no_grad()
 def lookup_publish_embeddings(
     module: torch.nn.Module, keys: torch.Tensor, table_id: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Read rank-local embeddings without changing scores, admitting or writing rows.
 
     Call on the training stream after the step's embedding updates, before
     launching further cache mutations. The current training pipeline orders
     these operations on the same stream, so no device-wide synchronization is
     needed. Callers using separate mutation streams must establish equivalent
-    dependencies. Only found rows are valid. Keep the pinned DynamicEmb
-    state-level APIs here: train-mode cache.lookup/storage.find can update
-    scores, and eval_lookup initializes misses instead of returning a mask.
+    dependencies. Input keys stay on the GPU for cache and built-in lookups.
+    Returns CPU keys, a CPU found mask and CPU embeddings in input order;
+    only found rows are valid. RocksDB misses are resolved on the CPU.
+    Keep the pinned DynamicEmb state-level APIs here: training lookups can
+    update scores, and eval_lookup initializes misses instead of returning
+    a mask.
     """
     from dynamicemb.key_value_table import (
         DynamicEmbStorage,
@@ -432,32 +435,52 @@ def lookup_publish_embeddings(
         if not isinstance(storage, RocksDBStorage):
             raise TypeError(f"No read-only delta lookup for {type(storage).__name__}")
 
+    keys_cpu = keys.cpu()
     dim = storage.embedding_dim(table_id)
-    found = torch.zeros_like(keys, dtype=torch.bool)
+    output_device = torch.device("cpu") if external else keys.device
+    found = torch.zeros(keys.numel(), dtype=torch.bool, device=output_device)
     values = torch.empty(
-        (keys.numel(), dim), dtype=storage.embedding_dtype(), device=keys.device
+        (keys.numel(), dim), dtype=storage.embedding_dtype(), device=output_device
     )
-    positions = torch.arange(keys.numel(), device=keys.device)
+    positions = torch.arange(keys.numel(), device=output_device)
     for state in states:
         tids = torch.full_like(keys, table_id, dtype=torch.int64)
         nmiss, missing_keys, missing_pos, _, _, hits, scores, slots = _find_keys(
             state, keys, tids, const_lookup=True
         )
         rows = _flat_row_indices_for_value_load(state, hits, scores, slots)
-        block = load_from_flat(state, rows, tids, CopyMode.EMBEDDING)
-        values[positions] = block[:, :dim]
-        found[positions] = hits
+        if external:
+            if not nmiss:
+                block = load_from_flat(state, rows, tids, CopyMode.EMBEDDING)
+                return keys_cpu, hits.cpu(), block[:, :dim].cpu()
+            hits_cpu = hits.cpu()
+            hit_positions = positions[hits_cpu]
+            if nmiss < keys.numel():
+                block = load_from_flat(state, rows, tids, CopyMode.EMBEDDING)
+                values.index_copy_(0, hit_positions, block[hits, :dim].cpu())
+            found[hit_positions] = True
+            next_positions = positions[~hits_cpu]
+        else:
+            block = load_from_flat(state, rows, tids, CopyMode.EMBEDDING)
+            values[positions] = block[:, :dim]
+            found[positions] = hits
+            next_positions = positions[missing_pos]
         if not nmiss:
-            return found, values
-        positions = positions[missing_pos]
+            return keys_cpu, found.cpu(), values.cpu()
+        positions = next_positions
         keys = missing_keys
 
-    if external and keys.numel():
-        tids = torch.full_like(keys, table_id, dtype=torch.int64)
-        _, _, _, _, _, hits, _, block = storage.find(keys, tids, CopyMode.EMBEDDING)
-        values[positions] = block[:, :dim]
-        found[positions] = hits
-    return found, values
+    if external and positions.numel():
+        missing_keys_cpu = keys_cpu[positions]
+        tids = torch.full_like(missing_keys_cpu, table_id, dtype=torch.int64)
+        _, _, _, _, _, hits, _, block = storage.find(
+            missing_keys_cpu, tids, CopyMode.EMBEDDING
+        )
+        if positions.numel() == keys_cpu.numel():
+            return keys_cpu, hits, block[:, :dim]
+        values.index_copy_(0, positions, block[:, :dim])
+        found.index_copy_(0, positions, hits)
+    return keys_cpu, found.cpu(), values.cpu()
 
 
 def _get_optimizer_multipler(

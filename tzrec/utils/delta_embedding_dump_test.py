@@ -242,7 +242,7 @@ class _FakeDynamicTables:
 
 def _fake_publish_lookup(module, keys, table_id):
     result = module.tables.find(keys, torch.full_like(keys, table_id), "EMBEDDING")
-    return result[5], result[7]
+    return keys.cpu(), result[5].cpu(), result[7].cpu()
 
 
 def _build_sharded_delta_dump_model(rank: int, world_size: int, ctx):
@@ -3033,11 +3033,12 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 global_step=5,
                 fqn=self._DYN_TABLE_FQN,
                 dynamic_module=dynamic_module,
-                tracker_ids=torch.tensor([101, 102, 103]),
+                tracker_ids=torch.tensor([103, 101, 102, 101], device="cuda"),
                 dump_evicted_tombstones=False,
             )
 
         self.assertEqual(num_rows, 2)
+        self.assertEqual(fake_tables.ids.device.type, "cuda")
         dynamic_module.flush.assert_not_called()
         self.assertEqual(fake_tables.copy_mode, "EMBEDDING")
         torch.testing.assert_close(fake_tables.ids.cpu(), torch.tensor([101, 102, 103]))
