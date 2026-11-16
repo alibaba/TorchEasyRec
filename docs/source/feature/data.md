@@ -411,9 +411,8 @@ data_config {
 }
 ```
 
-- 此例中每个rank的样本池容量为 512 x 98 = 50176 条样本
-- `num_workers=0`时读取仍在后台读取单元进行，主进程直接领取组好的batch完成特征处理
-- 池未满时会等待填满才出批：低流量场景下首个batch的产出时间约为"填满池所需时间"，调小`shuffle_buffer_size`可让首个batch更快产出（混洗范围随之变小）
+- 此例中每个rank的样本池容量为 512 x 98 = 50176 条样本; `num_workers=0`时读取仍在后台读取单元进行，主进程直接领取组好的batch完成特征处理
+- 池未满时会等待填满才出批，低流量场景下调小`shuffle_buffer_size`可让首个batch更快产出
 
 ### fg_encoded_multival_sep
 

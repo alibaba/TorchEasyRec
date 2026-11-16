@@ -42,29 +42,21 @@ from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, DATA_TIMESTAMP
 from tzrec.protos import data_pb2
 from tzrec.utils.logging_util import logger
 
-# capacity of the reader -> coordinator input queue, in decoded batches
 _INPUT_QUEUE_BATCHES_PER_READER = 2
-# one queued GET plus one queued CANCEL per consumer fit at once
+# Allow one pending GET and one CANCEL per consumer.
 _REQUEST_QUEUE_PER_CONSUMER = 2
-# coordinator loop wakeups per second while idle
 _LOOP_TICK_SECS = 0.1
 _WATCHDOG_TICK_SECS = 5.0
-# shutdown budget for reaping reader processes: a graceful phase then a
-# forced phase, each shared by all readers; the handle's stop timeout must
-# comfortably exceed the sum
+# Keep the handle's stop timeout above the combined reader deadlines.
 _READER_GRACEFUL_STOP_SECS = 6.0
 _READER_FORCED_STOP_SECS = 2.0
 _STATS_LOG_INTERVAL_SECS = 60.0
 
-# reader -> coordinator messages
 _DATA = "DATA"
 _EOF = "EOF"
 _ERROR = "ERROR"
-# worker -> coordinator messages
 _GET = "GET"
 _CANCEL = "CANCEL"
-# coordinator -> worker messages; ERROR shares the name of the reader ->
-# coordinator error, the direction is unambiguous
 _BATCH = "BATCH"
 _END = "END"
 
@@ -214,18 +206,14 @@ class SamplePool:
         self.capacity_rows = capacity_rows
         self.mode = mode
         self.rng = rng if rng is not None else np.random.default_rng()
-        # arrival chunks carry feature + checkpoint metadata + event-time
-        # columns; the arena indexes live rows as (chunk, row) pairs
         self._chunks: List[pa.RecordBatch] = []
         self._arena_chunk = np.empty(0, dtype=np.int32)
         self._arena_row = np.empty(0, dtype=np.int32)
         self.total_rows = 0
         self._dead_rows = 0
-        # window mode state
         self._frozen_chunk: Optional[np.ndarray] = None
         self._frozen_row: Optional[np.ndarray] = None
         self._frozen_pos = 0
-        # stats
         self.num_emits = 0
         self.num_compactions = 0
         self.rows_in = 0
@@ -244,8 +232,7 @@ class SamplePool:
         )
         self.total_rows += n
         self.rows_in += n
-        # frozen-window rows are outside the arena; compaction only runs
-        # when no window is frozen so their chunk positions stay valid
+        # Compaction would invalidate chunk indices held by a frozen window.
         if self._dead_rows > self.capacity_rows and self._frozen_chunk is None:
             self._compact()
 
@@ -288,7 +275,6 @@ class SamplePool:
                     batch = self._gather(self._frozen_chunk[sel], self._frozen_row[sel])
                     self._remove_from_live(batch.num_rows)
                     return batch
-                # the rest of the window joins the next one
                 leftover = slice(self._frozen_pos, n)
                 if self._frozen_pos < n:
                     self._arena_chunk = np.concatenate(
@@ -299,9 +285,6 @@ class SamplePool:
                     )
                 self._frozen_chunk = None
                 self._frozen_row = None
-                # the window boundary is a safe point to reclaim dead chunk
-                # buffers: leftover rows are back in the arena and the
-                # frozen arrays no longer reference chunk positions
                 if self._dead_rows > self.capacity_rows:
                     self._compact()
                 continue
@@ -309,7 +292,6 @@ class SamplePool:
                 if self.total_rows < num_rows:
                     return None
             elif self.total_rows < self.capacity_rows:
-                # wait until the pool is full
                 return None
             n_freeze = self.total_rows
             perm = self.rng.permutation(n_freeze)
@@ -325,7 +307,6 @@ class SamplePool:
             if self.total_rows < num_rows:
                 return None
         elif self.total_rows < self.capacity_rows:
-            # wait until the pool is refilled to capacity
             return None
         sel = self.rng.choice(len(self._arena_chunk), size=num_rows, replace=False)
         batch = self._gather(self._arena_chunk[sel], self._arena_row[sel])
@@ -375,7 +356,6 @@ class SamplePool:
         live chunks only, so their size stays proportional to the number of
         live chunks rather than the number of tables ever received.
         """
-        # group arena entries by chunk without per-row python loops
         order = np.argsort(self._arena_chunk, kind="stable")
         arena_c = self._arena_chunk[order]
         arena_r = self._arena_row[order]
@@ -390,11 +370,10 @@ class SamplePool:
                 chunk = chunk.take(pa.array(sorted_rows.astype(np.int64)))
             id_map = len(new_chunks)
             new_chunks.append(chunk)
-            # remap entries: new chunk id, and new row id = rank in sorted order
+            # searchsorted maps source row indices into the compacted chunk.
             arena_c[st : st + c] = id_map
             arena_r[st : st + c] = np.searchsorted(sorted_rows, rows)
-        # the arena feeds random sampling only, so the chunk-grouped order
-        # is fine as-is
+        # Sampling does not depend on the arena's row order.
         self._chunks = new_chunks
         self._arena_chunk = arena_c
         self._arena_row = arena_r
@@ -525,13 +504,11 @@ class Coordinator:
         self._trainer_pid = trainer_pid
         self._capacity_rows = capacity_rows
         self._pool = SamplePool(capacity_rows, mode)
-        # per-pass state, fully initialized by _start_pass
         self._plan = first_plan
         self._remaining: Optional[int] = None
         self._rows_read = 0
         self._eof_readers = set()
         self._verified = False
-        # GETs in arrival order; each consumer has at most one entry
         self._request_order: deque[int] = deque()
         self._closed = [False] * num_consumers
         self._error: Optional[str] = None
@@ -539,8 +516,6 @@ class Coordinator:
         self._ctx = mp.get_context("fork")
         self._reader_stop = self._ctx.Event()
         num_readers = first_plan.num_readers
-        # created before the readers are forked, so no queue feeder thread
-        # is ever forked into a reader
         self._input_q = self._ctx.Queue(
             maxsize=_INPUT_QUEUE_BATCHES_PER_READER * num_readers
         )
@@ -548,9 +523,7 @@ class Coordinator:
 
     def _start_readers(self) -> None:
         """Fork the reader processes."""
-        # fork before the event loop starts: the coordinator is still
-        # single-threaded and holds no consumer, so fork is safe; task
-        # deliveries happen only after every reader exists
+        # Fork before any queue puts can start feeder threads.
         pid = os.getpid()
         for i, task_q in enumerate(self._task_queues):
             p = self._ctx.Process(
@@ -577,8 +550,6 @@ class Coordinator:
         triggering GET is registered only afterwards.
         """
         self._plan = plan
-        # the read plan already applied the rank-step alignment and tail
-        # trimming; the coordinator only allocates its planned rows
         self._remaining = plan.planned_rows
         self._rows_read = 0
         self._eof_readers = set()
@@ -617,11 +588,7 @@ class Coordinator:
                 self._cancel_event.set()
                 return
             if self._is_complete():
-                # every consumer finished the finite pass; this GET opens
-                # the next one, and re-reading starts only now
                 self._start_pass(self._full_plan)
-            # one response queue per consumer: it cannot send a second GET
-            # before receiving the response of the first
             self._request_order.append(consumer_id)
 
     def _check_eof(self) -> None:
@@ -688,16 +655,12 @@ class Coordinator:
                     if self._verified:
                         end = True
                     else:
-                        # quota used up; the oldest request waits for EOF and
-                        # the row-count check, later requests must not jump in
+                        # Wait for EOF validation before ending the pass.
                         break
                 else:
-                    # all rows read (verified) or still arriving: the request
-                    # size is the same, only capacity and drain differ
                     num_rows = min(self._batch_size, self._remaining)
                     drain = self._verified or self._remaining < self._capacity_rows
             elif self._verified:
-                # unknown row count: drain what is left, applying the tail rule
                 available = self._pool.total_rows
                 if available == 0:
                     end = True
@@ -713,8 +676,6 @@ class Coordinator:
                 self._response_queues[consumer_id].put_nowait((_END, None))
                 self._closed[consumer_id] = True
                 if all(self._closed):
-                    # every consumer finished the pass; release the consumed
-                    # chunk buffers now instead of at the next pass's start
                     self._pool.discard()
                 self._request_order.popleft()
                 continue
@@ -740,7 +701,6 @@ class Coordinator:
     def _pool_has_room(self) -> bool:
         """Whether the coordinator should keep pulling reader data."""
         if self._input_done:
-            # no reader can add rows any more; only requests matter now
             return False
         return self._pool.total_rows < self._capacity_rows
 
@@ -781,14 +741,11 @@ class Coordinator:
                 if self._error is not None:
                     break
                 if self._pool_has_room():
-                    # a dead reader's input may end mid-frame; never read it
-                    # again, fail the service instead
+                    # NOTE: Reading a dead reader's truncated frame can block forever.
                     self._check_readers()
                     if self._error is None:
                         self._service_input(_LOOP_TICK_SECS)
                 elif not self._request_order:
-                    # consumers are busy processing their batches; block until
-                    # the next request instead of polling and adding latency
                     self._service_requests(_LOOP_TICK_SECS)
                 else:
                     time.sleep(0.001)
@@ -805,8 +762,7 @@ class Coordinator:
             self._log_stats()
             self._reader_stop.set()
             for response_q in self._response_queues:
-                # a consumer that is already gone must not block this
-                # process on a full queue's feeder thread at exit
+                # A feeder blocked on an abandoned consumer must not delay exit.
                 response_q.cancel_join_thread()
             self._input_q.cancel_join_thread()
             for task_q in self._task_queues:
@@ -876,10 +832,6 @@ class SampleShuffleHandle:
         self._mode = data_config.shuffle_mode
         self._capacity_rows = data_config.batch_size * data_config.shuffle_buffer_size
 
-        # the first pass continues the checkpoint's resume position; every
-        # later pass reads the full source. Only the reader's internal
-        # resume position is dropped; the training loop's own checkpoint
-        # state is not touched.
         self._first_plan = reader.create_read_plan(
             rank, world_size, self._num_consumers
         )
@@ -953,11 +905,10 @@ class SampleShuffleHandle:
                     if kind == _END:
                         finished = True
                         return
-                    # kind == _ERROR
                     raise RuntimeError(payload)
         finally:
             if not finished:
-                # the pass was abandoned; stop the whole rank's service
+                # Abandoning one consumer cancels the rank's service.
                 self._put_request((_CANCEL, consumer_id))
 
     def start(self) -> None:
@@ -989,15 +940,12 @@ class SampleShuffleHandle:
                 num_consumers=self._num_consumers,
                 trainer_pid=os.getpid(),
             ),
-            # not daemon: daemonic processes cannot fork reader children;
-            # orphan self-exit is handled via trainer_pid checks instead
+            # The coordinator must be non-daemonic to fork reader processes.
             daemon=False,
             name="tzrec-sample-shuffle-coordinator",
         )
         proc.start()
-        # interpreters can exit without close() on training-init failures;
-        # this runs before multiprocessing joins the non-daemon child, so
-        # initialization failures cannot hang the exit
+        # NOTE: Terminate before multiprocessing joins non-daemon children at exit.
         atexit.register(self._terminate_coordinator)
         self._proc = proc
         self._start_watchdog()
@@ -1029,8 +977,6 @@ class SampleShuffleHandle:
         """Stop the coordinator and its readers; idempotent."""
         if self._stop_event.is_set():
             return
-        # wake consumers even when the coordinator was never started (e.g. a
-        # dataloader creation failure between the eager iter and start)
         self._stop_event.set()
         proc = self._proc
         self._proc = None
@@ -1039,6 +985,6 @@ class SampleShuffleHandle:
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=5.0)
-        # do not wait for a full request queue's feeder thread at exit
+        # A full request queue must not delay shutdown.
         self._request_q.cancel_join_thread()
         atexit.unregister(self._terminate_coordinator)

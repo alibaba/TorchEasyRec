@@ -232,8 +232,6 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._sampler_inited = False
 
         self._reader = None
-        # attached by create_dataloader when the sample-shuffle path serves
-        # this dataset; forked workers inherit it, the trainer owns its life
         self._sample_shuffle: Optional[SampleShuffleHandle] = None
 
     def launch_sampler_cluster(
@@ -949,8 +947,6 @@ def create_dataloader(
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = data_config.prefetch_factor
 
-    # Restore the resume state and build the sample-shuffle service before
-    # forking, using the actual worker count.
     if checkpoint_state:
         dataset.load_state_dict(dict(checkpoint_state))
     sample_shuffle = None
@@ -993,27 +989,22 @@ def create_dataloader(
         # before beginning the training process to avoid potential CUDA-related
         # issues following model saving.
         first_iterator = iter(dataloader)
-        # start the service after the eager iter() forked the workers, so
-        # consumers and reader processes never share state with them
+        # Start after workers fork so they inherit no live service state.
         if sample_shuffle is not None:
             sample_shuffle.start()
     except Exception:
-        # a half-started service must not outlive the failed dataloader
         if sample_shuffle is not None:
             sample_shuffle.stop()
         raise
 
-    # stop the service when the dataset is released; the eager iter() above
-    # forked the workers, so only the trainer process registers it. The
-    # callback holds the handle, never the dataset.
-    sample_shuffle_finalizer = (
-        weakref.finalize(dataset, sample_shuffle.stop)
-        if sample_shuffle is not None
-        else None
-    )
-    # the dataloader owns the iterator helpers, so they must not own it:
-    # a strong reference here would keep the dataset (and its finalizer)
-    # alive until a cyclic GC pass
+    # Bind cleanup to the dataset so a live iterator keeps the service alive.
+    if sample_shuffle is not None:
+        dataloader.close = weakref.finalize(
+            dataset, sample_shuffle.stop
+        )  # pyre-ignore[16]
+    else:
+        dataloader.close = lambda: None  # pyre-ignore[16]
+    # Avoid a loader -> closure -> loader cycle that delays cleanup.
     dataloader_ref = weakref.ref(dataloader)
 
     def get_iterator() -> Iterator[Batch]:
@@ -1026,11 +1017,5 @@ def create_dataloader(
         assert loader is not None
         return iter(loader)
 
-    def close() -> None:
-        """Stop the sample-shuffle service; a no-op for paths without one."""
-        if sample_shuffle_finalizer is not None:
-            sample_shuffle_finalizer()
-
     dataloader.get_iterator = get_iterator  # pyre-ignore[16]
-    dataloader.close = close  # pyre-ignore[16]
     return dataloader

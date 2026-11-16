@@ -152,10 +152,8 @@ message DataConfig {
     optional uint32 shuffle_buffer_size  = 23 [default = 32];
 
     // shuffle mode. For SAMPLE_WINDOW and SAMPLE_ROLLING, raw samples are
-    // gathered into a per-rank shared pool of
-    // batch_size * shuffle_buffer_size samples, shuffled at sample level,
-    // then grouped into batches. Training only; every rank has its own
-    // independent pool.
+    // gathered into a per-rank shared pool of batch_size * shuffle_buffer_size samples,
+    // shuffled at sample level, then grouped into batches. For Training only.
     optional ShuffleMode shuffle_mode = 21 [default = BATCH];
 
     // maxcompute storage api data compression type, LZ4_FRAME | ZSTD | UNCOMPRESSED

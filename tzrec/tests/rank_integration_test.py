@@ -17,7 +17,6 @@ import sys
 import unittest
 
 import numpy as np
-import pyarrow as pa
 import torch
 from pyarrow import dataset as ds
 
@@ -27,6 +26,8 @@ from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.utils import calc_remaining_intervals
 from tzrec.main import _create_features
 from tzrec.optim.optimizer import has_fbgemm_ftrl
+from tzrec.protos import data_pb2
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.tests import utils
 from tzrec.utils import checkpoint_util, config_util, dynamicemb_util, misc_util
 from tzrec.utils.test_util import (
@@ -1369,20 +1370,6 @@ _SAMPLE_SHUFFLE_RESUME_STEPS = 5
 _SAMPLE_SHUFFLE_ROWS_PER_RANK = 32 * 128
 
 
-def _sample_shuffle_build_config(
-    test_dir: str, num_steps: int, train_input_path: str
-) -> str:
-    config = config_util.load_pipeline_config(
-        os.path.join(_SAMPLE_SHUFFLE_CONFIG_DIR, "sample_shuffle_mock.config")
-    )
-    config.train_input_path = train_input_path
-    config.model_dir = os.path.join(test_dir, "model")
-    config.train_config.num_steps = num_steps
-    path = os.path.join(test_dir, f"pipeline_{num_steps}.config")
-    config_util.save_message(config, path)
-    return path
-
-
 def _sample_shuffle_run_torchrun(
     config_path: str, log_path: str, continue_train: bool = False
 ) -> bool:
@@ -1413,20 +1400,33 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
         if self.success:
             shutil.rmtree(self.test_dir, True)
 
-    def _write_train_data(self) -> tuple[str, int]:
+    def _prepare_config(self) -> tuple[EasyRecConfig, int]:
+        config = config_util.load_pipeline_config(
+            os.path.join(_SAMPLE_SHUFFLE_CONFIG_DIR, "multi_tower_din_mock.config")
+        )
+        config.model_dir = os.path.join(self.test_dir, "model")
+        config.train_config.ClearField("num_epochs")
+        config.train_config.num_steps = _SAMPLE_SHUFFLE_STEPS
+        config.train_config.save_checkpoints_steps = 10
+        config.train_config.log_step_count_steps = 10
+        data_config = config.data_config
+        data_config.batch_size = 128
+        data_config.num_workers = 1
+        data_config.fg_mode = data_pb2.FG_NONE
+        data_config.shuffle = True
+        data_config.shuffle_mode = data_pb2.SAMPLE_ROLLING
+        data_config.shuffle_buffer_size = 4
+        features = _create_features(list(config.feature_configs), data_config)
         nproc = utils._get_nproc_per_node()
         total_rows = nproc * _SAMPLE_SHUFFLE_ROWS_PER_RANK
-        ids = np.arange(total_rows)
-        t = pa.table({"id": ids.astype(str), "label": ids % 2})
-        data_dir = os.path.join(self.test_dir, "train_data")
-        ds.write_dataset(
-            t,
-            data_dir,
-            format="parquet",
-            max_rows_per_file=total_rows // nproc,
-            max_rows_per_group=total_rows // nproc,
+        config.train_input_path, _ = utils.create_mock_data(
+            os.path.join(self.test_dir, "train_data"),
+            utils.build_mock_input_fg_encoded(features),
+            list(data_config.label_fields),
+            num_rows=total_rows,
+            num_parts=nproc,
         )
-        return os.path.join(data_dir, "*.parquet"), total_rows
+        return config, total_rows
 
     def _assert_resumed_positions(
         self, before: dict, after: dict, prefix: str, total_rows: int
@@ -1445,13 +1445,13 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
             )
 
     def test_train_save_resume(self):
-        train_input_path, total_rows = self._write_train_data()
+        config, total_rows = self._prepare_config()
+        train_input_path = config.train_input_path
         log_path = os.path.join(self.test_dir, "log_train_eval.txt")
 
-        config = _sample_shuffle_build_config(
-            self.test_dir, _SAMPLE_SHUFFLE_STEPS, train_input_path
-        )
-        ok = _sample_shuffle_run_torchrun(config, log_path)
+        config_path = os.path.join(self.test_dir, "pipeline.config")
+        config_util.save_message(config, config_path)
+        ok = _sample_shuffle_run_torchrun(config_path, log_path)
         self.assertTrue(ok, "initial training run failed; see log_train_eval.txt")
         ckpt = f"{self.test_dir}/model/model.ckpt-{_SAMPLE_SHUFFLE_STEPS - 1}"
         self.assertTrue(os.path.exists(os.path.join(ckpt, "_SUCCESS")))
@@ -1462,10 +1462,9 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
 
         resume_steps = _SAMPLE_SHUFFLE_STEPS + _SAMPLE_SHUFFLE_RESUME_STEPS
         final_step = resume_steps - 1
-        config = _sample_shuffle_build_config(
-            self.test_dir, resume_steps, train_input_path
-        )
-        ok = _sample_shuffle_run_torchrun(config, log_path, continue_train=True)
+        config.train_config.num_steps = resume_steps
+        config_util.save_message(config, config_path)
+        ok = _sample_shuffle_run_torchrun(config_path, log_path, continue_train=True)
         self.assertTrue(ok, "resume training run failed; see log_train_eval.txt")
         ckpt = f"{self.test_dir}/model/model.ckpt-{final_step}"
         self.assertTrue(os.path.exists(os.path.join(ckpt, "_SUCCESS")))

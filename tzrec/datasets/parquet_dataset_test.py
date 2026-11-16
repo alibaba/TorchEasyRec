@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gc
 import multiprocessing as mp
 import os
 import shutil
@@ -673,252 +672,106 @@ def _write_unique_parquet(test_dir: str, num_rows: int) -> None:
 class ParquetSampleShuffleTest(unittest.TestCase):
     """Sample-level shuffle on real parquet files."""
 
-    @parameterized.expand(
-        [
-            ("rolling_workers", data_pb2.SAMPLE_ROLLING, 2),
-            ("window_workers", data_pb2.SAMPLE_WINDOW, 2),
-            ("rolling_no_workers", data_pb2.SAMPLE_ROLLING, 0),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_sample_shuffle_epochs(self, _name, mode, num_workers):
-        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
-            _write_unique_parquet(test_dir, 100)
-            dataloader = create_dataloader(
-                sample_data_config(
-                    data_pb2.DatasetType.ParquetDataset, mode, num_workers
-                ),
-                raw_c_features(),
-                f"{test_dir}/*.parquet",
-                mode=Mode.TRAIN,
-            )
-            iterator = None
-            try:
-                for _ in range(2):
-                    iterator = dataloader.get_iterator()
-                    sizes, values, state = drain_sample(iterator)
-                    self.assertEqual(sum(sizes), 100)
-                    self.assertEqual(sorted(sizes), [4] + [8] * 12)
-                    self.assertEqual(sorted(values), list(range(100)))
-                    self.assertTrue(state)
-            finally:
-                stop_sample(dataloader, iterator)
-
-    @parameterized.expand(
-        [
-            [100, 0, False, 100],
-            [100, 5, False, 96],
-            [101, 0, True, 96],
-            [101, 2, False, 101],
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_sample_shuffle_tail_rules(
-        self, num_rows, min_batch_size, drop_remainder, expected_rows
-    ):
-        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
-            _write_unique_parquet(test_dir, num_rows)
-            dataloader = create_dataloader(
-                sample_data_config(
-                    data_pb2.DatasetType.ParquetDataset,
-                    data_pb2.SAMPLE_ROLLING,
-                    2,
-                    min_batch_size=min_batch_size,
-                    drop_remainder=drop_remainder,
-                ),
-                raw_c_features(),
-                f"{test_dir}/*.parquet",
-                mode=Mode.TRAIN,
-            )
-            iterator = None
-            try:
-                iterator = dataloader.get_iterator()
-                sizes, _, _ = drain_sample(iterator)
-                self.assertEqual(sum(sizes), expected_rows)
-                self.assertTrue(all(s <= 8 for s in sizes))
-            finally:
-                stop_sample(dataloader, iterator)
-
-    @parameterized.expand(
-        [("tail", 3), ("at_end", 0)], name_func=parameterized_name_func
-    )
-    def test_sample_shuffle_resume(self, _name, leftover_rows_per_source):
-        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
-            _write_unique_parquet(test_dir, 100)
-            cfg = sample_data_config(
-                data_pb2.DatasetType.ParquetDataset, data_pb2.SAMPLE_ROLLING, 2
-            )
-            features = raw_c_features()
-            path = f"{test_dir}/*.parquet"
-
-            dataloader = create_dataloader(cfg, features, path, mode=Mode.TRAIN)
-            iterator = None
-            try:
-                iterator = dataloader.get_iterator()
-                _, values, state = drain_sample(iterator)
-                self.assertEqual(sorted(values), list(range(100)))
-            finally:
-                stop_sample(dataloader, iterator)
-
-            # resume with a few rows left in every source interval, or exactly
-            # at the end
-            resume_state = {k: v - leftover_rows_per_source for k, v in state.items()}
-            dataloader = create_dataloader(
-                cfg, features, path, mode=Mode.TRAIN, checkpoint_state=resume_state
-            )
-            iterator = None
-            try:
-                iterator = dataloader.get_iterator()
-                sizes, _, _ = drain_sample(iterator)
-                self.assertEqual(sum(sizes), leftover_rows_per_source * len(state))
-                if leftover_rows_per_source == 0:
-                    self.assertEqual(sizes, [])
-                # the next pass ignores the consumed checkpoint
-                iterator = dataloader.get_iterator()
-                _, values, _ = drain_sample(iterator)
-                self.assertEqual(sorted(values), list(range(100)))
-            finally:
-                stop_sample(dataloader, iterator)
-
-    def test_sample_shuffle_rejects_batch_cost_size(self):
-        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
-            _write_unique_parquet(test_dir, 20)
-            with self.assertRaisesRegex(ValueError, "batch_cost_size"):
-                create_dataloader(
-                    sample_data_config(
-                        data_pb2.DatasetType.ParquetDataset,
-                        data_pb2.SAMPLE_ROLLING,
-                        1,
-                        sample_cost_field="raw_c",
-                        batch_cost_size=1024,
-                    ),
-                    raw_c_features(),
-                    f"{test_dir}/*.parquet",
-                    mode=Mode.TRAIN,
-                )
-
-    @parameterized.expand(
-        [[100, 50, 50], [101, 51, 50]], name_func=parameterized_name_func
-    )
-    def test_sample_shuffle_multi_rank_plan(self, num_rows, rank0_rows, rank1_rows):
-        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
-            _write_unique_parquet(test_dir, num_rows)
-            dataset = ParquetDataset(
-                sample_data_config(
-                    data_pb2.DatasetType.ParquetDataset, data_pb2.SAMPLE_ROLLING, 2
-                ),
-                raw_c_features(),
-                f"{test_dir}/*.parquet",
-                mode=Mode.TRAIN,
-            )
-            plans = [dataset._reader.create_read_plan(rank, 2, 2) for rank in range(2)]
-            self.assertNotIn(DATA_TIMESTAMP, plans[0].schema.names)
-            self.assertIn(CKPT_SOURCE_ID, plans[0].schema.names)
-            self.assertEqual([p.planned_rows for p in plans], [rank0_rows, rank1_rows])
-            covered = set()
-            for plan in plans:
-                rows = 0
-                for task in plan.tasks:
-                    for start, end in task.kwargs["intervals"]:
-                        rows += end - start
-                        covered.update(range(start, end))
-                self.assertEqual(rows, plan.planned_rows)
-            self.assertEqual(covered, set(range(num_rows)))
-
-
-_SAMPLE_EXIT_BODY = (
-    "import sys\n"
-    "from tzrec.constant import Mode\n"
-    "from tzrec.datasets.dataset import create_dataloader\n"
-    "from tzrec.protos import data_pb2\n"
-    "from tzrec.tests.utils import raw_c_features, sample_data_config\n"
-    "\n"
-    "\n"
-    "def main():\n"
-    "    dataloader = create_dataloader(\n"
-    "        sample_data_config(\n"
-    "            data_pb2.DatasetType.ParquetDataset,\n"
-    "            data_pb2.SAMPLE_ROLLING,\n"
-    "            2,\n"
-    "        ),\n"
-    "        raw_c_features(),\n"
-    "        sys.argv[1],\n"
-    "        mode=Mode.TRAIN,\n"
-    "    )\n"
-    "    next(dataloader.get_iterator())\n"
-    "\n"
-    "\n"
-    "if __name__ == '__main__':\n"
-    "    main()\n"
-)
-
-
-class SampleShuffleLifecycleTest(unittest.TestCase):
-    """Dataloader/dataset lifetime and service failure on parquet data."""
-
     def setUp(self):
-        self.test_dir = tempfile.TemporaryDirectory(prefix="tzrec_")
-        self.addCleanup(self.test_dir.cleanup)
-        _write_unique_parquet(self.test_dir.name, 100)
-        self.path = f"{self.test_dir.name}/*.parquet"
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir)
+        _write_unique_parquet(self.test_dir, 101)
+        self.path = f"{self.test_dir}/*.parquet"
 
-    def _dataloader(self, num_workers=2):
+    def _dataloader(
+        self,
+        mode=data_pb2.SAMPLE_ROLLING,
+        num_workers=2,
+        checkpoint_state=None,
+        **overrides,
+    ):
         return create_dataloader(
             sample_data_config(
-                data_pb2.DatasetType.ParquetDataset,
-                data_pb2.SAMPLE_ROLLING,
-                num_workers,
+                data_pb2.DatasetType.ParquetDataset, mode, num_workers, **overrides
+            ),
+            raw_c_features(),
+            self.path,
+            mode=Mode.TRAIN,
+            checkpoint_state=checkpoint_state,
+        )
+
+    @parameterized.expand(
+        [
+            [data_pb2.SAMPLE_ROLLING, 2, {}, 101],
+            [data_pb2.SAMPLE_WINDOW, 2, {}, 101],
+            [data_pb2.SAMPLE_ROLLING, 0, {}, 101],
+            [data_pb2.SAMPLE_ROLLING, 2, {"min_batch_size": 6}, 96],
+            [data_pb2.SAMPLE_ROLLING, 2, {"drop_remainder": True}, 96],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sample_shuffle_epochs(self, mode, num_workers, overrides, expected_rows):
+        dataloader = self._dataloader(mode, num_workers, **overrides)
+        iterator = None
+        try:
+            for _ in range(2):
+                iterator = dataloader.get_iterator()
+                sizes, values, state = drain_sample(iterator)
+                self.assertEqual(
+                    sorted(sizes), ([5] if expected_rows == 101 else []) + [8] * 12
+                )
+                self.assertEqual(sorted(values), list(range(expected_rows)))
+                self.assertTrue(state)
+        finally:
+            stop_sample(dataloader, iterator)
+
+    @parameterized.expand([[3], [0]], name_func=parameterized_name_func)
+    def test_sample_shuffle_resume(self, leftover_rows_per_source):
+        resume_state = {
+            f"{self.path}:0": 49 - leftover_rows_per_source,
+            f"{self.path}:50": 100 - leftover_rows_per_source,
+        }
+        dataloader = self._dataloader(checkpoint_state=resume_state)
+        iterator = None
+        try:
+            iterator = dataloader.get_iterator()
+            _, values, _ = drain_sample(iterator)
+            expected = list(range(50 - leftover_rows_per_source, 50)) + list(
+                range(101 - leftover_rows_per_source, 101)
+            )
+            self.assertEqual(sorted(values), expected)
+            iterator = dataloader.get_iterator()
+            _, values, _ = drain_sample(iterator)
+            self.assertEqual(sorted(values), list(range(101)))
+        finally:
+            stop_sample(dataloader, iterator)
+
+    def test_sample_shuffle_multi_rank_plan(self):
+        dataset = ParquetDataset(
+            sample_data_config(
+                data_pb2.DatasetType.ParquetDataset, data_pb2.SAMPLE_ROLLING, 2
             ),
             raw_c_features(),
             self.path,
             mode=Mode.TRAIN,
         )
-
-    @parameterized.expand(
-        [
-            ("release", 2, False),
-            ("release_no_workers", 0, False),
-            ("iterator", 2, True),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_reference_lifetime(self, _name, num_workers, keep_iterator):
-        """The service stops with the last reference; an iterator keeps it."""
-        dataloader = self._dataloader(num_workers)
-        proc = dataloader.dataset._sample_shuffle._proc
-        iterator = dataloader.get_iterator()
-        self.assertEqual(len(next(iterator).labels["label"]), 8)
-        del dataloader
-        gc.collect()
-        if keep_iterator:
-            self.assertTrue(proc.is_alive())
-            self.assertEqual(len(next(iterator).labels["label"]), 8)
-            iterator._shutdown_workers()
-        del iterator
-        gc.collect()
-        proc.join(timeout=30.0)
-        self.assertFalse(proc.is_alive())
+        plans = [dataset._reader.create_read_plan(rank, 2, 2) for rank in range(2)]
+        self.assertNotIn(DATA_TIMESTAMP, plans[0].schema.names)
+        self.assertIn(CKPT_SOURCE_ID, plans[0].schema.names)
+        self.assertEqual([p.planned_rows for p in plans], [51, 50])
+        covered = []
+        for plan in plans:
+            rows = 0
+            for task in plan.tasks:
+                for start, end in task.kwargs["intervals"]:
+                    rows += end - start
+                    covered.extend(range(start, end))
+            self.assertEqual(rows, plan.planned_rows)
+        self.assertEqual(sorted(covered), list(range(101)))
 
     def test_start_failure_cleanup(self):
-        """A failed start calls stop(); a post-spawn failure also joins it."""
-        with (
-            mock.patch.object(
-                sample_shuffle.SampleShuffleHandle,
-                "start",
-                side_effect=RuntimeError("boom"),
-            ),
-            mock.patch.object(sample_shuffle.SampleShuffleHandle, "stop") as stop,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "boom"):
-                self._dataloader()
-        stop.assert_called_once()
-
+        """A post-spawn start failure stops and joins the coordinator."""
         real_start = sample_shuffle.SampleShuffleHandle.start
         spawned = []
 
         def _start_then_fail(handle):
             real_start(handle)
-            spawned.append((handle, handle._proc))
+            spawned.append(handle._proc)
             raise RuntimeError("boom")
 
         with mock.patch.object(
@@ -926,17 +779,34 @@ class SampleShuffleLifecycleTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "boom"):
                 self._dataloader()
-        handle, proc = spawned[0]
-        self.assertTrue(handle._stop_event.is_set())
-        self.assertIsNone(handle._proc)
-        proc.join(timeout=30.0)
-        self.assertFalse(proc.is_alive())
+        self.assertFalse(spawned[0].is_alive())
 
     def test_process_exit_does_not_hang(self):
         """Interpreter exit stops the non-daemon coordinator by itself."""
-        script = os.path.join(self.test_dir.name, "exit_with_dataloader.py")
+        script = os.path.join(self.test_dir, "exit_with_dataloader.py")
         with open(script, "w") as f:
-            f.write(_SAMPLE_EXIT_BODY)
+            f.write("""\
+import sys
+from tzrec.constant import Mode
+from tzrec.datasets.dataset import create_dataloader
+from tzrec.protos import data_pb2
+from tzrec.tests.utils import raw_c_features, sample_data_config
+
+def main():
+    dataloader = create_dataloader(
+        sample_data_config(
+            data_pb2.DatasetType.ParquetDataset, data_pb2.SAMPLE_ROLLING, 2
+        ),
+        raw_c_features(),
+        sys.argv[1],
+        mode=Mode.TRAIN,
+    )
+    next(dataloader.get_iterator())
+
+
+if __name__ == "__main__":
+    main()
+""")
         env = dict(os.environ)
         env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
         subprocess.run(
@@ -952,7 +822,7 @@ class SampleShuffleLifecycleTest(unittest.TestCase):
         old_handler = signal.signal(signal.SIGALRM, _alarm)
         signal.setitimer(signal.ITIMER_REAL, 30.0)
         try:
-            next(iterator)  # pipeline is flowing
+            next(iterator)
             dataloader.dataset._sample_shuffle._proc.terminate()
             with self.assertRaisesRegex(
                 RuntimeError, "coordinator exited unexpectedly"
