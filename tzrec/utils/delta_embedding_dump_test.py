@@ -244,7 +244,8 @@ def _fake_publish_lookup(module, keys, table_id):
     result = module.tables.find(keys, torch.full_like(keys, table_id), "EMBEDDING")
     found = result[5]
     dim = module._dynamicemb_options[table_id].dim
-    return keys[found].cpu(), result[7][found, :dim].cpu(), keys[~found].cpu()
+    chunks = [(keys[found].cpu(), result[7][found, :dim].cpu())] if found.any() else []
+    return chunks, keys[~found].cpu()
 
 
 def _build_sharded_delta_dump_model(rank: int, world_size: int, ctx):
@@ -3012,12 +3013,23 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 },
             )
 
-    @parameterized.expand([("forward", False), ("tier_order", True)])
+    @parameterized.expand(
+        [
+            ("single_chunk", False, False),
+            ("tier_chunks", True, False),
+            ("quantized_tier_chunks", True, True),
+        ],
+        name_func=parameterized_name_func,
+    )
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for dynamicemb.")
     @mark_ci_scope("gpu")
-    def test_append_dynamic_rows_publishes_found_rows_only(self, name, reverse):
+    def test_append_dynamic_rows_publishes_found_rows_only(
+        self, name, split, quantized
+    ):
         torch.cuda.set_device(0)
-        dumper = self._eviction_dumper()
+        dumper = self._eviction_dumper(
+            DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_INT8 if quantized else None
+        )
         fake_tables = _FakeDynamicTables()
         dynamic_module = SimpleNamespace(
             table_names=["dyn_table"],
@@ -3028,12 +3040,11 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         table_chunks = []
 
         def lookup(module, keys, table_id):
-            hit_ids, values, missing = _fake_publish_lookup(module, keys, table_id)
-            return (
-                (hit_ids.flip(0), values.flip(0), missing)
-                if reverse
-                else (hit_ids, values, missing)
-            )
+            chunks, missing = _fake_publish_lookup(module, keys, table_id)
+            if split:
+                hit_ids, values = chunks[0]
+                chunks = [(hit_ids[1:], values[1:]), (hit_ids[:1], values[:1])]
+            return chunks, missing
 
         with mock.patch(
             "tzrec.utils.delta_embedding_dump.lookup_publish_embeddings",
@@ -3055,10 +3066,15 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         torch.testing.assert_close(fake_tables.ids.cpu(), torch.tensor([101, 102, 103]))
         torch.testing.assert_close(fake_tables.table_ids.cpu(), torch.tensor([0, 0, 0]))
         table = pa.concat_tables(table_chunks)
-        self.assertEqual(
-            dict(zip(table["key_id"].to_pylist(), table["embedding"].to_pylist())),
-            {101: [1.0, 2.0], 103: [5.0, 6.0]},
-        )
+        embeddings = table["embedding"].to_pylist()
+        if quantized:
+            embeddings = dequantize_quint8_rowwise_f16(
+                np.asarray(embeddings, dtype=np.uint8), emb_dim=2
+            ).tolist()
+        rows = dict(zip(table["key_id"].to_pylist(), embeddings))
+        self.assertEqual(set(rows), {101, 103})
+        np.testing.assert_allclose(rows[101], [1.0, 2.0], atol=1e-3)
+        np.testing.assert_allclose(rows[103], [5.0, 6.0], atol=1e-3)
         self.assertEqual(
             table["source"].to_pylist(),
             ["model_delta_tracker", "model_delta_tracker"],
@@ -3107,21 +3123,22 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             values=[[0.0, 0.0], [0.0, 0.0]],
         )
         table_chunks = []
+        dumper._tracker.get_unique = lambda consumer: {}
 
         with mock.patch(
             "tzrec.utils.delta_embedding_dump.lookup_publish_embeddings",
             side_effect=_fake_publish_lookup,
         ):
-            num_rows = dumper._append_dynamic_rows(
+            num_rows = dumper._append_model_delta_rows(
                 table_chunks,
                 global_step=5,
-                fqn=self._DYN_TABLE_FQN,
-                dynamic_module=dynamic_module,
-                tracker_ids=torch.empty(0, dtype=torch.int64),
+                table_weights={},
+                dynamic_modules={self._DYN_TABLE_FQN: dynamic_module},
                 dump_evicted_tombstones=True,
             )
 
         self.assertEqual(num_rows, 2)
+        self.assertEqual(dynamic_module.tables.ids.device.type, "cuda")
         dynamic_module.flush.assert_not_called()
         dynamic_module.pop_evicted_keys.assert_called_once_with(["dyn_table"])
         table = pa.concat_tables(table_chunks)
@@ -3156,7 +3173,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 global_step=5,
                 fqn=self._DYN_TABLE_FQN,
                 dynamic_module=dynamic_module,
-                tracker_ids=torch.tensor([7, 9]),
+                tracker_ids=torch.tensor([7, 9], device="cuda"),
                 dump_evicted_tombstones=True,
             )
 
@@ -3194,7 +3211,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                 global_step=5,
                 fqn=self._DYN_TABLE_FQN,
                 dynamic_module=dynamic_module,
-                tracker_ids=torch.tensor([101, 102, 103]),
+                tracker_ids=torch.tensor([101, 102, 103], device="cuda"),
                 dump_evicted_tombstones=True,
             )
 
@@ -3231,7 +3248,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
                         global_step=5,
                         fqn=self._DYN_TABLE_FQN,
                         dynamic_module=dynamic_module,
-                        tracker_ids=torch.tensor([101, 102, 103]),
+                        tracker_ids=torch.tensor([101, 102, 103], device="cuda"),
                         dump_evicted_tombstones=True,
                     )
 

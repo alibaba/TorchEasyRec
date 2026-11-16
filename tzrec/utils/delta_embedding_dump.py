@@ -1339,7 +1339,7 @@ class DeltaEmbeddingDumper:
                 tracker_ids = (
                     unique_rows.ids
                     if unique_rows is not None
-                    else torch.empty(0, dtype=torch.int64)
+                    else torch.empty(0, dtype=torch.int64, device="cuda")
                 )
                 num_rows += self._append_dynamic_rows(
                     table_chunks,
@@ -1493,7 +1493,7 @@ class DeltaEmbeddingDumper:
         tracker_ids: torch.Tensor,
         dump_evicted_tombstones: bool,
     ) -> int:
-        """Append one merged lookup's real rows and tombstones for a table.
+        """Append each lookup tier's real rows and the table's tombstones.
 
         The tracker ids and this dump's evicted keys are merged and
         deduplicated on the GPU, then resolved by a cache-first lookup batched
@@ -1508,7 +1508,7 @@ class DeltaEmbeddingDumper:
             global_step: Current training step.
             fqn: Dynamic table FQN.
             dynamic_module: Dynamic embedding module hosting the table.
-            tracker_ids: Touched ids recorded by the tracker for this table.
+            tracker_ids: GPU touched ids recorded by the tracker for this table.
             dump_evicted_tombstones: Whether to drain this table's evicted
                 keys and publish tombstones for the missing ones.
 
@@ -1519,14 +1519,13 @@ class DeltaEmbeddingDumper:
         table_id = cast(List[str], dynamic_module.table_names).index(table_name)
         # pyre-ignore [29]
         emb_dim = dynamic_module._dynamicemb_options[table_id].dim
-        device = torch.device("cuda", torch.cuda.current_device())
-        ids = tracker_ids.to(device=device, dtype=torch.int64)
+        ids = tracker_ids.to(dtype=torch.int64)
         evicted_ids: Optional[torch.Tensor] = None
         if dump_evicted_tombstones:
             evicted = self._pop_evicted_key_ids(fqn, dynamic_module, table_name)
             if evicted is not None and evicted.numel() > 0:
-                evicted_ids = evicted.cpu().to(torch.int64)
-                ids = torch.cat([ids, evicted_ids.to(device=device)])
+                evicted_ids = evicted.to(dtype=torch.int64)
+                ids = torch.cat([ids, evicted_ids.to(device=ids.device)])
         ids = ids.unique(sorted=True)
         if ids.numel() == 0:
             return 0
@@ -1534,7 +1533,7 @@ class DeltaEmbeddingDumper:
         num_rows = 0
         num_never_admitted = 0
         for start in range(0, ids.numel(), _FIND_BATCH_ROWS):
-            hit_ids, values_cpu, missing_ids = lookup_publish_embeddings(
+            hit_chunks, missing_ids = lookup_publish_embeddings(
                 dynamic_module, ids[start : start + _FIND_BATCH_ROWS], table_id
             )
             if evicted_ids is not None:
@@ -1544,15 +1543,16 @@ class DeltaEmbeddingDumper:
             else:
                 tombstone_ids = missing_ids.new_empty(0)
                 num_never_admitted += missing_ids.numel()
-            num_rows += self._append_table_chunk(
-                table_chunks,
-                global_step=global_step,
-                feature_name=feature_name,
-                table_fqn=fqn,
-                key_ids=hit_ids,
-                embeddings=values_cpu,
-                source="model_delta_tracker",
-            )
+            for hit_ids, values_cpu in hit_chunks:
+                num_rows += self._append_table_chunk(
+                    table_chunks,
+                    global_step=global_step,
+                    feature_name=feature_name,
+                    table_fqn=fqn,
+                    key_ids=hit_ids,
+                    embeddings=values_cpu,
+                    source="model_delta_tracker",
+                )
             num_rows += self._append_tombstone_chunks(
                 table_chunks,
                 global_step=global_step,

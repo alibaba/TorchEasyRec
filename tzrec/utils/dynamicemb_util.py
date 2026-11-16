@@ -399,7 +399,7 @@ def _log_dynamicemb_table_plan(
 @torch.no_grad()
 def lookup_publish_embeddings(
     module: torch.nn.Module, keys: torch.Tensor, table_id: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[List[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
     """Read rank-local embeddings without changing scores, admitting or writing rows.
 
     Call on the training stream after the step's embedding updates, before
@@ -407,8 +407,8 @@ def lookup_publish_embeddings(
     these operations on the same stream, so no device-wide synchronization is
     needed. Callers using separate mutation streams must establish equivalent
     dependencies. Input keys stay on the GPU for cache and built-in lookups.
-    Returns CPU hit keys, their embeddings and keys missing from every tier.
-    Hit rows are concatenated in tier order, with cache values taking priority.
+    Returns separate CPU (hit keys, embeddings) chunks for each tier and keys
+    missing from every tier. Cache values take priority over backing values.
     RocksDB misses are resolved on the CPU. Keep the pinned DynamicEmb
     state-level APIs here: training lookups can update scores, and eval_lookup
     initializes misses instead of returning a mask.
@@ -436,7 +436,7 @@ def lookup_publish_embeddings(
             raise TypeError(f"No read-only delta lookup for {type(storage).__name__}")
 
     dim = storage.embedding_dim(table_id)
-    hit_keys, hit_values = [], []
+    hit_chunks = []
     for state in states:
         tids = torch.full_like(keys, table_id, dtype=torch.int64)
         nmiss, missing_keys, _, _, _, hits, scores, slots = _find_keys(
@@ -447,8 +447,7 @@ def lookup_publish_embeddings(
             block = load_from_flat(state, rows, tids, CopyMode.EMBEDDING)
             tier_keys = keys[hits] if nmiss else keys
             tier_values = block[hits, :dim] if nmiss else block[:, :dim]
-            hit_keys.append(tier_keys.cpu() if external else tier_keys)
-            hit_values.append(tier_values.cpu() if external else tier_values)
+            hit_chunks.append((tier_keys.cpu(), tier_values.cpu()))
         keys = missing_keys
         if not nmiss:
             break
@@ -462,21 +461,16 @@ def lookup_publish_embeddings(
         if nmiss < missing_cpu.numel():
             if nmiss:
                 hit_rows = torch.nonzero(hits).flatten()
-                hit_keys.append(missing_cpu.index_select(0, hit_rows))
-                hit_values.append(block[:, :dim].index_select(0, hit_rows))
+                hit_chunks.append(
+                    (
+                        missing_cpu.index_select(0, hit_rows),
+                        block[:, :dim].index_select(0, hit_rows),
+                    )
+                )
             else:
-                hit_keys.append(missing_cpu)
-                hit_values.append(block[:, :dim])
+                hit_chunks.append((missing_cpu, block[:, :dim]))
         missing_cpu = missing_cpu[~hits]
-    if not hit_keys:
-        return (
-            missing_cpu.new_empty(0),
-            torch.empty((0, dim), dtype=storage.embedding_dtype(), device="cpu"),
-            missing_cpu,
-        )
-    if len(hit_keys) == 1:
-        return hit_keys[0].cpu(), hit_values[0].cpu(), missing_cpu
-    return torch.cat(hit_keys).cpu(), torch.cat(hit_values).cpu(), missing_cpu
+    return hit_chunks, missing_cpu
 
 
 def _get_optimizer_multipler(

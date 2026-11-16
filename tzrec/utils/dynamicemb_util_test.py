@@ -568,13 +568,13 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
         before = [scores(state) for state in states]
         # Query order differs from tier order; keys must stay paired with values.
         query = keys[torch.tensor([1, 0, 2], device=keys.device)]
-        hit_keys, values, missing = dynamicemb_util.lookup_publish_embeddings(
-            module, query, 0
-        )
-        self.assertEqual(
-            (hit_keys.device.type, values.device.type, missing.device.type),
-            ("cpu", "cpu", "cpu"),
-        )
+        chunks, missing = dynamicemb_util.lookup_publish_embeddings(module, query, 0)
+        self.assertEqual(missing.device.type, "cpu")
+        for chunk_keys, chunk_values in chunks:
+            self.assertEqual(chunk_keys.device.type, "cpu")
+            self.assertEqual(chunk_values.device.type, "cpu")
+        hit_keys = torch.cat([chunk_keys for chunk_keys, _ in chunks])
+        values = torch.cat([chunk_values for _, chunk_values in chunks])
         expected = {keys[0].item(): a.cpu()[0], keys[1].item(): b.cpu()[0]}
         self.assertEqual(hit_keys.numel(), len(expected))
         self.assertEqual(set(hit_keys.tolist()), set(expected))
@@ -590,36 +590,37 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
                 return original_find(query_keys, table_ids, mode)
 
             with mock.patch.object(module.tables, "find", side_effect=cpu_find):
-                db_keys, backing, misses = dynamicemb_util.lookup_publish_embeddings(
+                chunks, misses = dynamicemb_util.lookup_publish_embeddings(
                     module, keys[1:], 0
                 )
+                db_keys, backing = chunks[0]
                 self.assertEqual(db_keys.tolist(), [keys[1].item()])
                 self.assertEqual(misses.tolist(), [keys[2].item()])
                 torch.testing.assert_close(backing, b.cpu())
             with mock.patch.object(module.tables, "find", side_effect=AssertionError):
-                cpu_keys, cached, misses = dynamicemb_util.lookup_publish_embeddings(
+                chunks, misses = dynamicemb_util.lookup_publish_embeddings(
                     module, keys[:1], 0
                 )
+                cpu_keys, cached = chunks[0]
                 torch.testing.assert_close(cpu_keys, keys[:1].cpu())
                 self.assertFalse(misses.numel())
                 torch.testing.assert_close(cached, a.cpu())
             for empty_query in (keys[2:], keys[:0]):
-                cpu_keys, empty, misses = dynamicemb_util.lookup_publish_embeddings(
+                chunks, misses = dynamicemb_util.lookup_publish_embeddings(
                     module, empty_query, 0
                 )
-                self.assertFalse(cpu_keys.numel())
-                self.assertEqual(empty.shape, (0, 8))
+                self.assertEqual(chunks, [])
                 torch.testing.assert_close(misses, empty_query.cpu())
         for state, previous in zip(states, before):
             torch.testing.assert_close(scores(state), previous)
         if layout == "CACHING":
             # Reading the newer cache row did not overwrite the backing copy.
-            _, stored, _ = dynamicemb_util.lookup_publish_embeddings(
+            chunks, _ = dynamicemb_util.lookup_publish_embeddings(
                 SimpleNamespace(cache=None, tables=module.tables),
                 keys[:1],
                 0,
             )
-            torch.testing.assert_close(stored, b.cpu())
+            torch.testing.assert_close(chunks[0][1], b.cpu())
 
     def _shard_storages(self, dynamicemb_options):
         rows = dynamicemb_options.max_capacity
