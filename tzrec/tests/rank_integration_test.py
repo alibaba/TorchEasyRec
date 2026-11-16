@@ -1519,18 +1519,11 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
     def _prepare_config(self, source: str) -> tuple[EasyRecConfig, int | None]:
         nproc = utils._get_nproc_per_node()
         total_rows = nproc * _SAMPLE_SHUFFLE_ROWS_PER_RANK
+        config = config_util.load_pipeline_config(
+            os.path.join(_SAMPLE_SHUFFLE_CONFIG_DIR, "sample_shuffle_mock.config")
+        )
+        data_config = config.data_config
         if source == "parquet":
-            config = config_util.load_pipeline_config(
-                os.path.join(_SAMPLE_SHUFFLE_CONFIG_DIR, "multi_tower_din_mock.config")
-            )
-            config.train_config.ClearField("num_epochs")
-            data_config = config.data_config
-            data_config.batch_size = 128
-            data_config.num_workers = 1
-            data_config.fg_mode = data_pb2.FG_NONE
-            data_config.shuffle = True
-            data_config.shuffle_mode = "SAMPLE_ROLLING"
-            data_config.shuffle_buffer_size = 4
             features = _create_features(list(config.feature_configs), data_config)
             config.train_input_path, _ = utils.create_mock_data(
                 os.path.join(self.test_dir, "train_data"),
@@ -1539,31 +1532,26 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
                 num_rows=total_rows,
                 num_parts=nproc,
             )
+        elif source == "odps":
+            data_config.dataset_type = data_pb2.DatasetType.OdpsDataset
+            config.train_input_path = "odps://fake/tables/train"
         else:
-            config = config_util.load_pipeline_config(
-                os.path.join(_SAMPLE_SHUFFLE_CONFIG_DIR, "sample_shuffle_mock.config")
+            total_rows = None
+            data_config.dataset_type = data_pb2.DatasetType.KafkaDataset
+            data_config.input_fields.extend(
+                [
+                    data_pb2.Field(input_name="id", input_type=data_pb2.INT64),
+                    data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
+                ]
             )
-            if source == "odps":
-                config.data_config.dataset_type = data_pb2.DatasetType.OdpsDataset
-                config.data_config.ClearField("input_fields")
-                config.train_input_path = "odps://fake/tables/train"
-            else:
-                total_rows = None
-                config.data_config.dataset_type = data_pb2.DatasetType.KafkaDataset
-                config.data_config.input_fields.extend(
-                    [
-                        data_pb2.Field(input_name="id", input_type=data_pb2.INT64),
-                        data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
-                    ]
-                )
-                config.train_input_path = (
-                    "kafka://fake:9092/topic?group.id=tzrec_sample_it"
-                    "&auto.offset.reset=earliest"
-                    "&fake.num_partitions=4&fake.rows_per_msg=3"
-                    # keep ids legal for the embedding table; checkpoint metadata
-                    # still uses the message partition/offset
-                    "&fake.id_mod=100003"
-                )
+            config.train_input_path = (
+                "kafka://fake:9092/topic?group.id=tzrec_sample_it"
+                "&auto.offset.reset=earliest"
+                "&fake.num_partitions=4&fake.rows_per_msg=3"
+                # keep ids legal for the embedding table; checkpoint metadata
+                # still uses the message partition/offset
+                "&fake.id_mod=100003"
+            )
         config.model_dir = os.path.join(self.test_dir, "model")
         config.train_config.num_steps = _SAMPLE_SHUFFLE_STEPS
         config.train_config.save_checkpoints_steps = 10

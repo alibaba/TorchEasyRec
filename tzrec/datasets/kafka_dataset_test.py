@@ -1409,11 +1409,6 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
-        self._client = None
-
-    def tearDown(self):
-        if self._client is not None:
-            self._client.stop()
 
     def _dataloader(self, cfg_kwargs=None, uri_kwargs=None, checkpoint_state=None):
         from tzrec.datasets.dataset import create_dataloader
@@ -1441,16 +1436,16 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
 
         dataloader = self._dataloader(cfg_kwargs, uri_kwargs, checkpoint_state)
         self._client = dataloader.dataset._sample_shuffle
-        it = dataloader.get_iterator()
+        it = None
         old_handler = signal.signal(signal.SIGALRM, _alarm)
         signal.setitimer(signal.ITIMER_REAL, timeout)
         try:
+            it = dataloader.get_iterator()
             yield it
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             try:
                 utils.stop_sample(dataloader, it)
-                dataloader.close()
             finally:
                 signal.signal(signal.SIGALRM, old_handler)
 
@@ -1521,3 +1516,7 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
         # the context manager's explicit close is idempotent and stops it
         self.assertIsNone(self._client._proc)
         self.assertTrue(self._client._stop_event.is_set())
+
+
+if __name__ == "__main__":
+    unittest.main()

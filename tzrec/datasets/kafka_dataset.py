@@ -113,7 +113,7 @@ def _decode_kafka_messages(
     projections: Dict[pa.Schema, Optional[List[int]]],
     topic: str,
     on_decoded: Optional[Callable[[str], None]] = None,
-) -> Tuple[Optional[pa.Table], int, int]:
+) -> Tuple[Optional[pa.Table], int]:
     """Decode kafka messages into one table with checkpoint metadata columns.
 
     Args:
@@ -130,7 +130,6 @@ def _decode_kafka_messages(
             CKPT_ROW_IDX and DATA_TIMESTAMP columns; None when no message
             was decoded, including when every message was an error event.
         num_msgs: successfully decoded messages, for consume sizing.
-        num_rows: total rows decoded.
     """
     record_batchs = []
     # Track checkpoint metadata for each message
@@ -139,7 +138,6 @@ def _decode_kafka_messages(
     # Track event-time (Unix-epoch seconds) for each message
     timestamps = []
     num_msgs = 0
-    num_rows = 0
     for msg in messages:
         msg_error = msg.error()
         if msg_error:
@@ -185,7 +183,6 @@ def _decode_kafka_messages(
         batch_len = len(record_batch)
         record_batchs.append(record_batch)
         num_msgs += 1
-        num_rows += batch_len
 
         # Generate checkpoint metadata for each row in this message
         source_id = f"{topic}:{msg.partition()}"
@@ -203,7 +200,7 @@ def _decode_kafka_messages(
             on_decoded(source_id)
 
     if not record_batchs:
-        return None, num_msgs, num_rows
+        return None, num_msgs
 
     # combine into one record batch
     t = pa.Table.from_batches(record_batchs).combine_chunks()
@@ -213,14 +210,13 @@ def _decode_kafka_messages(
     t = t.append_column(CKPT_ROW_IDX, pa.array(row_indices, type=pa.int64()))
     # transient event-time column (seconds), read in _build_batch
     t = t.append_column(DATA_TIMESTAMP, pa.array(timestamps, type=pa.float64()))
-    return t, num_msgs, num_rows
+    return t, num_msgs
 
 
 def _consume_decoded_tables(
     consumer: Consumer,
     topic: str,
     on_assign: Callable[[Consumer, List[TopicPartition]], None],
-    stop_event: threading.Event,
     max_poll_interval_ms: int,
     batch_size: int,
     has_embedded_schema: bool,
@@ -249,7 +245,6 @@ def _consume_decoded_tables(
         topic: topic to subscribe to.
         on_assign: offset-resolution callback, invoked with the assigned
             partitions on every (re)assignment.
-        stop_event: set to end the loop.
         max_poll_interval_ms: consumer's max.poll.interval.ms setting.
         batch_size: target rows per consume round (EMA-estimated).
         has_embedded_schema: whether messages embed an IPC stream schema.
@@ -263,9 +258,6 @@ def _consume_decoded_tables(
     Yields:
         pa.Table: one decoded and projected table per consume round.
     """
-    # the heartbeat gets its own stop signal: the shared stop_event is only
-    # read here; setting it on exit would falsely signal a clean stop to
-    # workers after an abnormal reader death
     hb_stop = threading.Event()
     consumer_lock = threading.RLock()
     is_paused = [False]
@@ -320,7 +312,7 @@ def _consume_decoded_tables(
     heartbeat_thread.start()
     try:
         consumer.subscribe([topic], on_assign=_on_assign)
-        while not stop_event.is_set():
+        while True:
             if orphan_pid is not None and os.getppid() != orphan_pid:
                 logger.error(f"{log_prefix}: owner process gone, exiting")
                 return
@@ -346,7 +338,7 @@ def _consume_decoded_tables(
                 messages = pending
                 messages.extend(consumer.consume(num_messages, timeout=1.0))
 
-            t, num_msgs, num_rows = _decode_kafka_messages(
+            t, num_msgs = _decode_kafka_messages(
                 messages,
                 has_embedded_schema,
                 full_schema,
@@ -359,12 +351,11 @@ def _consume_decoded_tables(
                 continue
 
             # estimate batch_size per message
+            rows_per_msg = t.num_rows / num_msgs
             if batch_size_per_msg is None:
-                batch_size_per_msg = num_rows / num_msgs
+                batch_size_per_msg = rows_per_msg
             else:
-                batch_size_per_msg = (
-                    0.9 * batch_size_per_msg + 0.1 * num_rows / num_msgs
-                )
+                batch_size_per_msg = 0.9 * batch_size_per_msg + 0.1 * rows_per_msg
 
             yield t
     except Exception as e:
@@ -393,7 +384,6 @@ def _consume_round_robin_tables(
     worker_id: int,
     num_workers: int,
     on_assign: Callable[[Consumer, List[TopicPartition]], None],
-    stop_event: Any,
     has_embedded_schema: bool,
     full_schema: pa.Schema,
     reader_schema: pa.Schema,
@@ -418,7 +408,6 @@ def _consume_round_robin_tables(
         num_workers: total number of global readers.
         on_assign: callback that applies checkpoint/timestamp/reset offsets
             to all owned partitions before the first consumer is assigned.
-        stop_event: set to end the loop.
         has_embedded_schema: whether messages embed an IPC stream schema.
         full_schema: full schema for schema-less messages.
         reader_schema: schema to project and cast to.
@@ -457,14 +446,14 @@ def _consume_round_robin_tables(
 
         projections: Dict[pa.Schema, Optional[List[int]]] = {}
         idx = 0
-        while not stop_event.is_set():
+        while True:
             if orphan_pid is not None and os.getppid() != orphan_pid:
                 logger.error(f"{log_prefix}: owner process gone, exiting")
                 return
             messages = consumers[idx].consume(1, timeout=1.0)
             if not messages:
                 continue
-            table, _, _ = _decode_kafka_messages(
+            table, _ = _decode_kafka_messages(
                 messages,
                 has_embedded_schema,
                 full_schema,
@@ -629,7 +618,6 @@ def _consume_kafka(
     full_schema: pa.Schema,
     has_embedded_schema: bool,
     checkpoint_state: Optional[Dict[str, Any]] = None,
-    stop_event: Optional[Any] = None,
     orphan_pid: Optional[int] = None,
     round_robin_partition_order: Optional[List[int]] = None,
     kafka_log_every_n_messages: int = 0,
@@ -650,7 +638,6 @@ def _consume_kafka(
         full_schema: full schema for schema-less messages.
         has_embedded_schema: whether messages embed an IPC stream schema.
         checkpoint_state: BATCH resume state {topic:partition: offset}.
-        stop_event: consume loop stop signal; a private event by default.
         orphan_pid: when set, the loop exits once its parent pid changes.
         round_robin_partition_order: leader-ordered partition ids, or None
             for ordinary consumer-group subscription.
@@ -661,7 +648,6 @@ def _consume_kafka(
     """
     topic, config, start_timestamp_ms = _parse_kafka_uri(input_path)
     factory = consumer_factory or _default_consumer_factory
-    stop_event = stop_event if stop_event is not None else threading.Event()
     log_prefix = f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{reader_id}]"
     on_decoded = None
     if kafka_log_every_n_messages > 0:
@@ -723,7 +709,6 @@ def _consume_kafka(
             reader_id,
             num_readers,
             on_assign,
-            stop_event,
             has_embedded_schema,
             full_schema,
             reader_schema,
@@ -738,7 +723,6 @@ def _consume_kafka(
             consumer,
             topic,
             on_assign,
-            stop_event,
             max_poll_interval_ms,
             batch_size,
             has_embedded_schema,

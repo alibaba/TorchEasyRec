@@ -31,13 +31,10 @@ from tzrec.constant import Mode
 from tzrec.datasets import odps_dataset, sample_shuffle_readers
 from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.odps_dataset import OdpsDataset, OdpsWriter, _create_odps_account
-from tzrec.datasets.utils import (
-    CKPT_ROW_IDX,
-    CKPT_SOURCE_ID,
-    calc_remaining_intervals,
-)
+from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2, sampler_pb2
+from tzrec.tests import utils
 from tzrec.utils import test_util
 from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.misc_util import get_free_port, random_name
@@ -252,21 +249,14 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertEqual(sorted(sizes), [3616] + [4096] * 4)
             self.assertTrue(state)
         finally:
-            dataloader.close()
-            if iterator is not None:
-                iterator._shutdown_workers()
+            utils.stop_sample(dataloader, iterator)
 
         # resume with a three-row tail left in every source interval
         tail_state = {k: v - 3 for k, v in state.items()}
-        expected_rows = 0
-        for prefix in {k.rsplit(":", 1)[0] for k in state}:
-            prefix_state = {
-                k: v for k, v in tail_state.items() if k.rsplit(":", 1)[0] == prefix
-            }
-            expected_rows += sum(
-                end - start
-                for start, end in calc_remaining_intervals(prefix_state, prefix, 20000)
-            )
+        expected_state = {
+            f"{key.rsplit(':', 1)[0]}:{value - 2}": value
+            for key, value in state.items()
+        }
         dataloader = create_dataloader(
             cfg, features, path, mode=Mode.TRAIN, checkpoint_state=tail_state
         )
@@ -278,10 +268,8 @@ class OdpsDatasetTest(unittest.TestCase):
             for batch in iterator:
                 resumed_sizes.append(len(batch.labels["label"]))
                 update_dataloder_state(resumed_state, batch.checkpoint_info)
-            self.assertEqual(sum(resumed_sizes), expected_rows)
-            for key, value in resumed_state.items():
-                if key in tail_state:
-                    self.assertGreater(value, tail_state[key])
+            self.assertEqual(sum(resumed_sizes), 3 * len(state))
+            self.assertEqual(resumed_state, expected_state)
 
             # the next pass ignores the consumed checkpoint and reads it all
             iterator = dataloader.get_iterator()
@@ -290,9 +278,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 sizes.append(len(batch.labels["label"]))
             self.assertEqual(sorted(sizes), [3616] + [4096] * 4)
         finally:
-            dataloader.close()
-            if iterator is not None:
-                iterator._shutdown_workers()
+            utils.stop_sample(dataloader, iterator)
 
     @parameterized.expand([[False], [True]])
     @unittest.skipIf(
