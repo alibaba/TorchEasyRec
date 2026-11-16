@@ -10,6 +10,7 @@
 # limitations under the License.
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 from parameterized import parameterized
@@ -28,6 +29,27 @@ from tzrec.utils.test_util import (
 
 
 class SharedPromptBeamCacheTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            ["sdpa", {}, False],
+            ["flash_attention_2", {}, True],
+            ["flash_attention_2", {"sliding_window": 128}, False],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_cache_selection(self, attn_kernel, attention_attrs, shared):
+        model = SimpleNamespace(
+            config=SimpleNamespace(_attn_implementation=attn_kernel),
+            model=SimpleNamespace(
+                layers=[SimpleNamespace(self_attn=SimpleNamespace(**attention_attrs))]
+            ),
+        )
+        cache = create_shared_prompt_beam_cache(model)
+        if shared:
+            self.assertIsInstance(cache, SharedPromptBeamCache)
+        else:
+            self.assertIsNone(cache)
+
     def test_prefill_keeps_original_layout_and_attention_compute_dtype(self):
         cache = SharedPromptBeamCache(1)
         key = torch.randn(3, 2, 257, 8)

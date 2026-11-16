@@ -11,8 +11,7 @@
 
 """Band-restricted beam SID decode (no tzrec deps).
 
-Every level retains a global beam; the caller sets the final width from
-num_return_sequences.
+The caller supplies a capped global beam width for each SID level.
 """
 
 from typing import List, Optional, Sequence, Tuple

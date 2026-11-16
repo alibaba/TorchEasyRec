@@ -215,7 +215,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
             batch: carries the packed prompt and the padded width.
 
         Returns:
-            Up to ``num_return`` local codes per row, best first.
+            ``(B, self._capped_widths[-1], num_levels)`` local codes, best first.
         """
         infos = batch.additional_infos
         return generate_codes(
@@ -300,7 +300,7 @@ def generate_codes(
     """Beam-search the SID answer of packed prompts.
 
     Args:
-        lm: the causal LM.
+        lm: an HF causal LM implementing the Cache protocol.
         embeds: the assembled prompt embeddings, packed.
         cu_seqlens: row boundaries, ``(rows + 1,)``.
         max_seqlen: the widest row.

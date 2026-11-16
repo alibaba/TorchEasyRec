@@ -156,6 +156,6 @@ def create_shared_prompt_beam_cache(
     if model.config._attn_implementation != "flash_attention_2":
         return None
     attentions = [layer.self_attn for layer in model.model.layers]
-    if any(a.sliding_window is not None for a in attentions):
+    if any(getattr(a, "sliding_window", None) is not None for a in attentions):
         return None
     return SharedPromptBeamCache(len(attentions))

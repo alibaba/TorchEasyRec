@@ -1476,7 +1476,7 @@ class GenRecExportModel:
             device: the device to predict on, one of the constructor devices.
 
         Returns:
-            ``generated_sids_key``: ``(B, final_beam_width, num_levels)``
+            ``generated_sids_key``: ``(B, self._capped_widths[-1], num_levels)``
             local codes, best first.
         """
         frontend_outputs = self._frontend(batch, batch_size, device)
