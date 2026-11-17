@@ -838,12 +838,16 @@ def _train_and_evaluate(
             lr_schedulers=lr_scheduler,
         ):
             run_eval(i_step, i_epoch)
+        # Dump after checkpoint writeback to include tombstones for keys it evicted.
         final_dump_step = (
             delta_embedding_dumper.final_dump(i_step)
             if delta_embedding_dumper is not None
             else None
         )
         if final_dump_step is not None:
+            # Publish only paired versions: the final dense export uses the
+            # step the trailing delta was actually dumped at; the exporter's
+            # per-step dedupe skips a paired boundary that already exported.
             online_dense_exporter.maybe_export(
                 final_dump_step,
                 data_timestamp,
