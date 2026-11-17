@@ -400,19 +400,14 @@ def _log_dynamicemb_table_plan(
 def lookup_embeddings_for_publish(
     module: torch.nn.Module, keys: torch.Tensor, table_id: int
 ) -> tuple[List[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
-    """Read rank-local embeddings without changing scores, admitting or writing rows.
+    """Read embeddings for publication without changing scores or table contents.
 
-    Call on the training stream after the step's embedding updates, before
-    launching further cache mutations. The current training pipeline orders
-    these operations on the same stream, so no device-wide synchronization is
-    needed. Callers using separate mutation streams must establish equivalent
-    dependencies. Input keys stay on the GPU for cache and built-in lookups.
-    Returns separate CPU (hit keys, embeddings) chunks for each tier and keys
-    missing from every tier. Cache values take priority over backing values.
-    RocksDB reads overlap asynchronous cache copies; their completion event is
-    waited before returning CPU chunks. Keep the pinned DynamicEmb
-    state-level APIs here: training lookups can update scores, and eval_lookup
-    initializes misses instead of returning a mask.
+    Call on the training stream after embedding updates and before further cache
+    mutations. Cache hits take priority, and RocksDB reads overlap cache copies.
+
+    Returns:
+        Per-tier (keys, embeddings) chunks and keys missing from all tiers.
+        All returned tensors are on CPU and ready to read.
     """
     from dynamicemb.key_value_table import (
         DynamicEmbStorage,
