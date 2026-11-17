@@ -77,12 +77,23 @@ def _normalize_weight(weight: torch.Tensor, lengths: torch.Tensor) -> torch.Tens
 
 @torch.fx.wrap
 def _tile_size(x: torch.Tensor) -> int:
+    """Extract the scalar tile factor with a compiler-safe positivity check."""
     tile_size = x.item()
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        # check tile_size = 1 to make dynamo check size happy,
-        # because in DataParser.parse, we always set tile_size = 1.
-        torch._check(tile_size == 1)
+        torch._check(tile_size >= 1)
     # pyre-ignore [7]
+    return tile_size
+
+
+@torch.fx.wrap
+def _infer_tile_size(item_t: torch.Tensor, user_t: torch.Tensor) -> int:
+    """Infer the tile factor from candidate and user batch dimensions."""
+    item_bs = item_t.size(0)
+    user_bs = user_t.size(0)
+    tile_size = item_bs // user_bs
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        torch._check(tile_size >= 1)
+        torch._check(user_bs * tile_size == item_bs)
     return tile_size
 
 
@@ -91,6 +102,8 @@ def _pad_hard_search_input_tile_lengths(
     lengths: torch.Tensor, indices: torch.Tensor
 ) -> torch.Tensor:
     """Pad compact rows without repeating values for fixed-stride TorchRec inputs."""
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        torch._check(indices.numel() >= lengths.numel())
     return torch.nn.functional.pad(lengths, (0, indices.numel() - lengths.numel()))
 
 
@@ -468,6 +481,43 @@ class DataParser:
                         )
                     output_data[f"{feat_name}.values"] = _to_tensor(dense_values)
 
+    def _resolve_tile_size(self, input_data: Dict[str, torch.Tensor]) -> int:
+        """Resolve user-to-candidate tile factor using backed batch dims."""
+        item_key: Optional[str] = None
+        user_key: Optional[str] = None
+        hsk_feats = self._hard_search_input_tile_features
+
+        for keys in self.sparse_keys.values():
+            for k in keys:
+                if k in hsk_feats:
+                    continue
+                if k in self.user_feats:
+                    user_key = user_key or f"{k}.lengths"
+                else:
+                    item_key = item_key or f"{k}.lengths"
+        for keys in self.dense_keys.values():
+            for k in keys:
+                if k in hsk_feats:
+                    continue
+                if k in self.user_feats:
+                    user_key = user_key or f"{k}.values"
+                else:
+                    item_key = item_key or f"{k}.values"
+        for k in self.sequence_dense_keys:
+            if k in hsk_feats:
+                continue
+            if k in self.user_feats:
+                user_key = user_key or f"{k}.lengths"
+            else:
+                item_key = item_key or f"{k}.lengths"
+        if item_key is None:
+            for seq in sorted(set(hsk_feats.values())):
+                item_key = f"{seq}__inverse_indices"
+                break
+        if item_key is not None and user_key is not None:
+            return _infer_tile_size(input_data[item_key], input_data[user_key])
+        return _tile_size(input_data["batch_size"])
+
     def to_batch(
         self, input_data: Dict[str, torch.Tensor], force_no_tile: bool = False
     ) -> Batch:
@@ -485,7 +535,7 @@ class DataParser:
 
         tile_size = -1
         if input_tile:
-            tile_size = _tile_size(input_data["batch_size"])
+            tile_size = self._resolve_tile_size(input_data)
 
         if input_tile_emb:
             # For INPUT_TILE = 3 mode, batch_size of user features for sparse and dense
@@ -508,7 +558,9 @@ class DataParser:
                 )
             else:
                 sparse_features, sequence_mulval_lengths = (
-                    self._to_sparse_features_user1tile_itemb(input_data)
+                    self._to_sparse_features_user1tile_itemb(
+                        input_data, tile_size=tile_size
+                    )
                 )
         else:
             dense_features = self._to_dense_features(input_data)
@@ -676,6 +728,8 @@ class DataParser:
                     keys=mulval_keys,
                     values=torch.cat(mulval_key_lengths, dim=-1),
                     lengths=torch.cat(mulval_seq_lengths, dim=-1),
+                    stride=mulval_seq_lengths[0].size(0),
+                    length_per_key=[x.numel() for x in mulval_key_lengths],
                 )
                 sequence_mulval_lengths[dg] = sequence_mulval_length
         return sparse_features, sequence_mulval_lengths
@@ -736,7 +790,9 @@ class DataParser:
         return dense_features
 
     def _to_sparse_features_user1tile_itemb(
-        self, input_data: Dict[str, torch.Tensor]
+        self,
+        input_data: Dict[str, torch.Tensor],
+        tile_size: Optional[int] = None,
     ) -> Tuple[Dict[str, KeyedJaggedTensor], Dict[str, KeyedJaggedTensor]]:
         """Convert batch sparse features user_bs = 1 then tile and item_bs = B.
 
@@ -746,6 +802,7 @@ class DataParser:
 
         Args:
             input_data (dict): input tensor dict.
+            tile_size (int, optional): pre-resolved tile factor.
 
         Returns:
             sparse_features: a dict of KeyedJaggedTensor .
@@ -754,7 +811,8 @@ class DataParser:
         """
         sparse_features = {}
         sequence_mulval_lengths = {}
-        tile_size = _tile_size(input_data["batch_size"])
+        if tile_size is None:
+            tile_size = self._resolve_tile_size(input_data)
 
         for dg, keys in self.sparse_keys.items():
             values = []
@@ -825,6 +883,8 @@ class DataParser:
                     keys=mulval_keys,
                     values=torch.cat(mulval_key_lengths, dim=-1),
                     lengths=torch.cat(mulval_seq_lengths, dim=-1),
+                    stride=mulval_seq_lengths[0].size(0),
+                    length_per_key=[x.numel() for x in mulval_key_lengths],
                 )
                 sequence_mulval_lengths[dg] = sequence_mulval_length
         return sparse_features, sequence_mulval_lengths
@@ -950,6 +1010,8 @@ class DataParser:
                     keys=mulval_keys_user,
                     values=torch.cat(mulval_key_lengths_user, dim=-1),
                     lengths=torch.cat(mulval_seq_lengths_user, dim=-1),
+                    stride=mulval_seq_lengths_user[0].size(0),
+                    length_per_key=[x.numel() for x in mulval_key_lengths_user],
                 )
                 sequence_mulval_lengths[dg + "_user"] = sequence_mulval_length_user
             if len(mulval_keys_item) > 0:
@@ -957,6 +1019,8 @@ class DataParser:
                     keys=mulval_keys_item,
                     values=torch.cat(mulval_key_lengths_item, dim=-1),
                     lengths=torch.cat(mulval_seq_lengths_item, dim=-1),
+                    stride=mulval_seq_lengths_item[0].size(0),
+                    length_per_key=[x.numel() for x in mulval_key_lengths_item],
                 )
                 sequence_mulval_lengths[dg] = sequence_mulval_length_item
 

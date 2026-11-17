@@ -612,13 +612,16 @@ class UnifiedAOTIModelWrapper(nn.Module):
         # the AOTI model-pool mutex, deadlocking with the first thread.
         # object.__setattr__ bypasses nn.Module's strict registration.
         object.__setattr__(self, "_lock", threading.Lock())
-        object.__setattr__(self, "_key_order", None)
+        in_spec, out_spec = cast(Any, model).loader.get_call_spec()
+        in_tree = pytree.treespec_loads(in_spec)
+        # Forward takes a single `(data,)` arg; read compiled key order from it.
+        key_order: Optional[List[str]] = None
+        args_children = in_tree.children()[0].children() if in_tree.children() else []
+        if len(args_children) == 1 and isinstance(args_children[0].context, list):
+            key_order = list(args_children[0].context)
+        object.__setattr__(self, "_key_order", key_order)
         # AOTICompiledModel.__call__ reparses the call spec on every call.
-        object.__setattr__(
-            self,
-            "_out_spec",
-            pytree.treespec_loads(cast(Any, model).loader.get_call_spec()[1]),
-        )
+        object.__setattr__(self, "_out_spec", pytree.treespec_loads(out_spec))
 
     def forward(
         self,
@@ -643,6 +646,6 @@ class UnifiedAOTIModelWrapper(nn.Module):
         torch.cuda.set_device(device)
         with cast(Any, self._lock):
             flat_outputs = cast(Any, self.model).loader.boxed_run(
-                [data[k] for k in key_order]
+                [data[k].cpu().contiguous() for k in key_order]
             )
         return pytree.tree_unflatten(flat_outputs, self._out_spec)

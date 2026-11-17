@@ -311,5 +311,5 @@ export HARD_SEARCH_INPUT_TILE=1
 
 ### 使用限制
 
-- 当前支持 FX/TorchScript 和 distributed embedding，不支持 AOT/TRT、RTP、HSTU。
+- 当前支持 FX/TorchScript、统一 AOT（ENABLE_AOT=2）和 distributed embedding，不支持 ENABLE_AOT=1、TRT、RTP、HSTU。
 - 历史派生特征只能依赖同一份 hard-search 历史及共享用户输入或常量。若还依赖候选自身的 `item:` / `context:` 字段，或另一组历史，不能开启 `HARD_SEARCH_INPUT_TILE`。
