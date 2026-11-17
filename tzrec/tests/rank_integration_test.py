@@ -1559,30 +1559,21 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
         return config, total_rows
 
     def _entry(self, source: str, total_rows: int) -> str:
+        if source == "parquet":
+            return _SAMPLE_SHUFFLE_TRAIN_EVAL
+        self._trace_path = os.path.abspath(
+            os.path.join(self.test_dir, f"{source}_trace.jsonl")
+        )
         if source == "odps":
-            self._odps_trace_path = os.path.abspath(
-                os.path.join(self.test_dir, "odps_trace.jsonl")
+            body = _SAMPLE_SHUFFLE_FAKE_ODPS_BODY.format(
+                trace_path=self._trace_path, total_rows=total_rows
             )
             path = os.path.join(self.test_dir, "train_with_fake_odps.py")
-            with open(path, "w") as f:
-                f.write(
-                    _SAMPLE_SHUFFLE_FAKE_ODPS_BODY.format(
-                        trace_path=self._odps_trace_path, total_rows=total_rows
-                    )
-                )
-            return path
-        if source != "kafka":
-            return _SAMPLE_SHUFFLE_TRAIN_EVAL
-        self._kafka_trace_path = os.path.abspath(
-            os.path.join(self.test_dir, "kafka_trace.jsonl")
-        )
-        path = os.path.join(self.test_dir, "train_with_fake_kafka.py")
+        else:
+            body = _SAMPLE_SHUFFLE_FAKE_KAFKA_BODY.format(trace_path=self._trace_path)
+            path = os.path.join(self.test_dir, "train_with_fake_kafka.py")
         with open(path, "w") as f:
-            f.write(
-                _SAMPLE_SHUFFLE_FAKE_KAFKA_BODY.format(
-                    trace_path=self._kafka_trace_path
-                )
-            )
+            f.write(body)
         return path
 
     def _assert_resumed_positions(
@@ -1602,7 +1593,7 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
             )
 
     def _assert_kafka_resumed(self, state: dict) -> None:
-        with open(self._kafka_trace_path) as f:
+        with open(self._trace_path) as f:
             reads = [line.split() for line in f]
         self.assertTrue(reads)
         saved = {
@@ -1619,7 +1610,7 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
             self.assertGreater(start, saved[partition])
 
     def _assert_odps_trace(self, state: dict) -> None:
-        with open(self._odps_trace_path) as f:
+        with open(self._trace_path) as f:
             events = [json.loads(line) for line in f]
         ranks = set(range(utils._get_nproc_per_node()))
         trainers = [event for event in events if event["kind"] == "trainer"]
@@ -1660,9 +1651,8 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
         epochs = state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
         if source == "odps":
             self._assert_odps_trace(state)
-            os.unlink(self._odps_trace_path)
-        elif source == "kafka":
-            os.unlink(self._kafka_trace_path)
+        if source != "parquet":
+            os.unlink(self._trace_path)
 
         resume_steps = _SAMPLE_SHUFFLE_STEPS + _SAMPLE_SHUFFLE_RESUME_STEPS
         final_step = resume_steps - 1

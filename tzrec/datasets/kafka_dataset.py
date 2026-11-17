@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import copy
 import math
 import os
 import threading
@@ -18,13 +19,14 @@ from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Tup
 from urllib.parse import parse_qsl, urlparse
 
 import pyarrow as pa
-import torch.distributed as dist
 from confluent_kafka import (
     OFFSET_INVALID,
     Consumer,
     KafkaException,
+    Message,
     TopicPartition,
 )
+from torch import distributed as dist
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader
@@ -105,378 +107,6 @@ def _parse_kafka_uri(uri: str) -> Tuple[str, Dict[str, Any], Optional[int]]:
     return topic, params, start_timestamp_ms
 
 
-def _decode_kafka_messages(
-    messages: List[Any],
-    has_embedded_schema: bool,
-    full_schema: pa.Schema,
-    schema: pa.Schema,
-    projections: Dict[pa.Schema, Optional[List[int]]],
-    topic: str,
-    on_decoded: Optional[Callable[[str], None]] = None,
-) -> Tuple[Optional[pa.Table], int]:
-    """Decode kafka messages into one table with checkpoint metadata columns.
-
-    Args:
-        messages: kafka messages, each carrying exactly one record batch.
-        has_embedded_schema: whether messages embed an IPC stream schema.
-        full_schema: full schema for schema-less messages.
-        schema: reader schema to project and cast to.
-        projections: per-message-schema projection cache, mutated in place.
-        topic: topic name for checkpoint source ids.
-        on_decoded: optional callback for each successfully decoded source id.
-
-    Returns:
-        table: one table with the reader columns plus CKPT_SOURCE_ID,
-            CKPT_ROW_IDX and DATA_TIMESTAMP columns; None when no message
-            was decoded, including when every message was an error event.
-        num_msgs: successfully decoded messages, for consume sizing.
-    """
-    record_batchs = []
-    # Track checkpoint metadata for each message
-    source_ids = []
-    row_indices = []
-    # Track event-time (Unix-epoch seconds) for each message
-    timestamps = []
-    num_msgs = 0
-    for msg in messages:
-        msg_error = msg.error()
-        if msg_error:
-            logger.error(msg_error)
-            continue
-        msg_data = msg.value()
-        if has_embedded_schema:
-            # Read with embedded schema using IPC stream reader
-            # NOTE: Only the first record batch is read from each message.
-            # If a Kafka message contains multiple record batches in the IPC
-            # stream format, subsequent batches will be silently dropped.
-            # Each Kafka message should contain exactly one record batch.
-            reader = pa.ipc.open_stream(msg_data)
-            try:
-                record_batch = reader.read_next_batch()
-            finally:
-                reader.close()
-        else:
-            # Schema-less message (current behavior)
-            record_batch = pa.ipc.read_record_batch(msg_data, full_schema)
-
-        # Project onto the reader schema by column name, so upstream
-        # columns may be added or reordered. Metadata is dropped as
-        # a schema carrying it is unhashable and never projected on.
-        msg_schema = record_batch.schema.remove_metadata()
-        if msg_schema not in projections:
-            if projections:
-                logger.info(
-                    f"new kafka message schema {msg_schema.names}, "
-                    f"reading columns {schema.names}."
-                )
-            projections[msg_schema] = _build_projection(msg_schema, schema)
-        projection = projections[msg_schema]
-        if projection is not None:
-            # cast normalizes the nested nullability differences
-            # _build_projection tolerates, so that batches read from
-            # either schema still combine into one table below.
-            record_batch = pa.RecordBatch.from_arrays(
-                [record_batch.column(i) for i in projection],
-                names=schema.names,
-            ).cast(schema)
-
-        batch_len = len(record_batch)
-        record_batchs.append(record_batch)
-        num_msgs += 1
-
-        # Generate checkpoint metadata for each row in this message
-        source_id = f"{topic}:{msg.partition()}"
-        offset = msg.offset()
-        source_ids.extend([source_id] * batch_len)
-        # Use offset as the row index (each message has one offset)
-        row_indices.extend([offset] * batch_len)
-        # msg.timestamp() -> (type, ms), -1 when unavailable; use
-        # Unix-epoch seconds and keep -1 as the sentinel.
-        ts_ms = msg.timestamp()[1]
-        ts_s = ts_ms / 1000.0 if ts_ms >= 0 else -1.0
-        timestamps.extend([ts_s] * batch_len)
-
-        if on_decoded is not None:
-            on_decoded(source_id)
-
-    if not record_batchs:
-        return None, num_msgs
-
-    # combine into one record batch
-    t = pa.Table.from_batches(record_batchs).combine_chunks()
-
-    # Add checkpoint metadata columns
-    t = t.append_column(CKPT_SOURCE_ID, pa.array(source_ids, type=pa.string()))
-    t = t.append_column(CKPT_ROW_IDX, pa.array(row_indices, type=pa.int64()))
-    # transient event-time column (seconds), read in _build_batch
-    t = t.append_column(DATA_TIMESTAMP, pa.array(timestamps, type=pa.float64()))
-    return t, num_msgs
-
-
-def _consume_decoded_tables(
-    consumer: Consumer,
-    topic: str,
-    on_assign: Callable[[Consumer, List[TopicPartition]], None],
-    max_poll_interval_ms: int,
-    batch_size: int,
-    has_embedded_schema: bool,
-    full_schema: pa.Schema,
-    reader_schema: pa.Schema,
-    log_prefix: str,
-    orphan_pid: Optional[int] = None,
-    on_decoded: Optional[Callable[[str], None]] = None,
-) -> Iterator[pa.Table]:
-    """Shared consume loop with heartbeat pause/resume protection.
-
-    A background heartbeat thread monitors idle time (time since the last
-    ``consume()`` call). When the caller is blocked (a full queue, a blocked
-    ``yield``) for longer than 80% of ``max.poll.interval.ms``, the heartbeat
-    thread pauses all partitions and calls ``consumer.poll(0)`` periodically
-    to reset the application poll timer and keep the consumer in its group.
-    This prevents ``MAX_POLL_EXCEEDED`` errors during long downstream pauses
-    (checkpoint saves, evaluation, compilation warmup, etc.).
-
-    The caller decides assignment offsets via ``on_assign`` (set
-    ``tp.offset`` per partition; may raise); the actual ``assign`` call,
-    re-pause and logging are handled here under the consumer lock.
-
-    Args:
-        consumer: the kafka consumer (not yet subscribed).
-        topic: topic to subscribe to.
-        on_assign: offset-resolution callback, invoked with the assigned
-            partitions on every (re)assignment.
-        max_poll_interval_ms: consumer's max.poll.interval.ms setting.
-        batch_size: target rows per consume round (EMA-estimated).
-        has_embedded_schema: whether messages embed an IPC stream schema.
-        full_schema: full schema for schema-less messages.
-        reader_schema: schema to project and cast to.
-        log_prefix: log line prefix identifying this reader.
-        orphan_pid: when set, the loop exits once its parent pid changes
-            (the owning process died).
-        on_decoded: optional callback for each successfully decoded source id.
-
-    Yields:
-        pa.Table: one decoded and projected table per consume round.
-    """
-    hb_stop = threading.Event()
-    consumer_lock = threading.RLock()
-    is_paused = [False]
-    last_consume_time = [time.monotonic()]
-    idle_threshold = max_poll_interval_ms / 1000.0 * 0.8
-    stolen_msgs: List = []
-
-    def _on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
-        on_assign(consumer, partitions)
-        with consumer_lock:
-            consumer.assign(partitions)
-            if is_paused[0]:
-                consumer.pause(consumer.assignment())
-        logger.info(f"{log_prefix} assignment: {consumer.assignment()}")
-
-    def _heartbeat() -> None:
-        """Keep the consumer in its group while the caller is blocked."""
-        while not hb_stop.is_set():
-            try:
-                elapsed = time.monotonic() - last_consume_time[0]
-                if elapsed > idle_threshold:
-                    with consumer_lock:
-                        # Re-check elapsed inside lock to avoid racing
-                        # with the main thread that updates
-                        # last_consume_time under the same lock.
-                        elapsed = time.monotonic() - last_consume_time[0]
-                        if elapsed > idle_threshold:
-                            if not is_paused[0]:
-                                assignment = consumer.assignment()
-                                if assignment:
-                                    consumer.pause(assignment)
-                                is_paused[0] = True
-                                logger.debug(
-                                    f"{log_prefix} heartbeat: paused "
-                                    f"{len(assignment)} partitions after "
-                                    f"{elapsed:.1f}s idle"
-                                )
-                            msg = consumer.poll(0)
-                            if msg is not None and not msg.error():
-                                stolen_msgs.append(msg)
-            except Exception:
-                logger.warning(f"{log_prefix} heartbeat error", exc_info=True)
-            hb_stop.wait(1.0)
-
-    heartbeat_thread = threading.Thread(
-        target=_heartbeat, name=f"{log_prefix}-hb", daemon=True
-    )
-    batch_size_per_msg = None
-    # name-based projection per seen message schema, so an upstream schema
-    # change costs one recompute rather than one per message.
-    projections: Dict[pa.Schema, Optional[List[int]]] = {}
-    heartbeat_thread.start()
-    try:
-        consumer.subscribe([topic], on_assign=_on_assign)
-        while True:
-            if orphan_pid is not None and os.getppid() != orphan_pid:
-                logger.error(f"{log_prefix}: owner process gone, exiting")
-                return
-            num_messages = (
-                int(math.ceil(batch_size / batch_size_per_msg))
-                if batch_size_per_msg
-                else 2
-            )
-            # Hold consumer_lock during consume() so the heartbeat
-            # thread cannot call pause() concurrently.
-            # rd_kafka_consume_batch_queue() (used by consume()) is
-            # not thread-safe with concurrent pause/resume/seek.
-            with consumer_lock:
-                if is_paused[0]:
-                    assignment = consumer.assignment()
-                    if assignment:
-                        consumer.resume(assignment)
-                    is_paused[0] = False
-                    logger.debug(f"{log_prefix} heartbeat: resumed partitions")
-                last_consume_time[0] = time.monotonic()
-                pending = list(stolen_msgs)
-                stolen_msgs.clear()
-                messages = pending
-                messages.extend(consumer.consume(num_messages, timeout=1.0))
-
-            t, num_msgs = _decode_kafka_messages(
-                messages,
-                has_embedded_schema,
-                full_schema,
-                reader_schema,
-                projections,
-                topic,
-                on_decoded,
-            )
-            if t is None:
-                continue
-
-            # estimate batch_size per message
-            rows_per_msg = t.num_rows / num_msgs
-            if batch_size_per_msg is None:
-                batch_size_per_msg = rows_per_msg
-            else:
-                batch_size_per_msg = 0.9 * batch_size_per_msg + 0.1 * rows_per_msg
-
-            yield t
-    except Exception as e:
-        logger.error(f"{log_prefix} exception: {e}")
-        raise
-    finally:
-        hb_stop.set()
-        heartbeat_thread.join(timeout=5.0)
-        if heartbeat_thread.is_alive():
-            logger.warning(
-                "Heartbeat thread did not exit within timeout; "
-                "skipping consumer.close() to avoid race."
-            )
-        else:
-            try:
-                consumer.close()
-            except Exception as e:
-                logger.warning(f"consumer.close() failed: {e}")
-
-
-def _consume_round_robin_tables(
-    consumer_factory: Callable[..., Consumer],
-    topic: str,
-    config: Dict[str, Any],
-    partition_order: List[int],
-    worker_id: int,
-    num_workers: int,
-    on_assign: Callable[[Consumer, List[TopicPartition]], None],
-    has_embedded_schema: bool,
-    full_schema: pa.Schema,
-    reader_schema: pa.Schema,
-    log_prefix: str,
-    orphan_pid: Optional[int] = None,
-    on_decoded: Optional[Callable[[str], None]] = None,
-) -> Iterator[pa.Table]:
-    """Read this worker's owned partitions strictly in round-robin order.
-
-    Partitions are sliced from the leader-ordered list by global reader id,
-    then read in ascending partition order. Each partition gets its own
-    assigned consumer and one message per turn. Timeouts and error events
-    keep the current partition; successfully decoded zero-row messages
-    advance the rotation.
-
-    Args:
-        consumer_factory: consumer builder, called once per owned partition.
-        topic: kafka topic name.
-        config: kafka consumer configuration.
-        partition_order: partition ids ordered by leader and partition id.
-        worker_id: global reader id.
-        num_workers: total number of global readers.
-        on_assign: callback that applies checkpoint/timestamp/reset offsets
-            to all owned partitions before the first consumer is assigned.
-        has_embedded_schema: whether messages embed an IPC stream schema.
-        full_schema: full schema for schema-less messages.
-        reader_schema: schema to project and cast to.
-        log_prefix: log line prefix identifying this reader.
-        orphan_pid: when set, exit once the parent pid changes.
-        on_decoded: optional callback for each successfully decoded source id.
-
-    Yields:
-        One decoded and projected table per successful message.
-
-    Raises:
-        ValueError: if the topic has fewer partitions than global readers.
-    """
-    consumers: List[Consumer] = []
-    try:
-        if len(partition_order) < num_workers:
-            raise ValueError(
-                f"kafka topic {topic} has {len(partition_order)} partition(s), "
-                f"fewer than the {num_workers} dataloader workers; "
-                "kafka_partition_round_robin requires at least one partition "
-                "per worker."
-            )
-        owned_partitions = [
-            TopicPartition(topic, partition)
-            for partition in sorted(partition_order[worker_id::num_workers])
-        ]
-        consumer = consumer_factory(config)
-        consumers.append(consumer)
-        on_assign(consumer, owned_partitions)
-        consumer.assign([owned_partitions[0]])
-        for tp in owned_partitions[1:]:
-            consumer = consumer_factory(config)
-            consumers.append(consumer)
-            consumer.assign([tp])
-        logger.info(f"{log_prefix} assignment: {owned_partitions}")
-
-        projections: Dict[pa.Schema, Optional[List[int]]] = {}
-        idx = 0
-        while True:
-            if orphan_pid is not None and os.getppid() != orphan_pid:
-                logger.error(f"{log_prefix}: owner process gone, exiting")
-                return
-            messages = consumers[idx].consume(1, timeout=1.0)
-            if not messages:
-                continue
-            table, _ = _decode_kafka_messages(
-                messages,
-                has_embedded_schema,
-                full_schema,
-                reader_schema,
-                projections,
-                topic,
-                on_decoded,
-            )
-            if table is None:
-                continue
-            yield table
-            idx = (idx + 1) % len(consumers)
-    except Exception as e:
-        logger.error(f"{log_prefix} exception: {e}")
-        raise
-    finally:
-        for consumer in reversed(consumers):
-            try:
-                consumer.close()
-            except Exception as e:
-                logger.warning(f"consumer.close() failed: {e}")
-
-
 def _build_projection(
     src_schema: pa.Schema, dst_schema: pa.Schema
 ) -> Optional[List[int]]:
@@ -534,9 +164,9 @@ def _offsets_for_times_batched(
     consumer: Consumer,
     ts_partitions: List[TopicPartition],
     start_timestamp_ms: int,
-    batch_size: Optional[int] = None,
-    timeout: Optional[float] = None,
-    max_retries: Optional[int] = None,
+    batch_size: int,
+    timeout: float,
+    max_retries: int,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> Dict[Tuple[str, int], int]:
     """Resolve a start timestamp to offsets in chunks, with retry.
@@ -547,10 +177,6 @@ def _offsets_for_times_batched(
     A persistent failure re-raises rather than silently falling back, because
     this reader is shared with training, where falling back to
     ``auto.offset.reset`` would replay the whole topic.
-
-    ``batch_size``, ``timeout`` and ``max_retries`` default to the
-    ``TZREC_KAFKA_OFFSETS_FOR_TIMES_*`` environment variables, resolved at
-    call time so callers and tests can override them explicitly.
 
     Args:
         consumer (Consumer): the kafka consumer.
@@ -568,14 +194,6 @@ def _offsets_for_times_batched(
     Raises:
         KafkaException: if a chunk still fails after exhausting retries.
     """
-    if batch_size is None:
-        batch_size = max(
-            1, int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_BATCH_SIZE", "32"))
-        )
-    if timeout is None:
-        timeout = float(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_TIMEOUT", "30.0"))
-    if max_retries is None:
-        max_retries = int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES", "2"))
     resolved_map: Dict[Tuple[str, int], int] = {}
     for i in range(0, len(ts_partitions), batch_size):
         chunk = ts_partitions[i : i + batch_size]
@@ -608,138 +226,6 @@ def _offsets_for_times_batched(
     return resolved_map
 
 
-def _consume_kafka(
-    input_path: str,
-    consumer_factory: Optional[Any],
-    reader_id: int,
-    num_readers: int,
-    batch_size: int,
-    reader_schema: pa.Schema,
-    full_schema: pa.Schema,
-    has_embedded_schema: bool,
-    checkpoint_state: Optional[Dict[str, Any]] = None,
-    orphan_pid: Optional[int] = None,
-    round_robin_partition_order: Optional[List[int]] = None,
-    kafka_log_every_n_messages: int = 0,
-) -> Iterator[pa.RecordBatch]:
-    """Consume and decode Kafka with the BATCH assignment policy.
-
-    Every (re)assignment applies checkpoint offsets, then
-    ``start.timestamp.ms``, then ``auto.offset.reset``. Consumer creation,
-    decoding and the consumption loops are shared with the BATCH path.
-
-    Args:
-        input_path: kafka URI.
-        consumer_factory: consumer builder; the default builds real consumers.
-        reader_id: global consumer slot passed to the factory.
-        num_readers: global consumer slot count passed to the factory.
-        batch_size: target rows per consume round.
-        reader_schema: schema to project and cast each message to.
-        full_schema: full schema for schema-less messages.
-        has_embedded_schema: whether messages embed an IPC stream schema.
-        checkpoint_state: BATCH resume state {topic:partition: offset}.
-        orphan_pid: when set, the loop exits once its parent pid changes.
-        round_robin_partition_order: leader-ordered partition ids, or None
-            for ordinary consumer-group subscription.
-        kafka_log_every_n_messages: decoded-message log interval, 0 disables.
-
-    Yields:
-        PyArrow RecordBatch.
-    """
-    topic, config, start_timestamp_ms = _parse_kafka_uri(input_path)
-    factory = consumer_factory or _default_consumer_factory
-    log_prefix = f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{reader_id}]"
-    on_decoded = None
-    if kafka_log_every_n_messages > 0:
-        # process-local decoded-message counter and periodic logger
-        decoded_message_count = 0
-        decoded_partition_counts: Dict[str, int] = {}
-
-        def on_decoded(source_id: str) -> None:
-            """Count one decoded message and log at the configured interval."""
-            nonlocal decoded_message_count
-            decoded_partition_counts[source_id] = (
-                decoded_partition_counts.get(source_id, 0) + 1
-            )
-            decoded_message_count += 1
-            if decoded_message_count % kafka_log_every_n_messages == 0:
-                logger.info(
-                    f"{log_prefix} "
-                    f"decoded_messages={decoded_message_count} "
-                    f"partitions={decoded_partition_counts}"
-                )
-
-    def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
-        """Apply the ordinary checkpoint/timestamp/reset policy."""
-        ts_partitions = []
-        for tp in partitions:
-            source_key = f"{tp.topic}:{tp.partition}"
-            if checkpoint_state and source_key in checkpoint_state:
-                # Resume after last consumed offset
-                tp.offset = checkpoint_state[source_key] + 1
-            elif start_timestamp_ms is not None:
-                ts_partitions.append(tp)
-            else:
-                tp.offset = OFFSET_INVALID
-
-        if ts_partitions:
-            assert start_timestamp_ms is not None
-            resolved_map = _offsets_for_times_batched(
-                consumer, ts_partitions, start_timestamp_ms
-            )
-            for tp in ts_partitions:
-                res_offset = resolved_map.get((tp.topic, tp.partition))
-                if res_offset is not None and res_offset >= 0:
-                    tp.offset = res_offset
-                else:
-                    logger.warning(
-                        f"No offset found for timestamp "
-                        f"{start_timestamp_ms} on "
-                        f"{tp.topic}:{tp.partition}, "
-                        f"falling back to auto.offset.reset"
-                    )
-                    tp.offset = OFFSET_INVALID
-
-    if round_robin_partition_order is not None:
-        loop = _consume_round_robin_tables(
-            factory,
-            topic,
-            config,
-            round_robin_partition_order,
-            reader_id,
-            num_readers,
-            on_assign,
-            has_embedded_schema,
-            full_schema,
-            reader_schema,
-            log_prefix,
-            orphan_pid=orphan_pid,
-            on_decoded=on_decoded,
-        )
-    else:
-        max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
-        consumer = factory(config, reader_id=reader_id, num_readers=num_readers)
-        loop = _consume_decoded_tables(
-            consumer,
-            topic,
-            on_assign,
-            max_poll_interval_ms,
-            batch_size,
-            has_embedded_schema,
-            full_schema,
-            reader_schema,
-            log_prefix,
-            orphan_pid=orphan_pid,
-            on_decoded=on_decoded,
-        )
-    try:
-        for t in loop:
-            for batch in t.to_batches():
-                yield batch
-    finally:
-        loop.close()
-
-
 def _default_consumer_factory(
     config: Dict[str, Any], reader_id: int = 0, num_readers: int = 1
 ) -> Consumer:
@@ -748,52 +234,25 @@ def _default_consumer_factory(
 
 
 def _read_sample_batches(
-    input_path: str,
-    reader_id: int,
-    num_readers: int,
-    checkpoint_state: Optional[Dict[str, Any]],
-    reader_schema: pa.Schema,
-    full_schema: pa.Schema,
-    has_embedded_schema: bool,
-    batch_size: int,
-    consumer_factory: Optional[Any] = None,
-    round_robin_partition_order: Optional[List[int]] = None,
-    kafka_log_every_n_messages: int = 0,
+    reader: "KafkaReader",
+    worker_id: int,
+    num_workers: int,
 ) -> Iterator[pa.RecordBatch]:
     """Consume Kafka in a reader process for the sample-level shuffle plan.
 
     Args:
-        input_path: kafka URI.
-        reader_id: global consumer slot passed to the consumer factory.
-        num_readers: global consumer slot count.
-        checkpoint_state: resume state {topic:partition: offset}; the
-            reader applies checkpoint, timestamp and reset offsets on assignment.
-        reader_schema: schema to project and cast each message to.
-        full_schema: full schema for schema-less messages.
-        has_embedded_schema: whether messages embed an IPC stream schema.
-        batch_size: target rows per consume round.
-        consumer_factory: consumer builder; the default builds real consumers.
-        round_robin_partition_order: parent-resolved partition order, or None
-            for ordinary consumer-group subscription.
-        kafka_log_every_n_messages: decoded-message log interval, 0 disables.
+        reader: snapshot of the KafkaReader that built the plan.
+        worker_id: global consumer slot passed to the consumer factory.
+        num_workers: global consumer slot count.
 
     Yields:
         decoded record batches with checkpoint metadata and event time.
     """
-    yield from _consume_kafka(
-        input_path,
-        consumer_factory,
-        reader_id,
-        num_readers,
-        batch_size,
-        reader_schema,
-        full_schema,
-        has_embedded_schema,
-        checkpoint_state=checkpoint_state,
+    yield from reader._reader(
+        worker_id,
+        num_workers,
         # this process was forked by the coordinator
         orphan_pid=os.getppid(),
-        round_robin_partition_order=round_robin_partition_order,
-        kafka_log_every_n_messages=kafka_log_every_n_messages,
     )
 
 
@@ -849,8 +308,10 @@ class KafkaReader(BaseReader):
         input_fields (list): list of pa.Field for schema definition.
         consumer_factory: consumer builder; tests inject a double, the
             default builds real consumers.
-        kafka_partition_round_robin: read owned partitions strictly in turn.
-        kafka_log_every_n_messages: decoded-message log interval, 0 disables.
+        kafka_partition_round_robin (bool): whether to read the partitions owned
+            by each worker in strict round-robin order.
+        kafka_log_every_n_messages (int): log per-worker decoded message counts
+            every N messages, 0 disables.
     """
 
     def __init__(
@@ -878,12 +339,13 @@ class KafkaReader(BaseReader):
 
         self._consumer_factory = consumer_factory or _default_consumer_factory
         self._has_embedded_schema = False
-        self._round_robin_partition_order: Optional[List[int]] = (
+        self._kafka_partition_round_robin = kafka_partition_round_robin
+        self._log_every_n_messages = kafka_log_every_n_messages
+        self._round_robin_partition_order: List[int] = (
             self._get_round_robin_partition_order()
             if kafka_partition_round_robin
-            else None
+            else []
         )
-        self._log_every_n_messages = kafka_log_every_n_messages
 
         if input_fields:
             self._full_schema = pa.schema(input_fields)
@@ -1020,50 +482,429 @@ class KafkaReader(BaseReader):
             )
         return partition_order
 
+    def _set_start_offsets(
+        self,
+        consumer: Consumer,
+        partitions: List[TopicPartition],
+        start_timestamp_ms: Optional[int],
+    ) -> None:
+        """Set start offsets on partitions from checkpoint or start timestamp.
+
+        Args:
+            consumer (Consumer): the kafka consumer used for offset lookups.
+            partitions (list): partitions whose offsets are modified in place.
+            start_timestamp_ms (int, optional): start timestamp in milliseconds.
+        """
+        offt_batch_size = max(
+            1, int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_BATCH_SIZE", "32"))
+        )
+        offt_timeout = float(
+            os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_TIMEOUT", "30.0")
+        )
+        offt_retries = int(os.environ.get("TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES", "2"))
+
+        ts_partitions = []
+        for tp in partitions:
+            source_key = f"{tp.topic}:{tp.partition}"
+            if self._checkpoint_state and source_key in self._checkpoint_state:
+                # Resume after last consumed offset
+                tp.offset = self._checkpoint_state[source_key] + 1
+            elif start_timestamp_ms is not None:
+                ts_partitions.append(tp)
+            else:
+                tp.offset = OFFSET_INVALID
+
+        if ts_partitions:
+            assert start_timestamp_ms is not None
+            resolved_map = _offsets_for_times_batched(
+                consumer,
+                ts_partitions,
+                start_timestamp_ms,
+                offt_batch_size,
+                offt_timeout,
+                offt_retries,
+            )
+            for tp in ts_partitions:
+                res_offset = resolved_map.get((tp.topic, tp.partition))
+                if res_offset is not None and res_offset >= 0:
+                    tp.offset = res_offset
+                else:
+                    logger.warning(
+                        f"No offset found for timestamp "
+                        f"{start_timestamp_ms} on "
+                        f"{tp.topic}:{tp.partition}, "
+                        f"falling back to auto.offset.reset"
+                    )
+                    tp.offset = OFFSET_INVALID
+
+    def _decode_messages(
+        self,
+        messages: List[Message],
+        topic: str,
+        projections: Dict[pa.Schema, Optional[List[int]]],
+    ) -> Tuple[Optional[pa.Table], int]:
+        """Decode Kafka messages into one table with checkpoint metadata.
+
+        Args:
+            messages (list): kafka messages to decode.
+            topic (str): topic name, used to build the checkpoint source id.
+            projections (dict): schema projection cache reused across calls.
+
+        Returns:
+            table: combined table, or ``None`` when no message was decoded.
+            num_decoded: number of successfully decoded messages, including
+                messages that contain zero rows.
+        """
+        record_batchs = []
+        # Track checkpoint metadata for each message
+        source_ids = []
+        row_indices = []
+        # Track event-time (Unix-epoch seconds) for each message
+        timestamps = []
+
+        for msg in messages:
+            msg_error = msg.error()
+            if msg_error:
+                logger.error(msg_error)
+                continue
+            msg_data = msg.value()
+            if self._has_embedded_schema:
+                # Read with embedded schema using IPC stream reader
+                # NOTE: Only the first record batch is read from each message.
+                # If a Kafka message contains multiple record batches in the IPC
+                # stream format, subsequent batches will be silently dropped.
+                # Each Kafka message should contain exactly one record batch.
+                reader = pa.ipc.open_stream(msg_data)
+                try:
+                    record_batch = reader.read_next_batch()
+                finally:
+                    reader.close()
+            else:
+                # Schema-less message (current behavior)
+                record_batch = pa.ipc.read_record_batch(msg_data, self._full_schema)
+
+            # Project onto the reader schema by column name, so upstream
+            # columns may be added or reordered. Metadata is dropped as
+            # a schema carrying it is unhashable and never projected on.
+            msg_schema = record_batch.schema.remove_metadata()
+            if msg_schema not in projections:
+                if projections:
+                    logger.info(
+                        f"new kafka message schema {msg_schema.names}, "
+                        f"reading columns {self._schema.names}."
+                    )
+                projections[msg_schema] = _build_projection(msg_schema, self._schema)
+            projection = projections[msg_schema]
+            if projection is not None:
+                # cast normalizes the nested nullability differences
+                # _build_projection tolerates, so that batches read from
+                # either schema still combine into one table below.
+                record_batch = pa.RecordBatch.from_arrays(
+                    [record_batch.column(i) for i in projection],
+                    names=self._schema.names,
+                ).cast(self._schema)
+
+            record_batchs.append(record_batch)
+
+            # Generate checkpoint metadata for each row in this message
+            partition = msg.partition()
+            offset = msg.offset()
+            source_id = f"{topic}:{partition}"
+            batch_len = len(record_batch)
+            source_ids.extend([source_id] * batch_len)
+            # Use offset as the row index (each message has one offset)
+            row_indices.extend([offset] * batch_len)
+            # msg.timestamp() -> (type, ms), -1 when unavailable; use
+            # Unix-epoch seconds and keep -1 as the sentinel.
+            ts_ms = msg.timestamp()[1]
+            ts_s = ts_ms / 1000.0 if ts_ms >= 0 else -1.0
+            timestamps.extend([ts_s] * batch_len)
+
+            if self._log_every_n_messages > 0:
+                self._decoded_partition_counts[source_id] = (
+                    self._decoded_partition_counts.get(source_id, 0) + 1
+                )
+                self._decoded_message_count += 1
+                if self._decoded_message_count % self._log_every_n_messages == 0:
+                    logger.info(
+                        f"KafkaReader[rank-{os.environ.get('RANK', 0)}"
+                        f"|worker-{self._worker_id}] "
+                        f"decoded_messages={self._decoded_message_count} "
+                        f"partitions={self._decoded_partition_counts}"
+                    )
+
+        if not record_batchs:
+            return None, 0
+
+        # combine into one record batch
+        t = pa.Table.from_batches(record_batchs).combine_chunks()
+
+        # Add checkpoint metadata columns
+        t = t.append_column(CKPT_SOURCE_ID, pa.array(source_ids, type=pa.string()))
+        t = t.append_column(CKPT_ROW_IDX, pa.array(row_indices, type=pa.int64()))
+        # transient event-time column (seconds), read in _build_batch
+        t = t.append_column(DATA_TIMESTAMP, pa.array(timestamps, type=pa.float64()))
+        return t, len(record_batchs)
+
     def _reader(
-        self, worker_id: int = 0, num_workers: int = 1
+        self,
+        worker_id: int = 0,
+        num_workers: int = 1,
+        orphan_pid: Optional[int] = None,
     ) -> Generator[pa.RecordBatch, None, None]:
         """Read Arrow batches from Kafka.
 
-        Strict round-robin assigns one consumer per owned partition. In the
-        ordinary subscription path, a background heartbeat thread monitors
-        idle time since the last ``consume()`` call. When blocked at ``yield`` for
-        longer than 80% of ``max.poll.interval.ms``, the heartbeat thread
-        pauses all partitions and calls ``consumer.poll(0)`` periodically to
-        reset the application poll timer and keep the consumer in its group.
-        This prevents ``MAX_POLL_EXCEEDED`` errors during long downstream
-        pauses (checkpoint saves, evaluation, compilation warmup, etc.).
+        When partition round-robin is enabled the partitions owned by this
+        worker are read strictly in turn by :meth:`_round_robin_reader`.
+        Otherwise a background heartbeat thread monitors idle time (time since
+        the last ``consume()`` call).  When the generator is blocked at
+        ``yield`` for longer than 80% of ``max.poll.interval.ms``, the
+        heartbeat thread pauses all partitions and calls ``consumer.poll(0)``
+        periodically to reset the application poll timer and keep the consumer
+        in its group.  This prevents ``MAX_POLL_EXCEEDED`` errors during long
+        downstream pauses (checkpoint saves, evaluation, compilation warmup,
+        etc.).
 
         Args:
             worker_id: Worker ID
             num_workers: Total number of workers
+            orphan_pid: when set, exit once the parent pid changes.
 
         Yields:
             PyArrow RecordBatch
         """
-        yield from _consume_kafka(
-            self._input_path,
-            self._consumer_factory,
-            worker_id,
-            num_workers,
-            self._batch_size,
-            self._schema,
-            self._full_schema,
-            self._has_embedded_schema,
-            checkpoint_state=self._checkpoint_state,
-            round_robin_partition_order=self._round_robin_partition_order,
-            kafka_log_every_n_messages=self._log_every_n_messages,
+        self._worker_id = worker_id
+        self._decoded_message_count = 0
+        self._decoded_partition_counts: Dict[str, int] = {}
+
+        topic, config, start_timestamp_ms = _parse_kafka_uri(self._input_path)
+        if self._kafka_partition_round_robin:
+            yield from self._round_robin_reader(
+                topic,
+                config,
+                start_timestamp_ms,
+                worker_id,
+                num_workers,
+                orphan_pid=orphan_pid,
+            )
+            return
+
+        max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
+        consumer = self._consumer_factory(
+            config, reader_id=worker_id, num_readers=num_workers
         )
+        log_prefix = f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}]"
+
+        stop_event = threading.Event()
+        consumer_lock = threading.RLock()
+        is_paused = [False]
+        last_consume_time = [time.monotonic()]
+        idle_threshold = max_poll_interval_ms / 1000.0 * 0.8
+        stolen_msgs: List = []
+
+        # Define on_assign callback to seek to checkpointed offsets
+        def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
+            self._set_start_offsets(consumer, partitions, start_timestamp_ms)
+            with consumer_lock:
+                consumer.assign(partitions)
+                if is_paused[0]:
+                    consumer.pause(consumer.assignment())
+            logger.info(f"{log_prefix} assignment: {consumer.assignment()}")
+
+        def _heartbeat() -> None:
+            """Keep consumer alive when generator is blocked at yield."""
+            while not stop_event.is_set():
+                try:
+                    elapsed = time.monotonic() - last_consume_time[0]
+                    if elapsed > idle_threshold:
+                        with consumer_lock:
+                            # Re-check elapsed inside lock to avoid racing
+                            # with the main thread that updates
+                            # last_consume_time under the same lock.
+                            elapsed = time.monotonic() - last_consume_time[0]
+                            if elapsed > idle_threshold:
+                                if not is_paused[0]:
+                                    assignment = consumer.assignment()
+                                    if assignment:
+                                        consumer.pause(assignment)
+                                    is_paused[0] = True
+                                    logger.debug(
+                                        f"{log_prefix} heartbeat: paused "
+                                        f"{len(assignment)} partitions after "
+                                        f"{elapsed:.1f}s idle"
+                                    )
+                                msg = consumer.poll(0)
+                                if msg is not None and not msg.error():
+                                    stolen_msgs.append(msg)
+                except Exception:
+                    logger.warning(f"{log_prefix} heartbeat error", exc_info=True)
+                stop_event.wait(1.0)
+
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat,
+            name=f"{log_prefix}-hb",
+            daemon=True,
+        )
+        batch_size_per_msg = None
+        # name-based projection per seen message schema, so an upstream schema
+        # change costs one recompute rather than one per message.
+        projections: Dict[pa.Schema, Optional[List[int]]] = {}
+        heartbeat_thread.start()
+        try:
+            consumer.subscribe([topic], on_assign=on_assign)
+            while True:
+                if orphan_pid is not None and os.getppid() != orphan_pid:
+                    logger.error(f"{log_prefix}: owner process gone, exiting")
+                    return
+                num_messages = (
+                    int(math.ceil(self._batch_size / batch_size_per_msg))
+                    if batch_size_per_msg
+                    else 2
+                )
+                # Hold consumer_lock during consume() so the heartbeat
+                # thread cannot call pause() concurrently.
+                # rd_kafka_consume_batch_queue() (used by consume()) is
+                # not thread-safe with concurrent pause/resume/seek.
+                with consumer_lock:
+                    if is_paused[0]:
+                        assignment = consumer.assignment()
+                        if assignment:
+                            consumer.resume(assignment)
+                        is_paused[0] = False
+                        logger.debug(f"{log_prefix} heartbeat: resumed partitions")
+                    last_consume_time[0] = time.monotonic()
+                    pending = list(stolen_msgs)
+                    stolen_msgs.clear()
+                    messages = pending
+                    messages.extend(consumer.consume(num_messages, timeout=1.0))
+
+                t, num_decoded = self._decode_messages(messages, topic, projections)
+                if t is None:
+                    continue
+
+                # estimate batch_size per message
+                if batch_size_per_msg is None:
+                    batch_size_per_msg = len(t) / num_decoded
+                else:
+                    batch_size_per_msg = (
+                        0.9 * batch_size_per_msg + 0.1 * len(t) / num_decoded
+                    )
+
+                for batch in t.to_batches():
+                    yield batch
+        except Exception as e:
+            logger.error(f"{log_prefix} exception: {e}")
+            raise
+        finally:
+            stop_event.set()
+            heartbeat_thread.join(timeout=5.0)
+            if heartbeat_thread.is_alive():
+                logger.warning(
+                    "Heartbeat thread did not exit within timeout; "
+                    "skipping consumer.close() to avoid race."
+                )
+            else:
+                try:
+                    consumer.close()
+                except Exception as e:
+                    logger.warning(f"consumer.close() failed: {e}")
+
+    def _round_robin_reader(
+        self,
+        topic: str,
+        config: Dict[str, Any],
+        start_timestamp_ms: Optional[int],
+        worker_id: int,
+        num_workers: int,
+        orphan_pid: Optional[int] = None,
+    ) -> Generator[pa.RecordBatch, None, None]:
+        """Read this worker's partitions strictly in round-robin order.
+
+        Partitions are sliced from the leader-ordered list resolved at reader
+        construction, then read in ascending partition order.  Each owned
+        partition gets its own consumer, assigned up front.  The rotation
+        cursor does not advance while the current partition has no valid message.
+
+        Args:
+            topic (str): kafka topic name.
+            config (dict): kafka consumer configuration.
+            start_timestamp_ms (int, optional): start timestamp in milliseconds.
+            worker_id (int): global worker ID.
+            num_workers (int): total number of global workers.
+            orphan_pid (int, optional): when set, exit once the parent pid
+                changes.
+
+        Yields:
+            PyArrow RecordBatch
+
+        Raises:
+            ValueError: if the topic has fewer partitions than the total number
+                of workers.
+        """
+        log_prefix = f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}]"
+        consumers: List[Consumer] = []
+        try:
+            if len(self._round_robin_partition_order) < num_workers:
+                raise ValueError(
+                    f"kafka topic {topic} has "
+                    f"{len(self._round_robin_partition_order)} partition(s), "
+                    f"fewer than the {num_workers} dataloader workers; "
+                    "kafka_partition_round_robin requires at least one partition "
+                    "per worker."
+                )
+            owned_partitions = [
+                TopicPartition(topic, partition)
+                for partition in sorted(
+                    self._round_robin_partition_order[worker_id::num_workers]
+                )
+            ]
+            consumer = self._consumer_factory(config)
+            consumers.append(consumer)
+            self._set_start_offsets(consumer, owned_partitions, start_timestamp_ms)
+            consumer.assign([owned_partitions[0]])
+            for tp in owned_partitions[1:]:
+                consumer = self._consumer_factory(config)
+                consumers.append(consumer)
+                consumer.assign([tp])
+            logger.info(f"{log_prefix} assignment: {owned_partitions}")
+
+            projections: Dict[pa.Schema, Optional[List[int]]] = {}
+            idx = 0
+            while True:
+                if orphan_pid is not None and os.getppid() != orphan_pid:
+                    logger.error(f"{log_prefix}: owner process gone, exiting")
+                    return
+                messages = consumers[idx].consume(1, timeout=1.0)
+                if not messages:
+                    continue
+                t, _ = self._decode_messages(messages, topic, projections)
+                if t is None:
+                    continue
+                # A zero-row message advances the rotation even though it
+                # yields no record batch.
+                for batch in t.to_batches():
+                    yield batch
+                idx = (idx + 1) % len(consumers)
+        except Exception as e:
+            logger.error(f"{log_prefix} exception: {e}")
+            raise
+        finally:
+            for consumer in reversed(consumers):
+                try:
+                    consumer.close()
+                except Exception as e:
+                    logger.warning(f"consumer.close() failed: {e}")
 
     def create_read_plan(
         self, rank: int, world_size: int, num_readers: int
     ) -> ReadPlan:
         """Build a per-rank Kafka read plan.
 
-        Each rank's reader slots use global ids. Round-robin tasks receive
-        the parent-resolved partition order; ordinary tasks subscribe to the
-        shared consumer group. The checkpoint state travels with every task
-        and is applied on each assignment, like the BATCH path.
+        A copy of this reader, with the checkpoint state frozen, travels with
+        every task. Round-robin snapshots carry the parent-resolved partition
+        order; ordinary snapshots subscribe to the shared consumer group.
+        The checkpoint state is applied on each assignment, like the BATCH
+        path, and later changes to this reader do not affect the plan.
 
         Args:
             rank: this process's rank.
@@ -1073,7 +914,8 @@ class KafkaReader(BaseReader):
         Returns:
             a non-finite read plan with one task per reader.
         """
-        checkpoint_state = (
+        reader = copy.copy(self)
+        reader._checkpoint_state = (
             dict(self._checkpoint_state) if self._checkpoint_state else None
         )
         global_num_readers = world_size * num_readers
@@ -1081,17 +923,9 @@ class KafkaReader(BaseReader):
             ReadTask(
                 fn=_read_sample_batches,
                 kwargs=dict(
-                    input_path=self._input_path,
-                    reader_id=rank * num_readers + reader_id,
-                    num_readers=global_num_readers,
-                    checkpoint_state=checkpoint_state,
-                    reader_schema=self._schema,
-                    full_schema=self._full_schema,
-                    has_embedded_schema=self._has_embedded_schema,
-                    batch_size=self._batch_size,
-                    consumer_factory=self._consumer_factory,
-                    round_robin_partition_order=self._round_robin_partition_order,
-                    kafka_log_every_n_messages=self._log_every_n_messages,
+                    reader=reader,
+                    worker_id=rank * num_readers + reader_id,
+                    num_workers=global_num_readers,
                 ),
                 # local slot: groups tasks for this rank's reader processes
                 reader_id=reader_id,
