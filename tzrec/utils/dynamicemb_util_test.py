@@ -481,6 +481,7 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
             ("hybrid", "HYBRID", "TIMESTAMP"),
             ("flat_row", "HBM_ONLY", "NO_EVICTION"),
             ("host_only", "HOST_ONLY", "STEP"),
+            ("customized", "CACHING", "CUSTOMIZED"),
         ],
         name_func=parameterized_name_func,
     )
@@ -508,8 +509,13 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
             * dtype.itemsize
         )
         if is_rocksdb:
-            from tzrec_ext.rocksdb import BackendConfig, RocksDBSession
-            from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+            try:
+                from tzrec_ext.rocksdb import BackendConfig, RocksDBSession
+                from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+            except ModuleNotFoundError as exc:
+                if exc.name not in ("tzrec_ext", "tzrec_ext.rocksdb"):
+                    raise
+                self.skipTest("tzrec_ext.rocksdb is not installed")
 
             config = BackendConfig(32 << 20, 32 << 20, 1 << 20, 64 << 20, io_threads=2)
             session = RocksDBSession(config, make_test_dir())
@@ -642,6 +648,77 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
                 0,
             )
             torch.testing.assert_close(chunks[0][1], b.cpu())
+
+    @parameterized.expand(
+        [("builtin",), ("rocksdb",)], name_func=parameterized_name_func
+    )
+    def test_publish_reads_fused_tables_with_different_dimensions(self, backend):
+        from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+        from dynamicemb.key_value_table import store_to_flat
+        from fbgemm_gpu.split_embedding_configs import EmbOptimType
+
+        options = []
+        for dim in (8, 16):
+            opt = _table_options(8192, dim, score_strategy="STEP")
+            opt.dim = dim
+            opt.embedding_dtype = torch.float32
+            opt.index_type = torch.int64
+            opt.init_capacity = opt.max_capacity
+            opt.caching = True
+            opt.local_hbm_for_values = 1024 * dim * 4
+            options.append(opt)
+        if backend == "rocksdb":
+            try:
+                from tzrec_ext.rocksdb import BackendConfig, RocksDBSession
+                from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+            except ModuleNotFoundError as exc:
+                if exc.name not in ("tzrec_ext", "tzrec_ext.rocksdb"):
+                    raise
+                self.skipTest("tzrec_ext.rocksdb is not installed")
+            config = BackendConfig(32 << 20, 32 << 20, 1 << 20, 64 << 20, io_threads=2)
+            session = RocksDBSession(config, make_test_dir())
+            self.addCleanup(session.close)
+            for table_id, opt in enumerate(options):
+                opt.external_storage = RocksDBStorageFactory(
+                    config, f"t{table_id}", session
+                )
+        module = BatchedDynamicEmbeddingTablesV2(
+            table_options=options,
+            table_names=["t0", "t1"],
+            feature_table_map=[0, 1],
+            device=torch.device("cuda", torch.cuda.current_device()),
+            optimizer=EmbOptimType.EXACT_SGD,
+        )
+        if backend == "rocksdb":
+            module.tables.bind_cache(module.cache)
+        else:
+            module.tables.set_score(3)
+        module.cache.set_score(3)
+        keys = torch.tensor([11, 23], device="cuda")
+        for table_id in (0, 1):
+            tids = torch.full_like(keys, table_id)
+            values = torch.full((2, 16), 10 * table_id + 1.0, device="cuda")
+            module.tables.insert(keys, tids, values, torch.ones_like(keys))
+            slots = module.cache.insert_and_evict(keys[:1], tids[:1])[0]
+            store_to_flat(module.cache._state, slots, tids[:1], values[:1] + 100)
+        query = torch.tensor([23, 11, 91], device="cuda")
+        for table_id, dim in ((1, 16), (0, 8)):
+            chunks, missing = dynamicemb_util.lookup_embeddings_for_publish(
+                module, query, table_id
+            )
+            rows = {
+                key: value.tolist()
+                for chunk_keys, chunk_values in chunks
+                for key, value in zip(chunk_keys.tolist(), chunk_values)
+            }
+            self.assertEqual(
+                rows,
+                {
+                    11: [10 * table_id + 101.0] * dim,
+                    23: [10 * table_id + 1.0] * dim,
+                },
+            )
+            self.assertEqual(missing.tolist(), [91])
 
     def _shard_storages(self, dynamicemb_options):
         rows = dynamicemb_options.max_capacity
