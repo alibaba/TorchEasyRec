@@ -445,6 +445,65 @@ class GenRecIntegrationTest(unittest.TestCase):
             },
         )
 
+    @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
+    def test_genrec_export_distributed_embedding_aot(self):
+        """Export a distributed GenRec model with ENABLE_AOT=2 and predict."""
+        trained = self._train_eval_export()
+        dist_dir = os.path.join(self.test_dir, "export_dist_aot")
+        self.success = utils.test_export(
+            trained,
+            self.test_dir,
+            export_dir=dist_dir,
+            env_str="USE_DISTRIBUTED_EMBEDDING=1 ENABLE_AOT=2 QUANT_EMB=0",
+        )
+        self.assertTrue(self.success)
+        self.success = False
+
+        self.assertTrue(os.path.exists(os.path.join(dist_dir, "aoti/aoti_model.pt2")))
+        self.assertTrue(os.path.exists(os.path.join(dist_dir, "dense_meta.json")))
+        self.assertFalse(os.path.exists(os.path.join(dist_dir, "scripted_model.pt")))
+        self.assertFalse(
+            os.path.exists(os.path.join(dist_dir, "scripted_sparse_model.pt"))
+        )
+        graph_dir = os.path.join(dist_dir, "graph")
+        self.assertTrue(os.path.exists(os.path.join(graph_dir, "gm_dense.graph")))
+        self.assertFalse(os.path.exists(os.path.join(graph_dir, "gm_sparse.graph")))
+
+        sparse_dir = os.path.join(dist_dir, "sparse")
+        for name in (
+            "sparse_embeddings-00-of-01.npz",
+            "sparse_embedding.json",
+            "sparse_features.json",
+        ):
+            self.assertTrue(os.path.exists(os.path.join(sparse_dir, name)), name)
+        for name in ("config.json", "model.safetensors", "tokenizer.json"):
+            self.assertTrue(os.path.exists(os.path.join(dist_dir, name)), name)
+        with open(os.path.join(dist_dir, "model_acc.json"), "r") as f:
+            acc_cfg = json.load(f)
+        self.assertEqual(acc_cfg.get("DISTRIBUTED_EMBEDDING"), "1")
+        self.assertEqual(acc_cfg.get("INPUT_TILE"), "3")
+        self.assertEqual(acc_cfg.get("ENABLE_AOT"), "2")
+
+        predict_dir = os.path.join(self.test_dir, "predict_dist_aot")
+        self.success = utils.test_predict(
+            dist_dir,
+            self.data_glob,
+            predict_dir,
+            "answer",
+            "generated_sids",
+            self.test_dir,
+        )
+        self.assertTrue(self.success)
+        predicted = pq.read_table(predict_dir)
+        self.assertIn("answer", predicted.column_names)
+        sids = predicted.column("generated_sids").to_pylist()
+        self.assertEqual(len(sids), 8)
+        for row in sids:
+            self.assertEqual([len(beam) for beam in row], [3, 3])
+            for beam in row:
+                self.assertTrue(all(0 <= c < n for c, n in zip(beam, _CODEBOOK)), beam)
+
 
 if __name__ == "__main__":
     unittest.main()

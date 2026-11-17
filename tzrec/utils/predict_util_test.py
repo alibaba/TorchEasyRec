@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import io
 import json
 import os
@@ -18,7 +19,8 @@ import threading
 import time
 import unittest
 import zlib
-from typing import Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Optional, Tuple
 from unittest import mock
 
 import numpy as np
@@ -28,14 +30,28 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
+from tzrec.acc.aot_utils import export_distributed_dense_model_aot
 from tzrec.datasets.utils import Batch
 from tzrec.models.genrec_causal_lm_model import generate_codes, resolve_beam_config
-from tzrec.models.genrec_model import SLOT_EMBEDS
-from tzrec.models.model import CombinedModelWrapper
-from tzrec.prompt.assembler import CU_SEQLENS, HOLE_POSITIONS, INPUT_IDS
+from tzrec.models.genrec_model import SLOT_EMBEDS, GenRecFrontEnd
+from tzrec.models.model import CombinedModelWrapper, ScriptWrapper
+from tzrec.prompt.assembler import (
+    CU_SEQLENS,
+    HOLE_POSITIONS,
+    HOLE_SLOT_COUNTS,
+    INPUT_IDS,
+)
 from tzrec.prompt.compile import sid_bands
+from tzrec.prompt.hole_keys import HOLE_KEYS
+from tzrec.protos import feature_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
+from tzrec.protos.prompt_pb2 import PromptSlot
 from tzrec.utils import config_util, npz_util, predict_util, quant_util
+from tzrec.utils.export_util import (
+    _run_dense_graph_sanity_check,
+    build_dense_graph_module,
+    init_parameters,
+)
 from tzrec.utils.hf_export_util import SERVING_MODEL_TYPE
 from tzrec.utils.logging_util import logger
 from tzrec.utils.predict_util import (
@@ -49,7 +65,9 @@ from tzrec.utils.predict_util import (
     load_predict_model,
 )
 from tzrec.utils.test_util import (
+    GENREC_LONG_HIST_CODES,
     ci_resources,
+    create_genrec_test_model,
     create_tiny_causal_lm,
     make_test_dir,
     mark_ci_scope,
@@ -513,6 +531,41 @@ class _DenseSum(torch.nn.Module):
     ) -> Dict[str, torch.Tensor]:
         p = data["deep"].sum(1) + data["x.values"].sum(1) + data["sd.lengths"]
         return {"p": p * data["batch_size"]}
+
+
+class _DenseAOTIRich(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = torch.nn.Linear(16, 4)
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, torch.Tensor]:
+        del device
+        deep_out = self.proj(data["deep"]).sum(1)
+        seq_sum = data["seq"].sum() + data["sd.values"].sum()
+        mv_kl_sum = data["mv.key_lengths"].to(torch.float32).sum()
+        row_terms = (
+            data["x.values"].sum(1)
+            + data["seq__lengths"].to(torch.float32)
+            + data["sd.lengths"].to(torch.float32)
+            + data["mv.lengths"].to(torch.float32)
+        )
+        p = (deep_out + row_terms + (seq_sum + mv_kl_sum) * 0.01) * data[
+            "batch_size"
+        ].to(torch.float32)
+        return {"p": p}
+
+
+class _DenseAOTISingleArg(torch.nn.Module):
+    def __init__(self, inner: torch.nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return self.inner(data)
 
 
 def _write_export(export_dir, tables, features, dense_meta):
@@ -1038,6 +1091,551 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
             rtol=1e-5,
             atol=1e-5,
         )
+
+    def _build_rich_aoti_export(
+        self,
+        export_dir: str,
+        *,
+        include_enable_aot: bool = True,
+        ts_dir: Optional[str] = None,
+    ) -> Tuple[_Table, _Table, torch.nn.Module]:
+        dyn = _Table("model.ebc.dyn", 10, 8, False, dynamic=True)
+        static = _Table("model.ebc.static", 20, 8, False, dynamic=False)
+        features = {
+            "a__ebc": {
+                "embedding_name": dyn.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            },
+            "b__ebc": {
+                "embedding_name": static.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            },
+            "seq__ec": {
+                "embedding_name": dyn.name,
+                "pooling": "NONE",
+                "use_weight": False,
+            },
+        }
+        dense_meta = {
+            "sequence__ec": ["seq__ec", "seq__lengths"],
+            "deep": ["a__ebc", "b__ebc"],
+        }
+        _write_export(export_dir, [dyn, static], features, dense_meta)
+
+        torch.manual_seed(42)
+        dense_mod = _DenseAOTIRich().cuda().eval()
+        single_arg = _DenseAOTISingleArg(dense_mod).cuda().eval()
+        device = torch.device("cuda:0")
+        sample = {
+            "deep": torch.randn(2, 16, device=device),
+            "seq": torch.randn(3, 8, device=device),
+            "seq__lengths": torch.tensor([2, 1], dtype=torch.int32, device=device),
+            "x.values": torch.randn(2, 2, device=device),
+            "sd.values": torch.randn(3, 4, device=device),
+            "sd.lengths": torch.tensor([2, 1], dtype=torch.int64, device=device),
+            "mv.lengths": torch.tensor([2, 1], dtype=torch.int64, device=device),
+            "mv.key_lengths": torch.tensor([1, 2, 1], dtype=torch.int64, device=device),
+            "batch_size": torch.tensor(1, dtype=torch.int64, device=device),
+        }
+        batch_dim = torch.export.Dim("batch", min=1, max=256)
+        seq_dim = torch.export.Dim("seq", min=0, max=1024)
+        sd_dim = torch.export.Dim("sd", min=0, max=1024)
+        mv_dim = torch.export.Dim("mv", min=0, max=1024)
+        dyn_shapes = {
+            "deep": {0: batch_dim},
+            "seq": {0: seq_dim},
+            "seq__lengths": {0: batch_dim},
+            "x.values": {0: batch_dim},
+            "sd.values": {0: sd_dim},
+            "sd.lengths": {0: batch_dim},
+            "mv.lengths": {0: batch_dim},
+            "mv.key_lengths": {0: mv_dim},
+            "batch_size": {},
+        }
+        ep = torch.export.export(
+            single_arg, args=(sample,), dynamic_shapes=(dyn_shapes,)
+        )
+        aoti_dir = os.path.join(export_dir, "aoti")
+        os.makedirs(aoti_dir, exist_ok=True)
+        torch._inductor.aoti_compile_and_package(
+            ep, package_path=os.path.join(aoti_dir, "aoti_model.pt2")
+        )
+        acc_cfg = {"DISTRIBUTED_EMBEDDING": "1"}
+        if include_enable_aot:
+            acc_cfg["ENABLE_AOT"] = "2"
+        with open(os.path.join(export_dir, "model_acc.json"), "w") as f:
+            json.dump(acc_cfg, f)
+
+        if ts_dir is not None:
+            _write_export(ts_dir, [dyn, static], features, dense_meta)
+            torch.jit.script(dense_mod).save(os.path.join(ts_dir, "scripted_model.pt"))
+            with open(os.path.join(ts_dir, "model_acc.json"), "w") as f:
+                json.dump({"DISTRIBUTED_EMBEDDING": "1"}, f)
+
+        return dyn, static, dense_mod
+
+    @staticmethod
+    def _make_rich_batch(
+        dyn: _Table, bs: int, *, empty_seq: bool = False, seed: int = 0
+    ) -> Batch:
+        rng = torch.Generator().manual_seed(seed + bs + (100 if empty_seq else 0))
+        seq_bags = tuple(
+            [] if empty_seq else [dyn.keys[(i + j) % 5] for j in range((i % 2) + 1)]
+            for i in range(bs)
+        )
+        mv_bags = tuple(
+            [] if empty_seq else ([0, 1] if i % 2 == 0 else [2]) for i in range(bs)
+        )
+        bags = {
+            "a": tuple([dyn.keys[i % 5], -1] for i in range(bs)),
+            "b": tuple([i % 20] for i in range(bs)),
+            "seq": seq_bags,
+            "mv": mv_bags,
+        }
+        batch = _lookup_batch(bags, {})
+        batch.dense_features = {
+            "d": KeyedTensor(
+                keys=["x", "y"],
+                length_per_key=[2, 3],
+                values=torch.randn(bs, 5, generator=rng),
+            )
+        }
+        sd_lengths = (
+            torch.zeros(bs, dtype=torch.int32)
+            if empty_seq
+            else torch.tensor([(i % 2) + 1 for i in range(bs)], dtype=torch.int32)
+        )
+        batch.sequence_dense_features = {
+            "sd": JaggedTensor(
+                values=torch.randn(int(sd_lengths.sum()), 4, generator=rng),
+                lengths=sd_lengths,
+            )
+        }
+        mv_seq_list = (
+            [0] * bs if empty_seq else [1 if i % 2 == 0 else 0 for i in range(bs)]
+        )
+        mv_seq_lengths = torch.tensor(mv_seq_list, dtype=torch.int32)
+        mv_key_lengths = (
+            torch.zeros(0, dtype=torch.int32)
+            if empty_seq
+            else torch.full((int(mv_seq_lengths.sum()),), 2, dtype=torch.int32)
+        )
+        batch.sequence_mulval_lengths = {
+            "g_mv": KeyedJaggedTensor(
+                keys=["mv"],
+                values=mv_key_lengths,
+                lengths=mv_seq_lengths,
+            )
+        }
+        return batch
+
+    @parameterized.expand(
+        [
+            param("with_enable_aot", include_enable_aot=True),
+            param("fallback_without_enable_aot", include_enable_aot=False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_runs_aoti_dense_on_lookup(self, _name, include_enable_aot: bool) -> None:
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        ts_dir = make_test_dir()
+        try:
+            dyn, _static, _dense_mod = self._build_rich_aoti_export(
+                self.export_dir,
+                include_enable_aot=include_enable_aot,
+                ts_dir=ts_dir,
+            )
+            device = torch.device("cuda:0")
+            aoti_model = load_predict_model(self.export_dir, [device], log_model=True)
+            ts_model = load_predict_model(ts_dir, [device])
+            self.assertIsInstance(aoti_model, DistributedEmbeddingModel)
+            self.assertTrue(aoti_model._is_aot)
+
+            cases = [
+                (1, False),
+                (3, False),
+                (7, False),
+                (3, True),
+                (1, True),
+            ]
+            for bs, empty_seq in cases:
+                batch = self._make_rich_batch(dyn, bs, empty_seq=empty_seq)
+                tile_bs = torch.tensor(2, dtype=torch.int64)
+                with mock.patch.object(
+                    predict_util, "batch_to_dict", wraps=predict_util.batch_to_dict
+                ) as spy_b2d:
+                    actual = aoti_model(batch, tile_bs, device)
+                self.assertEqual(spy_b2d.call_args.args[1], {})
+                expected = ts_model(batch, tile_bs, device)
+                self.assertEqual(actual["p"].device, device)
+                self.assertEqual(actual["p"].shape, (bs,))
+                torch.testing.assert_close(
+                    actual["p"], expected["p"], rtol=1e-5, atol=1e-5
+                )
+        finally:
+            shutil.rmtree(ts_dir, ignore_errors=True)
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
+    def test_aoti_multithread_concurrent_inference(self) -> None:
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        try:
+            dyn, _static, _dense_mod = self._build_rich_aoti_export(self.export_dir)
+            device = torch.device("cuda:0")
+            model = load_predict_model(self.export_dir, [device])
+            batches = [
+                self._make_rich_batch(dyn, bs, empty_seq=empty_seq, seed=i)
+                for i, (bs, empty_seq) in enumerate(
+                    [(1, False), (3, False), (7, False), (4, True)]
+                )
+            ]
+            tile_bs = torch.tensor(2, dtype=torch.int64)
+            refs = [model(b, tile_bs, device)["p"].cpu() for b in batches]
+
+            num_workers = 4
+            streams = [torch.cuda.Stream(device) for _ in range(num_workers)]
+
+            def _worker(worker_id: int) -> None:
+                stream = streams[worker_id]
+                with torch.cuda.stream(stream):
+                    for step in range(8):
+                        idx = (worker_id + step) % len(batches)
+                        out = model(batches[idx], tile_bs, device)["p"]
+                        stream.synchronize()
+                        torch.testing.assert_close(
+                            out.cpu(), refs[idx], rtol=1e-5, atol=1e-5
+                        )
+
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                futures = [pool.submit(_worker, wid) for wid in range(num_workers)]
+                for fut in futures:
+                    fut.result()
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "requires 2 GPUs")
+    @ci_resources(slots=2)
+    def test_aoti_multi_gpu_concurrent_inference(self) -> None:
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        try:
+            dyn, _static, _dense_mod = self._build_rich_aoti_export(self.export_dir)
+            devices = [torch.device("cuda:0"), torch.device("cuda:1")]
+            model = load_predict_model(self.export_dir, devices)
+            self.assertEqual(len(model._dense_aoti), 2)
+
+            batches = [
+                self._make_rich_batch(dyn, bs, empty_seq=empty_seq, seed=i)
+                for i, (bs, empty_seq) in enumerate(
+                    [(1, False), (3, False), (7, False), (3, True)]
+                )
+            ]
+            tile_bs = torch.tensor(2, dtype=torch.int64)
+            refs = [model(b, tile_bs, devices[0])["p"].cpu() for b in batches]
+
+            num_workers = 4
+            streams = [
+                torch.cuda.Stream(devices[wid % len(devices)])
+                for wid in range(num_workers)
+            ]
+
+            def _worker(worker_id: int) -> None:
+                dev = devices[worker_id % len(devices)]
+                stream = streams[worker_id]
+                with torch.cuda.stream(stream):
+                    for step in range(6):
+                        idx = (worker_id + step) % len(batches)
+                        out = model(batches[idx], tile_bs, dev)["p"]
+                        self.assertEqual(out.device, dev)
+                        stream.synchronize()
+                        torch.testing.assert_close(
+                            out.cpu(), refs[idx], rtol=1e-5, atol=1e-5
+                        )
+
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                futures = [pool.submit(_worker, wid) for wid in range(num_workers)]
+                for fut in futures:
+                    fut.result()
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
+    def test_genrec_export_model_aoti_distributed(self) -> None:
+        device = torch.device("cuda:0")
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "USE_DISTRIBUTED_EMBEDDING": "1",
+                    "INPUT_TILE": "3",
+                    "ENABLE_AOT": "2",
+                },
+            ):
+                hist_cfg = feature_pb2.FeatureConfig(
+                    sequence_raw_feature=feature_pb2.RawFeature(
+                        feature_name="hist", expression="user:hist"
+                    )
+                )
+                beh_cfg = feature_pb2.FeatureConfig(
+                    sequence_id_feature=feature_pb2.IdFeature(
+                        feature_name="beh",
+                        expression="user:beh",
+                        num_buckets=32,
+                        embedding_dim=8,
+                        sequence_length=2,
+                    )
+                )
+                age_cfg = feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="age",
+                        expression="user:age",
+                        num_buckets=16,
+                        embedding_dim=4,
+                    )
+                )
+                genrec_model, _ = create_genrec_test_model(
+                    os.path.join(self.export_dir, "src"),
+                    feature_configs=[hist_cfg, beh_cfg, age_cfg],
+                    prompt=(
+                        "User : {{user_slot}} History : {{hist}} . {{beh}} Predict :"
+                    ),
+                    slots=[PromptSlot(name="user_slot", feature_names=["age"])],
+                )
+                init_parameters(genrec_model, device=device)
+                genrec_model.eval()
+                # build_dense_graph_module shrinks sparse tables on genrec_model
+                # in place, so snapshot a full-table reference copy beforehand.
+                ref_model = copy.deepcopy(genrec_model)
+                ref_wrapped = ScriptWrapper(GenRecFrontEnd(ref_model)).to(device).eval()
+                genrec_model.lm.save_pretrained(self.export_dir)
+                with open(os.path.join(self.export_dir, "config.json"), "w") as f:
+                    json.dump(
+                        {
+                            "model_type": SERVING_MODEL_TYPE,
+                            "text_config": json.loads(
+                                genrec_model.lm.config.to_json_string()
+                            ),
+                            "sid_space": {
+                                "codebook": [4, 4, 4],
+                                "base_vocab_size": 40,
+                            },
+                        },
+                        f,
+                    )
+                pipeline_cfg = EasyRecConfig()
+                pipeline_cfg.model_config.genrec_causal_lm_model.common.beam_widths.extend(
+                    [2, 2, 2]
+                )
+                config_util.save_message(
+                    pipeline_cfg, os.path.join(self.export_dir, "pipeline.config")
+                )
+
+                wrapped = ScriptWrapper(GenRecFrontEnd(genrec_model)).to(device).eval()
+                export_data = {
+                    "batch_size": torch.tensor(1, dtype=torch.int64, device=device),
+                    "hist.values": torch.tensor(
+                        GENREC_LONG_HIST_CODES * 2,
+                        dtype=torch.float32,
+                        device=device,
+                    ).reshape(-1, 1),
+                    "hist.lengths": torch.tensor(
+                        [6, 6], dtype=torch.int64, device=device
+                    ),
+                    "beh.values": torch.zeros(4, dtype=torch.int64, device=device),
+                    "beh.lengths": torch.tensor(
+                        [2, 2], dtype=torch.int64, device=device
+                    ),
+                    "age.values": torch.zeros(2, dtype=torch.int64, device=device),
+                    "age.lengths": torch.tensor(
+                        [1, 1], dtype=torch.int64, device=device
+                    ),
+                }
+                gm, full_graph, dense_meta = build_dense_graph_module(
+                    wrapped, export_data, device
+                )
+                sparse_kts, seq_jts = _run_dense_graph_sanity_check(
+                    wrapped, full_graph, gm, export_data, device
+                )
+                export_distributed_dense_model_aot(
+                    model=wrapped,
+                    gm=gm,
+                    data=export_data,
+                    sparse_kts=sparse_kts,
+                    seq_jts=seq_jts,
+                    dense_graph_config=dense_meta,
+                    save_dir=self.export_dir,
+                )
+
+                emb_sd = ref_model.embedding_group.state_dict()
+                age_w = (
+                    emb_sd["emb_impls.__BASE__.ebc_user.embedding_bags.age_emb.weight"]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                beh_w = (
+                    emb_sd[
+                        "seq_emb_impls.__BASE__.ec_dict_user.8.embeddings.beh_emb.weight"
+                    ]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                sparse_dir = os.path.join(self.export_dir, "sparse")
+                os.makedirs(sparse_dir, exist_ok=True)
+                npz_util.savez_streaming(
+                    os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"),
+                    {"age_emb": age_w, "beh_emb": beh_w},
+                )
+                with open(os.path.join(sparse_dir, "sparse_embedding.json"), "w") as f:
+                    json.dump(
+                        {
+                            "age_emb": {
+                                "dense": False,
+                                "is_dynamic": False,
+                                "dimension": 4,
+                                "shape": list(age_w.shape),
+                                "dtype": "float32",
+                            },
+                            "beh_emb": {
+                                "dense": False,
+                                "is_dynamic": False,
+                                "dimension": 8,
+                                "shape": list(beh_w.shape),
+                                "dtype": "float32",
+                            },
+                        },
+                        f,
+                    )
+                with open(os.path.join(sparse_dir, "sparse_features.json"), "w") as f:
+                    json.dump(
+                        {
+                            "age__ebc": {
+                                "embedding_name": "age_emb",
+                                "pooling": "SUM",
+                                "use_weight": False,
+                            },
+                            "beh__ec": {
+                                "embedding_name": "beh_emb",
+                                "pooling": "NONE",
+                                "use_weight": False,
+                            },
+                        },
+                        f,
+                    )
+                with open(os.path.join(self.export_dir, "dense_meta.json"), "w") as f:
+                    json.dump(dict(dense_meta), f)
+                with open(os.path.join(self.export_dir, "model_acc.json"), "w") as f:
+                    json.dump(
+                        {
+                            "DISTRIBUTED_EMBEDDING": "1",
+                            "INPUT_TILE": "3",
+                            "ENABLE_AOT": "2",
+                        },
+                        f,
+                    )
+
+            predict_model = load_predict_model(self.export_dir, [device])
+            self.assertIsInstance(predict_model, GenRecExportModel)
+            self.assertIsInstance(predict_model._frontend, DistributedEmbeddingModel)
+            self.assertTrue(predict_model._frontend._is_aot)
+
+            for bs in (1, 3):
+                batch = Batch(
+                    sparse_features={
+                        "g0": KeyedJaggedTensor(
+                            keys=["age", "beh"],
+                            values=torch.cat(
+                                [
+                                    torch.arange(1, bs + 1, dtype=torch.int64),
+                                    torch.arange(2, 2 + 2 * bs, dtype=torch.int64),
+                                ]
+                            ),
+                            lengths=torch.cat(
+                                [
+                                    torch.ones(bs, dtype=torch.int32),
+                                    torch.full((bs,), 2, dtype=torch.int32),
+                                ]
+                            ),
+                        )
+                    },
+                    sequence_dense_features={
+                        "hist": JaggedTensor(
+                            values=torch.tensor(
+                                GENREC_LONG_HIST_CODES * bs, dtype=torch.float32
+                            ).reshape(-1, 1),
+                            lengths=torch.full((bs,), 6, dtype=torch.int32),
+                        )
+                    },
+                )
+                tile_bs = torch.tensor(1, dtype=torch.int64)
+                with (
+                    torch.no_grad(),
+                    mock.patch.dict(os.environ, {"INPUT_TILE": "3"}),
+                ):
+                    raw_inputs = {
+                        k: v.to(device)
+                        for k, v in batch.to_dict(sparse_dtype=torch.int64).items()
+                    }
+                    raw_inputs["batch_size"] = tile_bs.to(device)
+                    expected_frontend = ref_wrapped(raw_inputs, device)
+                with torch.no_grad():
+                    actual_frontend = predict_model._frontend(batch, tile_bs, device)
+                for key in (
+                    INPUT_IDS,
+                    CU_SEQLENS,
+                    HOLE_POSITIONS,
+                    HOLE_KEYS,
+                    HOLE_SLOT_COUNTS,
+                    SLOT_EMBEDS,
+                ):
+                    self.assertIn(key, actual_frontend)
+                    self.assertEqual(actual_frontend[key].device, device)
+                    torch.testing.assert_close(
+                        actual_frontend[key],
+                        expected_frontend[key],
+                        rtol=1e-5,
+                        atol=1e-5,
+                    )
+
+                with torch.no_grad():
+                    actual = predict_model(batch, tile_bs, device)
+                    ref_lm = ref_model.lm.to(device)
+                    embeds = ref_lm.get_input_embeddings()(expected_frontend[INPUT_IDS])
+                    embeds.index_copy_(
+                        0,
+                        expected_frontend[HOLE_POSITIONS],
+                        expected_frontend[SLOT_EMBEDS].to(embeds.dtype),
+                    )
+                    _, band_lo, band_hi = sid_bands([4, 4, 4], 40)
+                    expected_codes = generate_codes(
+                        ref_lm,
+                        embeds,
+                        expected_frontend[CU_SEQLENS],
+                        int(torch.diff(expected_frontend[CU_SEQLENS]).max()),
+                        [2, 2, 2],
+                        list(zip(band_lo, band_hi)),
+                    )
+                self.assertEqual(actual["generated_sids"].device, device)
+                self.assertTrue(torch.equal(actual["generated_sids"], expected_codes))
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
 
 
 class GenRecExportModelTest(unittest.TestCase):

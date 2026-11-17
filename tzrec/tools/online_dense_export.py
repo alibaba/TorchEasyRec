@@ -17,6 +17,8 @@ import os
 import shutil
 from typing import Any, Dict, Optional
 
+import torch
+
 from tzrec.acc import utils as acc_utils
 from tzrec.main import _create_features, _create_model
 from tzrec.models.match_model import MatchModel
@@ -25,6 +27,7 @@ from tzrec.models.tdm import TDM
 from tzrec.utils import config_util
 from tzrec.utils.checkpoint_util import _get_checkpoint_step
 from tzrec.utils.export_util import (
+    _export_dense_model_on_device,
     ensure_input_tile_for_distributed_embedding,
     export_dense_model_cpu,
 )
@@ -77,6 +80,12 @@ def export_online_dense_model(
     if not acc_utils.use_distributed_embedding():
         raise RuntimeError("ONLINE_DENSE_EXPORT requires USE_DISTRIBUTED_EMBEDDING=1.")
 
+    is_aot = acc_utils.is_aot()
+    if is_aot and not torch.cuda.is_available():
+        raise RuntimeError(
+            "ONLINE_DENSE_EXPORT with ENABLE_AOT requires a CUDA device."
+        )
+
     ensure_input_tile_for_distributed_embedding()
 
     version = version or make_version()
@@ -115,14 +124,32 @@ def export_online_dense_model(
     scripted_model = ScriptWrapper(model)
 
     try:
-        export_dense_model_cpu(
-            pipeline_config=pipeline_config,
-            model=scripted_model,
-            checkpoint_path=checkpoint_path,
-            save_dir=tmp_dir,
-        )
+        if is_aot:
+            device = torch.device("cuda:0")
+            torch.cuda.set_device(device)
+            acc_utils.allow_tf32_for_export(pipeline_config)
+            mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
+            _export_dense_model_on_device(
+                pipeline_config=pipeline_config,
+                model=scripted_model,
+                checkpoint_path=checkpoint_path,
+                save_dir=tmp_dir,
+                device=device,
+                mixed_precision=mixed_precision,
+            )
+            required_files = [
+                os.path.join("aoti", "aoti_model.pt2"),
+                "dense_meta.json",
+            ]
+        else:
+            export_dense_model_cpu(
+                pipeline_config=pipeline_config,
+                model=scripted_model,
+                checkpoint_path=checkpoint_path,
+                save_dir=tmp_dir,
+            )
+            required_files = ["scripted_model.pt", "dense_meta.json"]
 
-        required_files = ["scripted_model.pt", "dense_meta.json"]
         for file_name in required_files:
             file_path = os.path.join(tmp_dir, file_name)
             if not os.path.exists(file_path):

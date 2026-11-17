@@ -371,11 +371,16 @@ class GenRecFrontEnd(nn.Module):
 
     def __init__(self, model: BaseGenRecModel) -> None:
         super().__init__()
-        if acc_utils.is_aot() or acc_utils.is_trt() or env_util.use_rtp():
+        if (
+            (acc_utils.is_aot() and not acc_utils.use_distributed_embedding())
+            or acc_utils.is_trt()
+            or env_util.use_rtp()
+        ):
             raise ValueError(
-                "the genrec front-end is exported with TorchScript only: its "
-                "prompt walk has data-dependent shapes, which AOT, TRT and RTP "
-                "export cannot capture. Unset ENABLE_AOT / ENABLE_TRT / USE_RTP."
+                "the genrec front-end is exported with TorchScript or distributed "
+                "AOT only: its prompt walk has data-dependent shapes, which unified "
+                "AOT, TRT and RTP export cannot capture. Unset ENABLE_AOT / "
+                "ENABLE_TRT / USE_RTP."
             )
         self.embedding_group = model.embedding_group
         self.projections = model.projections

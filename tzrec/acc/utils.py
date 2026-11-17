@@ -82,10 +82,14 @@ def is_hard_search_input_tile() -> bool:
         return False
     if not is_input_tile():
         raise ValueError("HARD_SEARCH_INPUT_TILE=1 requires INPUT_TILE=2 or 3.")
-    if is_trt() or (is_aot() and not is_unified_aot()) or env_util.use_rtp():
+    if (
+        is_trt()
+        or (is_aot() and not (is_unified_aot() or use_distributed_embedding()))
+        or env_util.use_rtp()
+    ):
         raise ValueError(
-            "HARD_SEARCH_INPUT_TILE only supports FX/TorchScript or unified AOT "
-            "(ENABLE_AOT=2) export."
+            "HARD_SEARCH_INPUT_TILE only supports FX/TorchScript, unified AOT "
+            "(ENABLE_AOT=2), or distributed AOT export."
         )
     return True
 
@@ -149,13 +153,19 @@ def is_unified_aot_predict(model_path: str) -> bool:
 
 def is_aot_predict(model_path: str) -> bool:
     """Judge is aot or not in predict (ENABLE_AOT={1,2})."""
-    with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
-        data = json.load(file)
-    enable_aot = data.get("ENABLE_AOT")
-    if enable_aot and str(enable_aot)[:1] in ("1", "2"):
-        return True
-    legacy = data.get("UNIFIED_AOT")
-    return bool(legacy) and str(legacy)[:1] == "1"
+    acc_json_path = os.path.join(model_path, "model_acc.json")
+    if os.path.exists(acc_json_path):
+        with open(acc_json_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        enable_aot = data.get("ENABLE_AOT")
+        if enable_aot is not None:
+            return str(enable_aot)[:1] in ("1", "2")
+        legacy = data.get("UNIFIED_AOT")
+        if legacy is not None:
+            return str(legacy)[:1] == "1"
+    return os.path.exists(
+        os.path.join(model_path, "aoti", "aoti_model.pt2")
+    ) and not os.path.exists(os.path.join(model_path, "scripted_model.pt"))
 
 
 def is_trt() -> bool:
@@ -363,10 +373,11 @@ def export_acc_config(
         ]
     if "MAX_EXPORT_BATCH_SIZE" in os.environ:
         acc_config["MAX_EXPORT_BATCH_SIZE"] = os.environ["MAX_EXPORT_BATCH_SIZE"]
-    # Normalize ENABLE_AOT — write "2" whenever the resolved mode is unified
-    # (whether via the new env or the legacy UNIFIED_AOT=1).
+    # Write "2" for single-stage .pt2 exports (unified or distributed dense).
     if is_aot():
-        acc_config["ENABLE_AOT"] = "2" if is_unified_aot() else "1"
+        acc_config["ENABLE_AOT"] = (
+            "2" if is_unified_aot() or use_distributed_embedding() else "1"
+        )
     if additional_export_config:
         acc_config.update(additional_export_config)
     if use_distributed_embedding():

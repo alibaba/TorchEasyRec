@@ -35,10 +35,12 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 ### 预测分布式 embedding 导出模型
 
-`USE_DISTRIBUTED_EMBEDDING=1` 导出的模型同样用上文的 `--scripted_model_path` 命令预测，会根据 `model_acc.json` 自动识别。
+`USE_DISTRIBUTED_EMBEDDING=1` 导出的模型同样用上文的 `--scripted_model_path` 命令预测，会根据导出目录下的 `model_acc.json` 自动识别分布式 embedding 模式（`"DISTRIBUTED_EMBEDDING": "1"`）与 AOTI 模式（`"ENABLE_AOT": "2"` 或 `"1"`；若 `model_acc.json` 缺少 `ENABLE_AOT` 字段，也会兜底检测是否存在 `aoti/aoti_model.pt2` 且无 `scripted_model.pt`）：
 
+- 对于 TorchScript 导出产物（`scripted_model.pt`）与 AOTI 导出产物（`aoti/aoti_model.pt2`），使用**完全相同的 `tzrec.predict` 命令**即可，无需额外命令行参数
+- 检测到 AOTI 产物时，进程会在每张可用 GPU 上分别加载独立 `device_index` 的 `aoti/aoti_model.pt2` 副本，由 NVE 在 GPU 上完成 sparse 查表并将 GPU 驻留张量直接送入 AOTI dense 模型执行前向推理（注意：预测机器的 GPU SM 架构必须与导出机器一致）
 - 建议每台机器只启动一个预测进程（`--nproc-per-node=1`），该进程使用本机全部 GPU，共享同一份 host 内存中的 embedding；每张 GPU 一个进程也能运行，但 host 内存占用随进程数成倍增加
-- `--predict_threads` 默认每张 GPU 一个前向线程；每多一个线程，GPU 上就多一份不计入 GPU 缓存预算的 embedding 查询缓冲区（大模型可达数 GB），设置更多线程时若显存不足请调低 `DIST_EMB_GPU_CACHE_RATIO`
+- `--predict_threads` 默认每张 GPU 一个前向线程；每多一个线程，GPU 上就多一份不计入 GPU 缓存预算的 embedding 查询缓冲区（大模型可达数 GB）。对于 AOTI 模型，同一张 GPU 上的多线程会通过各自独立的 CUDA Stream 并发查表并按每卡设备锁串行进入该卡的 AOTI dense Runner；设置更多线程时若显存不足，请调低 `DIST_EMB_GPU_CACHE_RATIO` 为 AOTI 工作区和线程查询缓冲区预留显存，或适当减小 `--batch_size` / `--predict_threads`
 
 ```bash
 torchrun --master_addr=localhost --master_port=32555 \

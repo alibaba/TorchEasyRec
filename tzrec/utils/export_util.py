@@ -54,11 +54,12 @@ from torchrec.quant.embedding_modules import (
 )
 from torchrec.sparse import jagged_tensor
 
+from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot, export_unified_model_aot
 from tzrec.acc.trt_utils import export_model_trt
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
-from tzrec.datasets.data_parser import _tile_size
+from tzrec.datasets.data_parser import _infer_tile_size, _tile_size
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
@@ -68,6 +69,7 @@ from tzrec.features.feature import (
     create_fg_json,
     get_hard_search_input_tile_features,
 )
+from tzrec.modules.embedding import _expand_hard_search_input_tile
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -650,6 +652,151 @@ def _infer_keyed_tensor_attrs_from_module(
     return keys, length_per_key
 
 
+def _classify_serving_batch_node(
+    key: str,
+    feat_by_name: Dict[str, BaseFeature],
+    hsk_feats: Set[str],
+) -> Optional[str]:
+    """Classify a serving placeholder key as 'item', 'user', or None."""
+    if key.endswith("__ebc") or key.endswith("__mc_ebc"):
+        return "item"
+    if key.endswith("__ebc_user") or key.endswith("__mc_ebc_user"):
+        return "user"
+    if key.endswith("__inverse_indices"):
+        return "item"
+    if key.endswith("__lengths"):
+        raw_name = key[: -len("__lengths")].split("@", 1)[0]
+        if raw_name in hsk_feats:
+            return None
+        feat = feat_by_name.get(raw_name)
+        if feat is not None and feat.is_user_feat:
+            return "user"
+        return "item"
+    if key.endswith(".values"):
+        feat_name = key[: -len(".values")]
+        if feat_name in hsk_feats:
+            return None
+        feat = feat_by_name.get(feat_name)
+        if feat is not None and not feat.is_sparse and not feat.is_sequence:
+            return "user" if feat.is_user_feat else "item"
+        return None
+    if key.endswith(".lengths"):
+        feat_name = key[: -len(".lengths")]
+        if feat_name in hsk_feats:
+            return None
+        feat = feat_by_name.get(feat_name)
+        if feat is not None and (
+            (not feat.is_sparse and feat.is_sequence)
+            or (feat.is_sparse and feat.is_sequence and feat.value_dim != 1)
+        ):
+            return "user" if feat.is_user_feat else "item"
+        return None
+    return None
+
+
+def _rewrite_tile_size_nodes(
+    graph: torch.fx.Graph,
+    root: torch.nn.Module,
+    input_node: torch.fx.Node,
+    features: List[BaseFeature],
+    hsk_feats: Set[str],
+) -> None:
+    """Replace remaining _tile_size / _infer_tile_size calls cleanly."""
+    tile_nodes = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function" and node.target in (_tile_size, _infer_tile_size)
+    ]
+    if not tile_nodes:
+        return
+
+    feat_by_name = {f.name: f for f in features}
+    item_t: Optional[torch.fx.Node] = None
+    user_t: Optional[torch.fx.Node] = None
+    for node in graph.nodes:
+        if (
+            node.op == "call_function"
+            and node.target == operator.getitem
+            and len(node.args) == 2
+            and node.args[0] is input_node
+            and isinstance(node.args[1], str)
+            and len(node.users) > 0
+        ):
+            side = _classify_serving_batch_node(node.args[1], feat_by_name, hsk_feats)
+            if side == "item" and item_t is None:
+                item_t = node
+            elif side == "user" and user_t is None:
+                user_t = node
+        if item_t is not None and user_t is not None:
+            break
+
+    last_placeholder = [n for n in graph.nodes if n.op == "placeholder"][-1]
+    if item_t is not None and user_t is not None:
+        # Place item_t, user_t and _infer_tile_size right after placeholders so
+        # the unified tile factor dominates all consumers in topological order.
+        last_placeholder.append(item_t)
+        item_t.append(user_t)
+        with graph.inserting_after(user_t):
+            unified_tile_node = graph.call_function(
+                _infer_tile_size, args=(item_t, user_t)
+            )
+    else:
+        with graph.inserting_after(last_placeholder):
+            batch_size_node = graph.call_function(
+                operator.getitem, args=(input_node, "batch_size")
+            )
+        with graph.inserting_after(batch_size_node):
+            unified_tile_node = graph.call_function(_tile_size, args=(batch_size_node,))
+
+    for tile_node in tile_nodes:
+        tile_node.replace_all_uses_with(unified_tile_node)
+
+
+def _verify_no_raw_sparse_keys(
+    graph: torch.fx.Graph,
+    root: torch.nn.Module,
+    input_node: torch.fx.Node,
+    features: List[BaseFeature],
+) -> None:
+    """Ensure raw sparse keys are eliminated from non-GenRec dense graphs."""
+    if any(
+        type(mod).__name__ in ("PromptAssembler", "HoleKeyBuilder")
+        for mod in root.modules()
+    ):
+        return
+    disallowed: Set[str] = set()
+    for feat in features:
+        if not feat.is_sparse or feat.stub_type:
+            continue
+        disallowed.add(f"{feat.name}.values")
+        disallowed.add(f"{feat.name}.weights")
+        if not (feat.is_sequence and feat.value_dim != 1):
+            disallowed.add(f"{feat.name}.lengths")
+    if not disallowed:
+        return
+
+    leftover = sorted(
+        {
+            cast(str, node.args[1])
+            for node in graph.nodes
+            if (
+                node.op == "call_function"
+                and node.target == operator.getitem
+                and len(node.args) == 2
+                and node.args[0] is input_node
+                and isinstance(node.args[1], str)
+                and len(node.users) > 0
+                and node.args[1] in disallowed
+            )
+        }
+    )
+    if leftover:
+        raise RuntimeError(
+            "Unexpected raw sparse keys remain in dense serving graph: "
+            + ", ".join(leftover)
+        )
+
+
 def _rewrite_dense_serving_graph(
     full_graph: torch.fx.Graph,
     root: torch.nn.Module,
@@ -743,10 +890,41 @@ def _rewrite_dense_serving_graph(
             emb_name = name + "__ec"
             dense_graph_config["sequence__ec"].append(emb_name)
             dense_graph_config["sequence__ec"].append(name + "__lengths")
+        elif (
+            node.op == "call_function" and node.target == _expand_hard_search_input_tile
+        ):
+            blocks = (
+                node.args[1] if len(node.args) > 1 else node.kwargs.get("blocks", [])
+            )
+            if not blocks:
+                node.replace_all_uses_with(node.args[0])
+            else:
+                required_keys = {block[2] for block in blocks if block[2]}
+                if len(node.args) > 2 and isinstance(node.args[2], dict):
+                    new_args = list(node.args)
+                    new_args[2] = {
+                        k: v for k, v in node.args[2].items() if k in required_keys
+                    }
+                    node.args = tuple(new_args)
+                elif isinstance(node.kwargs.get("additional_infos"), dict):
+                    new_kwargs = dict(node.kwargs)
+                    new_kwargs["additional_infos"] = {
+                        k: v
+                        for k, v in new_kwargs["additional_infos"].items()
+                        if k in required_keys
+                    }
+                    node.kwargs = new_kwargs
 
     graph.output(dict(zip(output_keys, output_values)))
+    _eliminate_dense_dead_code(graph)
+    features = cast(List[BaseFeature], getattr(root, "features", []) or [])
+    hsk_feats = (
+        set(get_hard_search_input_tile_features(features).keys()) if features else set()
+    )
+    _rewrite_tile_size_nodes(graph, root, input_node, features, hsk_feats)
+    _eliminate_dense_dead_code(graph)
+    _verify_no_raw_sparse_keys(graph, root, input_node, features)
     gm = torch.fx.GraphModule(root, graph)
-    _eliminate_dense_dead_code(gm.graph)
     gm = _prune_unused_param_and_buffer(gm)
 
     init_parameters(gm, device)
@@ -1728,11 +1906,19 @@ def export_distributed_embedding(
             os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"), sparse_arrays
         )
         dense_device = torch.device("cpu")
-        if pipeline_config.model_config.kernel != model_pb2.PYTORCH:
+        if (
+            pipeline_config.model_config.kernel != model_pb2.PYTORCH
+            or acc_utils.is_aot()
+        ):
             if not torch.cuda.is_available():
-                raise RuntimeError("TRITON/CUTLASS dense export requires a CUDA device")
+                raise RuntimeError(
+                    "TRITON/CUTLASS/AOT dense export requires a CUDA device"
+                )
             dense_device = torch.device("cuda:0")
             torch.cuda.set_device(dense_device)
+        if acc_utils.is_aot():
+            acc_utils.allow_tf32_for_export(pipeline_config)
+        mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
         _export_dense_model_on_device(
             pipeline_config,
             model,
@@ -1740,6 +1926,7 @@ def export_distributed_embedding(
             save_dir,
             dense_device,
             data_input_path=data_input_path,
+            mixed_precision=mixed_precision,
         )
         if uploader is not None:
             zch_tables = {
@@ -2012,24 +2199,32 @@ def _run_dense_graph_sanity_check(
     gm: torch.fx.GraphModule,
     data: Dict[str, torch.Tensor],
     device: torch.device,
-) -> None:
-    """Run the pre-surgery graph once before scripting.
+    mixed_precision: Optional[str] = None,
+) -> Tuple[Dict[str, KeyedTensor], Dict[str, JaggedTensor]]:
+    """Run the pre-surgery graph once before scripting or AOTI export.
 
     Executes the full graph via an Interpreter to validate that the model
-    runs end-to-end on the warm-up batch. The pruned-graph forward is
-    skipped to avoid OOM on large models (see comment below).
+    runs end-to-end on the warm-up batch and returns captured sparse outputs.
+    The pruned-graph forward is skipped to avoid OOM on large models.
     """
     sparse_kts: Dict[str, KeyedTensor] = {}
     seq_jts: Dict[str, JaggedTensor] = {}
     capture_gm = torch.fx.GraphModule(model, copy.deepcopy(full_graph))
-    with torch.no_grad():
+    autocast_dtype = (
+        acc_utils.mixed_precision_to_dtype(mixed_precision)
+        if device.type == "cuda"
+        else None
+    )
+    with (
+        torch.no_grad(),
+        torch.amp.autocast(
+            device_type=device.type,
+            dtype=autocast_dtype,
+            enabled=autocast_dtype is not None,
+        ),
+    ):
         _SparseMarkCapture(capture_gm, sparse_kts, seq_jts).run(data, device)
-    # The pruned-graph forward (gm on captured sparse outputs) is skipped:
-    # the captured outputs (~660 MB for large models) are kept alive as the
-    # placeholder value for the entire forward, and the dense-layer
-    # intermediates on top exceed available host memory. The capture
-    # forward above already validated the full graph end-to-end, and
-    # torch.jit.script still validates the pruned graph's structure.
+    return sparse_kts, seq_jts
 
 
 def _isolate_kafka_export_group(input_path: str) -> str:
@@ -2059,13 +2254,87 @@ def _isolate_kafka_export_group(input_path: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(params)))
 
 
+def _ensure_min_export_batch_rows(
+    data: Dict[str, torch.Tensor],
+    features: List[BaseFeature],
+) -> Dict[str, torch.Tensor]:
+    """Duplicate single-row AOT warm-up batches so item batch dim >= 2."""
+    user_feats = {f.name for f in features if f.is_user_feat}
+    hsk_feats = set(get_hard_search_input_tile_features(features).keys())
+    preserve_user_1 = acc_utils.is_input_tile() and acc_utils.is_input_tile_3_online()
+
+    item_rows: Optional[int] = None
+    for feat in features:
+        if feat.stub_type or feat.name in user_feats or feat.name in hsk_feats:
+            continue
+        if f"{feat.name}.lengths" in data:
+            item_rows = int(data[f"{feat.name}.lengths"].numel())
+            break
+        if (
+            not feat.is_sparse
+            and not feat.is_sequence
+            and f"{feat.name}.values" in data
+        ):
+            item_rows = int(data[f"{feat.name}.values"].size(0))
+            break
+    if item_rows is None:
+        for key, val in data.items():
+            if key.endswith("__inverse_indices") and val.dim() >= 1:
+                item_rows = int(val.size(0))
+                break
+    if item_rows is None and not preserve_user_1:
+        for feat in features:
+            if feat.stub_type:
+                continue
+            if f"{feat.name}.lengths" in data:
+                item_rows = int(data[f"{feat.name}.lengths"].numel())
+                break
+            if (
+                not feat.is_sparse
+                and not feat.is_sequence
+                and f"{feat.name}.values" in data
+            ):
+                item_rows = int(data[f"{feat.name}.values"].size(0))
+                break
+    if item_rows is None and not features:
+        for key, val in data.items():
+            if key != "batch_size" and val.dim() >= 1:
+                item_rows = int(val.size(0))
+                break
+
+    if item_rows is None or item_rows >= 2 or item_rows <= 0:
+        return data
+
+    new_data: Dict[str, torch.Tensor] = {}
+    for key, val in data.items():
+        if key == "batch_size":
+            new_data[key] = val * 2 if preserve_user_1 else val
+        elif key.endswith("__inverse_indices"):
+            new_data[key] = (
+                torch.cat([val, val + 1], dim=0) if val.numel() == 1 else val
+            )
+        else:
+            prefix = key
+            for suffix in (".values", ".lengths", ".weights", ".key_lengths"):
+                if key.endswith(suffix):
+                    prefix = key[: -len(suffix)]
+                    break
+            if preserve_user_1 and prefix in user_feats:
+                new_data[key] = val
+            elif val.dim() >= 1:
+                new_data[key] = torch.cat([val, val], dim=0)
+            else:
+                new_data[key] = val
+    return new_data
+
+
 def create_dense_export_warmup_data(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
     device: torch.device,
     data_input_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build one warm-up batch for CPU dense export.
+    """Build one warm-up batch for dense export.
 
     One batch from ``data_input_path`` (or ``pipeline_config.train_input_path``)
     materializes lazy-module shapes before FX tracing. Its sparse lookup
@@ -2093,6 +2362,15 @@ def create_dense_export_warmup_data(
         # isolate the export's Kafka group when falling back to train_input_path
         input_path = _isolate_kafka_export_group(input_path)
     data_config = copy.deepcopy(pipeline_config.data_config)
+    if acc_utils.is_aot():
+        inference_batch_size = max(
+            2,
+            min(
+                config_util.get_inference_batch_size(data_config),
+                acc_utils.get_max_export_batch_size(),
+            ),
+        )
+        config_util.set_inference_batch_size(data_config, inference_batch_size)
     data_config.num_workers = 1
     features = cast(List[BaseFeature], model.features)
     dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
@@ -2100,7 +2378,10 @@ def create_dense_export_warmup_data(
     batch = batch.to(device)
     for kjt in batch.sparse_features.values():
         kjt.values().zero_()
-    return batch.to_dict(sparse_dtype=torch.int64)
+    data = batch.to_dict(sparse_dtype=torch.int64)
+    if acc_utils.is_aot():
+        data = _ensure_min_export_batch_rows(data, features)
+    return data
 
 
 def _shrink_sparse_embedding_tables(model: nn.Module) -> None:
@@ -2186,6 +2467,7 @@ def build_dense_graph_module(
     model: BaseModule,
     data: Dict[str, Any],
     device: torch.device,
+    mixed_precision: Optional[str] = None,
 ) -> Tuple[torch.fx.GraphModule, torch.fx.Graph, Dict[str, Any]]:
     """Trace the model and rewrite it into the serving-style dense graph.
 
@@ -2199,6 +2481,7 @@ def build_dense_graph_module(
         model: model to export, switched to inference mode in place.
         data: warm-up batch dict (see create_dense_export_warmup_data).
         device: device the traced graph module lives on.
+        mixed_precision: optional ``"BF16"``, ``"FP16"``, or None.
 
     Returns:
         Tuple of (gm, full_graph, dense_graph_config): the rewritten dense
@@ -2221,7 +2504,19 @@ def build_dense_graph_module(
     # Materialize meta params; real weights are loaded by the caller.
     init_parameters(model, device)
     model.to(device)
-    with torch.no_grad():
+    autocast_dtype = (
+        acc_utils.mixed_precision_to_dtype(mixed_precision)
+        if device.type == "cuda"
+        else None
+    )
+    with (
+        torch.no_grad(),
+        torch.amp.autocast(
+            device_type=device.type,
+            dtype=autocast_dtype,
+            enabled=autocast_dtype is not None,
+        ),
+    ):
         model(data, device=device)
 
     leaf_modules = (
@@ -2288,13 +2583,18 @@ def finalize_dense_export(
     save_dir: str,
     dense_graph_config: Dict[str, Any],
     dense_model_traced: Optional[torch.fx.GraphModule] = None,
+    mixed_precision: Optional[str] = None,
+    input_tile: Optional[bool] = None,
+    input_tile_3_online: Optional[bool] = None,
+    hard_search_features: Optional[Dict[str, str]] = None,
 ) -> torch.fx.GraphModule:
-    """Sanity-check and script a dense graph carrying its final weights.
+    """Sanity-check and script or AOTI-compile a dense graph carrying final weights.
 
     Runs the rewritten graph once on serving-style inputs rebuilt from the
     warm-up batch (so graph surgery or KeyedTensor regroup errors surface at
     export time instead of at serving time), then writes dense_meta.json,
-    the graph dumps and the scripted model under ``save_dir``.
+    the graph dumps and either ``aoti/aoti_model.pt2`` (under ``is_aot()``) or
+    ``scripted_model.pt`` under ``save_dir``.
 
     FX tracing patches ``torch.nn.Module.__call__`` process-wide for its
     duration, so it is not safe to run concurrently with eager forwards.
@@ -2313,17 +2613,25 @@ def finalize_dense_export(
         device: device of ``gm``.
         save_dir: directory the export artifacts are written to.
         dense_graph_config: dense_meta config from build_dense_graph_module.
-        dense_model_traced: pre-traced ``gm`` to script; traced here if None.
+        dense_model_traced: pre-traced ``gm`` to export/script; traced here if None.
+        mixed_precision: optional ``"BF16"``, ``"FP16"``, or None.
+        input_tile: optional captured ``is_input_tile()`` flag for AOTI dynamic
+            shapes when exporting off the build thread.
+        input_tile_3_online: optional captured ``is_input_tile_3_online()`` flag.
+        hard_search_features: optional pre-resolved hard-search feature map for
+            AOTI dynamic shapes when exporting off the build thread.
 
     Returns:
-        The traced module that was scripted, so a caller can reuse it across
-        exports without re-tracing.
+        The traced module, so a caller can reuse it across exports without
+        re-tracing.
     """
     graph_dir = os.path.join(save_dir, "graph")
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(graph_dir, exist_ok=True)
 
-    _run_dense_graph_sanity_check(model, full_graph, gm, data, device)
+    sparse_kts, seq_jts = _run_dense_graph_sanity_check(
+        model, full_graph, gm, data, device, mixed_precision=mixed_precision
+    )
 
     with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
         f.write(str(full_graph))
@@ -2334,6 +2642,24 @@ def finalize_dense_export(
 
     if dense_model_traced is None:
         dense_model_traced = symbolic_trace(gm)
+
+    if acc_utils.is_aot():
+        aot_utils.export_distributed_dense_model_aot(
+            model=model,
+            gm=gm,
+            data=data,
+            sparse_kts=sparse_kts,
+            seq_jts=seq_jts,
+            dense_graph_config=dense_graph_config,
+            save_dir=save_dir,
+            mixed_precision=mixed_precision,
+            dense_model_traced=dense_model_traced,
+            input_tile=input_tile,
+            input_tile_3_online=input_tile_3_online,
+            hard_search_features=hard_search_features,
+        )
+        return dense_model_traced
+
     with open(os.path.join(save_dir, "gm_dense.code"), "w") as f:
         f.write(dense_model_traced.code)
     dense_model_scripted = torch.jit.script(dense_model_traced)
@@ -2379,12 +2705,15 @@ def _export_dense_model_on_device(
     save_dir: str,
     device: torch.device,
     data_input_path: Optional[str] = None,
+    mixed_precision: Optional[str] = None,
 ) -> None:
     """Build and restore a dense graph on the device its configured kernels need."""
     data = create_dense_export_warmup_data(
         pipeline_config, model, device, data_input_path
     )
-    gm, full_graph, dense_graph_config = build_dense_graph_module(model, data, device)
+    gm, full_graph, dense_graph_config = build_dense_graph_module(
+        model, data, device, mixed_precision=mixed_precision
+    )
     checkpoint_util.restore_model(
         checkpoint_path,
         gm,
@@ -2396,7 +2725,14 @@ def _export_dense_model_on_device(
         load_dynamicemb=False,
     )
     finalize_dense_export(
-        model, full_graph, gm, data, device, save_dir, dense_graph_config
+        model,
+        full_graph,
+        gm,
+        data,
+        device,
+        save_dir,
+        dense_graph_config,
+        mixed_precision=mixed_precision,
     )
 
 

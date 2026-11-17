@@ -27,6 +27,7 @@ from tzrec.acc.utils import (
     is_input_tile,
     is_input_tile_3_online,
     is_input_tile_emb,
+    use_distributed_embedding,
 )
 from tzrec.constant import Mode
 from tzrec.datasets.utils import (
@@ -487,14 +488,15 @@ class DataParser:
         user_key: Optional[str] = None
         hsk_feats = self._hard_search_input_tile_features
 
-        for keys in self.sparse_keys.values():
-            for k in keys:
-                if k in hsk_feats:
-                    continue
-                if k in self.user_feats:
-                    user_key = user_key or f"{k}.lengths"
-                else:
-                    item_key = item_key or f"{k}.lengths"
+        if not use_distributed_embedding():
+            for keys in self.sparse_keys.values():
+                for k in keys:
+                    if k in hsk_feats:
+                        continue
+                    if k in self.user_feats:
+                        user_key = user_key or f"{k}.lengths"
+                    else:
+                        item_key = item_key or f"{k}.lengths"
         for keys in self.dense_keys.values():
             for k in keys:
                 if k in hsk_feats:

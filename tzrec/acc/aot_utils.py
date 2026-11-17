@@ -10,8 +10,10 @@
 # limitations under the License.
 
 
+import operator
 import os
-from typing import Any, Dict, List, Optional, Set, Union, cast
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
 import torch
 import torch._inductor.codecache  # noqa: F401 -- populate torch._inductor.codecache so torch.export.pt2_archive._package._load_aoti can read it on PPU torch (host torch auto-imports it; PPU's tzrec-test:1.1-ppu image does not).
@@ -20,6 +22,7 @@ from torch import nn
 from tzrec.acc.utils import (
     is_autotune_with_sample_inputs,
     is_input_tile,
+    is_input_tile_3_online,
     is_unified_aot_predict,
 )
 from tzrec.features.feature import BaseFeature, get_hard_search_input_tile_features
@@ -341,6 +344,48 @@ def _pad_empty_sparse_values(
     return data
 
 
+def _collect_sequence_dim_groups(
+    features: List[BaseFeature],
+    feature_groups: List[model_pb2.FeatureGroupConfig],
+) -> Tuple[Dict[str, str], Set[str], Set[str], Set[str]]:
+    """Collect shared sequence Dim group mappings and JAGGED_SEQUENCE flags."""
+    from tzrec.protos.model_pb2 import FeatureGroupType
+
+    # Features in the same SequenceFeature config share per-sample lengths,
+    # so their step tensors (.values or .key_lengths) share a Dim.
+    feat_to_seq_dim_group: Dict[str, str] = {}
+    seq_feat_names: Set[str] = set()
+    for feat in features:
+        if feat.is_sequence:
+            seq_feat_names.add(feat.name)
+            if getattr(feat, "_is_grouped_seq", False):
+                seq_name = getattr(feat, "sequence_name", None)
+                if seq_name:
+                    feat_to_seq_dim_group[feat.name] = f"seq_{seq_name}"
+
+    jagged_seq_feat_names: Set[str] = set()
+    jagged_seq_groups: Set[str] = set()
+    for fg in feature_groups:
+        if fg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
+            for name in fg.feature_names:
+                if name in seq_feat_names:
+                    jagged_seq_feat_names.add(name)
+                    if name not in feat_to_seq_dim_group:
+                        feat_to_seq_dim_group[name] = f"fg_{fg.group_name}"
+                    jagged_seq_groups.add(feat_to_seq_dim_group[name])
+        for sg in fg.sequence_groups:
+            for name in sg.feature_names:
+                if name in seq_feat_names and name not in feat_to_seq_dim_group:
+                    feat_to_seq_dim_group[name] = f"sg_{fg.group_name}_{sg.group_name}"
+
+    return (
+        feat_to_seq_dim_group,
+        seq_feat_names,
+        jagged_seq_feat_names,
+        jagged_seq_groups,
+    )
+
+
 def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
     features: Any,
@@ -370,42 +415,12 @@ def _build_dynamic_shapes(
     Returns:
         dynamic_shapes dict for torch.export.export().
     """
-    from tzrec.protos.model_pb2 import FeatureGroupType
-
-    # Step 1: Group grouped sequence features by their sequence_name.
-    # Features in the same SequenceFeature config share per-sample lengths,
-    # so their step tensors (.values or .key_lengths) share a Dim.
-    # This takes precedence over FeatureGroupConfig because it reflects the
-    # authoritative data structure (shared sequence), not model organization.
-    feat_to_seq_dim_group: Dict[str, str] = {}
-    seq_feat_names: set = set()
-    for feat in features:
-        if feat.is_sequence:
-            seq_feat_names.add(feat.name)
-            if getattr(feat, "_is_grouped_seq", False):
-                seq_name = getattr(feat, "sequence_name", None)
-                if seq_name:
-                    feat_to_seq_dim_group[feat.name] = f"seq_{seq_name}"
-
-    # Step 2: For standalone sequence features not yet grouped, fall back to
-    # feature_groups structure, and track JAGGED_SEQUENCE (min=1) members.
-    jagged_seq_feat_names: Set[str] = set()
-    jagged_seq_groups: Set[str] = set()
-    for fg in feature_groups:
-        if fg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
-            for name in fg.feature_names:
-                if name in seq_feat_names:
-                    jagged_seq_feat_names.add(name)
-                    if name not in feat_to_seq_dim_group:
-                        feat_to_seq_dim_group[name] = f"fg_{fg.group_name}"
-                    jagged_seq_groups.add(feat_to_seq_dim_group[name])
-        # SEQUENCE (DIN-style) groups: standalone sequence features have
-        # independent lengths, so don't auto-share. Only grouped sequence
-        # features (from SequenceFeature config via sequence_groups) share nnz.
-        for sg in fg.sequence_groups:
-            for name in sg.feature_names:
-                if name in seq_feat_names and name not in feat_to_seq_dim_group:
-                    feat_to_seq_dim_group[name] = f"sg_{fg.group_name}_{sg.group_name}"
+    (
+        feat_to_seq_dim_group,
+        seq_feat_names,
+        jagged_seq_feat_names,
+        jagged_seq_groups,
+    ) = _collect_sequence_dim_groups(cast(List[BaseFeature], features), feature_groups)
 
     # Step 3: Collect prefixes with .lengths and .key_lengths siblings.
     lengths_prefixes = set()
@@ -580,4 +595,594 @@ def export_unified_model_aot(
         )
 
     logger.info("unified AOTI model exported to %s", save_dir)
+    return save_dir
+
+
+def _is_input_tile_user_keyed_tensor(name: str) -> bool:
+    """Whether a split KeyedTensor is the INPUT_TILE=3 user sparse side."""
+    return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
+
+
+def _extract_distributed_dense_consumed_keys(
+    gm: torch.fx.GraphModule, data: Dict[str, torch.Tensor]
+) -> Set[str]:
+    """Extract input dict keys consumed by the rewritten dense graph."""
+    input_node = next(n for n in gm.graph.nodes if n.op == "placeholder")
+    consumed_keys: Set[str] = set()
+    for node in gm.graph.nodes:
+        if (
+            node.op == "call_function"
+            and node.target == operator.getitem
+            and len(node.args) == 2
+            and node.args[0] is input_node
+            and isinstance(node.args[1], str)
+        ):
+            consumed_keys.add(node.args[1])
+
+    # GenRecFrontEnd forwards the raw dict directly to PromptAssembler and
+    # HoleKeyBuilder leaf modules, which read slot member tensors.
+    for mod in gm.modules():
+        mod_type = type(mod).__name__
+        if mod_type not in ("PromptAssembler", "HoleKeyBuilder"):
+            continue
+        if mod_type == "PromptAssembler" and getattr(mod, "anchor", None) == "":
+            if "batch_size" in data:
+                consumed_keys.add("batch_size")
+        for members in getattr(mod, "member_names", []):
+            for member in members:
+                for suffix in (".values", ".lengths", ".key_lengths"):
+                    key = f"{member}{suffix}"
+                    if key in data:
+                        consumed_keys.add(key)
+    return consumed_keys
+
+
+def _increment_first_length(
+    sample_data: Dict[str, torch.Tensor], key: str, delta: int
+) -> None:
+    """Increment the first entry of a non-empty length tensor without mutating."""
+    if key not in sample_data:
+        return
+    lengths = sample_data[key]
+    if lengths.numel() == 0:
+        return
+    updated = lengths.clone()
+    updated[0] = updated[0] + delta
+    sample_data[key] = updated
+
+
+def _pad_rows_zeros(sample_data: Dict[str, torch.Tensor], key: str, pad_n: int) -> None:
+    """Append ``pad_n`` zero rows along dim 0 for ``sample_data[key]``."""
+    tensor = sample_data[key]
+    sample_data[key] = torch.cat(
+        [tensor, tensor.new_zeros((pad_n, *tensor.shape[1:]))], dim=0
+    )
+
+
+def _pad_distributed_dense_sample_inputs(
+    sample_data: Dict[str, torch.Tensor],
+    seq_jts: Dict[str, Any],
+    features: List[BaseFeature],
+    feature_groups: List[model_pb2.FeatureGroupConfig],
+) -> Dict[str, torch.Tensor]:
+    """Pad <2-row sequence and sparse tensors to prevent 0/1 specialization."""
+    sample_data = dict(sample_data)
+    feat_to_seq_dim_group, seq_feat_names, _, _ = _collect_sequence_dim_groups(
+        features, feature_groups
+    )
+    feat_by_name = {f.name: f for f in features}
+    raw_name_to_ec_keys: Dict[str, List[str]] = defaultdict(list)
+    for name in seq_jts:
+        raw_name_to_ec_keys[name.split("@", 1)[0]].append(name)
+
+    # 1. Non-sequence raw sparse inputs (only present for GenRecFrontEnd).
+    for key in list(sample_data.keys()):
+        if not key.endswith(".lengths"):
+            continue
+        prefix = key[: -len(".lengths")]
+        if prefix in seq_feat_names:
+            continue
+        values_key = f"{prefix}.values"
+        if values_key not in sample_data:
+            continue
+        values = sample_data[values_key]
+        lengths = sample_data[key]
+        if values.numel() < 2 and lengths.numel() > 0:
+            pad_n = 2 - values.numel()
+            _pad_rows_zeros(sample_data, values_key, pad_n)
+            _increment_first_length(sample_data, key, pad_n)
+            weights_key = f"{prefix}.weights"
+            if weights_key in sample_data:
+                weights = sample_data[weights_key]
+                sample_data[weights_key] = torch.cat(
+                    [
+                        weights,
+                        torch.ones(pad_n, dtype=weights.dtype, device=weights.device),
+                    ],
+                    dim=0,
+                )
+
+    # 2. Sequence groups sharing a step Dim (EC, SequenceDense, mulval key_lengths,
+    # and any GenRec raw sparse sequence tensors).
+    seq_groups: Dict[str, List[BaseFeature]] = defaultdict(list)
+    for feat in features:
+        if not feat.is_sequence:
+            continue
+        group_key = feat_to_seq_dim_group.get(feat.name, f"feat_{feat.name}")
+        seq_groups[group_key].append(feat)
+
+    for group_feats in seq_groups.values():
+        step_size: Optional[int] = None
+        for feat in group_feats:
+            kl_key = f"{feat.name}.key_lengths"
+            if kl_key in sample_data:
+                step_size = int(sample_data[kl_key].size(0))
+                break
+            if not feat.is_sparse and f"{feat.name}.values" in sample_data:
+                step_size = int(sample_data[f"{feat.name}.values"].size(0))
+                break
+            for ec_key in raw_name_to_ec_keys.get(feat.name, []):
+                if ec_key in sample_data:
+                    step_size = int(sample_data[ec_key].size(0))
+                    break
+            if step_size is not None:
+                break
+            if feat.is_sparse and f"{feat.name}.values" in sample_data:
+                step_size = int(sample_data[f"{feat.name}.values"].size(0))
+                break
+
+        if step_size is not None and step_size < 2:
+            pad_steps = 2 - step_size
+            for feat in group_feats:
+                kl_key = f"{feat.name}.key_lengths"
+                lengths_key = f"{feat.name}.lengths"
+                values_key = f"{feat.name}.values"
+                if kl_key in sample_data:
+                    kl = sample_data[kl_key]
+                    sample_data[kl_key] = torch.cat(
+                        [kl, torch.ones(pad_steps, dtype=kl.dtype, device=kl.device)],
+                        dim=0,
+                    )
+                    _increment_first_length(sample_data, lengths_key, pad_steps)
+                    for ec_key in raw_name_to_ec_keys.get(feat.name, []):
+                        if ec_key in sample_data:
+                            _pad_rows_zeros(sample_data, ec_key, pad_steps)
+                        _increment_first_length(
+                            sample_data, f"{ec_key}__lengths", pad_steps
+                        )
+                    if values_key in sample_data:
+                        _pad_rows_zeros(sample_data, values_key, pad_steps)
+                elif not feat.is_sparse:
+                    if values_key in sample_data:
+                        _pad_rows_zeros(sample_data, values_key, pad_steps)
+                        _increment_first_length(sample_data, lengths_key, pad_steps)
+                else:
+                    for ec_key in raw_name_to_ec_keys.get(feat.name, []):
+                        if ec_key in sample_data:
+                            _pad_rows_zeros(sample_data, ec_key, pad_steps)
+                        _increment_first_length(
+                            sample_data, f"{ec_key}__lengths", pad_steps
+                        )
+                    if values_key in sample_data:
+                        _pad_rows_zeros(sample_data, values_key, pad_steps)
+                        _increment_first_length(sample_data, lengths_key, pad_steps)
+
+        # 3. Multi-value sequence sub-token values may still be <2 even when
+        # step count >= 2 (e.g. key_lengths=[0, 0]).
+        for feat in group_feats:
+            kl_key = f"{feat.name}.key_lengths"
+            if kl_key not in sample_data or sample_data[kl_key].numel() == 0:
+                continue
+            pad_delta = 0
+            for ec_key in raw_name_to_ec_keys.get(feat.name, []):
+                if ec_key in sample_data and sample_data[ec_key].size(0) < 2:
+                    pad_vals = 2 - int(sample_data[ec_key].size(0))
+                    _pad_rows_zeros(sample_data, ec_key, pad_vals)
+                    pad_delta = max(pad_delta, pad_vals)
+            raw_vals_key = f"{feat.name}.values"
+            if raw_vals_key in sample_data and sample_data[raw_vals_key].size(0) < 2:
+                pad_vals = 2 - int(sample_data[raw_vals_key].size(0))
+                _pad_rows_zeros(sample_data, raw_vals_key, pad_vals)
+                pad_delta = max(pad_delta, pad_vals)
+            if pad_delta > 0:
+                _increment_first_length(sample_data, kl_key, pad_delta)
+
+    # 4. Non-sequence Query EC entries in sequence__ec.
+    for ec_key in seq_jts:
+        raw_name = ec_key.split("@", 1)[0]
+        feat = feat_by_name.get(raw_name)
+        if raw_name in seq_feat_names or (feat is not None and feat.is_sequence):
+            continue
+        if ec_key in sample_data and sample_data[ec_key].size(0) < 2:
+            pad_n = 2 - int(sample_data[ec_key].size(0))
+            _pad_rows_zeros(sample_data, ec_key, pad_n)
+            _increment_first_length(sample_data, f"{ec_key}__lengths", pad_n)
+
+    return sample_data
+
+
+def _resolve_user_batch_size(
+    data: Dict[str, torch.Tensor],
+    seq_jts: Dict[str, Any],
+    features: List[BaseFeature],
+    hsk_feats: Set[str],
+) -> Optional[int]:
+    """Resolve the pre-tile user batch size from warm-up inputs."""
+    user_feats = {
+        f.name
+        for f in features
+        if f.is_user_feat and not f.stub_type and f.name not in hsk_feats
+    }
+    for feat in features:
+        if feat.name not in user_feats:
+            continue
+        lengths_key = f"{feat.name}.lengths"
+        if lengths_key in data:
+            return int(data[lengths_key].numel())
+        if not feat.is_sparse and not feat.is_sequence:
+            values_key = f"{feat.name}.values"
+            if values_key in data:
+                return int(data[values_key].size(0))
+    for ec_key, jt in seq_jts.items():
+        raw_name = ec_key.split("@", 1)[0]
+        if raw_name in user_feats:
+            return int(jt.lengths().numel())
+    return None
+
+
+def _prepare_distributed_dense_sample_inputs(
+    gm: torch.fx.GraphModule,
+    data: Dict[str, torch.Tensor],
+    sparse_kts: Dict[str, Any],
+    seq_jts: Dict[str, Any],
+    features: List[BaseFeature],
+    feature_groups: List[model_pb2.FeatureGroupConfig],
+    device: torch.device,
+    input_tile: Optional[bool] = None,
+    input_tile_3_online: Optional[bool] = None,
+    hard_search_features: Optional[Dict[str, str]] = None,
+) -> Dict[str, torch.Tensor]:
+    """Assemble and pad serving-style CUDA sample inputs for dense AOTI export."""
+    consumed_keys = _extract_distributed_dense_consumed_keys(gm, data)
+    online = (
+        is_input_tile_3_online() if input_tile_3_online is None else input_tile_3_online
+    )
+    resolved_input_tile = is_input_tile() if input_tile is None else input_tile
+    resolved_hsk: Dict[str, str] = (
+        (
+            get_hard_search_input_tile_features(features)
+            if hard_search_features is None
+            else hard_search_features
+        )
+        if resolved_input_tile
+        else {}
+    )
+    user_bs = _resolve_user_batch_size(data, seq_jts, features, set(resolved_hsk))
+    sample_data: Dict[str, torch.Tensor] = {}
+
+    for name, kt in sparse_kts.items():
+        if name not in consumed_keys:
+            continue
+        val = kt.values()
+        if _is_input_tile_user_keyed_tensor(name):
+            # EmbeddingGroupImpl marks __ebc_user / __mc_ebc_user after tiling;
+            # slice back to pre-tile user_bs so sample inputs match the dense graph.
+            target_rows = user_bs
+            if target_rows is None:
+                if online:
+                    target_rows = 1
+                elif "batch_size" in data:
+                    tile_size = int(data["batch_size"].item())
+                    if tile_size > 0 and val.size(0) % tile_size == 0:
+                        target_rows = val.size(0) // tile_size
+            if target_rows is not None and 0 < target_rows < val.size(0):
+                val = val[:target_rows]
+        sample_data[name] = val
+
+    for name, jt in seq_jts.items():
+        if name in consumed_keys:
+            sample_data[name] = jt.values()
+        lengths_key = f"{name}__lengths"
+        if lengths_key in consumed_keys:
+            sample_data[lengths_key] = jt.lengths().to(torch.int32)
+
+    for key in sorted(consumed_keys):
+        if key not in sample_data and key in data:
+            sample_data[key] = data[key]
+
+    sample_data = {
+        k: v.to(device=device).contiguous() for k, v in sorted(sample_data.items())
+    }
+    sample_data = _pad_distributed_dense_sample_inputs(
+        sample_data, seq_jts, features, feature_groups
+    )
+    return dict(sorted(sample_data.items()))
+
+
+def _build_distributed_dense_dynamic_shapes(
+    sample_data: Dict[str, torch.Tensor],
+    gm: torch.fx.GraphModule,
+    dense_graph_config: Dict[str, Any],
+    features: List[BaseFeature],
+    feature_groups: List[model_pb2.FeatureGroupConfig],
+    input_tile: Optional[bool] = None,
+    hard_search_features: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[int, torch.export.Dim]]:
+    """Build torch.export dynamic_shapes for a distributed dense serving graph."""
+    has_genrec = gm is not None and any(
+        type(mod).__name__ in ("PromptAssembler", "HoleKeyBuilder")
+        for mod in gm.modules()
+    )
+    (
+        feat_to_seq_dim_group,
+        seq_feat_names,
+        jagged_seq_feat_names,
+        jagged_seq_groups,
+    ) = _collect_sequence_dim_groups(features, feature_groups)
+
+    feat_by_name = {f.name: f for f in features}
+    mulval_seq_names: Set[str] = {
+        f.name for f in features if f.is_sparse and f.is_sequence and f.value_dim != 1
+    }
+    resolved_input_tile = is_input_tile() if input_tile is None else input_tile
+    # GenRec PromptAssembler stacks all segments along one shared prompt batch.
+    user_feat_names: Set[str] = (
+        {f.name for f in features if f.is_user_feat}
+        if resolved_input_tile and not has_genrec
+        else set()
+    )
+    resolved_hsk: Dict[str, str] = (
+        (
+            get_hard_search_input_tile_features(features)
+            if hard_search_features is None
+            else hard_search_features
+        )
+        if resolved_input_tile
+        else {}
+    )
+
+    seq_ec_entries = set(dense_graph_config.get("sequence__ec", []))
+    seq_ec_names = {
+        entry[: -len("__ec")] for entry in seq_ec_entries if entry.endswith("__ec")
+    }
+    seq_ec_lengths_names = {
+        entry for entry in seq_ec_entries if entry.endswith("__lengths")
+    }
+    ebc_item_names = {
+        k
+        for k in dense_graph_config
+        if k != "sequence__ec" and not _is_input_tile_user_keyed_tensor(k)
+    }
+    ebc_user_names = {
+        k
+        for k in dense_graph_config
+        if k != "sequence__ec" and _is_input_tile_user_keyed_tensor(k)
+    }
+
+    batch = torch.export.Dim("batch", min=1, max=499999999)
+    user_batch: Optional[torch.export.Dim] = None
+    hsk_batch_dims: Dict[str, torch.export.Dim] = {}
+    group_to_dim: Dict[str, torch.export.Dim] = {}
+    prefix_to_dim: Dict[str, torch.export.Dim] = {}
+    dynamic_shapes: Dict[str, Dict[int, torch.export.Dim]] = {}
+    dim_counter = 0
+
+    def _next_dim(min_len: int) -> torch.export.Dim:
+        nonlocal dim_counter
+        dim = torch.export.Dim(f"g_{dim_counter}", min=min_len, max=999999993)
+        dim_counter += 1
+        return dim
+
+    def _user_batch_shape(tensor: torch.Tensor) -> Dict[int, torch.export.Dim]:
+        nonlocal user_batch
+        if tensor.size(0) < 2:
+            return {}
+        if user_batch is None:
+            user_batch = torch.export.Dim("user_batch", min=1, max=499999999)
+        return {0: user_batch}
+
+    def _hsk_batch_shape(
+        feat_name: str, tensor: torch.Tensor
+    ) -> Dict[int, torch.export.Dim]:
+        if tensor.size(0) < 2:
+            return {}
+        seq_src = resolved_hsk[feat_name]
+        if seq_src not in hsk_batch_dims:
+            hsk_batch_dims[seq_src] = torch.export.Dim(
+                f"hsk_{seq_src}_batch", min=1, max=499999999
+            )
+        return {0: hsk_batch_dims[seq_src]}
+
+    def _get_seq_step_dim(feat_prefix: str) -> torch.export.Dim:
+        if feat_prefix in feat_to_seq_dim_group:
+            group = feat_to_seq_dim_group[feat_prefix]
+            if group not in group_to_dim:
+                min_len = 1 if group in jagged_seq_groups else 0
+                group_to_dim[group] = _next_dim(min_len)
+            return group_to_dim[group]
+        min_len = 1 if feat_prefix in jagged_seq_feat_names else 0
+        return _next_dim(min_len)
+
+    def _get_or_create_prefix_dim(feat_prefix: str) -> torch.export.Dim:
+        if feat_prefix not in prefix_to_dim:
+            prefix_to_dim[feat_prefix] = _next_dim(0)
+        return prefix_to_dim[feat_prefix]
+
+    for key, tensor in sample_data.items():
+        if tensor.dim() == 0 or key == "batch_size":
+            dynamic_shapes[key] = {}
+        elif key in ebc_item_names or key.endswith("__ebc") or key.endswith("__mc_ebc"):
+            dynamic_shapes[key] = {0: batch}
+        elif key in ebc_user_names or _is_input_tile_user_keyed_tensor(key):
+            dynamic_shapes[key] = (
+                {0: batch} if has_genrec else _user_batch_shape(tensor)
+            )
+        elif key in seq_ec_lengths_names or key.endswith("__lengths"):
+            raw_name = key[: -len("__lengths")].split("@", 1)[0]
+            if resolved_input_tile and raw_name in resolved_hsk:
+                dynamic_shapes[key] = _hsk_batch_shape(raw_name, tensor)
+            elif resolved_input_tile and raw_name in user_feat_names:
+                dynamic_shapes[key] = _user_batch_shape(tensor)
+            else:
+                dynamic_shapes[key] = {0: batch}
+        elif key in seq_ec_names:
+            raw_name = key.split("@", 1)[0]
+            if raw_name in mulval_seq_names:
+                # Sub-token rows vary independently of sequence step count.
+                dynamic_shapes[key] = {0: _next_dim(0)}
+            elif raw_name in seq_feat_names:
+                dynamic_shapes[key] = {0: _get_seq_step_dim(raw_name)}
+            else:
+                # Non-sequence Query EC entry inside a sequence group.
+                dynamic_shapes[key] = {0: _next_dim(0)}
+        elif key.endswith("__inverse_indices"):
+            dynamic_shapes[key] = {0: batch}
+        else:
+            prefix = key
+            for suffix in (".values", ".lengths", ".weights", ".key_lengths"):
+                if key.endswith(suffix):
+                    prefix = key[: -len(suffix)]
+                    break
+            feat = feat_by_name.get(prefix)
+            if key.endswith(".values"):
+                if prefix in seq_feat_names and feat is not None and not feat.is_sparse:
+                    dynamic_shapes[key] = {0: _get_seq_step_dim(prefix)}
+                elif prefix in seq_feat_names and feat is not None and feat.is_sparse:
+                    if prefix in mulval_seq_names:
+                        dynamic_shapes[key] = {0: _get_or_create_prefix_dim(prefix)}
+                    else:
+                        dynamic_shapes[key] = {0: _get_seq_step_dim(prefix)}
+                elif feat is not None and feat.is_sparse:
+                    dynamic_shapes[key] = {0: _get_or_create_prefix_dim(prefix)}
+                elif resolved_input_tile and prefix in resolved_hsk:
+                    dynamic_shapes[key] = _hsk_batch_shape(prefix, tensor)
+                elif resolved_input_tile and prefix in user_feat_names:
+                    dynamic_shapes[key] = _user_batch_shape(tensor)
+                else:
+                    dynamic_shapes[key] = {0: batch}
+            elif key.endswith(".lengths"):
+                if resolved_input_tile and prefix in resolved_hsk:
+                    dynamic_shapes[key] = _hsk_batch_shape(prefix, tensor)
+                elif resolved_input_tile and prefix in user_feat_names:
+                    dynamic_shapes[key] = _user_batch_shape(tensor)
+                else:
+                    dynamic_shapes[key] = {0: batch}
+            elif key.endswith(".key_lengths"):
+                dynamic_shapes[key] = {0: _get_seq_step_dim(prefix)}
+            elif key.endswith(".weights"):
+                dynamic_shapes[key] = {0: _get_or_create_prefix_dim(prefix)}
+            else:
+                dynamic_shapes[key] = {0: batch}
+
+    return dynamic_shapes
+
+
+def export_distributed_dense_model_aot(
+    model: nn.Module,
+    gm: torch.fx.GraphModule,
+    data: Dict[str, torch.Tensor],
+    sparse_kts: Dict[str, Any],
+    seq_jts: Dict[str, Any],
+    dense_graph_config: Dict[str, Any],
+    save_dir: str,
+    mixed_precision: Optional[str] = None,
+    dense_model_traced: Optional[torch.fx.GraphModule] = None,
+    input_tile: Optional[bool] = None,
+    input_tile_3_online: Optional[bool] = None,
+    hard_search_features: Optional[Dict[str, str]] = None,
+) -> str:
+    """Export a distributed-embedding dense serving graph to CUDA AOTInductor.
+
+    Args:
+        model: original wrapped model exposing ``features`` / ``feature_groups``.
+        gm: rewritten pure-dense serving ``GraphModule`` with restored weights.
+        data: warm-up input dict from ``create_dense_export_warmup_data``.
+        sparse_kts: captured ``fx_mark_keyed_tensor`` outputs from sanity run.
+        seq_jts: captured ``fx_mark_seq_ec_jt`` outputs from sanity run.
+        dense_graph_config: ``dense_meta.json`` mapping.
+        save_dir: export output directory receiving ``gm_dense.code`` and
+            ``aoti/aoti_model.pt2``.
+        mixed_precision: optional ``"BF16"``, ``"FP16"``, or None/empty string.
+        dense_model_traced: optional pre-traced ``gm`` to reuse without
+            calling ``symbolic_trace`` on a background thread.
+        input_tile: optional captured ``is_input_tile()`` flag so background
+            exports do not depend on ``os.environ["INPUT_TILE"]``.
+        input_tile_3_online: optional captured ``is_input_tile_3_online()`` flag.
+        hard_search_features: optional pre-resolved hard-search feature map so
+            background exports do not re-read ``os.environ["INPUT_TILE"]``.
+
+    Returns:
+        ``save_dir``.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    device = next(
+        (p.device for p in gm.parameters()),
+        next(
+            (b.device for b in gm.buffers()),
+            next(
+                (v.device for v in data.values() if isinstance(v, torch.Tensor)),
+                torch.device(f"cuda:{torch.cuda.current_device()}"),
+            ),
+        ),
+    )
+    features = cast(List[BaseFeature], getattr(model, "features", []) or [])
+    feature_groups = list(getattr(model, "feature_groups", []) or [])
+
+    dense_sample_data = _prepare_distributed_dense_sample_inputs(
+        gm=gm,
+        data=data,
+        sparse_kts=sparse_kts,
+        seq_jts=seq_jts,
+        features=features,
+        feature_groups=feature_groups,
+        device=device,
+        input_tile=input_tile,
+        input_tile_3_online=input_tile_3_online,
+        hard_search_features=hard_search_features,
+    )
+    dynamic_shapes = _build_distributed_dense_dynamic_shapes(
+        sample_data=dense_sample_data,
+        gm=gm,
+        dense_graph_config=dense_graph_config,
+        features=features,
+        feature_groups=feature_groups,
+        input_tile=input_tile,
+        hard_search_features=hard_search_features,
+    )
+    logger.info("distributed dense dynamic shapes=%s", dynamic_shapes)
+
+    gm.eval()
+    if dense_model_traced is None:
+        dense_model_traced = symbolic_trace(gm)
+    dense_model_traced.eval()
+    with open(os.path.join(save_dir, "gm_dense.code"), "w") as f:
+        f.write(dense_model_traced.code)
+
+    placeholders = [n for n in dense_model_traced.graph.nodes if n.op == "placeholder"]
+    # Bind device="cuda" (not "cuda:0") so the compiled .pt2 works on any GPU.
+    device_arg = "cuda" if len(placeholders) >= 2 else ""
+    dense_to_export = CudaAutocastWrapper(
+        dense_model_traced, mixed_precision, device=device_arg
+    ).eval()
+
+    logger.info("exporting distributed dense model with torch.export...")
+    with torch._inductor.config.patch(
+        {"unsafe_ignore_unsupported_triton_autotune_args": True}
+    ):
+        exported_pg = torch.export.export(
+            dense_to_export,
+            args=(dense_sample_data,),
+            dynamic_shapes=(dynamic_shapes,),
+        )
+
+    logger.info("compiling distributed dense model with AOTI...")
+    with torch._inductor.config.patch(_aoti_compile_cfg()):
+        aoti_dir = os.path.join(save_dir, "aoti")
+        os.makedirs(aoti_dir, exist_ok=True)
+        torch._inductor.aoti_compile_and_package(
+            exported_pg,
+            package_path=os.path.join(aoti_dir, "aoti_model.pt2"),
+        )
+
+    logger.info("distributed dense AOTI model exported to %s", save_dir)
     return save_dir

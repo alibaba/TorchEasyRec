@@ -20,7 +20,9 @@ Serving publish contract:
 ├── current.json                  # Atomic pointer to the latest version
 └── versions/
     └── <yyyyMMddHHmmss>/         # Immutable version directory
-        ├── scripted_model.pt     # TorchScript dense model
+        ├── scripted_model.pt     # TorchScript dense model (default)
+        ├── aoti/
+        │   └── aoti_model.pt2    # CUDA AOTInductor dense model (ENABLE_AOT)
         ├── dense_meta.json       # Placeholder -> serving embedding mapping
         ├── graph/                # Graph dump for debugging
         └── READY                 # Completion marker written before the switch
@@ -41,6 +43,10 @@ current.json (manifest v2):
 
 - Build each version under a temporary directory, write ``READY``, then rename
   it atomically into place.
+- When ``ENABLE_AOT`` is set (``ENABLE_AOT=1`` or ``2``), each version emits
+  ``aoti/aoti_model.pt2`` instead of ``scripted_model.pt``. The training/export
+  GPU SM architecture must match the online serving GPU SM architecture, and a
+  live serving process must not mix ``.pt`` and ``.pt2`` versions.
 - ``current.json`` flips only when the version's dense pairing step
   (``checkpoint_step``) is <= the cross-rank sparse upload watermark, and
   ``sparse_step`` records that watermark at flip time, so
@@ -58,6 +64,7 @@ current.json (manifest v2):
   superseded by a newer build before it was published is removed.
 """
 
+import contextlib
 import datetime
 import json
 import os
@@ -75,6 +82,7 @@ from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._tensor import DTensor
 
 from tzrec.acc import utils as acc_utils
+from tzrec.features.feature import get_hard_search_input_tile_features
 from tzrec.optim.ema import DenseEMA
 from tzrec.utils import config_util
 from tzrec.utils.checkpoint_util import remap_input_tile_user_key
@@ -279,6 +287,13 @@ class OnlineDenseExportManager:
         publish_interval_minutes: Optional[int] = None,
     ) -> None:
         self._enabled = _online_dense_export_enabled()
+        self._is_aot = acc_utils.is_aot()
+        self._mixed_precision: Optional[str] = None
+        self._cudnn_allow_tf32: Optional[bool] = None
+        self._cuda_matmul_allow_tf32: Optional[bool] = None
+        self._input_tile: Optional[bool] = None
+        self._input_tile_3_online: Optional[bool] = None
+        self._hard_search_features: Optional[Dict[str, str]] = None
         self._rank = int(os.environ.get("RANK", 0))
         self._cond = Condition()
         self._pending: Optional[Dict[str, Any]] = None
@@ -331,6 +346,10 @@ class OnlineDenseExportManager:
         if not acc_utils.use_distributed_embedding():
             raise RuntimeError(
                 "ONLINE_DENSE_EXPORT=1 requires USE_DISTRIBUTED_EMBEDDING=1."
+            )
+        if self._is_aot and not torch.cuda.is_available():
+            raise RuntimeError(
+                "ONLINE_DENSE_EXPORT=1 with ENABLE_AOT requires a CUDA device."
             )
         # fail fast on a misconfigured retention K instead of at prune time,
         # where the worker's exception guard would swallow it and silently
@@ -443,7 +462,7 @@ class OnlineDenseExportManager:
         from tzrec.models.model import ScriptWrapper
         from tzrec.models.tdm import TDM
 
-        device = torch.device("cpu")
+        device = torch.device("cuda:0") if self._is_aot else torch.device("cpu")
         prev_input_tile = os.environ.get("INPUT_TILE")
         prev_world_size = os.environ.get("WORLD_SIZE")
         os.environ["INPUT_TILE"] = "3"
@@ -454,6 +473,13 @@ class OnlineDenseExportManager:
             )
             features = _create_features(
                 list(pipeline_config.feature_configs), pipeline_config.data_config
+            )
+            self._input_tile = acc_utils.is_input_tile()
+            self._input_tile_3_online = acc_utils.is_input_tile_3_online()
+            self._hard_search_features = (
+                get_hard_search_input_tile_features(features)
+                if self._input_tile
+                else {}
             )
             twin_model = _create_model(
                 pipeline_config.model_config,
@@ -472,28 +498,57 @@ class OnlineDenseExportManager:
                     "(export_model) instead."
                 )
             twin_model = ScriptWrapper(twin_model)
+            if self._is_aot:
+                torch.cuda.set_device(device)
+                self._mixed_precision = acc_utils.mixed_precision_for_export(
+                    pipeline_config
+                )
             warmup_data = create_dense_export_warmup_data(
                 pipeline_config, twin_model, device
             )
             gm, full_graph, dense_graph_config = build_dense_graph_module(
-                twin_model, warmup_data, device
+                twin_model,
+                warmup_data,
+                device,
+                mixed_precision=self._mixed_precision,
             )
-            # Fail fast on trace/script errors instead of at the first export.
+            # Fail fast on trace/script/AOTI errors instead of at the first
+            # export (and warm TORCHINDUCTOR_CACHE_DIR under ENABLE_AOT).
             # Tracing happens here on the main thread and the traced module is
             # reused by every export; fx-tracing on the worker would patch
             # nn.Module.__call__ process-wide and race training forwards.
-            with tempfile.TemporaryDirectory(
-                prefix="online_dense_export_dryrun_"
-            ) as dry_run_dir:
-                dense_model_traced = finalize_dense_export(
-                    twin_model,
-                    full_graph,
-                    gm,
-                    warmup_data,
-                    device,
-                    dry_run_dir,
-                    dense_graph_config,
-                )
+            prev_cudnn_tf32: Optional[bool] = None
+            prev_matmul_tf32: Optional[bool] = None
+            try:
+                if self._is_aot:
+                    prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+                    prev_matmul_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
+                    acc_utils.allow_tf32_for_export(pipeline_config)
+                    self._cudnn_allow_tf32 = bool(torch.backends.cudnn.allow_tf32)
+                    self._cuda_matmul_allow_tf32 = bool(
+                        torch.backends.cuda.matmul.allow_tf32
+                    )
+                with tempfile.TemporaryDirectory(
+                    prefix="online_dense_export_dryrun_"
+                ) as dry_run_dir:
+                    dense_model_traced = finalize_dense_export(
+                        twin_model,
+                        full_graph,
+                        gm,
+                        warmup_data,
+                        device,
+                        dry_run_dir,
+                        dense_graph_config,
+                        mixed_precision=self._mixed_precision,
+                        input_tile=self._input_tile,
+                        input_tile_3_online=self._input_tile_3_online,
+                        hard_search_features=self._hard_search_features,
+                    )
+            finally:
+                if prev_cudnn_tf32 is not None:
+                    torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+                if prev_matmul_tf32 is not None:
+                    torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
         finally:
             if prev_input_tile is None:
                 os.environ.pop("INPUT_TILE", None)
@@ -831,7 +886,7 @@ class OnlineDenseExportManager:
                 logger.exception("online dense export task failed; continuing")
 
     def _run_task(self, task: Dict[str, Any]) -> None:
-        """Load the snapshot into the resident graph, script it, mark it ready.
+        """Load the snapshot into the resident graph, compile it, mark it ready.
 
         Builds the immutable version directory (READY marker + atomic
         rename) but does not flip current.json: the finished version is
@@ -846,7 +901,7 @@ class OnlineDenseExportManager:
         versions_root = os.path.join(self._export_root, VERSIONS_DIR)
         version_dir = os.path.join(versions_root, version)
         tmp_dir = f"{version_dir}.tmp.{os.getpid()}"
-        device = torch.device("cpu")
+        device = torch.device("cuda:0") if self._is_aot else torch.device("cpu")
         start_time = time.monotonic()
         logger.info(
             "start online dense export version %s (step %s)", version, task["step"]
@@ -863,19 +918,53 @@ class OnlineDenseExportManager:
             assert self._warmup_data is not None
             assert self._dense_graph_config is not None
             assert self._dense_model_traced is not None
-            # load_state_dict copies in place and the traced module shares these
-            # parameters, so it carries the reloaded weights without re-tracing.
-            self._gm.load_state_dict(task["snapshot"])
-            finalize_dense_export(
-                self._twin_model,
-                self._full_graph,
-                self._gm,
-                self._warmup_data,
-                device,
-                tmp_dir,
-                self._dense_graph_config,
-                dense_model_traced=self._dense_model_traced,
-            )
+            prev_cudnn_tf32: Optional[bool] = None
+            prev_matmul_tf32: Optional[bool] = None
+            export_stream: Optional[torch.cuda.Stream] = None
+            try:
+                if self._is_aot:
+                    torch.cuda.set_device(device)
+                    # Isolate H2D snapshot copies and AOTI export on a dedicated
+                    # stream so the worker does not serialize on training work.
+                    export_stream = torch.cuda.Stream(device=device)
+                    prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+                    prev_matmul_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
+                    if self._cudnn_allow_tf32 is not None:
+                        torch.backends.cudnn.allow_tf32 = self._cudnn_allow_tf32
+                    if self._cuda_matmul_allow_tf32 is not None:
+                        torch.backends.cuda.matmul.allow_tf32 = (
+                            self._cuda_matmul_allow_tf32
+                        )
+                stream_ctx = (
+                    torch.cuda.stream(export_stream)
+                    if export_stream is not None
+                    else contextlib.nullcontext()
+                )
+                with stream_ctx:
+                    # load_state_dict copies in place; the traced module shares
+                    # these parameters without re-tracing.
+                    self._gm.load_state_dict(task["snapshot"])
+                    finalize_dense_export(
+                        self._twin_model,
+                        self._full_graph,
+                        self._gm,
+                        self._warmup_data,
+                        device,
+                        tmp_dir,
+                        self._dense_graph_config,
+                        dense_model_traced=self._dense_model_traced,
+                        mixed_precision=self._mixed_precision,
+                        input_tile=self._input_tile,
+                        input_tile_3_online=self._input_tile_3_online,
+                        hard_search_features=self._hard_search_features,
+                    )
+                if export_stream is not None:
+                    export_stream.synchronize()
+            finally:
+                if prev_cudnn_tf32 is not None:
+                    torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+                if prev_matmul_tf32 is not None:
+                    torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
             ready_path = os.path.join(tmp_dir, "READY")
             with open(ready_path, "w") as f:
                 f.write(_utc_now())
