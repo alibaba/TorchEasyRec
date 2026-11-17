@@ -17,6 +17,7 @@ import signal
 import time
 import unittest
 from contextlib import contextmanager
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
@@ -40,7 +41,7 @@ from tzrec.datasets.kafka_dataset import (
     _offsets_for_times_batched,
     _parse_kafka_uri,
 )
-from tzrec.datasets.utils import DATA_TIMESTAMP
+from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, DATA_TIMESTAMP
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.tests import utils
@@ -1225,10 +1226,12 @@ class FakeKafkaConsumer:
         self._positions = {}
         self._assignment = []
         self._topic = None
+        self._on_assign = None
         self._trace_path = os.environ.get("TZREC_FAKE_KAFKA_TRACE")
 
     def subscribe(self, topics, on_assign=None):
         self._topic = topics[0]
+        self._on_assign = on_assign
         parts = [
             p
             for p in range(self._num_partitions)
@@ -1238,6 +1241,8 @@ class FakeKafkaConsumer:
             on_assign(self, [TopicPartition(self._topic, p) for p in parts])
 
     def assign(self, partitions):
+        # NOTE: Assignment replaces all previously owned partitions.
+        self._positions = {}
         for tp in partitions:
             # unset offsets (OFFSET_INVALID) resolve like auto.offset.reset=earliest
             self._positions[tp.partition] = max(tp.offset, 0)
@@ -1311,6 +1316,21 @@ class FakeKafkaConsumer:
         pass
 
 
+class FakeKafkaReader(KafkaReader):
+    """Inject fake consumers during construction and in the reader process."""
+
+    def __init__(self, *args, **kwargs):
+        with mock.patch.object(kafka_dataset, "Consumer", FakeKafkaConsumer):
+            super().__init__(*args, **kwargs)
+
+    def _reader(self, worker_id=0, num_workers=1, orphan_pid=None):
+        consumer = partial(
+            FakeKafkaConsumer, reader_id=worker_id, num_readers=num_workers
+        )
+        with mock.patch.object(kafka_dataset, "Consumer", consumer):
+            yield from super()._reader(worker_id, num_workers, orphan_pid)
+
+
 def _fake_uri(**params):
     qs = "&".join(f"fake.{k}={v}" for k, v in params.items())
     return (
@@ -1340,17 +1360,58 @@ def _features():
     )
 
 
+class KafkaReaderRebalanceTest(unittest.TestCase):
+    """A rebalance mid-stream re-seeks partitions from the checkpoint."""
+
+    def test_rebalance_resumes_after_checkpointed_offset(self):
+        consumer = FakeKafkaConsumer(
+            {"fake.num_partitions": "2", "fake.rows_per_msg": "2"},
+            reader_id=0,
+            num_readers=2,
+        )
+        with mock.patch.object(kafka_dataset, "Consumer", return_value=consumer):
+            reader = KafkaReader(
+                _fake_uri(num_partitions=2, rows_per_msg=2),
+                batch_size=8,
+                input_fields=[
+                    pa.field("id", pa.int64()),
+                    pa.field("label", pa.int64()),
+                ],
+            )
+            reader.load_state_dict({"topic:1": 9})
+            gen = reader._reader(0, 1)
+            self.addCleanup(gen.close)
+            first = next(gen)
+
+        self.assertEqual(set(first.column(CKPT_SOURCE_ID).to_pylist()), {"topic:0"})
+        self.assertEqual(sorted(first.column(CKPT_ROW_IDX).to_pylist()), [0, 0, 1, 1])
+        self.assertEqual(
+            sorted(first.column(DATA_TIMESTAMP).to_pylist()), [1.0, 1.0, 2.0, 2.0]
+        )
+        consumer._on_assign(consumer, [TopicPartition("topic", 1)])
+        self.assertEqual(consumer._positions, {1: 10})
+        second = next(gen)
+        rows = second.to_pylist()
+        self.assertEqual({row[CKPT_SOURCE_ID] for row in rows}, {"topic:1"})
+        self.assertEqual(
+            sorted(row[CKPT_ROW_IDX] for row in rows),
+            [10, 10, 11, 11, 12, 12, 13, 13],
+        )
+        for row in rows:
+            offset = row[CKPT_ROW_IDX]
+            self.assertEqual(row[DATA_TIMESTAMP], float(offset + 1))
+            self.assertEqual(row["id"], _FAKE_ID_BASE + offset * 2 + row["id"] % 2)
+
+
 class ReaderDispatchTest(unittest.TestCase):
-    """KafkaReader.create_read_plan hands reader snapshots to the tasks."""
+    """KafkaReader.create_read_plan carries reader state across processes."""
 
     @parameterized.expand(
         [("subscribe", False), ("round_robin", True)],
         name_func=parameterized_name_func,
     )
     def test_read_plan_uses_global_reader_ids(self, _name, round_robin):
-        with mock.patch.object(
-            kafka_dataset, "_default_consumer_factory", FakeKafkaConsumer
-        ):
+        with mock.patch.object(kafka_dataset, "Consumer", FakeKafkaConsumer):
             reader = kafka_dataset.KafkaReader(
                 _fake_uri(),
                 batch_size=8,
@@ -1365,24 +1426,22 @@ class ReaderDispatchTest(unittest.TestCase):
             )
             reader.load_state_dict({"topic:0": 12})
             plan = reader.create_read_plan(1, 2, 2)
-            # the plan freezes the checkpoint state it was built with
-            reader.load_state_dict({"topic:0": 99})
+        # the plan must cross the spawned coordinator process boundary
+        plan = pickle.loads(pickle.dumps(plan))
         self.assertEqual(plan.num_readers, 2)
         self.assertEqual([t.reader_id for t in plan.tasks], [0, 1])
         # consumers of every rank share one global group
         self.assertEqual([t.kwargs["worker_id"] for t in plan.tasks], [2, 3])
         self.assertEqual([t.kwargs["num_workers"] for t in plan.tasks], [4, 4])
         for task in plan.tasks:
-            snapshot = task.kwargs["reader"]
-            self.assertEqual(snapshot._checkpoint_state, {"topic:0": 12})
-            self.assertEqual(snapshot._log_every_n_messages, 7)
-            self.assertEqual(snapshot._kafka_partition_round_robin, round_robin)
+            task_reader = task.kwargs["reader"]
+            self.assertEqual(task_reader._checkpoint_state, {"topic:0": 12})
+            self.assertEqual(task_reader._log_every_n_messages, 7)
+            self.assertEqual(task_reader._kafka_partition_round_robin, round_robin)
             self.assertEqual(
-                snapshot._round_robin_partition_order,
+                task_reader._round_robin_partition_order,
                 [0, 1] if round_robin else [],
             )
-        # the plan must cross the spawned coordinator process boundary
-        pickle.loads(pickle.dumps(plan))
         self.assertFalse(plan.is_finite)
         # Kafka is the source that declares event time to the pool
         self.assertIn(DATA_TIMESTAMP, plan.schema.names)
@@ -1392,9 +1451,7 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
     """Full stack: create_dataloader + spawned coordinator + fake consumers."""
 
     def setUp(self):
-        patcher = mock.patch.object(
-            kafka_dataset, "_default_consumer_factory", FakeKafkaConsumer
-        )
+        patcher = mock.patch.object(kafka_dataset, "KafkaReader", FakeKafkaReader)
         patcher.start()
         self.addCleanup(patcher.stop)
 

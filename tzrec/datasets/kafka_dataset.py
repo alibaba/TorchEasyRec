@@ -10,7 +10,6 @@
 # limitations under the License.
 
 
-import copy
 import math
 import os
 import threading
@@ -226,13 +225,6 @@ def _offsets_for_times_batched(
     return resolved_map
 
 
-def _default_consumer_factory(
-    config: Dict[str, Any], reader_id: int = 0, num_readers: int = 1
-) -> Consumer:
-    """Build a real Kafka consumer; test doubles may use the reader context."""
-    return Consumer(config)
-
-
 def _read_sample_batches(
     reader: "KafkaReader",
     worker_id: int,
@@ -241,9 +233,9 @@ def _read_sample_batches(
     """Consume Kafka in a reader process for the sample-level shuffle plan.
 
     Args:
-        reader: snapshot of the KafkaReader that built the plan.
-        worker_id: global consumer slot passed to the consumer factory.
-        num_workers: global consumer slot count.
+        reader: KafkaReader that built the plan.
+        worker_id: global reader id.
+        num_workers: total number of global readers.
 
     Yields:
         decoded record batches with checkpoint metadata and event time.
@@ -306,8 +298,6 @@ class KafkaReader(BaseReader):
         shuffle (bool): shuffle data or not.
         shuffle_buffer_size (int): buffer size for shuffle.
         input_fields (list): list of pa.Field for schema definition.
-        consumer_factory: consumer builder; tests inject a double, the
-            default builds real consumers.
         kafka_partition_round_robin (bool): whether to read the partitions owned
             by each worker in strict round-robin order.
         kafka_log_every_n_messages (int): log per-worker decoded message counts
@@ -323,7 +313,6 @@ class KafkaReader(BaseReader):
         shuffle: bool = False,
         shuffle_buffer_size: int = 32,
         input_fields: Optional[List[pa.Field]] = None,
-        consumer_factory: Optional[Any] = None,
         kafka_partition_round_robin: bool = False,
         kafka_log_every_n_messages: int = 0,
         **kwargs: Any,
@@ -337,7 +326,6 @@ class KafkaReader(BaseReader):
             shuffle_buffer_size,
         )
 
-        self._consumer_factory = consumer_factory or _default_consumer_factory
         self._has_embedded_schema = False
         self._kafka_partition_round_robin = kafka_partition_round_robin
         self._log_every_n_messages = kafka_log_every_n_messages
@@ -385,7 +373,7 @@ class KafkaReader(BaseReader):
                 valid schema.
         """
         topic, config, _ = _parse_kafka_uri(self._input_path)
-        consumer = self._consumer_factory(config)
+        consumer = Consumer(config)
 
         try:
             # Directly assign partition 0 (no subscribe, no group coordination)
@@ -446,7 +434,7 @@ class KafkaReader(BaseReader):
         result: List[Any] = [None, None]
         if rank == 0:
             try:
-                consumer = self._consumer_factory(config)
+                consumer = Consumer(config)
                 try:
                     metadata = consumer.list_topics(topic, timeout=30.0)
                     topic_metadata = metadata.topics.get(topic)
@@ -690,9 +678,7 @@ class KafkaReader(BaseReader):
             return
 
         max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
-        consumer = self._consumer_factory(
-            config, reader_id=worker_id, num_readers=num_workers
-        )
+        consumer = Consumer(config)
         log_prefix = f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}]"
 
         stop_event = threading.Event()
@@ -858,12 +844,12 @@ class KafkaReader(BaseReader):
                     self._round_robin_partition_order[worker_id::num_workers]
                 )
             ]
-            consumer = self._consumer_factory(config)
+            consumer = Consumer(config)
             consumers.append(consumer)
             self._set_start_offsets(consumer, owned_partitions, start_timestamp_ms)
             consumer.assign([owned_partitions[0]])
             for tp in owned_partitions[1:]:
-                consumer = self._consumer_factory(config)
+                consumer = Consumer(config)
                 consumers.append(consumer)
                 consumer.assign([tp])
             logger.info(f"{log_prefix} assignment: {owned_partitions}")
@@ -900,11 +886,10 @@ class KafkaReader(BaseReader):
     ) -> ReadPlan:
         """Build a per-rank Kafka read plan.
 
-        A copy of this reader, with the checkpoint state frozen, travels with
-        every task. Round-robin snapshots carry the parent-resolved partition
-        order; ordinary snapshots subscribe to the shared consumer group.
-        The checkpoint state is applied on each assignment, like the BATCH
-        path, and later changes to this reader do not affect the plan.
+        Each task carries this reader and a global reader id. Round-robin
+        tasks reuse the parent-resolved partition order; ordinary tasks
+        subscribe to the shared consumer group. Checkpoint state is applied
+        on each assignment, like the BATCH path.
 
         Args:
             rank: this process's rank.
@@ -914,16 +899,12 @@ class KafkaReader(BaseReader):
         Returns:
             a non-finite read plan with one task per reader.
         """
-        reader = copy.copy(self)
-        reader._checkpoint_state = (
-            dict(self._checkpoint_state) if self._checkpoint_state else None
-        )
         global_num_readers = world_size * num_readers
         tasks = [
             ReadTask(
                 fn=_read_sample_batches,
                 kwargs=dict(
-                    reader=reader,
+                    reader=self,
                     worker_id=rank * num_readers + reader_id,
                     num_workers=global_num_readers,
                 ),

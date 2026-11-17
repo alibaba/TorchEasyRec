@@ -1182,6 +1182,18 @@ class OdpsRestoreSessionsTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "only 3 partition sessions"):
             reader._restore_sessions({f"{self.input_path}#3#old3:0": 9})
 
+    def test_restore_rejects_expired_session(self):
+        reader = self._reader()
+        reader._table_to_cli["t"] = _StubScanClient(status=SessionStatus.EXPIRED)
+        with self.assertRaisesRegex(RuntimeError, "has expired"):
+            reader._restore_sessions({f"{self.input_path}#0#old0:0": 49})
+        self.assertNotIn("old0", reader._sess_id_to_cli)
+        self.assertNotIn("old0", reader._sess_row_counts)
+        self.assertEqual(
+            [x.session_id for x in reader._input_to_sess[self.input_path]],
+            ["new0", "new1", "new2"],
+        )
+
 
 @ci_resources(split="case", timeout=600)
 class OdpsStorageErrorLogTest(unittest.TestCase):

@@ -196,7 +196,7 @@ class CsvReader(BaseReader):
         Raises:
             ValueError: when more than one rank is used.
         """
-        if world_size != 1 or rank != 0:
+        if world_size != 1:
             raise ValueError(
                 "sample-level shuffle supports CsvDataset only on a single "
                 f"rank, got rank {rank} of {world_size}"
@@ -205,8 +205,6 @@ class CsvReader(BaseReader):
         tasks = []
         for reader_id in range(num_readers):
             input_files = self._input_files[reader_id::num_readers]
-            if not input_files:
-                continue
             tasks.append(
                 ReadTask(
                     fn=_reader_iter,

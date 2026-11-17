@@ -229,26 +229,30 @@ class SamplePoolTest(unittest.TestCase):
 class CoordinatorTest(unittest.TestCase):
     """In-process coordinator tests over the request/response protocol."""
 
-    def _make_coordinator(self, first_plan, full_plan, min_batch_size=0):
+    def _make_coordinator(
+        self, first_plan, full_plan, min_batch_size=0, mode=_ROLLING, num_consumers=1
+    ):
         """Create the queues and coordinator; callers drive passes and threads."""
         ctx = mp.get_context("spawn")
         request_q = ctx.Queue()
-        response_q = ctx.Queue(maxsize=1)
+        response_queues = [ctx.Queue(maxsize=1) for _ in range(num_consumers)]
         self.addCleanup(request_q.cancel_join_thread)
-        self.addCleanup(response_q.cancel_join_thread)
+        for response_q in response_queues:
+            self.addCleanup(response_q.cancel_join_thread)
         coord = Coordinator(
             first_plan=first_plan,
             full_plan=full_plan,
             request_q=request_q,
-            response_queues=[response_q],
+            response_queues=response_queues,
             stop_event=ctx.Event(),
             cancel_event=ctx.Event(),
-            mode=_ROLLING,
+            mode=mode,
             capacity_rows=16,
             batch_size=8,
             min_batch_size=min_batch_size,
-            num_consumers=1,
-            trainer_pid=os.getpid(),
+            num_consumers=num_consumers,
+            # NOTE: The coordinator thread shares this process's parent PID.
+            trainer_pid=os.getppid(),
         )
         self.addCleanup(coord._input_q.cancel_join_thread)
         for task_q in coord._task_queues:
@@ -304,6 +308,38 @@ class CoordinatorTest(unittest.TestCase):
                 return batches, msg
             batches.append(pa.ipc.read_record_batch(msg[1], _PLAN_SCHEMA))
             self._request(coord)
+
+    def _run_with_readers(self, coord):
+        """Run the coordinator in a thread and capture errors."""
+        errors = queue.Queue()
+
+        def run():
+            try:
+                coord.run()
+            except BaseException as error:
+                errors.put(error)
+
+        runner = threading.Thread(target=run, daemon=True)
+        runner.start()
+        self.addCleanup(coord._stop_event.set)
+        self.addCleanup(runner.join, 10.0)
+        return runner, errors
+
+    def _stop_runner(self, coord, runner, errors):
+        """Stop the coordinator and verify reader cleanup."""
+        coord._stop_event.set()
+        runner.join(timeout=10.0)
+        self.assertFalse(runner.is_alive())
+        self.assertTrue(errors.empty())
+        self.assertFalse(any(p.is_alive() for p in coord._readers))
+
+    def _wait_queued(self, coord, consumer_id, timeout=5.0):
+        """Wait for an unclaimed response."""
+        deadline = time.monotonic() + timeout
+        while coord._response_queues[consumer_id].empty():
+            if time.monotonic() > deadline:
+                self.fail(f"consumer {consumer_id} was never served")
+            time.sleep(0.005)
 
     @parameterized.expand(
         [
@@ -415,40 +451,43 @@ class CoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(coord._error, str(error))
 
-    def test_two_readers_merge_and_reuse_processes_across_passes(self):
+    @parameterized.expand(
+        [("window", _WINDOW), ("rolling", _ROLLING)],
+        name_func=parameterized_name_func,
+    )
+    def test_readers_merge_and_reuse_across_passes(self, _name, mode):
+        """Merge reader tails below and above capacity across passes."""
         first_tasks = [
             ReadTask(
                 fn=_yield_rows,
-                kwargs=dict(n=4, chunk=4, reorder=True),
-                reader_id=0,
-            ),
-            ReadTask(
-                fn=_yield_rows,
-                kwargs=dict(n=4, chunk=4, start_id=100),
-                reader_id=1,
-            ),
+                kwargs=dict(
+                    n=2, chunk=2, start_id=100 * reader_id, reorder=reader_id == 0
+                ),
+                reader_id=reader_id,
+            )
+            for reader_id in range(4)
         ]
         full_tasks = [
-            ReadTask(fn=_yield_rows, kwargs=dict(n=6, chunk=4), reader_id=0),
             ReadTask(
                 fn=_yield_rows,
-                kwargs=dict(n=4, chunk=4, start_id=100),
-                reader_id=1,
-            ),
+                kwargs=dict(n=5, chunk=5, start_id=100 * reader_id),
+                reader_id=reader_id,
+            )
+            for reader_id in range(4)
         ]
         coord = self._make_coordinator(
-            first_plan=_plan(8, tasks=first_tasks, num_readers=2),
-            full_plan=_plan(10, tasks=full_tasks, num_readers=2),
+            _plan(8, tasks=first_tasks, num_readers=4),
+            _plan(20, tasks=full_tasks, num_readers=4),
+            mode=mode,
         )
-        runner = threading.Thread(target=coord.run, daemon=True)
-        runner.start()
+        runner, errors = self._run_with_readers(coord)
 
         batches, msg = self._collect_batches(coord, timeout=5.0)
         self.assertEqual(msg[0], sample_shuffle._END)
-        self.assertEqual(len(batches), 1)
+        self.assertEqual([b.num_rows for b in batches], [8])
+        ids = [i for b in batches for i in b.column("id").to_pylist()]
         self.assertEqual(
-            sorted(batches[0].column("id").to_pylist()),
-            [0, 1, 2, 3, 100, 101, 102, 103],
+            sorted(ids), sorted(100 * r + i for r in range(4) for i in range(2))
         )
         self.assertTrue(runner.is_alive())
         pids = [p.pid for p in coord._readers]
@@ -456,14 +495,93 @@ class CoordinatorTest(unittest.TestCase):
 
         batches, msg = self._collect_batches(coord, timeout=5.0)
         self.assertEqual(msg[0], sample_shuffle._END)
+        self.assertEqual([b.num_rows for b in batches], [8, 8, 4])
         ids = [i for b in batches for i in b.column("id").to_pylist()]
-        self.assertEqual(sorted(ids), list(range(6)) + list(range(100, 104)))
+        self.assertEqual(
+            sorted(ids), sorted(100 * r + i for r in range(4) for i in range(5))
+        )
+        self.assertEqual(len(ids), len(set(ids)))
         self.assertEqual([p.pid for p in coord._readers], pids)
 
-        coord._stop_event.set()
-        runner.join(timeout=10.0)
-        self.assertFalse(runner.is_alive())
-        self.assertFalse(any(p.is_alive() for p in coord._readers))
+        self._stop_runner(coord, runner, errors)
+
+    def test_slow_consumer_shares_quota_with_fast(self):
+        """A consumer holding its response must not stall the other one."""
+        task = ReadTask(fn=_yield_rows, kwargs=dict(n=32, chunk=16))
+        plan = _plan(32, tasks=[task])
+        coord = self._make_coordinator(plan, plan, num_consumers=2)
+        runner, errors = self._run_with_readers(coord)
+        coord._request_q.put((sample_shuffle._GET, 0))
+        self._wait_queued(coord, 0)
+        batches = []
+        for _ in range(3):
+            coord._request_q.put((sample_shuffle._GET, 1))
+            kind, payload = coord._response_queues[1].get(timeout=5.0)
+            self.assertEqual(kind, sample_shuffle._BATCH)
+            batches.append(pa.ipc.read_record_batch(payload, _PLAN_SCHEMA))
+        kind, payload = coord._response_queues[0].get(timeout=5.0)
+        self.assertEqual(kind, sample_shuffle._BATCH)
+        batches.append(pa.ipc.read_record_batch(payload, _PLAN_SCHEMA))
+        for consumer_id in (0, 1):
+            coord._request_q.put((sample_shuffle._GET, consumer_id))
+            msg = coord._response_queues[consumer_id].get(timeout=5.0)
+            self.assertEqual(msg[0], sample_shuffle._END)
+        self.assertEqual(sorted(b.num_rows for b in batches), [8, 8, 8, 8])
+        ids = [i for b in batches for i in b.column("id").to_pylist()]
+        self.assertEqual(sorted(ids), list(range(32)))
+        self.assertEqual(len(ids), len(set(ids)))
+        self._stop_runner(coord, runner, errors)
+
+    def test_stop_with_unclaimed_response(self):
+        """Stop the serving thread with unclaimed responses."""
+        task = ReadTask(fn=_yield_rows, kwargs=dict(n=32, chunk=16))
+        plan = _plan(32, tasks=[task])
+        coord = self._make_coordinator(plan, plan, num_consumers=2)
+        runner, errors = self._run_with_readers(coord)
+        coord._request_q.put((sample_shuffle._GET, 0))
+        self._wait_queued(coord, 0)
+        coord._request_q.put((sample_shuffle._GET, 1))
+        self._wait_queued(coord, 1)
+        self._stop_runner(coord, runner, errors)
+
+    def _wait_input_backpressure(self, coord):
+        """Wait for the pool to exceed capacity and back up the input queue."""
+        deadline = time.monotonic() + 10.0
+        while not (coord._pool.total_rows >= 20 and coord._input_q.full()):
+            if time.monotonic() > deadline:
+                self.fail("reader never filled the pool and the input queue")
+            time.sleep(0.01)
+        time.sleep(1.0)
+        self.assertEqual(coord._pool.total_rows, 20)
+        self.assertTrue(coord._input_q.full())
+
+    def _backpressure_coord(self):
+        """Coordinator whose single reader outgrows a capacity-1 input queue."""
+        task = ReadTask(fn=_yield_rows, kwargs=dict(n=30, chunk=5))
+        plan = _plan(30, tasks=[task])
+        with mock.patch.object(sample_shuffle, "_INPUT_QUEUE_BATCHES_PER_READER", 1):
+            coord = self._make_coordinator(plan, plan)
+        runner, errors = self._run_with_readers(coord)
+        return coord, runner, errors
+
+    def test_input_queue_backpressure_resumes(self):
+        """Consumption after the reader waited on the input queue loses nothing."""
+        coord, runner, errors = self._backpressure_coord()
+        self._wait_input_backpressure(coord)
+        batches, msg = self._collect_batches(coord, timeout=5.0)
+        self.assertEqual(msg[0], sample_shuffle._END)
+        self.assertEqual([b.num_rows for b in batches], [8, 8, 8, 6])
+        ids = [i for b in batches for i in b.column("id").to_pylist()]
+        self.assertEqual(sorted(ids), list(range(30)))
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(coord._pool.total_rows, 0)
+        self._stop_runner(coord, runner, errors)
+
+    def test_stop_while_reader_waits_on_input_queue(self):
+        """Stopping while the reader is blocked on input must exit cleanly."""
+        coord, runner, errors = self._backpressure_coord()
+        self._wait_input_backpressure(coord)
+        self._stop_runner(coord, runner, errors)
 
 
 def _yield_rows(n=10, chunk=4, start_id=0, reorder=False):
