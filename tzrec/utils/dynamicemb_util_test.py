@@ -569,7 +569,9 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
         before = [scores(state) for state in states]
         # Query order differs from tier order; keys must stay paired with values.
         query = keys[torch.tensor([1, 0, 2], device=keys.device)]
-        chunks, missing = dynamicemb_util.lookup_publish_embeddings(module, query, 0)
+        chunks, missing = dynamicemb_util.lookup_embeddings_for_publish(
+            module, query, 0
+        )
         self.assertEqual(missing.device.type, "cpu")
         for chunk_keys, chunk_values in chunks:
             self.assertEqual(chunk_keys.device.type, "cpu")
@@ -591,7 +593,7 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
                 return original_find(query_keys, table_ids, mode)
 
             with mock.patch.object(module.tables, "find", side_effect=cpu_find):
-                chunks, misses = dynamicemb_util.lookup_publish_embeddings(
+                chunks, misses = dynamicemb_util.lookup_embeddings_for_publish(
                     module, keys[1:], 0
                 )
                 db_keys, backing = chunks[0]
@@ -617,7 +619,7 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
                     side_effect=delayed_load,
                 ),
             ):
-                chunks, misses = dynamicemb_util.lookup_publish_embeddings(
+                chunks, misses = dynamicemb_util.lookup_embeddings_for_publish(
                     module, keys[:1], 0
                 )
                 cpu_keys, cached = chunks[0]
@@ -625,7 +627,7 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
                 self.assertEqual(cached.tolist(), expected_cached)
                 self.assertFalse(misses.numel())
             for empty_query in (keys[2:], keys[:0]):
-                chunks, misses = dynamicemb_util.lookup_publish_embeddings(
+                chunks, misses = dynamicemb_util.lookup_embeddings_for_publish(
                     module, empty_query, 0
                 )
                 self.assertEqual(chunks, [])
@@ -634,7 +636,7 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
             torch.testing.assert_close(scores(state), previous)
         if layout == "CACHING":
             # Reading the newer cache row did not overwrite the backing copy.
-            chunks, _ = dynamicemb_util.lookup_publish_embeddings(
+            chunks, _ = dynamicemb_util.lookup_embeddings_for_publish(
                 SimpleNamespace(cache=None, tables=module.tables),
                 keys[:1],
                 0,

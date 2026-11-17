@@ -397,7 +397,7 @@ def _log_dynamicemb_table_plan(
 
 
 @torch.no_grad()
-def lookup_publish_embeddings(
+def lookup_embeddings_for_publish(
     module: torch.nn.Module, keys: torch.Tensor, table_id: int
 ) -> tuple[List[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
     """Read rank-local embeddings without changing scores, admitting or writing rows.

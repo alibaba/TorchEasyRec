@@ -51,7 +51,7 @@ from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, DeltaEmbeddingQuantType
-from tzrec.utils.dynamicemb_util import lookup_publish_embeddings
+from tzrec.utils.dynamicemb_util import lookup_embeddings_for_publish
 from tzrec.utils.feature_store_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
     FEATURE_STORE_EMBEDDING_TYPE_UINT8,
@@ -1533,7 +1533,7 @@ class DeltaEmbeddingDumper:
         num_rows = 0
         num_never_admitted = 0
         for start in range(0, ids.numel(), _FIND_BATCH_ROWS):
-            hit_chunks, missing_ids = lookup_publish_embeddings(
+            hit_chunks, missing_ids = lookup_embeddings_for_publish(
                 dynamic_module, ids[start : start + _FIND_BATCH_ROWS], table_id
             )
             if evicted_ids is not None:

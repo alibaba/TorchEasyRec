@@ -3047,7 +3047,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             return chunks, missing
 
         with mock.patch(
-            "tzrec.utils.delta_embedding_dump.lookup_publish_embeddings",
+            "tzrec.utils.delta_embedding_dump.lookup_embeddings_for_publish",
             side_effect=lookup,
         ):
             num_rows = dumper._append_dynamic_rows(
@@ -3126,7 +3126,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         dumper._tracker.get_unique = lambda consumer: {}
 
         with mock.patch(
-            "tzrec.utils.delta_embedding_dump.lookup_publish_embeddings",
+            "tzrec.utils.delta_embedding_dump.lookup_embeddings_for_publish",
             side_effect=_fake_publish_lookup,
         ):
             num_rows = dumper._append_model_delta_rows(
@@ -3165,7 +3165,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         table_chunks = []
 
         with mock.patch(
-            "tzrec.utils.delta_embedding_dump.lookup_publish_embeddings",
+            "tzrec.utils.delta_embedding_dump.lookup_embeddings_for_publish",
             side_effect=_fake_publish_lookup,
         ):
             num_rows = dumper._append_dynamic_rows(
@@ -3203,7 +3203,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         table_chunks = []
 
         with mock.patch(
-            "tzrec.utils.delta_embedding_dump.lookup_publish_embeddings",
+            "tzrec.utils.delta_embedding_dump.lookup_embeddings_for_publish",
             side_effect=_fake_publish_lookup,
         ):
             num_rows = dumper._append_dynamic_rows(
@@ -3238,7 +3238,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         table_chunks = []
 
         with mock.patch(
-            "tzrec.utils.delta_embedding_dump.lookup_publish_embeddings",
+            "tzrec.utils.delta_embedding_dump.lookup_embeddings_for_publish",
             side_effect=_fake_publish_lookup,
         ):
             with mock.patch("tzrec.utils.delta_embedding_dump._FIND_BATCH_ROWS", 2):
