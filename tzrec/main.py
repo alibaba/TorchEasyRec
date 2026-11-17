@@ -621,7 +621,6 @@ def _train_and_evaluate(
     # data about as fresh; deployment of the successor follows its exit.
     handover = create_online_learning_handover(model_dir, train_config)
     handed_over = False
-    defer_final_dump = False
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
@@ -717,14 +716,14 @@ def _train_and_evaluate(
 
                     dump_decision = DumpDecision.NONE
                     if delta_embedding_dumper is not None:
-                        defer_final_dump = (
+                        is_final_step = (
                             i_step == train_config.num_steps - 1
                             if use_step
                             else i_epoch == train_config.num_epochs - 1
                             and pipeline.input_drained
                         )
                         dump_decision = delta_embedding_dumper.maybe_dump(
-                            i_step, allow_dump=not defer_final_dump
+                            i_step, allow_dump=not is_final_step
                         )
                 except StopIteration:
                     # Input exhaustion is reported after the pipeline drains.
@@ -744,7 +743,7 @@ def _train_and_evaluate(
                 # Single entry point for step / epoch / event-time saves + dedupe;
                 # maybe_save reconciles this rank's event-time across ranks in lockstep.
                 data_timestamp = batch.data_timestamp
-                if not defer_final_dump and ckpt_manager.maybe_save(
+                if ckpt_manager.maybe_save(
                     i_step,
                     model,
                     optimizer,
@@ -791,7 +790,7 @@ def _train_and_evaluate(
                     if lr.by_epoch:
                         lr.step()
 
-            if not defer_final_dump and ckpt_manager.maybe_save(
+            if ckpt_manager.maybe_save(
                 i_step,
                 model,
                 optimizer,
@@ -828,7 +827,7 @@ def _train_and_evaluate(
         if prof is not None:
             prof.stop()
         # a retired lineage is never resumed, so skip its final checkpoint
-        saved = not handed_over and ckpt_manager.maybe_save(
+        if not handed_over and ckpt_manager.maybe_save(
             i_step,
             model,
             optimizer,
@@ -837,7 +836,8 @@ def _train_and_evaluate(
             data_timestamp=data_timestamp,
             final=True,
             lr_schedulers=lr_scheduler,
-        )
+        ):
+            run_eval(i_step, i_epoch)
         final_dump_step = (
             delta_embedding_dumper.final_dump(i_step)
             if delta_embedding_dumper is not None
@@ -851,8 +851,6 @@ def _train_and_evaluate(
                 final=True,
                 dense_ema=export_dense_ema,
             )
-        if saved:
-            run_eval(i_step, i_epoch)
         if delta_embedding_dumper is not None:
             # Drain uploads first so the final watermark covers the final dump.
             delta_embedding_dumper.close()

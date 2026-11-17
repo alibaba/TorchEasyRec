@@ -537,7 +537,9 @@ class MainTest(unittest.TestCase):
                     delta_embedding_dumper=mock.Mock() if has_dumper else None,
                 )
 
-    @parameterized.expand([("steps",), ("epochs",)], name_func=parameterized_name_func)
+    @parameterized.expand(
+        [("steps",), ("epochs",), ("final",)], name_func=parameterized_name_func
+    )
     def test_train_loop_pairs_dense_export_with_delta_dump(self, limit) -> None:
         """The dump decision drives the export; the poll and final publish follow.
 
@@ -563,8 +565,7 @@ class MainTest(unittest.TestCase):
             return {"loss": torch.tensor(1.0)}, {}, batch
 
         pipeline.progress.side_effect = progress
-        ckpt_manager = mock.Mock()
-        ckpt_manager.maybe_save.side_effect = lambda *a, **kw: kw.get("final", False)
+        ckpt_manager = checkpoint_util.CheckpointManager(self.test_dir)
         probe = {"pk": "emb.t", "sk": 1, "crc32": "aa" * 4, "encoding": "fp32"}
         upload_states = [(0, []), (0, []), (1, [probe]), (2, [probe])]
         dumper = mock.MagicMock()
@@ -580,9 +581,11 @@ class MainTest(unittest.TestCase):
         parent = mock.Mock()
         parent.attach_mock(dumper, "dumper")
         parent.attach_mock(exporter, "exporter")
-        parent.attach_mock(ckpt_manager.maybe_save, "save")
+        parent.attach_mock(model.module.model.on_train_end, "train_end")
         train_config = _train_config(
-            num_steps=3 if limit == "steps" else 0,
+            num_steps=0 if limit == "epochs" else 3,
+            save_checkpoints_steps=2 if limit == "steps" else 0,
+            save_checkpoints_epochs=1 if limit == "epochs" else 0,
             num_epochs=1 if limit == "epochs" else 0,
             log_step_count_steps=10,
         )
@@ -592,6 +595,7 @@ class MainTest(unittest.TestCase):
         )
 
         with (
+            mock.patch.object(ckpt_manager, "save", parent.save),
             mock.patch("tzrec.main._evaluate", parent.evaluate),
             mock.patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0"}),
             mock.patch("tzrec.main.create_train_pipeline", return_value=pipeline),
@@ -633,40 +637,31 @@ class MainTest(unittest.TestCase):
         )
         dumper.final_dump.assert_called_once_with(2)
         exporter.finalize_publish.assert_called_once_with(upload_states[3])
-        tracked = {
+        write_and_eval = ["save", "evaluate"]
+        per_step = [
             "dumper.maybe_dump",
             "exporter.maybe_export",
             "exporter.poll_publish",
+        ]
+        expected = per_step * 2 + ["dumper.maybe_dump"]
+        if limit == "steps":
+            expected += write_and_eval
+        expected += ["exporter.maybe_export", "exporter.poll_publish"]
+        if limit == "epochs":
+            expected += write_and_eval
+        expected += ["train_end"]
+        if limit == "final":
+            expected += write_and_eval
+        expected += [
             "dumper.final_dump",
-            "save",
-            "evaluate",
+            "exporter.maybe_export",
             "dumper.close",
             "exporter.finalize_publish",
             "exporter.close",
-        }
+        ]
         self.assertEqual(
-            [name for name, _, _ in parent.mock_calls if name in tracked],
-            [
-                "dumper.maybe_dump",
-                "save",
-                "exporter.maybe_export",
-                "exporter.poll_publish",
-            ]
-            * 2
-            + [
-                "dumper.maybe_dump",
-                "exporter.maybe_export",
-                "exporter.poll_publish",
-                "save",
-            ]
-            + [
-                "dumper.final_dump",
-                "exporter.maybe_export",
-                "evaluate",
-                "dumper.close",
-                "exporter.finalize_publish",
-                "exporter.close",
-            ],
+            [name for name, _, _ in parent.mock_calls if name in set(expected)],
+            expected,
         )
 
     def _train_lrs(
