@@ -296,9 +296,10 @@ class KafkaReader(BaseReader):
         shuffle_buffer_size (int): buffer size for shuffle.
         input_fields (list): list of pa.Field for schema definition.
         kafka_partition_round_robin (bool): whether to read the partitions owned
-            by each worker in round-robin order, a quantum of messages per
-            turn; partitions already caught up with the broker are skipped
-            instead of blocking the rotation.
+            by each worker in round-robin order, taking enough messages per
+            turn that one full rotation yields about one batch; partitions
+            already caught up with the broker are skipped instead of blocking
+            the rotation.
         kafka_log_every_n_messages (int): log per-worker decoded message counts
             every N messages, 0 disables.
     """
@@ -802,19 +803,19 @@ class KafkaReader(BaseReader):
         worker_id: int,
         num_workers: int,
     ) -> Generator[pa.RecordBatch, None, None]:
-        """Read this worker's partitions in round-robin order, by quantum.
+        """Read this worker's partitions in round-robin order, N messages per turn.
 
         Partitions are sliced from the leader-ordered list resolved at
         reader construction; each owned partition gets its own consumer,
-        assigned up front.  Every turn consumes up to ``quantum`` messages
-        from the current partition, where ``quantum`` is derived from the
-        estimated rows per message so that one full rotation yields about
-        one batch.  Messages confirmed to exist on the broker (below its
-        cached high watermark) are waited for; a partition already read to
-        its end is never waited on, so idle partitions never block the
-        rotation once the reader has caught up with live data.  While every
-        partition is caught up, the loop sleeps briefly per rotation to
-        avoid busy spinning.
+        assigned up front.  Every turn consumes up to ``msg_per_turn``
+        messages from the current partition, where the count is derived
+        from the estimated rows per message so that one full rotation
+        yields about one batch.  Messages confirmed to exist on the
+        broker (below its cached high watermark) are waited for; a
+        partition already read to its end is never waited on, so idle
+        partitions never block the rotation once the reader has caught up
+        with live data.  While every partition is caught up, the loop
+        sleeps briefly per rotation to avoid busy spinning.
 
         Args:
             topic (str): kafka topic name.
@@ -904,16 +905,16 @@ class KafkaReader(BaseReader):
                 if parent is not None and os.getppid() != parent.pid:
                     logger.error(f"{log_prefix}: owner process gone, exiting")
                     return
-                quantum = (
+                msg_per_turn = (
                     max(1, math.ceil(self._batch_size / (rows_per_msg * num_parts)))
                     if rows_per_msg
                     else 1
                 )
                 messages, got = _take_events(
-                    consumers[idx].consume(quantum, timeout=0), idx
+                    consumers[idx].consume(msg_per_turn, timeout=0), idx
                 )
                 high = -1
-                if got < quantum:
+                if got < msg_per_turn:
                     _, high = consumers[idx].get_watermark_offsets(
                         owned_partitions[idx], cached=True
                     )
@@ -922,7 +923,7 @@ class KafkaReader(BaseReader):
                         # first message or the EOF event
                         missing = 1
                     else:
-                        missing = min(quantum - got, high - next_offsets[idx])
+                        missing = min(msg_per_turn - got, high - next_offsets[idx])
                     if missing > 0:
                         more, got_more = _take_events(
                             consumers[idx].consume(missing, timeout=1.0), idx

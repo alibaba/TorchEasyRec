@@ -375,9 +375,6 @@ pipeline.global-job-parameters: |
 
 - 仅对KafkaDataset生效，默认为false；开启后启动时按leader排序分区并分发到各worker（有效全局worker数为`world_size * max(data_config.num_workers, 1)`），每个worker为自己负责的分区各创建一个consumer
 - 每次从当前分区读取N条消息。N按消息平均行数估算，使各分区轮完一轮约凑满一个batch；分区剩余不足N条时读完为止
-- 当前分区仍有积压、但消息尚未到达时等待；已读到分区末尾时跳过
-- 因此存量阶段各分区按消息条数同步推进，追上实时数据后，空闲分区不会阻塞读取
-- 分区归属依据启动时的leader排序，运行期间固定；每个worker的consumer数量等于其负责的分区数
 
 ### kafka_log_every_n_messages
 

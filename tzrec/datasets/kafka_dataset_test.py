@@ -232,7 +232,7 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
                 [mock.call(1, timeout=0), mock.call(2, timeout=0)],
             ),
             param(
-                "backlogged_fills_quantum",
+                "backlogged_fills_turn",
                 (0, 10),
                 [2, 4, 4],
                 [
@@ -244,7 +244,7 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         ],
         name_func=parameterized_name_func,
     )
-    def test_round_robin_quantum_follows_rows_estimate(
+    def test_round_robin_msg_per_turn_follows_rows_estimate(
         self, _name, watermark, expected_rows, expected_calls
     ):
         consumers = [mock.Mock(), mock.Mock()]
