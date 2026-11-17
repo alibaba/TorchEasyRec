@@ -220,16 +220,13 @@ class OdpsDatasetTest(unittest.TestCase):
         )
         feature_cfgs = self._create_test_table_and_feature_cfgs()
         features = create_features(feature_cfgs, fg_mode=FgMode.FG_DAG)
-        cfg = data_pb2.DataConfig(
-            batch_size=4096,
-            dataset_type=data_pb2.DatasetType.OdpsDataset,
-            fg_mode=FgMode.FG_DAG,
-            label_fields=["label"],
-            odps_data_quota_name=self.test_quota,
-            shuffle=True,
-            shuffle_mode="SAMPLE_ROLLING",
-            shuffle_buffer_size=2,
+        cfg = utils.sample_data_config(
+            data_pb2.DatasetType.OdpsDataset,
+            "SAMPLE_ROLLING",
             num_workers=2,
+            batch_size=4096,
+            fg_mode=FgMode.FG_DAG,
+            odps_data_quota_name=self.test_quota,
         )
         path = (
             f"odps://{self.test_project}/tables/"
@@ -263,19 +260,13 @@ class OdpsDatasetTest(unittest.TestCase):
         iterator = None
         try:
             iterator = dataloader.get_iterator()
-            resumed_sizes = []
-            resumed_state = {}
-            for batch in iterator:
-                resumed_sizes.append(len(batch.labels["label"]))
-                update_dataloder_state(resumed_state, batch.checkpoint_info)
+            resumed_sizes, _, resumed_state = utils.drain_sample(iterator)
             self.assertEqual(sum(resumed_sizes), 3 * len(state))
             self.assertEqual(resumed_state, expected_state)
 
             # the next pass ignores the consumed checkpoint and reads it all
             iterator = dataloader.get_iterator()
-            sizes = []
-            for batch in iterator:
-                sizes.append(len(batch.labels["label"]))
+            sizes, _, _ = utils.drain_sample(iterator)
             self.assertEqual(sorted(sizes), [3616] + [4096] * 4)
         finally:
             utils.stop_sample(dataloader, iterator)

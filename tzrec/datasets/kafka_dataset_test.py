@@ -16,7 +16,6 @@ import pickle
 import signal
 import time
 import unittest
-from contextlib import contextmanager
 from functools import partial
 from types import SimpleNamespace
 from unittest import mock
@@ -41,7 +40,7 @@ from tzrec.datasets.kafka_dataset import (
     _offsets_for_times_batched,
     _parse_kafka_uri,
 )
-from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, DATA_TIMESTAMP
+from tzrec.datasets.utils import DATA_TIMESTAMP
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.tests import utils
@@ -438,11 +437,16 @@ class KafkaReaderDecodedMessageLogTest(unittest.TestCase):
         consumer = mock.Mock()
         consumer.consume.return_value = [_msg(0, 0, 1)]
         reader = self._make_reader(consumer, kafka_log_every_n_messages=100)
+        reader.load_state_dict({"topic:0": 9})
         gen = reader._reader(0, 1)
         self.addCleanup(gen.close)
         next(gen)
         on_assign = consumer.subscribe.call_args.kwargs["on_assign"]
         on_assign(consumer, [TopicPartition("topic", 0)])
+        # the callback re-seeks to the offset after the checkpointed one
+        consumer.assign.assert_called_once()
+        (tp,) = consumer.assign.call_args.args[0]
+        self.assertEqual((tp.topic, tp.partition, tp.offset), ("topic", 0, 10))
         self.assertEqual(reader._decoded_message_count, 1)
         self.assertEqual(reader._decoded_partition_counts, {"topic:0": 1})
         next(gen)
@@ -1338,28 +1342,6 @@ def _fake_uri(**params):
     )
 
 
-def _data_config(**overrides):
-    cfg = utils.sample_data_config(
-        data_pb2.DatasetType.KafkaDataset,
-        overrides.pop("shuffle_mode", "SAMPLE_ROLLING"),
-        overrides.pop("num_workers", 2),
-        **overrides,
-    )
-    cfg.input_fields.extend(
-        [
-            data_pb2.Field(input_name="id", input_type=data_pb2.INT64),
-            data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
-        ]
-    )
-    return cfg
-
-
-def _features():
-    return create_features(
-        [feature_pb2.FeatureConfig(id_feature=feature_pb2.IdFeature(feature_name="id"))]
-    )
-
-
 class KafkaReaderLifecycleTest(unittest.TestCase):
     """Idle polling stops on parent death and remains valid in the main process."""
 
@@ -1402,49 +1384,6 @@ class KafkaReaderLifecycleTest(unittest.TestCase):
                 gen.close()
             self.assertEqual(consume.call_count, 1 if has_parent else 2)
             close.assert_called_once()
-
-
-class KafkaReaderRebalanceTest(unittest.TestCase):
-    """A rebalance mid-stream re-seeks partitions from the checkpoint."""
-
-    def test_rebalance_resumes_after_checkpointed_offset(self):
-        consumer = FakeKafkaConsumer(
-            {"fake.num_partitions": "2", "fake.rows_per_msg": "2"},
-            reader_id=0,
-            num_readers=2,
-        )
-        with mock.patch.object(kafka_dataset, "Consumer", return_value=consumer):
-            reader = KafkaReader(
-                _fake_uri(num_partitions=2, rows_per_msg=2),
-                batch_size=8,
-                input_fields=[
-                    pa.field("id", pa.int64()),
-                    pa.field("label", pa.int64()),
-                ],
-            )
-            reader.load_state_dict({"topic:1": 9})
-            gen = reader._reader(0, 1)
-            self.addCleanup(gen.close)
-            first = next(gen)
-
-        self.assertEqual(set(first.column(CKPT_SOURCE_ID).to_pylist()), {"topic:0"})
-        self.assertEqual(sorted(first.column(CKPT_ROW_IDX).to_pylist()), [0, 0, 1, 1])
-        self.assertEqual(
-            sorted(first.column(DATA_TIMESTAMP).to_pylist()), [1.0, 1.0, 2.0, 2.0]
-        )
-        consumer._on_assign(consumer, [TopicPartition("topic", 1)])
-        self.assertEqual(consumer._positions, {1: 10})
-        second = next(gen)
-        rows = second.to_pylist()
-        self.assertEqual({row[CKPT_SOURCE_ID] for row in rows}, {"topic:1"})
-        self.assertEqual(
-            sorted(row[CKPT_ROW_IDX] for row in rows),
-            [10, 10, 11, 11, 12, 12, 13, 13],
-        )
-        for row in rows:
-            offset = row[CKPT_ROW_IDX]
-            self.assertEqual(row[DATA_TIMESTAMP], float(offset + 1))
-            self.assertEqual(row["id"], _FAKE_ID_BASE + offset * 2 + row["id"] % 2)
 
 
 class ReaderDispatchTest(unittest.TestCase):
@@ -1499,34 +1438,6 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    @contextmanager
-    def _iterator(self, cfg_kwargs, uri_kwargs, checkpoint_state=None, timeout=60.0):
-        from tzrec.datasets.dataset import create_dataloader
-
-        def _alarm(signum, frame):
-            raise TimeoutError("timed out waiting for batches")
-
-        dataloader = create_dataloader(
-            _data_config(**cfg_kwargs),
-            _features(),
-            _fake_uri(**uri_kwargs),
-            mode=Mode.TRAIN,
-            checkpoint_state=checkpoint_state,
-        )
-        self._client = dataloader.dataset._sample_shuffle
-        it = None
-        old_handler = signal.signal(signal.SIGALRM, _alarm)
-        signal.setitimer(signal.ITIMER_REAL, timeout)
-        try:
-            it = dataloader.get_iterator()
-            yield it
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            try:
-                utils.stop_sample(dataloader, it)
-            finally:
-                signal.signal(signal.SIGALRM, old_handler)
-
     @parameterized.expand(
         [
             param("rolling", checkpoint=5),
@@ -1553,21 +1464,55 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
         round_robin=False,
         checkpoint=0,
     ):
+        from tzrec.datasets.dataset import create_dataloader
+
+        def _alarm(signum, frame):
+            raise TimeoutError("timed out waiting for batches")
+
         checkpoint_state = (
             {f"topic:{p}": checkpoint for p in range(num_partitions)}
             if checkpoint
             else None
         )
-        with self._iterator(
-            dict(
-                shuffle_mode=mode,
-                num_workers=num_workers,
-                kafka_partition_round_robin=round_robin,
-            ),
-            dict(num_partitions=num_partitions, rows_per_msg=rows_per_msg),
-            checkpoint_state,
-        ) as it:
+        cfg = utils.sample_data_config(
+            data_pb2.DatasetType.KafkaDataset,
+            mode,
+            num_workers,
+            kafka_partition_round_robin=round_robin,
+        )
+        cfg.input_fields.extend(
+            [
+                data_pb2.Field(input_name="id", input_type=data_pb2.INT64),
+                data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
+            ]
+        )
+        features = create_features(
+            [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(feature_name="id")
+                )
+            ]
+        )
+        dataloader = create_dataloader(
+            cfg,
+            features,
+            _fake_uri(num_partitions=num_partitions, rows_per_msg=rows_per_msg),
+            mode=Mode.TRAIN,
+            checkpoint_state=checkpoint_state,
+        )
+        client = dataloader.dataset._sample_shuffle
+        it = None
+        old_handler = signal.signal(signal.SIGALRM, _alarm)
+        signal.setitimer(signal.ITIMER_REAL, 60.0)
+        try:
+            it = dataloader.get_iterator()
             batches = [next(it) for _ in range(n_batches)]
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            try:
+                utils.stop_sample(dataloader, it)
+            finally:
+                signal.signal(signal.SIGALRM, old_handler)
         seen = set()
         for b in batches:
             ids = b.to_dict()["id.values"].tolist()
@@ -1593,9 +1538,9 @@ class SampleShuffleEndToEndTest(unittest.TestCase):
                 [b.checkpoint_info for b in batches], [{"topic:0": 0}] * n_batches
             )
             self.assertEqual([b.data_timestamp for b in batches], [1.0] * n_batches)
-        # the context manager's explicit close is idempotent and stops it
-        self.assertIsNone(self._client._proc)
-        self.assertTrue(self._client._stop_event.is_set())
+        # explicit close and the dataset finalize hook are both idempotent
+        self.assertIsNone(client._proc)
+        self.assertTrue(client._stop_event.is_set())
 
 
 if __name__ == "__main__":

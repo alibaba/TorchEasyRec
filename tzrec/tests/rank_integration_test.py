@@ -1379,28 +1379,27 @@ def _append_odps_trace(trace_path, **event):
 
 class _FakeOdpsArrowReader:
     def __init__(self, table, read_req, trace_path):
-        self._table = table
         self._read_req = read_req
         self._trace_path = trace_path
-        self._offset = 0
+        self._row_index = read_req.row_index
+        self._batches = iter(
+            table.slice(read_req.row_index, read_req.row_count).to_batches(
+                max_chunksize=read_req.max_batch_rows
+            )
+        )
 
     def read(self):
-        if self._offset >= self._read_req.row_count:
+        batch = next(self._batches, None)
+        if batch is None:
             return None
-        start = self._read_req.row_index + self._offset
-        n = min(
-            self._read_req.max_batch_rows,
-            self._read_req.row_count - self._offset,
-        )
-        batch = self._table.slice(start, n).to_batches(max_chunksize=n)[0]
         _append_odps_trace(
             self._trace_path,
             kind="read",
             session_id=self._read_req.session_id,
-            row_index=start,
-            row_count=n,
+            row_index=self._row_index,
+            row_count=batch.num_rows,
         )
-        self._offset += n
+        self._row_index += batch.num_rows
         return batch
 
 
@@ -1577,10 +1576,9 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
         return path
 
     def _assert_resumed_positions(
-        self, before: dict, after: dict, prefix: str, total_rows: int
+        self, before: dict, after: dict, remaining: list, prefix: str
     ) -> None:
         """New reads must start inside the ranges left by the checkpoint."""
-        remaining = calc_remaining_intervals(before, prefix, total_rows)
         new_keys = [
             key for key in after if key not in before and key.startswith(prefix + ":")
         ]
@@ -1609,7 +1607,7 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
         for partition, start in starts.items():
             self.assertGreater(start, saved[partition])
 
-    def _assert_odps_trace(self, state: dict) -> None:
+    def _assert_odps_trace(self, state: dict, remaining: list | None = None) -> None:
         with open(self._trace_path) as f:
             events = [json.loads(line) for line in f]
         ranks = set(range(utils._get_nproc_per_node()))
@@ -1629,6 +1627,14 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
         }
         self.assertTrue(session_ids)
         self.assertEqual({event["session_id"] for event in reads}, session_ids)
+        if remaining is not None:
+            # the storage API must really serve reads from the ranges the
+            # checkpoint left, not just report progress metadata inside them
+            for event in reads:
+                self.assertTrue(
+                    any(begin <= event["row_index"] < end for begin, end in remaining),
+                    f"read at row {event['row_index']} is outside {remaining}",
+                )
 
     @parameterized.expand(
         [("kafka",), ("parquet",), ("odps",)], name_func=parameterized_name_func
@@ -1668,6 +1674,7 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
         resumed_epochs = resumed_state.get(checkpoint_util.EPOCHS_COMPLETED, 0)
         self.assertEqual(resumed_epochs, epochs)
         self.assertTrue(keys <= resumed_state.keys())
+        remaining = None
         if total_rows is None:
             self._assert_kafka_resumed(state)
         else:
@@ -1676,9 +1683,10 @@ class SampleShuffleIntegrationTest(unittest.TestCase):
                 prefixes = {key.rsplit(":", 1)[0] for key in keys}
                 self.assertEqual(len(prefixes), 1)
                 prefix = prefixes.pop()
-            self._assert_resumed_positions(state, resumed_state, prefix, total_rows)
+            remaining = calc_remaining_intervals(state, prefix, total_rows)
+            self._assert_resumed_positions(state, resumed_state, remaining, prefix)
         if source == "odps":
-            self._assert_odps_trace(resumed_state)
+            self._assert_odps_trace(resumed_state, remaining)
         self.success = True
 
 
