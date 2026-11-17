@@ -538,7 +538,8 @@ class MainTest(unittest.TestCase):
                 )
 
     @parameterized.expand(
-        [("steps",), ("epochs",), ("final",)], name_func=parameterized_name_func
+        [("steps",), ("epochs",), ("two_epochs",), ("final",)],
+        name_func=parameterized_name_func,
     )
     def test_train_loop_pairs_dense_export_with_delta_dump(self, limit) -> None:
         """The dump decision drives the export; the poll and final publish follow.
@@ -555,13 +556,19 @@ class MainTest(unittest.TestCase):
         optimizer.params = {}
         optimizer.param_groups = []
         train_dataloader = mock.Mock()
-        train_dataloader.get_iterator.return_value = iter([object()] * 3)
+        epoch_batches = (
+            ((False, True), (True,))
+            if limit == "two_epochs"
+            else ((False, False, True),)
+        )
+        train_dataloader.get_iterator.side_effect = [
+            iter(batches) for batches in epoch_batches
+        ]
         batch = SimpleNamespace(checkpoint_info=None, data_timestamp=17.0)
         pipeline = mock.Mock()
-        batches = iter(range(3))
 
         def progress(iterator):
-            pipeline.input_drained = next(batches) == 2
+            pipeline.input_drained = next(iterator)
             return {"loss": torch.tensor(1.0)}, {}, batch
 
         pipeline.progress.side_effect = progress
@@ -569,11 +576,9 @@ class MainTest(unittest.TestCase):
         probe = {"pk": "emb.t", "sk": 1, "crc32": "aa" * 4, "encoding": "fp32"}
         upload_states = [(0, []), (0, []), (1, [probe]), (2, [probe])]
         dumper = mock.MagicMock()
-        dumper.maybe_dump.side_effect = [
-            DumpDecision.NONE,
-            DumpDecision.PAIRED,
-            DumpDecision.NONE,
-        ]
+        dumper.maybe_dump.side_effect = lambda step, *, allow_dump: (
+            DumpDecision.PAIRED if step > 0 and allow_dump else DumpDecision.NONE
+        )
         dumper.completed_upload_state.side_effect = list(upload_states)
         dumper.final_dump.return_value = 2
         exporter = mock.Mock()
@@ -582,11 +587,12 @@ class MainTest(unittest.TestCase):
         parent.attach_mock(dumper, "dumper")
         parent.attach_mock(exporter, "exporter")
         parent.attach_mock(model.module.model.on_train_end, "train_end")
+        by_epoch = limit in ("epochs", "two_epochs")
         train_config = _train_config(
-            num_steps=0 if limit == "epochs" else 3,
+            num_steps=0 if by_epoch else 3,
             save_checkpoints_steps=2 if limit == "steps" else 0,
-            save_checkpoints_epochs=1 if limit == "epochs" else 0,
-            num_epochs=1 if limit == "epochs" else 0,
+            save_checkpoints_epochs=1 if by_epoch else 0,
+            num_epochs=len(epoch_batches) if by_epoch else 0,
             log_step_count_steps=10,
         )
         train_config.delta_embedding_dump_config.paired_dump_interval_steps = 1
@@ -643,11 +649,14 @@ class MainTest(unittest.TestCase):
             "exporter.maybe_export",
             "exporter.poll_publish",
         ]
-        expected = per_step * 2 + ["dumper.maybe_dump"]
+        expected = per_step * 2
+        if limit == "two_epochs":
+            expected += write_and_eval
+        expected += ["dumper.maybe_dump"]
         if limit == "steps":
             expected += write_and_eval
         expected += ["exporter.maybe_export", "exporter.poll_publish"]
-        if limit == "epochs":
+        if by_epoch:
             expected += write_and_eval
         expected += ["train_end"]
         if limit == "final":

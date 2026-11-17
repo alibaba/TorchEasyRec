@@ -1151,8 +1151,8 @@ class DeltaEmbeddingDumper:
     def final_dump(self, global_step: int) -> Optional[int]:
         """Flush the trailing partial interval at the end of training.
 
-        Only a successful dump consumes this step. A cadence boundary deferred
-        until after the final checkpoint still needs its first dump.
+        Repeating a completed dump could overwrite its shard with an empty one
+        because the tracker cursor has advanced. A deferred step still needs a dump.
 
         Args:
             global_step: Current training step.
@@ -1176,14 +1176,9 @@ class DeltaEmbeddingDumper:
     def _sync_final_step(self, global_step: int) -> int:
         """Align the final step across ranks before the trailing flush.
 
-        ``maybe_dump`` runs in lockstep so every rank shares ``global_step``,
-        but ``final_dump`` is reached with each rank's own last step. With
-        ``check_all_workers_data_status=False`` ranks can exhaust the dataloader
-        at different steps, so without syncing each would write a lone shard to
-        its own ``step_<N>/`` dir -- exactly the ragged shard set the per-rank
-        empty-shard logic prevents. Reduce with MAX so the furthest-progressed
-        rank's trailing delta is never swallowed by the boundary-step skip, and
-        so every rank takes the same skip/dump decision into the same dir.
+        Ranks can finish at different local steps. Use the largest step so all
+        ranks target the same shard directory and check that step against
+        their last completed dump.
         """
         if self._world_size <= 1:
             return global_step
@@ -1471,10 +1466,9 @@ class DeltaEmbeddingDumper:
         When eviction ids are present, merge and deduplicate both sets on the
         CPU and upload one lookup batch at a time. Otherwise tracker ids stay
         on the GPU.
-        Each key publishes exactly one row:
-        its current embedding when present, a zero tombstone when absent
-        but evicted, and nothing (with a warning) when it was never
-        admitted.
+
+        Publish the current embedding for hits and a zero tombstone for missing
+        evicted keys. Skip other misses and report their count.
 
         Args:
             table_chunks: List to append the per-table parquet chunks to.

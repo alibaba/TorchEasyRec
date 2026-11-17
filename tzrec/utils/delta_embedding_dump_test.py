@@ -3123,39 +3123,41 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             torch.zeros_like(fresh),
             torch.full((512, 8), 3.0, device=device),
         )
-        dumper = self._eviction_dumper()
-        dumper._output_dir = make_test_dir()
-        self.addCleanup(shutil.rmtree, dumper._output_dir)
-        dumper._file_prefix = "delta"
-        dumper._feature_store_enabled = False
-        dumper._uploader = None
-        dumper._last_dump_step = None
-        dumper._dump_evicted_tombstones = True
-        dumper._paired_interval_steps = 1
-        dumper._tracker.get_unique = lambda _: {
-            self._DYN_TABLE_FQN: SimpleNamespace(ids=fresh)
-        }
-        dumper._tracker.step = mock.Mock()
+        output_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, output_dir)
+        dumper = DeltaEmbeddingDumper(
+            module,
+            DeltaEmbeddingDumpConfig(
+                output_dir=output_dir,
+                dump_evicted_tombstones=True,
+                paired_dump_interval_steps=1,
+            ),
+            output_dir,
+            device,
+        )
+        dumper._tracker.store.append(
+            batch_idx=dumper._tracker.curr_batch_idx,
+            fqn=self._DYN_TABLE_FQN,
+            ids=fresh,
+            states=None,
+        )
         self.assertEqual(dumper.maybe_dump(1, allow_dump=False), DumpDecision.NONE)
-        module.dump(dumper._output_dir)
+        module.dump(output_dir)
         snapshot = set(
             np.fromfile(
-                encode_checkpoint_file_path(dumper._output_dir, name, 0, 1, "keys"),
+                encode_checkpoint_file_path(output_dir, name, 0, 1, "keys"),
                 dtype=np.int64,
             ).tolist()
         )
         deleted = old - snapshot
         self.assertEqual(len(deleted), 512)
-        with (
-            mock.patch.object(
-                dumper,
-                "_collect_dynamic_modules",
-                return_value={self._DYN_TABLE_FQN: module},
-            ),
-            mock.patch.object(dumper, "_collect_table_weights", return_value={}),
+        with mock.patch.object(
+            dumper,
+            "_collect_dynamic_modules",
+            return_value={self._DYN_TABLE_FQN: module},
         ):
             self.assertEqual(dumper.final_dump(1), 1)
-        (path,) = glob.glob(os.path.join(dumper._output_dir, "*.parquet"))
+        (path,) = glob.glob(os.path.join(output_dir, "*.parquet"))
         rows = pq.read_table(path).to_pylist()
         self.assertEqual(len(rows), len(deleted) + fresh.numel())
         self.assertEqual(

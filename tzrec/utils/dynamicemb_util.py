@@ -405,6 +405,11 @@ def lookup_embeddings_for_publish(
     Call on the training stream after embedding updates and before further cache
     mutations. Cache hits take priority, and RocksDB reads overlap cache copies.
 
+    Args:
+        module: DynamicEmb module that owns the table.
+        keys: Unique IDs on the module's CUDA device.
+        table_id: Index of the table in ``module.table_names``.
+
     Returns:
         Per-tier (keys, embeddings) chunks and keys missing from all tiers.
         All returned tensors are on CPU and ready to read.
