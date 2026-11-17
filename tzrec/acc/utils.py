@@ -82,8 +82,11 @@ def is_hard_search_input_tile() -> bool:
         return False
     if not is_input_tile():
         raise ValueError("HARD_SEARCH_INPUT_TILE=1 requires INPUT_TILE=2 or 3.")
-    if is_cuda_export() or env_util.use_rtp():
-        raise ValueError("HARD_SEARCH_INPUT_TILE only supports FX/TorchScript export.")
+    if is_trt() or (is_aot() and not is_unified_aot()) or env_util.use_rtp():
+        raise ValueError(
+            "HARD_SEARCH_INPUT_TILE only supports FX/TorchScript or unified AOT "
+            "(ENABLE_AOT=2) export."
+        )
     return True
 
 

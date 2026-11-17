@@ -142,6 +142,19 @@ def fx_int_item(x: torch.Tensor) -> int:
 
 
 @torch.fx.wrap
+def fx_nonneg_int_item(x: torch.Tensor) -> int:
+    """Fx trace wrapper for non-negative `int(x.item())`."""
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        int_item = x.item()
+        torch._check(int_item >= 0)
+        torch._check(int_item <= 2**31 - 1)
+    else:
+        int_item = int(x.item())
+    # pyre-ignore[7]
+    return int_item
+
+
+@torch.fx.wrap
 def fx_numel(x: torch.Tensor) -> int:
     """Fx trace wrapper for x.numel()."""
     total_len = x.numel()
