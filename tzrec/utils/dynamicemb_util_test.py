@@ -491,6 +491,7 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
         from dynamicemb.key_value_table import (
             _find_keys,
             _insert_key_values,
+            load_from_flat,
             store_to_flat,
         )
         from fbgemm_gpu.split_embedding_configs import EmbOptimType
@@ -597,14 +598,32 @@ class DynamicEmbRuntimeStorageTest(unittest.TestCase):
                 self.assertEqual(db_keys.tolist(), [keys[1].item()])
                 self.assertEqual(misses.tolist(), [keys[2].item()])
                 torch.testing.assert_close(backing, b.cpu())
-            with mock.patch.object(module.tables, "find", side_effect=AssertionError):
+            cached_slots = _find_keys(
+                module.cache._state, keys[:1], tids[:1], const_lookup=True
+            )[7]
+            store_to_flat(module.cache._state, cached_slots, tids[:1], a * 3)
+            expected_keys = keys[:1].cpu().tolist()
+            expected_cached = torch.full((1, 8), 3, dtype=dtype).tolist()
+
+            def delayed_load(*args, **kwargs):
+                block = load_from_flat(*args, **kwargs)
+                torch.cuda._sleep(20_000_000)
+                return block
+
+            with (
+                mock.patch.object(module.tables, "find", side_effect=AssertionError),
+                mock.patch(
+                    "dynamicemb.key_value_table.load_from_flat",
+                    side_effect=delayed_load,
+                ),
+            ):
                 chunks, misses = dynamicemb_util.lookup_publish_embeddings(
                     module, keys[:1], 0
                 )
                 cpu_keys, cached = chunks[0]
-                torch.testing.assert_close(cpu_keys, keys[:1].cpu())
+                self.assertEqual(cpu_keys.tolist(), expected_keys)
+                self.assertEqual(cached.tolist(), expected_cached)
                 self.assertFalse(misses.numel())
-                torch.testing.assert_close(cached, a.cpu())
             for empty_query in (keys[2:], keys[:0]):
                 chunks, misses = dynamicemb_util.lookup_publish_embeddings(
                     module, empty_query, 0

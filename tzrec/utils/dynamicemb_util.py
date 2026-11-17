@@ -409,7 +409,8 @@ def lookup_publish_embeddings(
     dependencies. Input keys stay on the GPU for cache and built-in lookups.
     Returns separate CPU (hit keys, embeddings) chunks for each tier and keys
     missing from every tier. Cache values take priority over backing values.
-    RocksDB misses are resolved on the CPU. Keep the pinned DynamicEmb
+    RocksDB reads overlap asynchronous cache copies; their completion event is
+    waited before returning CPU chunks. Keep the pinned DynamicEmb
     state-level APIs here: training lookups can update scores, and eval_lookup
     initializes misses instead of returning a mask.
     """
@@ -437,22 +438,35 @@ def lookup_publish_embeddings(
 
     dim = storage.embedding_dim(table_id)
     hit_chunks = []
+    missing_cpu = None
+    cache_copy_done = None
     for state in states:
         tids = torch.full_like(keys, table_id, dtype=torch.int64)
         nmiss, missing_keys, _, _, _, hits, scores, slots = _find_keys(
             state, keys, tids, const_lookup=True
         )
+        if external:
+            missing_cpu = missing_keys.cpu()
         if nmiss < keys.numel():
             rows = _flat_row_indices_for_value_load(state, hits, scores, slots)
             block = load_from_flat(state, rows, tids, CopyMode.EMBEDDING)
             tier_keys = keys[hits] if nmiss else keys
             tier_values = block[hits, :dim] if nmiss else block[:, :dim]
-            hit_chunks.append((tier_keys.cpu(), tier_values.cpu()))
+            hit_chunks.append(
+                (
+                    tier_keys.to(device="cpu", non_blocking=external),
+                    tier_values.to(device="cpu", non_blocking=external),
+                )
+            )
+            if external:
+                cache_copy_done = torch.cuda.Event()
+                cache_copy_done.record()
         keys = missing_keys
         if not nmiss:
             break
 
-    missing_cpu = keys.cpu()
+    if missing_cpu is None:
+        missing_cpu = keys.cpu()
     if external and missing_cpu.numel():
         tids = torch.full_like(missing_cpu, table_id, dtype=torch.int64)
         nmiss, _, _, _, _, hits, _, block = storage.find(
@@ -470,6 +484,8 @@ def lookup_publish_embeddings(
             else:
                 hit_chunks.append((missing_cpu, block[:, :dim]))
         missing_cpu = missing_cpu[~hits]
+    if cache_copy_done is not None:
+        cache_copy_done.synchronize()
     return hit_chunks, missing_cpu
 
 
