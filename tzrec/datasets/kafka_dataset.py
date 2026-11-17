@@ -11,6 +11,7 @@
 
 
 import math
+import multiprocessing as mp
 import os
 import threading
 import time
@@ -240,12 +241,7 @@ def _read_sample_batches(
     Yields:
         decoded record batches with checkpoint metadata and event time.
     """
-    yield from reader._reader(
-        worker_id,
-        num_workers,
-        # this process was forked by the coordinator
-        orphan_pid=os.getppid(),
-    )
+    yield from reader._reader(worker_id, num_workers)
 
 
 class KafkaDataset(BaseDataset):
@@ -638,9 +634,10 @@ class KafkaReader(BaseReader):
         self,
         worker_id: int = 0,
         num_workers: int = 1,
-        orphan_pid: Optional[int] = None,
     ) -> Generator[pa.RecordBatch, None, None]:
         """Read Arrow batches from Kafka.
+
+        In a multiprocessing child, stop polling when the parent process exits.
 
         When partition round-robin is enabled the partitions owned by this
         worker are read strictly in turn by :meth:`_round_robin_reader`.
@@ -656,7 +653,6 @@ class KafkaReader(BaseReader):
         Args:
             worker_id: Worker ID
             num_workers: Total number of workers
-            orphan_pid: when set, exit once the parent pid changes.
 
         Yields:
             PyArrow RecordBatch
@@ -673,7 +669,6 @@ class KafkaReader(BaseReader):
                 start_timestamp_ms,
                 worker_id,
                 num_workers,
-                orphan_pid=orphan_pid,
             )
             return
 
@@ -735,11 +730,12 @@ class KafkaReader(BaseReader):
         # name-based projection per seen message schema, so an upstream schema
         # change costs one recompute rather than one per message.
         projections: Dict[pa.Schema, Optional[List[int]]] = {}
+        parent = mp.parent_process()
         heartbeat_thread.start()
         try:
             consumer.subscribe([topic], on_assign=on_assign)
             while True:
-                if orphan_pid is not None and os.getppid() != orphan_pid:
+                if parent is not None and os.getppid() != parent.pid:
                     logger.error(f"{log_prefix}: owner process gone, exiting")
                     return
                 num_messages = (
@@ -802,7 +798,6 @@ class KafkaReader(BaseReader):
         start_timestamp_ms: Optional[int],
         worker_id: int,
         num_workers: int,
-        orphan_pid: Optional[int] = None,
     ) -> Generator[pa.RecordBatch, None, None]:
         """Read this worker's partitions strictly in round-robin order.
 
@@ -817,8 +812,6 @@ class KafkaReader(BaseReader):
             start_timestamp_ms (int, optional): start timestamp in milliseconds.
             worker_id (int): global worker ID.
             num_workers (int): total number of global workers.
-            orphan_pid (int, optional): when set, exit once the parent pid
-                changes.
 
         Yields:
             PyArrow RecordBatch
@@ -829,6 +822,7 @@ class KafkaReader(BaseReader):
         """
         log_prefix = f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}]"
         consumers: List[Consumer] = []
+        parent = mp.parent_process()
         try:
             if len(self._round_robin_partition_order) < num_workers:
                 raise ValueError(
@@ -857,7 +851,7 @@ class KafkaReader(BaseReader):
             projections: Dict[pa.Schema, Optional[List[int]]] = {}
             idx = 0
             while True:
-                if orphan_pid is not None and os.getppid() != orphan_pid:
+                if parent is not None and os.getppid() != parent.pid:
                     logger.error(f"{log_prefix}: owner process gone, exiting")
                     return
                 messages = consumers[idx].consume(1, timeout=1.0)

@@ -1323,12 +1323,12 @@ class FakeKafkaReader(KafkaReader):
         with mock.patch.object(kafka_dataset, "Consumer", FakeKafkaConsumer):
             super().__init__(*args, **kwargs)
 
-    def _reader(self, worker_id=0, num_workers=1, orphan_pid=None):
+    def _reader(self, worker_id=0, num_workers=1):
         consumer = partial(
             FakeKafkaConsumer, reader_id=worker_id, num_readers=num_workers
         )
         with mock.patch.object(kafka_dataset, "Consumer", consumer):
-            yield from super()._reader(worker_id, num_workers, orphan_pid)
+            yield from super()._reader(worker_id, num_workers)
 
 
 def _fake_uri(**params):
@@ -1358,6 +1358,50 @@ def _features():
     return create_features(
         [feature_pb2.FeatureConfig(id_feature=feature_pb2.IdFeature(feature_name="id"))]
     )
+
+
+class KafkaReaderLifecycleTest(unittest.TestCase):
+    """Idle polling stops on parent death and remains valid in the main process."""
+
+    @parameterized.expand(
+        [
+            ("subscribe_parent_exit", False, True),
+            ("round_robin_parent_exit", True, True),
+            ("subscribe_main_process", False, False),
+            ("round_robin_main_process", True, False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_idle_poll_parent_lifecycle(self, _name, round_robin, has_parent):
+        reader = FakeKafkaReader(
+            _fake_uri(num_partitions=1),
+            batch_size=1,
+            input_fields=[pa.field("x", pa.int64())],
+            kafka_partition_round_robin=round_robin,
+        )
+        with (
+            mock.patch.object(
+                kafka_dataset.mp,
+                "parent_process",
+                return_value=SimpleNamespace(pid=123) if has_parent else None,
+            ),
+            mock.patch.object(kafka_dataset.os, "getppid", side_effect=[123, 456]),
+            mock.patch.object(
+                FakeKafkaConsumer, "consume", side_effect=[[], [_msg(0, 0, 7)]]
+            ) as consume,
+            mock.patch.object(FakeKafkaConsumer, "close") as close,
+        ):
+            gen = reader._reader()
+            try:
+                if has_parent:
+                    with self.assertRaises(StopIteration):
+                        next(gen)
+                else:
+                    self.assertEqual(next(gen).column("x").to_pylist(), [7])
+            finally:
+                gen.close()
+            self.assertEqual(consume.call_count, 1 if has_parent else 2)
+            close.assert_called_once()
 
 
 class KafkaReaderRebalanceTest(unittest.TestCase):
