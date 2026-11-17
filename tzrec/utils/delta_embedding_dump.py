@@ -1055,18 +1055,20 @@ class DeltaEmbeddingDumper:
         if error is not None:
             raise error.with_traceback(error.__traceback__)
 
-    def maybe_dump(self, global_step: int) -> DumpDecision:
+    def maybe_dump(self, global_step: int, *, allow_dump: bool = True) -> DumpDecision:
         """Dump on the configured step or time interval and advance tracker state.
 
         Args:
             global_step: Current training step.
+            allow_dump: If False, advance the tracker but retain IDs for final_dump.
+                All ranks must agree when using timed publication.
 
         Returns:
             This step's rank-uniform decision level; the caller drives the
             same-step dense export from ``DumpDecision.PAIRED``.
         """
         self._check_feature_store_upload_error()
-        decision = self._dump_decision(global_step)
+        decision = self._dump_decision(global_step) if allow_dump else DumpDecision.NONE
         if decision != DumpDecision.NONE:
             self.dump(global_step)
             self._last_dump_step = global_step
@@ -1149,12 +1151,8 @@ class DeltaEmbeddingDumper:
     def final_dump(self, global_step: int) -> Optional[int]:
         """Flush the trailing partial interval at the end of training.
 
-        Steps already written by ``maybe_dump`` (any cadence boundary) have no
-        remaining delta; re-dumping them would overwrite their shards with an
-        empty file under multi-GPU, so skip the dump there. Every skip/dump
-        decision is a function of rank-uniform values (the synced step, the
-        interval config, and -- timed cadence only, which steps in lockstep --
-        ``_last_dump_step``), so all ranks agree on the returned step.
+        Only a successful dump consumes this step. A cadence boundary deferred
+        until after the final checkpoint still needs its first dump.
 
         Args:
             global_step: Current training step.
@@ -1170,33 +1168,9 @@ class DeltaEmbeddingDumper:
             logger.info("Skipping delta embedding dump at step %s.", global_step)
             return None
         global_step = self._sync_final_step(global_step)
-        if self._paired_interval_steps is not None and (
-            global_step % self._paired_interval_steps == 0
-            or (
-                self._sparse_interval_steps is not None
-                and global_step % self._sparse_interval_steps == 0
-            )
-        ):
-            # Boundary steps were already written (with full delta) by
-            # ``maybe_dump``. Re-dumping here has no new delta to flush -- every
-            # rank's consumer cursor has already advanced past the boundary's
-            # delta (all ranks run the same step count, so every rank
-            # participated in the boundary dump) -- and torchrec's
-            # ``get_unique`` raises ``torch.cat(): expected a non-empty list of
-            # Tensors`` on the empty consumer window. Re-dumping would also
-            # overwrite the already-written boundary shards (with an empty file
-            # under multi-GPU), so skip. A sparse-only boundary still returns
-            # its step: its delta is on record but no dense export paired with
-            # it yet, so the caller owes the final export.
-            return global_step
-        if (
-            self._paired_interval_secs is not None
-            and global_step == self._last_dump_step
-        ):
-            # A timed dump can land on any step. Avoid replacing that step's full
-            # delta with an empty final shard when training ends immediately after.
-            return global_step
-        self.dump(global_step)
+        if global_step != self._last_dump_step:
+            self.dump(global_step)
+            self._last_dump_step = global_step
         return global_step
 
     def _sync_final_step(self, global_step: int) -> int:

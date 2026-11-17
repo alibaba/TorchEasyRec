@@ -1538,49 +1538,21 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
             cfg.quant_type, DeltaEmbeddingQuantType.DELTA_EMBEDDING_QUANT_NONE
         )
 
-    def test_final_dump_skips_boundary_step_to_avoid_overwrite(self):
+    def test_final_dump_writes_deferred_boundary_only_once(self):
         dumper = object.__new__(DeltaEmbeddingDumper)
         dumper._paired_interval_steps = 50
-        dumper._sparse_interval_steps = None
-        dumper._paired_interval_secs = None
-        dumper._sparse_interval_secs = None
         dumper._last_dump_step = None
         dumper._world_size = 1
+        dumper._feature_store_enabled = False
+        dumper._tracker = mock.Mock()
         with mock.patch.object(dumper, "dump") as dump_mock:
-            # Boundary steps were already written by maybe_dump; skip the dump
-            # so a trailing empty shard never overwrites the real one, but
-            # still report the step for the final export pairing.
-            self.assertEqual(dumper.final_dump(50), 50)
-            self.assertEqual(dumper.final_dump(100), 100)
-            dump_mock.assert_not_called()
-
-            # Step 0 is not publishable; final_dump returns early. A positive
-            # trailing partial interval must still be flushed, and final_dump
-            # reports the step it dumped so the caller can pair exports to it.
             self.assertIsNone(dumper.final_dump(0))
-            self.assertEqual(dumper.final_dump(73), 73)
-            self.assertEqual(
-                [call.args[0] for call in dump_mock.call_args_list],
-                [73],
-            )
-
-    def test_final_dump_skips_sparse_boundary_but_returns_step(self):
-        # A sparse-only boundary was dumped by maybe_dump without a dense
-        # export; final_dump must not re-dump it (empty-shard overwrite) but
-        # must return the step so the caller fires the final paired export.
-        dumper = object.__new__(DeltaEmbeddingDumper)
-        dumper._paired_interval_steps = 50
-        dumper._sparse_interval_steps = 25
-        dumper._paired_interval_secs = None
-        dumper._sparse_interval_secs = None
-        dumper._last_dump_step = None
-        dumper._world_size = 1
-        with mock.patch.object(dumper, "dump") as dump_mock:
-            self.assertEqual(dumper.final_dump(25), 25)
-            self.assertEqual(dumper.final_dump(50), 50)
+            self.assertEqual(dumper.maybe_dump(50, allow_dump=False), DumpDecision.NONE)
+            dumper._tracker.step.assert_called_once()
             dump_mock.assert_not_called()
-            self.assertEqual(dumper.final_dump(63), 63)
-            dump_mock.assert_called_once_with(63)
+            self.assertEqual(dumper.final_dump(50), 50)
+            self.assertEqual(dumper.final_dump(50), 50)
+            dump_mock.assert_called_once_with(50)
 
     def test_final_dump_syncs_step_across_ranks_before_flush(self):
         # A lagging rank reaches final_dump at a boundary step (50) while the
@@ -3094,6 +3066,105 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
         )
         dumper._warned_no_retain_tables = set()
         return dumper
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and _HAS_EVICTED_ITEM_MODE, "requires DynamicEmb CUDA"
+    )
+    @mark_ci_scope("gpu")
+    def test_final_dump_includes_evictions_from_checkpoint(self):
+        from dynamicemb import DynamicEmbScoreStrategy, DynamicEmbTableOptions
+        from dynamicemb.batched_dynamicemb_tables import (
+            BatchedDynamicEmbeddingTablesV2,
+            encode_checkpoint_file_path,
+        )
+        from dynamicemb.key_value_table import _find_keys, store_to_flat
+        from fbgemm_gpu.split_embedding_configs import EmbOptimType
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        options = DynamicEmbTableOptions(
+            dim=8,
+            max_capacity=2048,
+            init_capacity=2048,
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=device.index,
+            score_strategy=DynamicEmbScoreStrategy.STEP,
+            caching=True,
+            local_hbm_for_values=1024 * 8 * 4,
+            evicted_item_mode=EvictedItemMode.RETAIN_KEY,
+        )
+        name = "dyn_table"
+        module = BatchedDynamicEmbeddingTablesV2(
+            table_options=[options],
+            table_names=[name],
+            feature_table_map=[0],
+            device=device,
+            optimizer=EmbOptimType.EXACT_SGD,
+        )
+        candidates = torch.arange(4096, device=device)
+        tids = torch.zeros_like(candidates)
+        module.tables.set_score(1)
+        module.tables.insert(
+            candidates,
+            tids,
+            torch.ones(4096, 8, device=device),
+            torch.ones_like(candidates),
+        )
+        found = _find_keys(module.tables._state, candidates, tids, const_lookup=True)[5]
+        old = set(candidates[found].tolist())
+        module.pop_evicted_keys()
+
+        fresh = torch.arange(10000, 10512, device=device)
+        module.cache.set_score(3)
+        slots = module.cache.insert_and_evict(fresh, torch.zeros_like(fresh))[0]
+        store_to_flat(
+            module.cache._state,
+            slots,
+            torch.zeros_like(fresh),
+            torch.full((512, 8), 3.0, device=device),
+        )
+        dumper = self._eviction_dumper()
+        dumper._output_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, dumper._output_dir)
+        dumper._file_prefix = "delta"
+        dumper._feature_store_enabled = False
+        dumper._uploader = None
+        dumper._last_dump_step = None
+        dumper._dump_evicted_tombstones = True
+        dumper._paired_interval_steps = 1
+        dumper._tracker.get_unique = lambda _: {
+            self._DYN_TABLE_FQN: SimpleNamespace(ids=fresh)
+        }
+        dumper._tracker.step = mock.Mock()
+        self.assertEqual(dumper.maybe_dump(1, allow_dump=False), DumpDecision.NONE)
+        module.dump(dumper._output_dir)
+        snapshot = set(
+            np.fromfile(
+                encode_checkpoint_file_path(dumper._output_dir, name, 0, 1, "keys"),
+                dtype=np.int64,
+            ).tolist()
+        )
+        deleted = old - snapshot
+        self.assertEqual(len(deleted), 512)
+        with (
+            mock.patch.object(
+                dumper,
+                "_collect_dynamic_modules",
+                return_value={self._DYN_TABLE_FQN: module},
+            ),
+            mock.patch.object(dumper, "_collect_table_weights", return_value={}),
+        ):
+            self.assertEqual(dumper.final_dump(1), 1)
+        (path,) = glob.glob(os.path.join(dumper._output_dir, "*.parquet"))
+        rows = pq.read_table(path).to_pylist()
+        self.assertEqual(len(rows), len(deleted) + fresh.numel())
+        self.assertEqual(
+            {r["key_id"] for r in rows if r["source"] == "dynamicemb_evicted"}, deleted
+        )
+        self.assertEqual(
+            {r["key_id"] for r in rows if r["source"] == "model_delta_tracker"},
+            snapshot - old,
+        )
 
     def _eviction_module(self, evicted_keys, founds=None, values=None, rows=None):
         table_name = self._DYN_TABLE_FQN.rsplit(".", maxsplit=1)[-1]

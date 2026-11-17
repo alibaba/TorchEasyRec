@@ -621,6 +621,7 @@ def _train_and_evaluate(
     # data about as fresh; deployment of the successor follows its exit.
     handover = create_online_learning_handover(model_dir, train_config)
     handed_over = False
+    defer_final_dump = False
 
     # this rank's last consumed event-time, reused by the epoch / final saves
     data_timestamp = -1.0
@@ -716,7 +717,15 @@ def _train_and_evaluate(
 
                     dump_decision = DumpDecision.NONE
                     if delta_embedding_dumper is not None:
-                        dump_decision = delta_embedding_dumper.maybe_dump(i_step)
+                        defer_final_dump = (
+                            i_step == train_config.num_steps - 1
+                            if use_step
+                            else i_epoch == train_config.num_epochs - 1
+                            and pipeline.input_drained
+                        )
+                        dump_decision = delta_embedding_dumper.maybe_dump(
+                            i_step, allow_dump=not defer_final_dump
+                        )
                 except StopIteration:
                     # Input exhaustion is reported after the pipeline drains.
                     # Run maintenance before the pass-end saves.
@@ -735,7 +744,7 @@ def _train_and_evaluate(
                 # Single entry point for step / epoch / event-time saves + dedupe;
                 # maybe_save reconciles this rank's event-time across ranks in lockstep.
                 data_timestamp = batch.data_timestamp
-                if ckpt_manager.maybe_save(
+                if not defer_final_dump and ckpt_manager.maybe_save(
                     i_step,
                     model,
                     optimizer,
@@ -782,7 +791,7 @@ def _train_and_evaluate(
                     if lr.by_epoch:
                         lr.step()
 
-            if ckpt_manager.maybe_save(
+            if not defer_final_dump and ckpt_manager.maybe_save(
                 i_step,
                 model,
                 optimizer,
@@ -802,16 +811,6 @@ def _train_and_evaluate(
         # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
         # the only checkpoint and persists whatever on_train_end produced.
         _model.on_train_end()
-        final_dump_step = None
-        if delta_embedding_dumper is not None:
-            # Flush the trailing partial interval before the final checkpoint.
-            # final_dump does not re-dump boundary steps already written by
-            # maybe_dump (all ranks run the same step count, so every rank
-            # participated in those dumps and reaches the same final step) but
-            # still returns the step so the final export can pair with a
-            # sparse-only boundary.
-            final_dump_step = delta_embedding_dumper.final_dump(i_step)
-
         _log_train(
             i_step,
             losses,
@@ -829,7 +828,7 @@ def _train_and_evaluate(
         if prof is not None:
             prof.stop()
         # a retired lineage is never resumed, so skip its final checkpoint
-        if not handed_over and ckpt_manager.maybe_save(
+        saved = not handed_over and ckpt_manager.maybe_save(
             i_step,
             model,
             optimizer,
@@ -838,12 +837,13 @@ def _train_and_evaluate(
             data_timestamp=data_timestamp,
             final=True,
             lr_schedulers=lr_scheduler,
-        ):
-            run_eval(i_step, i_epoch)
+        )
+        final_dump_step = (
+            delta_embedding_dumper.final_dump(i_step)
+            if delta_embedding_dumper is not None
+            else None
+        )
         if final_dump_step is not None:
-            # Publish only paired versions: the final dense export uses the
-            # step the trailing delta was actually dumped at; the exporter's
-            # per-step dedupe skips a paired boundary that already exported.
             online_dense_exporter.maybe_export(
                 final_dump_step,
                 data_timestamp,
@@ -851,6 +851,8 @@ def _train_and_evaluate(
                 final=True,
                 dense_ema=export_dense_ema,
             )
+        if saved:
+            run_eval(i_step, i_epoch)
         if delta_embedding_dumper is not None:
             # Drain uploads first so the final watermark covers the final dump.
             delta_embedding_dumper.close()
