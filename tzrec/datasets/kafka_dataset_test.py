@@ -197,29 +197,41 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
             [0, 1.0, 0, 0],
         )
 
-    def test_round_robin_skips_caught_up_partition(self):
+    @parameterized.expand(
+        [
+            param("eof_at_high_watermark", 5),
+            param("eof_below_high_watermark", 10),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_round_robin_skips_caught_up_partition(self, _name, high):
         consumers = [mock.Mock(), mock.Mock()]
         consumers[0].consume.side_effect = [
             [_msg(0, 0, 1)],
             [_msg(0, 1, 2)],
             [_msg(0, 2, 3)],
+            [_msg(0, 3, 4)],
         ]
         consumers[1].consume.side_effect = [
             [],
             [_eof(1, 5)],
             [],
             [_msg(1, 5, 9)],
+            [],
+            [_msg(1, 6, 10)],
         ]
-        consumers[1].get_watermark_offsets.return_value = (0, 5)
+        consumers[1].get_watermark_offsets.return_value = (0, high)
         with mock.patch("tzrec.datasets.kafka_dataset.logger") as mock_logger:
             gen = self._make_reader(consumers)._reader(0, 1)
             self.addCleanup(gen.close)
             observed = [next(gen).column("x")[0].as_py() for _ in range(4)]
-        self.assertEqual(observed, [1, 2, 3, 9])
-        # after the EOF event the caught-up partition no longer blocks
+            self.assertEqual(observed, [1, 2, 3, 9])
+            consumers[1].get_watermark_offsets.return_value = (0, 10)
+            observed = [next(gen).column("x")[0].as_py() for _ in range(2)]
+        self.assertEqual(observed, [4, 10])
         self.assertEqual(
             [call.kwargs["timeout"] for call in consumers[1].consume.call_args_list],
-            [0, 1.0, 0, 0],
+            [0, 1.0, 0, 0, 0, 1.0],
         )
         mock_logger.error.assert_not_called()
 

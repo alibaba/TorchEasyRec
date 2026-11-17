@@ -811,11 +811,11 @@ class KafkaReader(BaseReader):
         messages from the current partition, where the count is derived
         from the estimated rows per message so that one full rotation
         yields about one batch.  Messages confirmed to exist on the
-        broker (below its cached high watermark) are waited for; a
-        partition already read to its end is never waited on, so idle
-        partitions never block the rotation once the reader has caught up
-        with live data.  While every partition is caught up, the loop
-        sleeps briefly per rotation to avoid busy spinning.
+        broker (below its cached high watermark) are waited for, unless the
+        partition is at EOF.  EOF partitions are skipped until another message
+        arrives, even if pending transactions keep their last stable offset
+        below the high watermark.  While every partition is caught up, the
+        loop sleeps briefly per rotation to avoid busy spinning.
 
         Args:
             topic (str): kafka topic name.
@@ -849,8 +849,6 @@ class KafkaReader(BaseReader):
                     self._round_robin_partition_order[worker_id::num_workers]
                 )
             ]
-            # partition EOF events pin next_offsets to the partition end, which
-            # is what makes caught-up partitions skippable.
             config = {**config, "enable.partition.eof": "true"}
             consumer = Consumer(config)
             consumers.append(consumer)
@@ -865,6 +863,7 @@ class KafkaReader(BaseReader):
             projections: Dict[pa.Schema, Optional[List[int]]] = {}
             num_parts = len(consumers)
             next_offsets: List[int] = [OFFSET_INVALID] * num_parts
+            at_eof = [False] * num_parts
             rows_per_msg: Optional[float] = None
             idle_turns = 0
 
@@ -874,9 +873,10 @@ class KafkaReader(BaseReader):
                 """Split one consume() batch into messages to decode and a count.
 
                 Normal messages advance ``next_offsets[idx]`` past the consumed
-                offset.  Partition-EOF events pin ``next_offsets[idx]`` to the
-                partition end and are dropped.  Any other error event is kept
-                so ``_decode_messages`` logs it as before.
+                offset and clear its EOF status.  Partition-EOF events pin
+                ``next_offsets[idx]`` to the visible partition end, set its EOF
+                status and are dropped.  Any other error event is kept so
+                ``_decode_messages`` logs it as before.
 
                 Args:
                     events: events returned by one consume() call.
@@ -893,9 +893,11 @@ class KafkaReader(BaseReader):
                     if msg_error is None:
                         retained.append(msg)
                         next_offsets[idx] = msg.offset() + 1
+                        at_eof[idx] = False
                         got += 1
                     elif msg_error.code() == KafkaError._PARTITION_EOF:
                         next_offsets[idx] = msg.offset()
+                        at_eof[idx] = True
                     else:
                         retained.append(msg)
                 return retained, got
@@ -914,7 +916,7 @@ class KafkaReader(BaseReader):
                     consumers[idx].consume(msg_per_turn, timeout=0), idx
                 )
                 high = -1
-                if got < msg_per_turn:
+                if got < msg_per_turn and not at_eof[idx]:
                     _, high = consumers[idx].get_watermark_offsets(
                         owned_partitions[idx], cached=True
                     )
@@ -925,17 +927,13 @@ class KafkaReader(BaseReader):
                     else:
                         missing = min(msg_per_turn - got, high - next_offsets[idx])
                     if missing > 0:
-                        more, got_more = _take_events(
+                        more, _ = _take_events(
                             consumers[idx].consume(missing, timeout=1.0), idx
                         )
                         messages.extend(more)
-                        got += got_more
-                t: Optional[pa.Table] = None
-                num_decoded = 0
-                if messages:
-                    t, num_decoded = self._decode_messages(messages, topic, projections)
+                t, num_decoded = self._decode_messages(messages, topic, projections)
                 if t is None:
-                    if 0 <= high <= next_offsets[idx]:
+                    if at_eof[idx] or 0 <= high <= next_offsets[idx]:
                         # caught up with the partition end: nothing to wait for
                         idx = (idx + 1) % num_parts
                         idle_turns += 1
