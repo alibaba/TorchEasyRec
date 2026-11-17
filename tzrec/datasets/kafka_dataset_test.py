@@ -1230,12 +1230,10 @@ class FakeKafkaConsumer:
         self._positions = {}
         self._assignment = []
         self._topic = None
-        self._on_assign = None
         self._trace_path = os.environ.get("TZREC_FAKE_KAFKA_TRACE")
 
     def subscribe(self, topics, on_assign=None):
         self._topic = topics[0]
-        self._on_assign = on_assign
         parts = [
             p
             for p in range(self._num_partitions)
