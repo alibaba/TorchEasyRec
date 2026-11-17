@@ -396,6 +396,99 @@ def _log_dynamicemb_table_plan(
     )
 
 
+@torch.no_grad()
+def lookup_embeddings_for_publish(
+    module: torch.nn.Module, keys: torch.Tensor, table_id: int
+) -> tuple[List[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+    """Read embeddings for publication without changing scores or table contents.
+
+    Call on the training stream after embedding updates and before further cache
+    mutations. Cache hits take priority, and RocksDB reads overlap cache copies.
+
+    Args:
+        module: DynamicEmb module that owns the table.
+        keys: Unique IDs on the module's CUDA device.
+        table_id: Index of the table in ``module.table_names``.
+
+    Returns:
+        Per-tier (keys, embeddings) chunks and keys missing from all tiers.
+        All returned tensors are on CPU and ready to read.
+    """
+    from dynamicemb.key_value_table import (
+        DynamicEmbStorage,
+        HybridStorage,
+        _find_keys,
+        _flat_row_indices_for_value_load,
+        load_from_flat,
+    )
+    from dynamicemb.types import CopyMode
+
+    cache, storage = module.cache, module.tables
+    states = [cache._state] if cache is not None else []
+    external = not isinstance(storage, (DynamicEmbStorage, HybridStorage))
+    if isinstance(storage, DynamicEmbStorage):
+        states.append(storage._state)
+    elif isinstance(storage, HybridStorage):
+        states.extend((storage._hbm, storage._host))
+    else:
+        from tzrec_ext.rocksdb.storage import RocksDBStorage
+
+        if not isinstance(storage, RocksDBStorage):
+            raise TypeError(f"No read-only delta lookup for {type(storage).__name__}")
+
+    dim = storage.embedding_dim(table_id)
+    hit_chunks = []
+    missing_cpu = None
+    cache_copy_done = None
+    for state in states:
+        tids = torch.full_like(keys, table_id, dtype=torch.int64)
+        nmiss, missing_keys, _, _, _, hits, scores, slots = _find_keys(
+            state, keys, tids, const_lookup=True
+        )
+        if external:
+            missing_cpu = missing_keys.cpu()
+        if nmiss < keys.numel():
+            rows = _flat_row_indices_for_value_load(state, hits, scores, slots)
+            block = load_from_flat(state, rows, tids, CopyMode.EMBEDDING)
+            tier_keys = keys[hits] if nmiss else keys
+            tier_values = block[hits, :dim] if nmiss else block[:, :dim]
+            hit_chunks.append(
+                (
+                    tier_keys.to(device="cpu", non_blocking=external),
+                    tier_values.to(device="cpu", non_blocking=external),
+                )
+            )
+            if external:
+                cache_copy_done = torch.cuda.Event()
+                cache_copy_done.record()
+        keys = missing_keys
+        if not nmiss:
+            break
+
+    if missing_cpu is None:
+        missing_cpu = keys.cpu()
+    if external and missing_cpu.numel():
+        tids = torch.full_like(missing_cpu, table_id, dtype=torch.int64)
+        nmiss, _, _, _, _, hits, _, block = storage.find(
+            missing_cpu, tids, CopyMode.EMBEDDING
+        )
+        if nmiss < missing_cpu.numel():
+            if nmiss:
+                hit_rows = torch.nonzero(hits).flatten()
+                hit_chunks.append(
+                    (
+                        missing_cpu.index_select(0, hit_rows),
+                        block[:, :dim].index_select(0, hit_rows),
+                    )
+                )
+            else:
+                hit_chunks.append((missing_cpu, block[:, :dim]))
+        missing_cpu = missing_cpu[~hits]
+    if cache_copy_done is not None:
+        cache_copy_done.synchronize()
+    return hit_chunks, missing_cpu
+
+
 def _get_optimizer_multipler(
     optimizer_class: Optional[Type[torch.optim.Optimizer]],
     shape: torch.Size,

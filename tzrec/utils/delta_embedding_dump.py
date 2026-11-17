@@ -51,6 +51,7 @@ from torchrec.modules.mc_modules import MCHManagedCollisionModule
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from tzrec.protos.train_pb2 import DeltaEmbeddingDumpConfig, DeltaEmbeddingQuantType
+from tzrec.utils.dynamicemb_util import lookup_embeddings_for_publish
 from tzrec.utils.feature_store_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
     FEATURE_STORE_EMBEDDING_TYPE_UINT8,
@@ -1054,18 +1055,20 @@ class DeltaEmbeddingDumper:
         if error is not None:
             raise error.with_traceback(error.__traceback__)
 
-    def maybe_dump(self, global_step: int) -> DumpDecision:
+    def maybe_dump(self, global_step: int, *, allow_dump: bool = True) -> DumpDecision:
         """Dump on the configured step or time interval and advance tracker state.
 
         Args:
             global_step: Current training step.
+            allow_dump: If False, advance the tracker but retain IDs for final_dump.
+                All ranks must agree when using timed publication.
 
         Returns:
             This step's rank-uniform decision level; the caller drives the
             same-step dense export from ``DumpDecision.PAIRED``.
         """
         self._check_feature_store_upload_error()
-        decision = self._dump_decision(global_step)
+        decision = self._dump_decision(global_step) if allow_dump else DumpDecision.NONE
         if decision != DumpDecision.NONE:
             self.dump(global_step)
             self._last_dump_step = global_step
@@ -1148,12 +1151,8 @@ class DeltaEmbeddingDumper:
     def final_dump(self, global_step: int) -> Optional[int]:
         """Flush the trailing partial interval at the end of training.
 
-        Steps already written by ``maybe_dump`` (any cadence boundary) have no
-        remaining delta; re-dumping them would overwrite their shards with an
-        empty file under multi-GPU, so skip the dump there. Every skip/dump
-        decision is a function of rank-uniform values (the synced step, the
-        interval config, and -- timed cadence only, which steps in lockstep --
-        ``_last_dump_step``), so all ranks agree on the returned step.
+        Repeating a completed dump could overwrite its shard with an empty one
+        because the tracker cursor has advanced. A deferred step still needs a dump.
 
         Args:
             global_step: Current training step.
@@ -1169,46 +1168,17 @@ class DeltaEmbeddingDumper:
             logger.info("Skipping delta embedding dump at step %s.", global_step)
             return None
         global_step = self._sync_final_step(global_step)
-        if self._paired_interval_steps is not None and (
-            global_step % self._paired_interval_steps == 0
-            or (
-                self._sparse_interval_steps is not None
-                and global_step % self._sparse_interval_steps == 0
-            )
-        ):
-            # Boundary steps were already written (with full delta) by
-            # ``maybe_dump``. Re-dumping here has no new delta to flush -- every
-            # rank's consumer cursor has already advanced past the boundary's
-            # delta (all ranks run the same step count, so every rank
-            # participated in the boundary dump) -- and torchrec's
-            # ``get_unique`` raises ``torch.cat(): expected a non-empty list of
-            # Tensors`` on the empty consumer window. Re-dumping would also
-            # overwrite the already-written boundary shards (with an empty file
-            # under multi-GPU), so skip. A sparse-only boundary still returns
-            # its step: its delta is on record but no dense export paired with
-            # it yet, so the caller owes the final export.
-            return global_step
-        if (
-            self._paired_interval_secs is not None
-            and global_step == self._last_dump_step
-        ):
-            # A timed dump can land on any step. Avoid replacing that step's full
-            # delta with an empty final shard when training ends immediately after.
-            return global_step
-        self.dump(global_step)
+        if global_step != self._last_dump_step:
+            self.dump(global_step)
+            self._last_dump_step = global_step
         return global_step
 
     def _sync_final_step(self, global_step: int) -> int:
         """Align the final step across ranks before the trailing flush.
 
-        ``maybe_dump`` runs in lockstep so every rank shares ``global_step``,
-        but ``final_dump`` is reached with each rank's own last step. With
-        ``check_all_workers_data_status=False`` ranks can exhaust the dataloader
-        at different steps, so without syncing each would write a lone shard to
-        its own ``step_<N>/`` dir -- exactly the ragged shard set the per-rank
-        empty-shard logic prevents. Reduce with MAX so the furthest-progressed
-        rank's trailing delta is never swallowed by the boundary-step skip, and
-        so every rank takes the same skip/dump decision into the same dir.
+        Ranks can finish at different local steps. Use the largest step so all
+        ranks target the same shard directory and check that step against
+        their last completed dump.
         """
         if self._world_size <= 1:
             return global_step
@@ -1300,15 +1270,13 @@ class DeltaEmbeddingDumper:
         global_step: int,
         table_weights: Dict[str, _TableWeight],
         dynamic_modules: Dict[str, nn.Module],
-        flushed_module_ids: Optional[Set[int]] = None,
         dump_evicted_tombstones: bool = False,
     ) -> int:
         """Append real rows for touched ids and tombstones for evicted keys.
 
-        Dynamic tables merge the tracker's ids with this dump's evicted
-        keys into one post-flush lookup: found keys publish their current
-        embeddings, missing keys from the evicted set publish zero
-        tombstones, and missing keys that were never admitted are skipped
+        Dynamic tables query tracked and evicted keys without duplicates:
+        found keys publish their current embeddings, missing evicted keys publish
+        zero tombstones, and missing keys that were never admitted are skipped
         with a warning. One lookup resolves both orderings within a dump
         interval -- an evicted-then-reinserted key publishes exactly its
         fresh row, an insert-then-evict key exactly one tombstone. Row-wise
@@ -1320,8 +1288,6 @@ class DeltaEmbeddingDumper:
             global_step: Current training step.
             table_weights: Local weight shards keyed by table FQN.
             dynamic_modules: Dynamic embedding modules keyed by table FQN.
-            flushed_module_ids: Modules already flushed this dump; created
-                locally when None so direct callers keep working.
             dump_evicted_tombstones: When True, dynamic tables drain their
                 evicted-key buffers and publish tombstones; tables without
                 tracker rows are still visited so the buffers are drained.
@@ -1330,8 +1296,6 @@ class DeltaEmbeddingDumper:
             Number of rows appended.
         """
         num_rows = 0
-        if flushed_module_ids is None:
-            flushed_module_ids = set()
         unique_rows_by_fqn = self._tracker.get_unique(_CONSUMER)
         fqns = list(unique_rows_by_fqn)
         if dump_evicted_tombstones:
@@ -1343,7 +1307,7 @@ class DeltaEmbeddingDumper:
                 tracker_ids = (
                     unique_rows.ids
                     if unique_rows is not None
-                    else torch.empty(0, dtype=torch.int64)
+                    else torch.empty(0, dtype=torch.int64, device="cuda")
                 )
                 num_rows += self._append_dynamic_rows(
                     table_chunks,
@@ -1351,7 +1315,6 @@ class DeltaEmbeddingDumper:
                     fqn=fqn,
                     dynamic_module=dynamic_module,
                     tracker_ids=tracker_ids,
-                    flushed_module_ids=flushed_module_ids,
                     dump_evicted_tombstones=dump_evicted_tombstones,
                 )
                 continue
@@ -1496,95 +1459,69 @@ class DeltaEmbeddingDumper:
         fqn: str,
         dynamic_module: nn.Module,
         tracker_ids: torch.Tensor,
-        flushed_module_ids: Set[int],
         dump_evicted_tombstones: bool,
     ) -> int:
-        """Append one merged lookup's real rows and tombstones for a table.
+        """Append each lookup tier's real rows and the table's tombstones.
 
-        The tracker ids and this dump's evicted keys are merged and
-        deduplicated on host, then resolved by a post-flush ``find`` batched
-        in ``_FIND_BATCH_ROWS`` slices so the GPU values buffer stays capped
-        regardless of eviction volume. Each key publishes exactly one row:
-        its current embedding when present, a zero tombstone when absent
-        but evicted, and nothing (with a warning) when it was never
-        admitted.
+        When eviction ids are present, merge and deduplicate both sets on the
+        CPU and upload one lookup batch at a time. Otherwise tracker ids stay
+        on the GPU.
+
+        Publish the current embedding for hits and a zero tombstone for missing
+        evicted keys. Skip other misses and report their count.
 
         Args:
             table_chunks: List to append the per-table parquet chunks to.
             global_step: Current training step.
             fqn: Dynamic table FQN.
             dynamic_module: Dynamic embedding module hosting the table.
-            tracker_ids: Touched ids recorded by the tracker for this table.
-            flushed_module_ids: Modules already flushed this dump; a module
-                hosting several tables flushes once, not once per table.
+            tracker_ids: GPU touched ids recorded by the tracker for this table.
             dump_evicted_tombstones: Whether to drain this table's evicted
                 keys and publish tombstones for the missing ones.
 
         Returns:
             Number of rows appended.
         """
-        try:
-            from dynamicemb.types import CopyMode
-        except ImportError as exc:
-            raise RuntimeError(
-                "dynamicemb is required to dump dynamic embedding values."
-            ) from exc
         table_name = fqn.rsplit(".", maxsplit=1)[-1]
-        # flush() both syncs the caching store for the lookup and can evict
-        # backing-store rows; flush before the pop and the find so both see
-        # the post-flush state.
-        if id(dynamic_module) not in flushed_module_ids:
-            dynamic_module.flush()
-            flushed_module_ids.add(id(dynamic_module))
         table_id = cast(List[str], dynamic_module.table_names).index(table_name)
         # pyre-ignore [29]
         emb_dim = dynamic_module._dynamicemb_options[table_id].dim
-        ids = tracker_ids.cpu().to(torch.int64)
+        ids = tracker_ids.to(dtype=torch.int64)
         evicted_ids: Optional[torch.Tensor] = None
         if dump_evicted_tombstones:
             evicted = self._pop_evicted_key_ids(fqn, dynamic_module, table_name)
             if evicted is not None and evicted.numel() > 0:
-                evicted_ids = evicted.cpu().to(torch.int64)
-                ids = torch.cat([ids, evicted_ids])
+                evicted_ids = evicted.to(dtype=torch.int64).unique(sorted=True)
+                ids = torch.cat([ids.cpu(), evicted_ids])
         ids = ids.unique(sorted=True)
-        if ids.numel() == 0:
-            return 0
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        # The evicted mask stays on CPU: per-batch tombstone and never-admitted
-        # selections reuse the CPU batch ids, so only the found mask and the
-        # embedding values cross the device boundary.
-        evicted_mask = torch.isin(ids, evicted_ids) if evicted_ids is not None else None
         feature_name = _feature_name(self._tracker.fqn_to_feature_names.get(fqn, []))
         num_rows = 0
         num_never_admitted = 0
         for start in range(0, ids.numel(), _FIND_BATCH_ROWS):
-            batch_ids = ids[start : start + _FIND_BATCH_ROWS]
-            gpu_ids = batch_ids.to(device=device)
-            table_ids = torch.full_like(gpu_ids, table_id, dtype=torch.int64)
-            _, _, _, _, _, founds, _, values = dynamic_module.tables.find(
-                gpu_ids, table_ids, CopyMode.EMBEDDING
+            batch_ids = ids[start : start + _FIND_BATCH_ROWS].to(tracker_ids.device)
+            hit_chunks, missing_ids = lookup_embeddings_for_publish(
+                dynamic_module, batch_ids, table_id
             )
-            founds = founds.to(dtype=torch.bool)
-            # Only the compact found mask moves D2H; found and tombstone key
-            # ids reuse the CPU batch ids instead of round-tripping GPU ids.
-            founds_cpu = founds.cpu()
-            missing_cpu = ~founds_cpu
-            if evicted_mask is not None:
-                batch_evicted = evicted_mask[start : start + _FIND_BATCH_ROWS]
-                tombstone_ids = batch_ids[missing_cpu & batch_evicted]
-                num_never_admitted += int((missing_cpu & ~batch_evicted).sum())
+            if evicted_ids is not None:
+                positions = torch.searchsorted(evicted_ids, missing_ids).clamp_max(
+                    evicted_ids.numel() - 1
+                )
+                missing_evicted = evicted_ids[positions] == missing_ids
+                tombstone_ids = missing_ids[missing_evicted]
+                num_never_admitted += int((~missing_evicted).sum())
             else:
-                tombstone_ids = batch_ids.new_empty(0)
-                num_never_admitted += int(missing_cpu.sum())
-            num_rows += self._append_table_chunk(
-                table_chunks,
-                global_step=global_step,
-                feature_name=feature_name,
-                table_fqn=fqn,
-                key_ids=batch_ids[founds_cpu],
-                embeddings=values[founds, :emb_dim].detach(),
-                source="model_delta_tracker",
-            )
+                tombstone_ids = missing_ids.new_empty(0)
+                num_never_admitted += missing_ids.numel()
+            for hit_ids, values_cpu in hit_chunks:
+                num_rows += self._append_table_chunk(
+                    table_chunks,
+                    global_step=global_step,
+                    feature_name=feature_name,
+                    table_fqn=fqn,
+                    key_ids=hit_ids,
+                    embeddings=values_cpu,
+                    source="model_delta_tracker",
+                )
             num_rows += self._append_tombstone_chunks(
                 table_chunks,
                 global_step=global_step,
