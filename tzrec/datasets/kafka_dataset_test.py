@@ -27,7 +27,7 @@ from alibabacloud_alikafka20190916.client import Client as AliKafkaClient
 from alibabacloud_credentials.client import Client as CredClient
 from alibabacloud_tea_openapi import models as openapi_models
 from alibabacloud_tea_util import models as util_models
-from confluent_kafka import KafkaException, Producer, TopicPartition
+from confluent_kafka import KafkaError, KafkaException, Producer, TopicPartition
 from parameterized import param, parameterized
 from torch.utils.data import DataLoader
 
@@ -106,6 +106,16 @@ def _msg(partition, offset, value, rows=1, error=None):
     )
 
 
+def _eof(partition, offset):
+    return mock.Mock(
+        **{
+            "error.return_value": KafkaError(KafkaError._PARTITION_EOF),
+            "partition.return_value": partition,
+            "offset.return_value": offset,
+        }
+    )
+
+
 def _decoded_logs(mock_logger):
     return [
         call.args[0]
@@ -117,7 +127,9 @@ def _decoded_logs(mock_logger):
 class KafkaReaderRoundRobinTest(unittest.TestCase):
     """Round-robin reading with mocked consumers."""
 
-    def _make_reader(self, consumers, partitions=(0, 1), leaders=None, **kwargs):
+    def _make_reader(
+        self, consumers, partitions=(0, 1), leaders=None, batch_size=1, **kwargs
+    ):
         leaders = leaders or {partition: 0 for partition in partitions}
         query_consumer = mock.Mock()
         query_consumer.list_topics.return_value = SimpleNamespace(
@@ -145,7 +157,7 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         )
         return KafkaReader(
             "kafka://broker:9092/topic?group.id=g1",
-            1,
+            batch_size,
             input_fields=[pa.field("x", pa.int64())],
             kafka_partition_round_robin=True,
             **kwargs,
@@ -166,20 +178,112 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         ]
         consumers[1].consume.side_effect = [
             [],
-            [_msg(1, 0, 0, error="boom")],
+            [_msg(1, 0, 0, error=KafkaError(KafkaError._TRANSPORT))],
             [_msg(1, 0, 3)],
             [_msg(1, 1, 4)],
         ]
+        for consumer in consumers:
+            consumer.get_watermark_offsets.return_value = (0, 2)
         gen = self._make_reader(consumers)._reader(0, 1)
         self.addCleanup(gen.close)
         observed = [next(gen).column("x")[0].as_py() for _ in expected]
         self.assertEqual(observed, expected)
         self.assertEqual(
-            consumers[0].consume.call_args_list, [mock.call(1, timeout=1.0)] * 2
+            [call.kwargs["timeout"] for call in consumers[0].consume.call_args_list],
+            [0, 0],
         )
         self.assertEqual(
-            consumers[1].consume.call_args_list, [mock.call(1, timeout=1.0)] * 4
+            [call.kwargs["timeout"] for call in consumers[1].consume.call_args_list],
+            [0, 1.0, 0, 0],
         )
+
+    def test_round_robin_skips_caught_up_partition(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[0].consume.side_effect = [
+            [_msg(0, 0, 1)],
+            [_msg(0, 1, 2)],
+            [_msg(0, 2, 3)],
+        ]
+        consumers[1].consume.side_effect = [
+            [],
+            [_eof(1, 5)],
+            [],
+            [_msg(1, 5, 9)],
+        ]
+        consumers[1].get_watermark_offsets.return_value = (0, 5)
+        with mock.patch("tzrec.datasets.kafka_dataset.logger") as mock_logger:
+            gen = self._make_reader(consumers)._reader(0, 1)
+            self.addCleanup(gen.close)
+            observed = [next(gen).column("x")[0].as_py() for _ in range(4)]
+        self.assertEqual(observed, [1, 2, 3, 9])
+        # after the EOF event the caught-up partition no longer blocks
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in consumers[1].consume.call_args_list],
+            [0, 1.0, 0, 0],
+        )
+        mock_logger.error.assert_not_called()
+
+    @parameterized.expand(
+        [
+            param(
+                "caught_up_takes_partial",
+                (0, 2),
+                [2, 4, 2],
+                [mock.call(1, timeout=0), mock.call(2, timeout=0)],
+            ),
+            param(
+                "backlogged_fills_quantum",
+                (0, 10),
+                [2, 4, 4],
+                [
+                    mock.call(1, timeout=0),
+                    mock.call(2, timeout=0),
+                    mock.call(1, timeout=1.0),
+                ],
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_round_robin_quantum_follows_rows_estimate(
+        self, _name, watermark, expected_rows, expected_calls
+    ):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[0].consume.side_effect = [
+            [_msg(0, 0, 1, rows=2)],
+            [_msg(0, 1, 2, rows=2)],
+            [_msg(0, 2, 3, rows=2)],
+        ]
+        consumers[0].get_watermark_offsets.return_value = watermark
+        consumers[1].consume.return_value = [
+            _msg(1, 0, 4, rows=2),
+            _msg(1, 1, 5, rows=2),
+        ]
+        gen = self._make_reader(consumers, batch_size=8)._reader(0, 1)
+        self.addCleanup(gen.close)
+        observed = [next(gen).num_rows for _ in expected_rows]
+        self.assertEqual(observed, expected_rows)
+        self.assertEqual(consumers[0].consume.call_args_list, expected_calls)
+
+    def test_round_robin_sleeps_when_all_caught_up(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[0].consume.side_effect = [[_eof(0, 3)]] + [[]] * 8
+        consumers[1].consume.side_effect = [[_eof(1, 7)]] + [[]] * 8
+        consumers[0].get_watermark_offsets.return_value = (0, 3)
+        consumers[1].get_watermark_offsets.return_value = (0, 7)
+
+        class _StopLoop(Exception):
+            pass
+
+        sleep = mock.Mock(side_effect=_StopLoop)
+        with mock.patch.object(kafka_dataset.time, "sleep", sleep):
+            gen = self._make_reader(consumers)._reader(0, 1)
+            self.addCleanup(gen.close)
+            with self.assertRaises(_StopLoop):
+                next(gen)
+        sleep.assert_called_once_with(0.01)
+        for consumer in consumers:
+            for call in consumer.consume.call_args_list:
+                self.assertEqual(call.kwargs["timeout"], 0)
 
     @parameterized.expand(
         [
@@ -1292,6 +1396,10 @@ class FakeKafkaConsumer:
             self._positions[p] = o + 1
         return out
 
+    def get_watermark_offsets(self, partition, timeout=-1, cached=False):
+        # infinite stream: one message is always in backlog past the position
+        return (0, self._positions.get(partition.partition, 0) + 1)
+
     def _trace_read(self, partition, offset):
         if self._trace_path is None:
             return
@@ -1345,14 +1453,16 @@ class KafkaReaderLifecycleTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("subscribe_parent_exit", False, True),
-            ("round_robin_parent_exit", True, True),
-            ("subscribe_main_process", False, False),
-            ("round_robin_main_process", True, False),
+            ("subscribe_parent_exit", False, True, 1),
+            ("round_robin_parent_exit", True, True, 2),
+            ("subscribe_main_process", False, False, 3),
+            ("round_robin_main_process", True, False, 3),
         ],
         name_func=parameterized_name_func,
     )
-    def test_idle_poll_parent_lifecycle(self, _name, round_robin, has_parent):
+    def test_idle_poll_parent_lifecycle(
+        self, _name, round_robin, has_parent, expected_calls
+    ):
         reader = FakeKafkaReader(
             _fake_uri(num_partitions=1),
             batch_size=1,
@@ -1367,7 +1477,7 @@ class KafkaReaderLifecycleTest(unittest.TestCase):
             ),
             mock.patch.object(kafka_dataset.os, "getppid", side_effect=[123, 456]),
             mock.patch.object(
-                FakeKafkaConsumer, "consume", side_effect=[[], [_msg(0, 0, 7)]]
+                FakeKafkaConsumer, "consume", side_effect=[[], [], [_msg(0, 0, 7)]]
             ) as consume,
             mock.patch.object(FakeKafkaConsumer, "close") as close,
         ):
@@ -1380,7 +1490,7 @@ class KafkaReaderLifecycleTest(unittest.TestCase):
                     self.assertEqual(next(gen).column("x").to_pylist(), [7])
             finally:
                 gen.close()
-            self.assertEqual(consume.call_count, 1 if has_parent else 2)
+            self.assertEqual(consume.call_count, expected_calls)
             close.assert_called_once()
 
 

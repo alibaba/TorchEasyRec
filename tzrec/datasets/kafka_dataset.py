@@ -22,6 +22,7 @@ import pyarrow as pa
 from confluent_kafka import (
     OFFSET_INVALID,
     Consumer,
+    KafkaError,
     KafkaException,
     Message,
     TopicPartition,
@@ -295,7 +296,9 @@ class KafkaReader(BaseReader):
         shuffle_buffer_size (int): buffer size for shuffle.
         input_fields (list): list of pa.Field for schema definition.
         kafka_partition_round_robin (bool): whether to read the partitions owned
-            by each worker in strict round-robin order.
+            by each worker in round-robin order, a quantum of messages per
+            turn; partitions already caught up with the broker are skipped
+            instead of blocking the rotation.
         kafka_log_every_n_messages (int): log per-worker decoded message counts
             every N messages, 0 disables.
     """
@@ -640,7 +643,7 @@ class KafkaReader(BaseReader):
         In a multiprocessing child, stop polling when the parent process exits.
 
         When partition round-robin is enabled the partitions owned by this
-        worker are read strictly in turn by :meth:`_round_robin_reader`.
+        worker are read in round-robin order by :meth:`_round_robin_reader`.
         Otherwise a background heartbeat thread monitors idle time (time since
         the last ``consume()`` call).  When the generator is blocked at
         ``yield`` for longer than 80% of ``max.poll.interval.ms``, the
@@ -799,12 +802,19 @@ class KafkaReader(BaseReader):
         worker_id: int,
         num_workers: int,
     ) -> Generator[pa.RecordBatch, None, None]:
-        """Read this worker's partitions strictly in round-robin order.
+        """Read this worker's partitions in round-robin order, by quantum.
 
-        Partitions are sliced from the leader-ordered list resolved at reader
-        construction, then read in ascending partition order.  Each owned
-        partition gets its own consumer, assigned up front.  The rotation
-        cursor does not advance while the current partition has no valid message.
+        Partitions are sliced from the leader-ordered list resolved at
+        reader construction; each owned partition gets its own consumer,
+        assigned up front.  Every turn consumes up to ``quantum`` messages
+        from the current partition, where ``quantum`` is derived from the
+        estimated rows per message so that one full rotation yields about
+        one batch.  Messages confirmed to exist on the broker (below its
+        cached high watermark) are waited for; a partition already read to
+        its end is never waited on, so idle partitions never block the
+        rotation once the reader has caught up with live data.  While every
+        partition is caught up, the loop sleeps briefly per rotation to
+        avoid busy spinning.
 
         Args:
             topic (str): kafka topic name.
@@ -838,6 +848,9 @@ class KafkaReader(BaseReader):
                     self._round_robin_partition_order[worker_id::num_workers]
                 )
             ]
+            # partition EOF events pin next_offsets to the partition end, which
+            # is what makes caught-up partitions skippable.
+            config = {**config, "enable.partition.eof": "true"}
             consumer = Consumer(config)
             consumers.append(consumer)
             self._set_start_offsets(consumer, owned_partitions, start_timestamp_ms)
@@ -849,22 +862,97 @@ class KafkaReader(BaseReader):
             logger.info(f"{log_prefix} assignment: {owned_partitions}")
 
             projections: Dict[pa.Schema, Optional[List[int]]] = {}
+            num_parts = len(consumers)
+            next_offsets: List[int] = [OFFSET_INVALID] * num_parts
+            rows_per_msg: Optional[float] = None
+            idle_turns = 0
+
+            def _take_events(
+                events: List[Message], idx: int
+            ) -> Tuple[List[Message], int]:
+                """Split one consume() batch into messages to decode and a count.
+
+                Normal messages advance ``next_offsets[idx]`` past the consumed
+                offset.  Partition-EOF events pin ``next_offsets[idx]`` to the
+                partition end and are dropped.  Any other error event is kept
+                so ``_decode_messages`` logs it as before.
+
+                Args:
+                    events: events returned by one consume() call.
+                    idx: index of the partition the events belong to.
+
+                Returns:
+                    retained messages (normal and error events) and the number
+                    of normal messages among them.
+                """
+                retained: List[Message] = []
+                got = 0
+                for msg in events:
+                    msg_error = msg.error()
+                    if msg_error is None:
+                        retained.append(msg)
+                        next_offsets[idx] = msg.offset() + 1
+                        got += 1
+                    elif msg_error.code() == KafkaError._PARTITION_EOF:
+                        next_offsets[idx] = msg.offset()
+                    else:
+                        retained.append(msg)
+                return retained, got
+
             idx = 0
             while True:
                 if parent is not None and os.getppid() != parent.pid:
                     logger.error(f"{log_prefix}: owner process gone, exiting")
                     return
-                messages = consumers[idx].consume(1, timeout=1.0)
-                if not messages:
-                    continue
-                t, _ = self._decode_messages(messages, topic, projections)
+                quantum = (
+                    max(1, math.ceil(self._batch_size / (rows_per_msg * num_parts)))
+                    if rows_per_msg
+                    else 1
+                )
+                messages, got = _take_events(
+                    consumers[idx].consume(quantum, timeout=0), idx
+                )
+                high = -1
+                if got < quantum:
+                    _, high = consumers[idx].get_watermark_offsets(
+                        owned_partitions[idx], cached=True
+                    )
+                    if next_offsets[idx] < 0 or high < 0:
+                        # nothing read yet (or watermark unknown): wait for the
+                        # first message or the EOF event
+                        missing = 1
+                    else:
+                        missing = min(quantum - got, high - next_offsets[idx])
+                    if missing > 0:
+                        more, got_more = _take_events(
+                            consumers[idx].consume(missing, timeout=1.0), idx
+                        )
+                        messages.extend(more)
+                        got += got_more
+                t: Optional[pa.Table] = None
+                num_decoded = 0
+                if messages:
+                    t, num_decoded = self._decode_messages(messages, topic, projections)
                 if t is None:
+                    if 0 <= high <= next_offsets[idx]:
+                        # caught up with the partition end: nothing to wait for
+                        idx = (idx + 1) % num_parts
+                        idle_turns += 1
+                        if idle_turns >= num_parts:
+                            time.sleep(0.01)
+                            idle_turns = 0
                     continue
+                idle_turns = 0
+                # estimate rows per message like the non-round-robin path
+                if rows_per_msg is None:
+                    rows_per_msg = len(t) / num_decoded
+                else:
+                    rows_per_msg = 0.9 * rows_per_msg + 0.1 * len(t) / num_decoded
                 # A zero-row message advances the rotation even though it
                 # yields no record batch.
                 for batch in t.to_batches():
                     yield batch
-                idx = (idx + 1) % len(consumers)
+                idx = (idx + 1) % num_parts
         except Exception as e:
             logger.error(f"{log_prefix} exception: {e}")
             raise
