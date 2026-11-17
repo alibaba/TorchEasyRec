@@ -1494,10 +1494,9 @@ class DeltaEmbeddingDumper:
     ) -> int:
         """Append each lookup tier's real rows and the table's tombstones.
 
-        Tracked ids stay on the GPU. Evicted CPU ids are uploaded in slices,
-        excluding ids already tracked. Combined key slices hold at most twice
-        the lookup batch size. Each lookup uses at most ``_FIND_BATCH_ROWS``
-        keys, regardless of eviction volume.
+        When eviction ids are present, merge and deduplicate both sets on the
+        CPU and upload one lookup batch at a time. Otherwise tracker ids stay
+        on the GPU.
         Each key publishes exactly one row:
         its current embedding when present, a zero tombstone when absent
         but evicted, and nothing (with a warning) when it was never
@@ -1525,67 +1524,43 @@ class DeltaEmbeddingDumper:
             evicted = self._pop_evicted_key_ids(fqn, dynamic_module, table_name)
             if evicted is not None and evicted.numel() > 0:
                 evicted_ids = evicted.to(dtype=torch.int64).unique(sorted=True)
-        batched_evicted_ids = evicted_ids
-        if (
-            evicted_ids is not None
-            and ids.numel() + evicted_ids.numel() <= 2 * _FIND_BATCH_ROWS
-        ):
-            ids = torch.cat([ids, evicted_ids.to(ids.device)])
-            batched_evicted_ids = None
+                ids = torch.cat([ids.cpu(), evicted_ids])
         ids = ids.unique(sorted=True)
         feature_name = _feature_name(self._tracker.fqn_to_feature_names.get(fqn, []))
         num_rows = 0
         num_never_admitted = 0
-        num_candidates = max(
-            ids.numel(),
-            batched_evicted_ids.numel() if batched_evicted_ids is not None else 0,
-        )
-        for start in range(0, num_candidates, _FIND_BATCH_ROWS):
-            batch_ids = ids[start : start + _FIND_BATCH_ROWS]
-            if batched_evicted_ids is not None and start < batched_evicted_ids.numel():
-                evicted_batch = batched_evicted_ids[
-                    start : start + _FIND_BATCH_ROWS
-                ].to(ids.device)
-                if ids.numel():
-                    positions = torch.searchsorted(ids, evicted_batch).clamp_max(
-                        ids.numel() - 1
-                    )
-                    evicted_batch = evicted_batch[ids[positions] != evicted_batch]
-                if evicted_batch.numel():
-                    batch_ids = torch.cat([batch_ids, evicted_batch])
-            for batch_start in range(0, batch_ids.numel(), _FIND_BATCH_ROWS):
-                hit_chunks, missing_ids = lookup_embeddings_for_publish(
-                    dynamic_module,
-                    batch_ids[batch_start : batch_start + _FIND_BATCH_ROWS],
-                    table_id,
+        for start in range(0, ids.numel(), _FIND_BATCH_ROWS):
+            batch_ids = ids[start : start + _FIND_BATCH_ROWS].to(tracker_ids.device)
+            hit_chunks, missing_ids = lookup_embeddings_for_publish(
+                dynamic_module, batch_ids, table_id
+            )
+            if evicted_ids is not None:
+                positions = torch.searchsorted(evicted_ids, missing_ids).clamp_max(
+                    evicted_ids.numel() - 1
                 )
-                if evicted_ids is not None:
-                    positions = torch.searchsorted(evicted_ids, missing_ids).clamp_max(
-                        evicted_ids.numel() - 1
-                    )
-                    missing_evicted = evicted_ids[positions] == missing_ids
-                    tombstone_ids = missing_ids[missing_evicted]
-                    num_never_admitted += int((~missing_evicted).sum())
-                else:
-                    tombstone_ids = missing_ids.new_empty(0)
-                    num_never_admitted += missing_ids.numel()
-                for hit_ids, values_cpu in hit_chunks:
-                    num_rows += self._append_table_chunk(
-                        table_chunks,
-                        global_step=global_step,
-                        feature_name=feature_name,
-                        table_fqn=fqn,
-                        key_ids=hit_ids,
-                        embeddings=values_cpu,
-                        source="model_delta_tracker",
-                    )
-                num_rows += self._append_tombstone_chunks(
+                missing_evicted = evicted_ids[positions] == missing_ids
+                tombstone_ids = missing_ids[missing_evicted]
+                num_never_admitted += int((~missing_evicted).sum())
+            else:
+                tombstone_ids = missing_ids.new_empty(0)
+                num_never_admitted += missing_ids.numel()
+            for hit_ids, values_cpu in hit_chunks:
+                num_rows += self._append_table_chunk(
                     table_chunks,
                     global_step=global_step,
-                    fqn=fqn,
-                    tombstone_ids=tombstone_ids,
-                    emb_dim=emb_dim,
+                    feature_name=feature_name,
+                    table_fqn=fqn,
+                    key_ids=hit_ids,
+                    embeddings=values_cpu,
+                    source="model_delta_tracker",
                 )
+            num_rows += self._append_tombstone_chunks(
+                table_chunks,
+                global_step=global_step,
+                fqn=fqn,
+                tombstone_ids=tombstone_ids,
+                emb_dim=emb_dim,
+            )
         if num_never_admitted > 0:
             logger.warning(
                 "Skip %s missing dynamic embedding ids for table %s.",
