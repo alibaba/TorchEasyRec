@@ -296,13 +296,13 @@ class RocksDBRuntime:
             self.groups.append(m)
 
     def evict(self) -> None:
-        """Evict every RocksDB table above its capacity.
+        """Reclaim excess persisted rows from each RocksDB table.
 
         Call only with no lookup in flight (a completed update, or the end of
         a pass).
         """
         for m in self.groups:
-            m.tables.evict_to_capacity()
+            m.tables.maybe_evict_records()
 
     def reset_for_import(self, model: nn.Module) -> None:
         """Start RocksDB tables from a fresh empty DB before ``DynamicEmbLoad``.
