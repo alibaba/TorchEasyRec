@@ -492,6 +492,11 @@ class BaseFeature(object, metaclass=_meta_cls):
                 raise ValueError(
                     f"hard_search_key for {self.sequence_name} must be item:<field>."
                 )
+            if self.sequence_length == 0:
+                raise ValueError(
+                    f"hard_search_key for {self.sequence_name} requires a positive "
+                    "sequence_length."
+                )
 
         # for fg encoded data
         self._fg_encoded_kwargs = {}
