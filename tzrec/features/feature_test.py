@@ -606,9 +606,15 @@ class FeatureTest(unittest.TestCase):
             config.sequence_feature.hard_search_key = "item:cate"
         config.sequence_feature.sequence_delim = "|"
         config.sequence_feature.sequence_length = 0
-        features = feature_lib.create_features([config])
-        self.assertEqual(features[0].sequence_delim, "|")
-        self.assertEqual(features[0].sequence_length, 0)
+        if hard_search:
+            with self.assertRaisesRegex(
+                ValueError, "hard_search_key.*requires a positive sequence_length"
+            ):
+                feature_lib.create_features([config])
+        else:
+            features = feature_lib.create_features([config])
+            self.assertEqual(features[0].sequence_delim, "|")
+            self.assertEqual(features[0].sequence_length, 0)
 
         config.sequence_feature.sequence_length = 2**31
         with self.assertRaisesRegex(
@@ -664,7 +670,9 @@ class FeatureTest(unittest.TestCase):
                 ],
             )
         )
-        with self.assertRaisesRegex(ValueError, "sequence-prefixed.*shared_map"):
+        with self.assertRaisesRegex(
+            RuntimeError, "must use the sequence prefix: shared_map"
+        ):
             feature_lib.create_features([config], fg_mode=FgMode.FG_DAG)
 
     @parameterized.expand([(False,), (True,)], name_func=parameterized_name_func)
