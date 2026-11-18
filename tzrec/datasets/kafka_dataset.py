@@ -22,7 +22,6 @@ import pyarrow as pa
 from confluent_kafka import (
     OFFSET_INVALID,
     Consumer,
-    KafkaError,
     KafkaException,
     Message,
     TopicPartition,
@@ -807,8 +806,8 @@ class KafkaReader(BaseReader):
 
         Each partition has its own consumer. Estimated rows per message set
         the turn size so one rotation yields about one batch. Wait for unread
-        messages below the cached high watermark; skip caught-up or EOF
-        partitions. EOF can precede the high watermark with pending transactions.
+        messages below the cached high watermark and skip empty or caught-up
+        partitions.
         Sleep briefly after an idle rotation to avoid busy spinning.
 
         Args:
@@ -834,8 +833,6 @@ class KafkaReader(BaseReader):
                     f"kafka topic {topic} has "
                     f"{len(self._round_robin_partition_order)} partition(s), "
                     f"fewer than the {num_workers} dataloader workers; "
-                    "kafka_partition_round_robin requires at least one partition "
-                    "per worker."
                 )
             owned_partitions = [
                 TopicPartition(topic, partition)
@@ -843,7 +840,6 @@ class KafkaReader(BaseReader):
                     self._round_robin_partition_order[worker_id::num_workers]
                 )
             ]
-            config = {**config, "enable.partition.eof": "true"}
             consumer = Consumer(config)
             consumers.append(consumer)
             self._set_start_offsets(consumer, owned_partitions, start_timestamp_ms)
@@ -856,40 +852,18 @@ class KafkaReader(BaseReader):
 
             projections: Dict[pa.Schema, Optional[List[int]]] = {}
             num_parts = len(consumers)
-            next_offsets: List[int] = [OFFSET_INVALID] * num_parts
-            at_eof = [False] * num_parts
+            next_offsets = [tp.offset for tp in owned_partitions]
             rows_per_msg: Optional[float] = None
             idle_turns = 0
 
-            def _take_events(
-                events: List[Message], idx: int
-            ) -> Tuple[List[Message], int]:
-                """Update offset/EOF state and filter EOF events.
-
-                Other errors remain in the result for ``_decode_messages`` to log.
-
-                Args:
-                    events: events returned by one consume() call.
-                    idx: index of the partition the events belong to.
-
-                Returns:
-                    retained messages and the number of non-error messages.
-                """
-                retained: List[Message] = []
+            def _record_offsets(messages: List[Message], idx: int) -> int:
+                """Record the next offset and return the number of data messages."""
                 got = 0
-                for msg in events:
-                    msg_error = msg.error()
-                    if msg_error is None:
-                        retained.append(msg)
+                for msg in messages:
+                    if not msg.error():
                         next_offsets[idx] = msg.offset() + 1
-                        at_eof[idx] = False
                         got += 1
-                    elif msg_error.code() == KafkaError._PARTITION_EOF:
-                        next_offsets[idx] = msg.offset()
-                        at_eof[idx] = True
-                    else:
-                        retained.append(msg)
-                return retained, got
+                return got
 
             idx = 0
             while True:
@@ -901,27 +875,28 @@ class KafkaReader(BaseReader):
                     if rows_per_msg
                     else 1
                 )
-                messages, got = _take_events(
-                    consumers[idx].consume(msg_per_turn, timeout=0), idx
-                )
-                high = -1
-                if got < msg_per_turn and not at_eof[idx]:
-                    _, high = consumers[idx].get_watermark_offsets(
+                consumer = consumers[idx]
+                messages = consumer.consume(msg_per_turn, timeout=0)
+                got = _record_offsets(messages, idx)
+                caught_up = False
+                if got < msg_per_turn:
+                    low, high = consumer.get_watermark_offsets(
                         owned_partitions[idx], cached=True
                     )
-                    if next_offsets[idx] < 0 or high < 0:
-                        # NOTE: Wait for a message or EOF before deciding to skip.
-                        missing = 1
-                    else:
-                        missing = min(msg_per_turn - got, high - next_offsets[idx])
-                    if missing > 0:
-                        more, _ = _take_events(
-                            consumers[idx].consume(missing, timeout=1.0), idx
+                    next_offset = next_offsets[idx]
+                    caught_up = high >= 0 and (low == high or next_offset >= high)
+                    if not caught_up:
+                        missing = (
+                            1
+                            if next_offset < 0 or high < 0
+                            else min(msg_per_turn - got, high - next_offset)
                         )
+                        more = consumer.consume(missing, timeout=1.0)
+                        _record_offsets(more, idx)
                         messages.extend(more)
                 t, num_decoded = self._decode_messages(messages, topic, projections)
                 if t is None:
-                    if at_eof[idx] or 0 <= high <= next_offsets[idx]:
+                    if caught_up:
                         idx = (idx + 1) % num_parts
                         idle_turns += 1
                         if idle_turns >= num_parts:

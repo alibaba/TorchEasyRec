@@ -26,7 +26,7 @@ from alibabacloud_alikafka20190916.client import Client as AliKafkaClient
 from alibabacloud_credentials.client import Client as CredClient
 from alibabacloud_tea_openapi import models as openapi_models
 from alibabacloud_tea_util import models as util_models
-from confluent_kafka import KafkaError, KafkaException, Producer, TopicPartition
+from confluent_kafka import KafkaException, Producer, TopicPartition
 from parameterized import param, parameterized
 from torch.utils.data import DataLoader
 
@@ -106,16 +106,6 @@ def _msg(partition, offset, value, rows=1, error=None):
     )
 
 
-def _eof(partition, offset):
-    return mock.Mock(
-        **{
-            "error.return_value": KafkaError(KafkaError._PARTITION_EOF),
-            "partition.return_value": partition,
-            "offset.return_value": offset,
-        }
-    )
-
-
 def _decoded_logs(mock_logger):
     return [
         call.args[0]
@@ -184,12 +174,12 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         ]
         consumers[1].consume.side_effect = [
             [],
-            [_msg(1, 0, 0, error=KafkaError(KafkaError._TRANSPORT))],
+            [_msg(1, 0, 0, error="boom")],
             [_msg(1, 0, 3)],
             [_msg(1, 1, 4)],
         ]
-        for consumer in consumers:
-            consumer.get_watermark_offsets.return_value = (0, 2)
+        consumers[0].get_watermark_offsets.return_value = (0, 2)
+        consumers[1].get_watermark_offsets.side_effect = [(-1, -1), (0, 2)]
         gen = self._make_reader(consumers)._reader(0, 1)
         self.addCleanup(gen.close)
         observed = [next(gen).column("x")[0].as_py() for _ in expected]
@@ -203,105 +193,69 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
             [0, 1.0, 0, 0],
         )
 
-    @parameterized.expand(
-        [
-            param("eof_at_high_watermark", 5),
-            param("eof_below_high_watermark", 10),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_round_robin_skips_caught_up_partition(self, _name, high):
+    def test_round_robin_skips_caught_up_partition_after_resume(self):
         consumers = [mock.Mock(), mock.Mock()]
         consumers[0].consume.side_effect = [
-            [_msg(0, 0, 1)],
-            [_msg(0, 1, 2)],
-            [_msg(0, 2, 3)],
-            [_msg(0, 3, 4)],
+            [_msg(0, offset, offset + 1)] for offset in range(4)
         ]
         consumers[1].consume.side_effect = [
             [],
-            [_eof(1, 5)],
-            [],
             [_msg(1, 5, 9)],
+            [],
             [],
             [_msg(1, 6, 10)],
         ]
-        consumers[1].get_watermark_offsets.return_value = (0, high)
-        with mock.patch("tzrec.datasets.kafka_dataset.logger") as mock_logger:
-            gen = self._make_reader(consumers)._reader(0, 1)
-            self.addCleanup(gen.close)
-            observed = [next(gen).column("x")[0].as_py() for _ in range(4)]
-            self.assertEqual(observed, [1, 2, 3, 9])
-            consumers[1].get_watermark_offsets.return_value = (0, 10)
-            observed = [next(gen).column("x")[0].as_py() for _ in range(2)]
-        self.assertEqual(observed, [4, 10])
+        consumers[1].get_watermark_offsets.side_effect = [
+            (0, high) for high in (5, 6, 7)
+        ]
+        reader = self._make_reader(consumers)
+        reader.load_state_dict({"topic:1": 4})
+        gen = reader._reader(0, 1)
+        self.addCleanup(gen.close)
+        observed = [next(gen).column("x")[0].as_py() for _ in range(6)]
+        self.assertEqual(observed, [1, 2, 9, 3, 4, 10])
         self.assertEqual(
             [call.kwargs["timeout"] for call in consumers[1].consume.call_args_list],
-            [0, 1.0, 0, 0, 0, 1.0],
+            [0, 0, 0, 0, 1.0],
         )
-        mock_logger.error.assert_not_called()
 
-    @parameterized.expand(
-        [
-            param(
-                "caught_up_takes_partial",
-                (0, 2),
-                [2, 4, 2],
-                [mock.call(1, timeout=0), mock.call(2, timeout=0)],
-            ),
-            param(
-                "backlogged_fills_turn",
-                (0, 10),
-                [2, 4, 4],
-                [
-                    mock.call(1, timeout=0),
-                    mock.call(2, timeout=0),
-                    mock.call(1, timeout=1.0),
-                ],
-            ),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_round_robin_msg_per_turn_follows_rows_estimate(
-        self, _name, watermark, expected_rows, expected_calls
-    ):
+    def test_round_robin_msg_per_turn_follows_rows_estimate(self):
         consumers = [mock.Mock(), mock.Mock()]
         consumers[0].consume.side_effect = [
-            [_msg(0, 0, 1, rows=2)],
-            [_msg(0, 1, 2, rows=2)],
-            [_msg(0, 2, 3, rows=2)],
+            [_msg(0, offset, offset + 1, rows=2)] for offset in range(4)
         ]
-        consumers[0].get_watermark_offsets.return_value = watermark
-        consumers[1].consume.return_value = [
-            _msg(1, 0, 4, rows=2),
-            _msg(1, 1, 5, rows=2),
+        consumers[0].get_watermark_offsets.side_effect = [(0, 2), (0, 10)]
+        consumers[1].consume.side_effect = [
+            [_msg(1, offset, offset + 5, rows=2) for offset in range(start, start + 2)]
+            for start in (0, 2)
         ]
         gen = self._make_reader(consumers, batch_size=8)._reader(0, 1)
         self.addCleanup(gen.close)
-        observed = [next(gen).num_rows for _ in expected_rows]
-        self.assertEqual(observed, expected_rows)
-        self.assertEqual(consumers[0].consume.call_args_list, expected_calls)
+        self.assertEqual([next(gen).num_rows for _ in range(5)], [2, 4, 2, 4, 4])
+        self.assertEqual(
+            consumers[0].consume.call_args_list,
+            [
+                mock.call(1, timeout=0),
+                mock.call(2, timeout=0),
+                mock.call(2, timeout=0),
+                mock.call(1, timeout=1.0),
+            ],
+        )
 
     def test_round_robin_sleeps_when_all_caught_up(self):
         consumers = [mock.Mock(), mock.Mock()]
-        consumers[0].consume.side_effect = [[_eof(0, 3)]] + [[]] * 8
-        consumers[1].consume.side_effect = [[_eof(1, 7)]] + [[]] * 8
-        consumers[0].get_watermark_offsets.return_value = (0, 3)
-        consumers[1].get_watermark_offsets.return_value = (0, 7)
-
-        class _StopLoop(Exception):
-            pass
-
-        sleep = mock.Mock(side_effect=_StopLoop)
+        for consumer, offset in zip(consumers, (5, 7)):
+            consumer.consume.side_effect = [[]]
+            consumer.get_watermark_offsets.return_value = (offset, offset)
+        sleep = mock.Mock(side_effect=RuntimeError)
         with mock.patch.object(kafka_dataset.time, "sleep", sleep):
             gen = self._make_reader(consumers)._reader(0, 1)
             self.addCleanup(gen.close)
-            with self.assertRaises(_StopLoop):
+            with self.assertRaises(RuntimeError):
                 next(gen)
         sleep.assert_called_once_with(0.01)
         for consumer in consumers:
-            for call in consumer.consume.call_args_list:
-                self.assertEqual(call.kwargs["timeout"], 0)
+            consumer.consume.assert_called_once_with(1, timeout=0)
 
     @parameterized.expand(
         [

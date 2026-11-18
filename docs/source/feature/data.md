@@ -374,7 +374,7 @@ pipeline.global-job-parameters: |
 ### kafka_partition_round_robin
 
 - 仅对KafkaDataset生效，默认为false；开启后启动时按leader排序分区并分发到各worker（有效全局worker数为`world_size * max(data_config.num_workers, 1)`），每个worker为自己负责的分区各创建一个consumer
-- 每次从当前分区读取N条消息。N按消息平均行数估算，使各分区轮完一轮约凑满一个batch；分区剩余不足N条时读完为止
+- 每次从当前分区读取最多N条消息。N按消息平均行数估算，使各分区轮完一轮约凑满一个batch；根据缓存的水位跳过空分区和已追平的分区
 - 分区归属依据启动时的leader排序，运行期间固定；每个worker的consumer数量等于其负责的分区数
 
 ### kafka_log_every_n_messages
