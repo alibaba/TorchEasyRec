@@ -9,10 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) Alibaba, Inc. and its affiliates.
+import contextlib
+import contextvars
 import json
 import os
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Iterator, Optional, Union
 
 import torch
 
@@ -22,10 +23,64 @@ from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import env_util, quant_util
 from tzrec.utils.logging_util import logger
 
+_USE_DISTRIBUTED_EMBEDDING_CTX: contextvars.ContextVar[Optional[bool]] = (
+    contextvars.ContextVar("tzrec_use_distributed_embedding", default=None)
+)
+_INPUT_TILE_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "tzrec_input_tile", default=None
+)
+_INPUT_TILE_3_ONLINE_CTX: contextvars.ContextVar[Optional[bool]] = (
+    contextvars.ContextVar("tzrec_input_tile_3_online", default=None)
+)
+
+
+@contextlib.contextmanager
+def export_env_scope(
+    use_distributed_embedding: Optional[bool] = None,
+    input_tile: Optional[str] = None,
+    input_tile_3_online: Optional[bool] = None,
+) -> Iterator[None]:
+    """Scope export acc flags in contextvars without mutating ``os.environ``."""
+    dist_tok = (
+        _USE_DISTRIBUTED_EMBEDDING_CTX.set(use_distributed_embedding)
+        if use_distributed_embedding is not None
+        else None
+    )
+    tile_tok = _INPUT_TILE_CTX.set(input_tile) if input_tile is not None else None
+    online_tok = (
+        _INPUT_TILE_3_ONLINE_CTX.set(input_tile_3_online)
+        if input_tile_3_online is not None
+        else None
+    )
+    try:
+        yield
+    finally:
+        if online_tok is not None:
+            _INPUT_TILE_3_ONLINE_CTX.reset(online_tok)
+        if tile_tok is not None:
+            _INPUT_TILE_CTX.reset(tile_tok)
+        if dist_tok is not None:
+            _USE_DISTRIBUTED_EMBEDDING_CTX.reset(dist_tok)
+
+
+def _is_distributed_embedding_enabled() -> bool:
+    ctx = _USE_DISTRIBUTED_EMBEDDING_CTX.get()
+    if ctx is not None:
+        return ctx
+    return os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1"
+
 
 def use_distributed_embedding() -> bool:
     """Export model for distributed embedding mode of EAS processor."""
-    return os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1"
+    return _is_distributed_embedding_enabled()
+
+
+def get_input_tile() -> Optional[str]:
+    """Return active ``INPUT_TILE`` value from export scope or ``os.environ``."""
+    ctx = _INPUT_TILE_CTX.get()
+    if ctx is not None:
+        return ctx
+    return os.environ.get("INPUT_TILE")
 
 
 def is_distributed_embedding_predict(model_path: str) -> bool:
@@ -37,7 +92,7 @@ def is_distributed_embedding_predict(model_path: str) -> bool:
 
 def is_input_tile() -> bool:
     """Judge is input file or not."""
-    input_tile = os.environ.get("INPUT_TILE")
+    input_tile = get_input_tile()
     if input_tile and (input_tile[0] == "2" or input_tile[0] == "3"):
         return True
     return False
@@ -58,7 +113,7 @@ def is_input_tile_emb() -> bool:
 
     Embedding Split user/item
     """
-    input_tile = os.environ.get("INPUT_TILE")
+    input_tile = get_input_tile()
     if input_tile and input_tile[0] == "3":
         return True
     return False
@@ -70,10 +125,24 @@ def is_input_tile_3_online() -> bool:
     If INPUT_TILE_3_ONLINE=1, sequential tensor use jt.values() directly,
     offline prediction for the model will not be supported.
     """
+    ctx = _INPUT_TILE_3_ONLINE_CTX.get()
+    if ctx is not None:
+        return ctx
     input_tile_3_online = os.environ.get("INPUT_TILE_3_ONLINE")
     if input_tile_3_online and input_tile_3_online[0] == "1":
         return True
     return False
+
+
+def is_input_tile_3_online_predict(model_path: str) -> bool:
+    """Return whether exported model enabled ``INPUT_TILE_3_ONLINE``."""
+    acc_json_path = os.path.join(model_path, "model_acc.json")
+    if not os.path.exists(acc_json_path):
+        return False
+    with open(acc_json_path, "r", encoding="utf-8") as file:
+        data = json.load(file)
+    val = data.get("INPUT_TILE_3_ONLINE")
+    return bool(val) and str(val)[:1] == "1"
 
 
 def is_hard_search_input_tile() -> bool:
@@ -123,11 +192,11 @@ def is_unified_aot() -> bool:
 def is_unified_aot_predict(model_path: str) -> bool:
     """Judge whether the exported model uses unified AOTI in predict.
 
-    Reads ``ENABLE_AOT`` from model_acc.json (=2 → unified). Falls back
+    Reads ``ENABLE_AOT`` from model_acc.json (=2 -> unified). Falls back
     to the legacy ``UNIFIED_AOT`` key for pre-fold exports, then to
     file presence (legacy two-stage exports produce
     scripted_sparse_model.pt; unified exports do not) when neither
-    JSON key is present — keeps unit tests that bypass the full export
+    JSON key is present -- keeps unit tests that bypass the full export
     pipeline working.
     """
     acc_json_path = os.path.join(model_path, "model_acc.json")
@@ -145,7 +214,7 @@ def is_unified_aot_predict(model_path: str) -> bool:
     if not os.path.exists(sparse_model_path):
         logger.warning(
             "model_acc.json missing ENABLE_AOT; falling back to file-presence "
-            "heuristic (no scripted_sparse_model.pt → unified)"
+            "heuristic (no scripted_sparse_model.pt -> unified)"
         )
         return True
     return False
@@ -322,7 +391,7 @@ def mixed_precision_for_export(pipeline_config: EasyRecConfig) -> str:
 
     Compares ``train_config.mixed_precision`` with
     ``export_config.mixed_precision``; logs a warning when they differ.
-    Returns ``export_config.mixed_precision`` — does not fall back to
+    Returns ``export_config.mixed_precision`` -- does not fall back to
     train_config. The export-time AMP intent must be expressed
     explicitly on ``export_config``.
     """
@@ -346,6 +415,9 @@ def mixed_precision_for_export(pipeline_config: EasyRecConfig) -> str:
 def export_acc_config(
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     hard_search_input_tile_features: Optional[Dict[str, str]] = None,
+    use_distributed_embedding: Optional[bool] = None,
+    input_tile: Optional[str] = None,
+    input_tile_3_online: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Export acc config for model online inference.
 
@@ -354,16 +426,32 @@ def export_acc_config(
             into the acc config.
         hard_search_input_tile_features (dict, optional): hard-search feature to
             sequence mapping for HARD_SEARCH_INPUT_TILE.
+        use_distributed_embedding (bool, optional): explicit distributed
+            embedding flag overriding context/env.
+        input_tile (str, optional): explicit INPUT_TILE value overriding
+            context/env.
+        input_tile_3_online (bool, optional): explicit INPUT_TILE_3_ONLINE
+            value overriding env when specified.
     """
+    dist_emb = (
+        _is_distributed_embedding_enabled()
+        if use_distributed_embedding is None
+        else use_distributed_embedding
+    )
+    resolved_input_tile = get_input_tile() if input_tile is None else input_tile
     # use int64 sparse id as input
     acc_config: Dict[str, Any] = {"SPARSE_INT64": "1"}
-    if "INPUT_TILE" in os.environ:
-        acc_config["INPUT_TILE"] = os.environ["INPUT_TILE"]
+    if resolved_input_tile is not None:
+        acc_config["INPUT_TILE"] = resolved_input_tile
+    if input_tile_3_online is not None:
+        acc_config["INPUT_TILE_3_ONLINE"] = "1" if input_tile_3_online else "0"
+    elif "INPUT_TILE_3_ONLINE" in os.environ:
+        acc_config["INPUT_TILE_3_ONLINE"] = os.environ["INPUT_TILE_3_ONLINE"]
     if "QUANT_EMB" in os.environ:
         acc_config["QUANT_EMB"] = os.environ["QUANT_EMB"]
     if "QUANT_EC_EMB" in os.environ:
         acc_config["QUANT_EC_EMB"] = os.environ["QUANT_EC_EMB"]
-    if use_distributed_embedding() and is_distributed_sparse_quant():
+    if dist_emb and is_distributed_sparse_quant():
         acc_config["DIST_QUANT"] = "INT8"
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
@@ -375,12 +463,10 @@ def export_acc_config(
         acc_config["MAX_EXPORT_BATCH_SIZE"] = os.environ["MAX_EXPORT_BATCH_SIZE"]
     # Write "2" for single-stage .pt2 exports (unified or distributed dense).
     if is_aot():
-        acc_config["ENABLE_AOT"] = (
-            "2" if is_unified_aot() or use_distributed_embedding() else "1"
-        )
+        acc_config["ENABLE_AOT"] = "2" if is_unified_aot() or dist_emb else "1"
     if additional_export_config:
         acc_config.update(additional_export_config)
-    if use_distributed_embedding():
+    if dist_emb:
         acc_config["DISTRIBUTED_EMBEDDING"] = "1"
     if hard_search_input_tile_features:
         acc_config["hard_search_input_tile"] = {
@@ -388,6 +474,18 @@ def export_acc_config(
             "features": hard_search_input_tile_features,
         }
     return acc_config
+
+
+def is_portable_cpu_aot() -> bool:
+    """Return whether opt-in portable CPU ISA flags are enabled for AOTI."""
+    val = os.environ.get("AOTI_PORTABLE_CPU")
+    return bool(val) and val[0] == "1"
+
+
+def get_aot_cpu_march() -> Optional[str]:
+    """Return explicit ``-march`` target for AOTI host compilation when set."""
+    val = os.environ.get("AOTI_CPU_MARCH")
+    return val if val is not None else None
 
 
 def get_max_export_batch_size() -> int:
@@ -417,15 +515,17 @@ def allow_tf32(config: Union[TrainConfig, ExportConfig]) -> None:
         torch.backends.cuda.matmul.allow_tf32 = config.cuda_matmul_allow_tf32
 
 
-def allow_tf32_for_export(pipeline_config: EasyRecConfig) -> None:
-    """Apply TF32 flags for AOTI export.
+def allow_tf32_for_export(
+    pipeline_config: EasyRecConfig, mutate_globals: bool = True
+) -> None:
+    """Apply or validate TF32 flags for AOTI export.
 
     Warns when ``train_config`` and ``export_config`` are both
     explicitly set on a field and disagree, then applies train_config
-    first and export_config second so train applies for fields export
-    leaves untouched and export wins where set. Must run BEFORE
-    ``torch.export.export()`` so AOTI captures the resolved
-    ``torch.backends`` globals into Triton ``ALLOW_TF32`` constexprs.
+    first and export_config second when ``mutate_globals`` is True.
+    When ``mutate_globals`` is False (concurrent background export),
+    process-global ``torch.backends`` flags are left untouched and any
+    mismatch with the configured export TF32 preference logs a warning.
     """
     train_cfg = pipeline_config.train_config
     export_cfg = pipeline_config.export_config
@@ -442,5 +542,47 @@ def allow_tf32_for_export(pipeline_config: EasyRecConfig) -> None:
                 field,
                 getattr(train_cfg, field),
             )
-    allow_tf32(train_cfg)
-    allow_tf32(export_cfg)
+    if mutate_globals:
+        allow_tf32(train_cfg)
+        allow_tf32(export_cfg)
+        return
+
+    live_values = {
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+    }
+    for field, live in live_values.items():
+        desired: Optional[bool] = None
+        if export_cfg.HasField(field):
+            desired = getattr(export_cfg, field)
+        elif train_cfg.HasField(field):
+            desired = getattr(train_cfg, field)
+        if desired is not None and desired != live:
+            logger.warning(
+                "Concurrent background AOTI export keeps live training %s=%s "
+                "(configured=%s) to avoid mutating process-global TF32 state.",
+                field,
+                live,
+                desired,
+            )
+
+
+def canonical_contiguous(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a tensor with exact row-major C-order strides.
+
+    PyTorch treats size-0/size-1 dimensions as contiguous regardless of their
+    stride, so ``.contiguous()`` keeps outer strides (e.g. ``(4, 1)`` on shape
+    ``(1, 1)``) from stacked DataParser slices. AOTI runtime input checks
+    verify exact C-order strides, so clone into contiguous format when needed.
+    """
+    tensor = tensor.contiguous()
+    if tensor.dim() == 0:
+        return tensor
+    expected = 1
+    strides = tensor.stride()
+    shape = tensor.shape
+    for i in range(tensor.dim() - 1, -1, -1):
+        if strides[i] != expected:
+            return tensor.clone(memory_format=torch.contiguous_format)
+        expected *= shape[i]
+    return tensor

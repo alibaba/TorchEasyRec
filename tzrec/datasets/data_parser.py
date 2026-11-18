@@ -23,6 +23,7 @@ from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.modules.embedding_configs import PoolingType
 
 from tzrec.acc.utils import (
+    export_env_scope,
     is_cuda_export,
     is_input_tile,
     is_input_tile_3_online,
@@ -131,9 +132,24 @@ class DataParser:
         fg_threads: int = 1,
         force_base_data_group: bool = False,
         sampler_type: Optional[str] = None,
+        rank: Optional[int] = None,
+        input_tile: Optional[str] = None,
+        input_tile_3_online: Optional[bool] = None,
+        use_distributed_embedding: Optional[bool] = None,
     ) -> None:
         self._features = features
-        hard_search_input_tile_features = get_hard_search_input_tile_features(features)
+        self._rank = rank
+        self._explicit_input_tile = input_tile
+        self._explicit_input_tile_3_online = input_tile_3_online
+        self._explicit_use_distributed_embedding = use_distributed_embedding
+        with export_env_scope(
+            use_distributed_embedding=use_distributed_embedding,
+            input_tile=input_tile,
+            input_tile_3_online=input_tile_3_online,
+        ):
+            hard_search_input_tile_features = get_hard_search_input_tile_features(
+                features
+            )
         self._hard_search_input_tile_features = {
             f.name: hard_search_input_tile_features[f.name]
             for f in features
@@ -217,18 +233,25 @@ class DataParser:
 
         self.user_inputs = set()
         self.user_feats = set()
-        if is_input_tile():
+        if self._is_input_tile():
             self._init_fg_hander()
+            with export_env_scope(
+                use_distributed_embedding=use_distributed_embedding,
+                input_tile=input_tile,
+                input_tile_3_online=input_tile_3_online,
+            ):
+                hs_inputs = get_hard_search_inputs(self._features, self._fg_handler)
             self.user_inputs = {
                 self._to_real_input_name(x)
                 for x in self._fg_handler.user_inputs()
                 | set(self._fg_handler.sequence_input_to_name().keys())
-            } - {
-                self._to_real_input_name(x)
-                for x in get_hard_search_inputs(self._features, self._fg_handler)
-            }
+            } - {self._to_real_input_name(x) for x in hs_inputs}
             self.user_feats = set([x.name for x in self._features if x.is_user_feat])
-            is_rank_zero = os.environ.get("RANK", "0") == "0"
+            is_rank_zero = (
+                os.environ.get("RANK", "0") == "0"
+                if self._rank is None
+                else self._rank == 0
+            )
             if is_rank_zero:
                 logger.info(f"self.user_feats: {self.user_feats}")
                 logger.info(f"self.user_inputs: {self.user_inputs}")
@@ -237,6 +260,35 @@ class DataParser:
             logger.info(f"self.sparse_keys: {self.sparse_keys}")
             logger.info(f"self.dense_keys: {self.dense_keys}")
             logger.info(f"self.sequence_dense_keys: {self.sequence_dense_keys}")
+
+    def _is_input_tile(self) -> bool:
+        """Return whether user input tiling is enabled for this parser."""
+        if self._explicit_input_tile is not None:
+            return bool(self._explicit_input_tile) and self._explicit_input_tile[0] in (
+                "2",
+                "3",
+            )
+        return is_input_tile()
+
+    def _is_input_tile_emb(self) -> bool:
+        """Return whether embedding-level input tiling is enabled for this parser."""
+        if self._explicit_input_tile is not None:
+            return (
+                bool(self._explicit_input_tile) and self._explicit_input_tile[0] == "3"
+            )
+        return is_input_tile_emb()
+
+    def _is_input_tile_3_online(self) -> bool:
+        """Return whether online sequence mode is enabled for this parser."""
+        if self._explicit_input_tile_3_online is not None:
+            return self._explicit_input_tile_3_online
+        return is_input_tile_3_online()
+
+    def _use_distributed_embedding(self) -> bool:
+        """Return whether distributed embedding mode is active for this parser."""
+        if self._explicit_use_distributed_embedding is not None:
+            return self._explicit_use_distributed_embedding
+        return use_distributed_embedding()
 
     def _init_fg_hander(self) -> None:
         """Init pyfg dag handler."""
@@ -258,8 +310,8 @@ class DataParser:
             output_data (dict): parsed feature data.
         """
         output_data = {}
-        if is_input_tile():
-            if is_input_tile_3_online():
+        if self._is_input_tile():
+            if self._is_input_tile_3_online():
                 # When INPUT_TILE_3_ONLINE=1, the sequential tensor (seq_t) is retrieved
                 # via jt.values() rather than jt.to_padded_dense(seq_len) in
                 # embedding.py. Setting tile_size to 1 would result in an incorrect
@@ -488,7 +540,7 @@ class DataParser:
         user_key: Optional[str] = None
         hsk_feats = self._hard_search_input_tile_features
 
-        if not use_distributed_embedding():
+        if not self._use_distributed_embedding():
             for keys in self.sparse_keys.values():
                 for k in keys:
                     if k in hsk_feats:
@@ -532,8 +584,8 @@ class DataParser:
         Returns:
             an instance of Batch.
         """
-        input_tile = is_input_tile()
-        input_tile_emb = is_input_tile_emb()
+        input_tile = self._is_input_tile()
+        input_tile_emb = self._is_input_tile_emb()
 
         tile_size = -1
         if input_tile:

@@ -26,6 +26,7 @@ import pyarrow as pa
 import torch
 from parameterized import param, parameterized
 
+from tzrec.acc import utils as acc_utils
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.main import (
     _create_model,
@@ -142,8 +143,8 @@ class MainTest(unittest.TestCase):
             env_at_calls.append(
                 (
                     "features",
-                    os.environ.get("USE_DISTRIBUTED_EMBEDDING"),
-                    os.environ.get("INPUT_TILE"),
+                    "1" if acc_utils.use_distributed_embedding() else "0",
+                    acc_utils.get_input_tile(),
                 )
             )
             return []
@@ -152,8 +153,8 @@ class MainTest(unittest.TestCase):
             env_at_calls.append(
                 (
                     "model",
-                    os.environ.get("USE_DISTRIBUTED_EMBEDDING"),
-                    os.environ.get("INPUT_TILE"),
+                    "1" if acc_utils.use_distributed_embedding() else "0",
+                    acc_utils.get_input_tile(),
                 )
             )
             return mock.Mock()
@@ -1440,6 +1441,32 @@ class OnlineLearningHandoverTest(unittest.TestCase):
         dumper.final_dump.assert_called_once_with(2)
         dumper.close.assert_called_once()
         exporter.finalize_publish.assert_called_once()
+
+    def test_predict_rejects_batch_size_gt_one_for_input_tile_3_online(self) -> None:
+        from google.protobuf import text_format
+
+        cfg = EasyRecConfig()
+        cfg.data_config.batch_size = 1
+        with open(os.path.join(self.test_dir, "pipeline.config"), "w") as f:
+            f.write(text_format.MessageToString(cfg))
+        with open(os.path.join(self.test_dir, "model_acc.json"), "w") as f:
+            import json
+
+            json.dump({"INPUT_TILE_3_ONLINE": "1"}, f)
+        with (
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32_for_export"),
+            self.assertRaisesRegex(ValueError, "INPUT_TILE_3_ONLINE=1"),
+        ):
+            predict(
+                predict_input_path="unused",
+                predict_output_path="unused",
+                scripted_model_path=self.test_dir,
+                batch_size=2,
+            )
 
 
 if __name__ == "__main__":

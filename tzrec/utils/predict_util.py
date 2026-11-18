@@ -1124,6 +1124,7 @@ class _DenseInputModel(torch.nn.Module):
         self,
         embeddings: Dict[str, torch.Tensor],
         dense_features: Dict[str, KeyedTensor],
+        sparse_features: Dict[str, KeyedJaggedTensor],
         sequence_mulval_lengths: Dict[str, KeyedJaggedTensor],
         sequence_dense_features: Dict[str, JaggedTensor],
         additional_infos: Dict[str, torch.Tensor],
@@ -1135,6 +1136,7 @@ class _DenseInputModel(torch.nn.Module):
         Args:
             embeddings (dict): DistributedEmbeddingLookup's outputs.
             dense_features (dict): Batch.dense_features.
+            sparse_features (dict): raw Batch.sparse_features needed by dense.
             sequence_mulval_lengths (dict): Batch.sequence_mulval_lengths.
             sequence_dense_features (dict): Batch.sequence_dense_features.
             additional_infos (dict): Batch.additional_infos.
@@ -1146,7 +1148,7 @@ class _DenseInputModel(torch.nn.Module):
         """
         inputs = batch_to_dict(
             {k: v.to(device, non_blocking=True) for k, v in dense_features.items()},
-            torch.jit.annotate(Dict[str, KeyedJaggedTensor], {}),
+            {k: v.to(device, non_blocking=True) for k, v in sparse_features.items()},
             {
                 k: v.to(device, non_blocking=True)
                 for k, v in sequence_mulval_lengths.items()
@@ -1156,7 +1158,9 @@ class _DenseInputModel(torch.nn.Module):
                 for k, v in sequence_dense_features.items()
             },
             {k: v.to(device, non_blocking=True) for k, v in additional_infos.items()},
-            None if batch_size is None else batch_size.to(device, non_blocking=True),
+            None
+            if batch_size is None
+            else batch_size.to(device=device, dtype=torch.int64, non_blocking=True),
             torch.int64,
         )
         for k, v in inputs.items():
@@ -1213,14 +1217,37 @@ class _DistributedDenseAOTIWrapper(nn.Module):
         flat_inputs = []
         for k in self._key_order:
             t = inputs[k].contiguous()
-            # Sliced 1D/odd-dim tensors can be contiguous yet <16-byte aligned,
-            # triggering an AOTI runtime copy warning; clone once to align.
+            # Sliced 1D/odd-dim tensors can be contiguous yet <16-byte aligned
+            # or have non-C strides on size-1 dims; normalize before alignment.
+            t = acc_utils.canonical_contiguous(t)
             if t.numel() > 0 and t.data_ptr() % 16 != 0:
                 t = t.clone()
             flat_inputs.append(t)
         with cast(Any, self._lock):
             flat_outputs = cast(Any, self.model).loader.boxed_run(flat_inputs)
         return pytree.tree_unflatten(flat_outputs, self._out_spec)
+
+
+_RAW_SPARSE_SUFFIXES = (".values", ".lengths", ".weights", ".key_lengths")
+
+
+def _extract_script_required_keys(dense: torch.jit.ScriptModule) -> Set[str]:
+    """Collect raw sparse tensor keys referenced by a scripted dense model."""
+    required: Set[str] = set()
+    for mod in dense.modules():
+        for members in getattr(mod, "member_names", []):
+            for member in members:
+                for suffix in _RAW_SPARSE_SUFFIXES:
+                    required.add(f"{member}{suffix}")
+    for node in dense.inlined_graph.nodes():
+        if node.kind() != "prim::Constant":
+            continue
+        for attr in node.attributeNames():
+            if node.kindOf(attr) == "s":
+                val = node.s(attr)
+                if val.endswith(_RAW_SPARSE_SUFFIXES):
+                    required.add(val)
+    return required
 
 
 class DistributedEmbeddingModel:
@@ -1258,8 +1285,7 @@ class DistributedEmbeddingModel:
                 self._dense_aoti[device] = _DistributedDenseAOTIWrapper(aoti_model)
             self._required_keys = set(self._dense_aoti[devices[0]]._key_order)
             self._has_raw_sparse_candidates = any(
-                k.endswith((".values", ".lengths", ".weights"))
-                for k in self._required_keys
+                k.endswith(_RAW_SPARSE_SUFFIXES) for k in self._required_keys
             )
             if log_model:
                 logger.info(
@@ -1270,11 +1296,17 @@ class DistributedEmbeddingModel:
             for device in devices:
                 dense = _load_scripted_model(model_path, device)
                 self._dense[device] = torch.jit.script(_DenseInputModel(dense))
+            self._required_keys = _extract_script_required_keys(
+                self._dense[devices[0]].dense
+            )
+            self._has_raw_sparse_candidates = any(
+                k.endswith(_RAW_SPARSE_SUFFIXES) for k in self._required_keys
+            )
             if log_model:
                 logger.info(str(self._dense[devices[0]]))
 
     def _needed_sparse_kjt_names(self, batch: Batch) -> Tuple[str, ...]:
-        """Return sparse KJT dict keys whose raw tensors the AOTI model reads."""
+        """Return sparse KJT dict keys whose raw tensors the dense model reads."""
         if not self._has_raw_sparse_candidates or not batch.sparse_features:
             return ()
         layout = (
@@ -1296,6 +1328,7 @@ class DistributedEmbeddingModel:
             if any(
                 f"{k}.values" in self._required_keys
                 or f"{k}.weights" in self._required_keys
+                or f"{k}.key_lengths" in self._required_keys
                 or (
                     f"{k}.lengths" in self._required_keys
                     and k not in mulval_or_seq_dense
@@ -1320,11 +1353,20 @@ class DistributedEmbeddingModel:
             The dense model's predictions.
         """
         embeddings = self._lookup(batch, device)
+        sparse_features = {
+            name: _kjt_to_device(batch.sparse_features[name], device)
+            for name in self._needed_sparse_kjt_names(batch)
+        }
+        sequence_mulval_lengths = {
+            k: _kjt_to_device(v, device)
+            for k, v in batch.sequence_mulval_lengths.items()
+        }
         if not self._is_aot:
             return self._dense[device](
                 embeddings,
                 batch.dense_features,
-                batch.sequence_mulval_lengths,
+                sparse_features,
+                sequence_mulval_lengths,
                 batch.sequence_dense_features,
                 batch.additional_infos,
                 batch_size,
@@ -1333,17 +1375,10 @@ class DistributedEmbeddingModel:
         dense_features = {
             k: v.to(device, non_blocking=True) for k, v in batch.dense_features.items()
         }
-        sparse_features = {
-            name: _kjt_to_device(batch.sparse_features[name], device)
-            for name in self._needed_sparse_kjt_names(batch)
-        }
         inputs = batch_to_dict(
             dense_features,
             sparse_features,
-            {
-                k: _kjt_to_device(v, device)
-                for k, v in batch.sequence_mulval_lengths.items()
-            },
+            sequence_mulval_lengths,
             {
                 k: v.to(device, non_blocking=True)
                 for k, v in batch.sequence_dense_features.items()
@@ -1523,9 +1558,10 @@ def _wrap_batch_predict_model(
 
 def _load_scripted_model(model_path: str, device: torch.device) -> nn.Module:
     """Load an export's scripted_model.pt on ``device`` for inference."""
-    # disable jit compile, as it compiles too slow now.
+    # Disable jit compile without mutating process-wide os.environ.
     if "PYTORCH_TENSOREXPR_FALLBACK" not in os.environ:
-        os.environ["PYTORCH_TENSOREXPR_FALLBACK"] = "2"
+        torch._C._jit_texpr_set_fallback_allowed(True)
+        torch._C._jit_set_texpr_fuser_enabled(False)
     model = torch.jit.load(
         os.path.join(model_path, "scripted_model.pt"), map_location=device
     )

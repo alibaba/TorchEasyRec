@@ -9,22 +9,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import operator
 import os
 import shutil
 import unittest
+from typing import Optional
 from unittest import mock
 
+import filelock
 import torch
 from parameterized import parameterized
-from torch.utils._pytree import treespec_loads
+from torch import fx, nn
+from torch.utils._pytree import tree_flatten, treespec_dumps, treespec_loads
 from torchrec import JaggedTensor, KeyedTensor
 
+from tzrec.acc import aot_utils
+from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import (
+    _aoti_compile_cfg,
     _build_distributed_dense_dynamic_shapes,
     _build_dynamic_shapes,
+    _compile_and_package_aoti,
     _pad_empty_sparse_values,
     _prepare_distributed_dense_sample_inputs,
     export_distributed_dense_model_aot,
+    export_model_aot,
     export_unified_model_aot,
     load_model_aot,
 )
@@ -629,6 +638,207 @@ class AotUtilsTest(unittest.TestCase):
                     for key, val in expected.items():
                         torch.testing.assert_close(actual[key], val)
 
+    def test_load_model_aot_device_validation_and_index_normalization(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires a CUDA device"):
+            load_model_aot(self.test_dir, torch.device("cpu"))
+
+        _, in_spec = tree_flatten(({"a": torch.zeros(1)}, {}))
+        _, out_spec = tree_flatten({"p": torch.zeros(1)})
+        fake_pkg = mock.Mock()
+        fake_pkg.loader.get_call_spec.return_value = (
+            treespec_dumps(in_spec),
+            treespec_dumps(out_spec),
+        )
+        with (
+            mock.patch.object(aot_utils, "is_unified_aot_predict", return_value=True),
+            mock.patch.object(
+                torch._inductor, "aoti_load_package", return_value=fake_pkg
+            ) as load_pkg_mock,
+        ):
+            load_model_aot(self.test_dir, torch.device("cuda"))
+            load_pkg_mock.assert_called_once_with(
+                os.path.join(self.test_dir, "aoti", "aoti_model.pt2"),
+                device_index=-1,
+            )
+
+    def test_export_aot_requires_cuda_before_makedirs(self) -> None:
+        with mock.patch("torch.cuda.is_available", return_value=False):
+            for name, fn in (
+                (
+                    "legacy",
+                    lambda d: export_model_aot(mock.Mock(), mock.Mock(), {}, {}, d),
+                ),
+                ("unified", lambda d: export_unified_model_aot(mock.Mock(), {}, d)),
+                (
+                    "dist_dense",
+                    lambda d: export_distributed_dense_model_aot(
+                        mock.Mock(), mock.Mock(), {}, {}, {}, {}, d
+                    ),
+                ),
+            ):
+                with self.subTest(case=name):
+                    save_dir = os.path.join(self.test_dir, f"no_cuda_{name}")
+                    with self.assertRaisesRegex(RuntimeError, "requires a CUDA device"):
+                        fn(save_dir)
+                    self.assertFalse(os.path.exists(save_dir))
+
+    def test_aoti_compile_cfg_portable_cpu_and_cache_lock(self) -> None:
+        with mock.patch.dict(os.environ, {"AOTI_PORTABLE_CPU": "1"}, clear=True):
+            cfg = _aoti_compile_cfg()
+            self.assertIn("cpp.march", cfg)
+            self.assertIn("cpp.simdlen", cfg)
+
+        with mock.patch.dict(
+            os.environ,
+            {"AOTI_CPU_MARCH": "x86-64-v3", "AOTI_CPU_SIMDLEN": "128"},
+            clear=True,
+        ):
+            cfg = _aoti_compile_cfg()
+            self.assertEqual(cfg["cpp.march"], "x86-64-v3")
+            self.assertEqual(cfg["cpp.simdlen"], 128)
+
+        cache_dir = os.path.join(self.test_dir, "inductor_cache")
+        save_dir = os.path.join(self.test_dir, "lock_export")
+        events = []
+
+        class _RecordingLock:
+            def __init__(self, path: str) -> None:
+                self._path = path
+
+            def __enter__(self):
+                events.append(("enter", self._path))
+                return self
+
+            def __exit__(self, *args):
+                events.append(("exit", self._path))
+
+        def _fake_compile_and_package(exported_pg, *, package_path):
+            events.append(("compile", package_path))
+            return package_path
+
+        dummy_ep = mock.Mock()
+        dummy_ep.range_constraints = {}
+        with (
+            mock.patch.dict(os.environ, {"TORCHINDUCTOR_CACHE_DIR": cache_dir}),
+            mock.patch.object(filelock, "FileLock", side_effect=_RecordingLock),
+            mock.patch.object(
+                torch._inductor,
+                "aoti_compile_and_package",
+                side_effect=_fake_compile_and_package,
+            ),
+        ):
+            _compile_and_package_aoti(dummy_ep, save_dir)
+
+        expected_lock = os.path.join(cache_dir, ".tzrec_aoti_package.lock")
+        expected_pkg = os.path.join(save_dir, "aoti", "aoti_model.pt2")
+        self.assertEqual(
+            events,
+            [
+                ("enter", expected_lock),
+                ("compile", expected_pkg),
+                ("exit", expected_lock),
+            ],
+        )
+
+    def test_build_dynamic_shapes_warns_static_and_tracks_non_seq_hsk(self) -> None:
+        id_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="u_id",
+                expression="user:u_id",
+                num_buckets=16,
+                embedding_dim=4,
+            )
+        )
+        hsk_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="hsk_item",
+                expression="item:hsk_item",
+                num_buckets=16,
+                embedding_dim=4,
+            )
+        )
+        feats = create_features([id_cfg, hsk_cfg])
+        feats[1]._is_hard_search_feat = True
+        data = {
+            "u_id.values": torch.tensor([1, 2], dtype=torch.int64),
+            "u_id.lengths": torch.tensor([2], dtype=torch.int64),
+            "hsk_item.values": torch.tensor([1, 2], dtype=torch.int64),
+            "hsk_item.lengths": torch.tensor([1, 1], dtype=torch.int64),
+        }
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"INPUT_TILE": "3", "INPUT_TILE_3_ONLINE": "0"},
+                clear=True,
+            ),
+            mock.patch.object(
+                aot_utils,
+                "get_hard_search_input_tile_features",
+                return_value={"hsk_item": "user_ctx"},
+            ),
+            mock.patch.object(aot_utils.logger, "warning") as warn_log,
+        ):
+            shapes = _build_dynamic_shapes(data, feats, [])
+
+        self.assertEqual(shapes["u_id.lengths"], {})
+        self.assertEqual(shapes["hsk_item.lengths"][0].__name__, "hsk_user_ctx_batch")
+        self.assertTrue(
+            any(
+                "degraded to static" in str(call.args[0])
+                for call in warn_log.call_args_list
+            )
+        )
+
+    @mark_ci_scope("gpu")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_export_unified_model_aot_prunes_unused_keys(self) -> None:
+        id_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="item_id",
+                expression="item:item_id",
+                num_buckets=16,
+                embedding_dim=4,
+            )
+        )
+        feats = create_features([id_cfg])
+
+        class _UnusedBatchSizeModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.features = feats
+                self.feature_groups = []
+                self.emb = nn.Embedding(16, 4)
+
+            def set_is_inference(self, _is_inference: bool) -> None:
+                return None
+
+            def forward(self, batch, _device=None):
+                vals = batch["item_id.values"]
+                lens = batch["item_id.lengths"]
+                emb = self.emb(vals)
+                return {"out": emb.sum() + lens.sum().float()}
+
+        sample_data = {
+            "item_id.values": torch.tensor([1, 2], dtype=torch.int64),
+            "item_id.lengths": torch.tensor([1, 1], dtype=torch.int64),
+            "batch_size": torch.tensor(2, dtype=torch.int64),
+        }
+        save_dir = os.path.join(self.test_dir, "unified_pruned")
+        with mock.patch.dict(os.environ, {"ENABLE_AOT": "2"}):
+            export_unified_model_aot(_UnusedBatchSizeModel(), sample_data, save_dir)
+            loaded = load_model_aot(save_dir, torch.device("cuda"))
+
+        in_spec = treespec_loads(loaded.model.loader.get_call_spec()[0])
+        key_order = list(in_spec.child(0).child(0).context)
+        self.assertNotIn("batch_size", key_order)
+        self.assertEqual(set(key_order), {"item_id.values", "item_id.lengths"})
+        cold_in = {
+            "item_id.values": torch.empty(0, dtype=torch.int64),
+            "item_id.lengths": torch.tensor([0], dtype=torch.int64),
+        }
+        out = loaded(cold_in, torch.device("cuda:0"))
+        self.assertEqual(float(out["out"].item()), 0.0)
+
 
 class DistributedDenseAotUtilsTest(unittest.TestCase):
     def setUp(self):
@@ -923,7 +1133,7 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
             self.assertEqual(shapes["u_seq__id"][0].min, 0)
             self.assertEqual(shapes["u_seq__mv"][0].min, 0)
             self.assertEqual(shapes["i_id@seq"][0].min, 0)
-            self.assertEqual(shapes["j_seq__id"][0].min, 1)
+            self.assertEqual(shapes["j_seq__id"][0].min, 0)
             self.assertIn("hsk_u_seq_batch", shapes["u_seq__id__lengths"][0].__name__)
             self.assertEqual(
                 shapes["u_seq__id__lengths"][0],
@@ -1979,6 +2189,213 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
         finally:
             torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
             torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
+    def test_jagged_sequence_min_bound_with_and_without_hstu_op(self) -> None:
+        j_seq = feature_pb2.FeatureConfig(
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="j_seq",
+                sequence_length=4,
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="id",
+                            expression="user:j_seq",
+                            num_buckets=16,
+                            embedding_dim=4,
+                        )
+                    )
+                ],
+            )
+        )
+        feats = create_features([j_seq])
+        groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="jagged_seq",
+                feature_names=["j_seq__id"],
+                group_type=model_pb2.JAGGED_SEQUENCE,
+            )
+        ]
+
+        class _PlainMod(nn.Module):
+            def forward(self, data):
+                return data["j_seq__id"]
+
+        def hstu_varlen_fwd(x):
+            return x
+
+        class _HstuMod(nn.Module):
+            def forward(self, data):
+                return hstu_varlen_fwd(data["j_seq__id"])
+
+        sample_data = {
+            "j_seq__id": torch.randn(3, 4),
+            "j_seq__id.values": torch.tensor([1, 2, 3], dtype=torch.int64),
+            "j_seq__id.lengths": torch.tensor([2, 1], dtype=torch.int64),
+        }
+        dense_meta = {"sequence__ec": ["j_seq__id__ec", "j_seq__id__lengths"]}
+
+        plain_gm = fx.symbolic_trace(_PlainMod())
+        shapes_plain = _build_distributed_dense_dynamic_shapes(
+            sample_data=sample_data,
+            gm=plain_gm,
+            dense_graph_config=dense_meta,
+            features=feats,
+            feature_groups=groups,
+            input_tile=False,
+        )
+        self.assertEqual(shapes_plain["j_seq__id"][0].min, 0)
+
+        hstu_gm = fx.symbolic_trace(_HstuMod())
+        shapes_hstu = _build_distributed_dense_dynamic_shapes(
+            sample_data=sample_data,
+            gm=hstu_gm,
+            dense_graph_config=dense_meta,
+            features=feats,
+            feature_groups=groups,
+            input_tile=False,
+        )
+        self.assertEqual(shapes_hstu["j_seq__id"][0].min, 1)
+
+    @mark_ci_scope("gpu")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_distributed_dense_dead_mv_lengths_and_genrec_zero_len_cold_start(
+        self,
+    ) -> None:
+        device = torch.device("cuda:0")
+        seq_mv_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="seq_mv",
+                expression="user:seq_mv",
+                num_buckets=16,
+                embedding_dim=4,
+                value_dim=0,
+            )
+        )
+        mv_feats = create_features([seq_mv_cfg])
+
+        class _DeadLengthsModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.features = mv_feats
+                self.feature_groups = []
+                self.head = nn.Linear(4, 1)
+
+            def forward(self, data, dev: Optional[torch.device] = None):
+                return {"out": self.head(data["seq_mv"]).sum(dim=1)}
+
+        dead_mod = _DeadLengthsModel().to(device).eval()
+        dead_gm = fx.symbolic_trace(dead_mod)
+        input_node = next(n for n in dead_gm.graph.nodes if n.op == "placeholder")
+        with dead_gm.graph.inserting_after(input_node):
+            dead_gm.graph.call_function(
+                operator.getitem, args=(input_node, "seq_mv__lengths")
+            )
+        dead_gm.recompile()
+        self.assertNotIn(
+            "seq_mv__lengths",
+            aot_utils._extract_distributed_dense_consumed_keys(
+                dead_gm,
+                {
+                    "seq_mv": torch.randn(3, 4, device=device),
+                    "seq_mv__lengths": torch.tensor([2, 1], dtype=torch.int64),
+                },
+            ),
+        )
+        dead_save_dir = os.path.join(self.test_dir, "dead_mv_lengths")
+        with mock.patch.dict(os.environ, {"ENABLE_AOT": "2"}):
+            export_distributed_dense_model_aot(
+                model=ScriptWrapper(dead_mod),
+                gm=dead_gm,
+                data={
+                    "seq_mv": torch.randn(3, 4, device=device),
+                    "seq_mv__lengths": torch.tensor([2, 1], dtype=torch.int64),
+                },
+                sparse_kts={},
+                seq_jts={
+                    "seq_mv": JaggedTensor(
+                        values=torch.randn(3, 4, device=device),
+                        lengths=torch.tensor([2, 1], dtype=torch.int64, device=device),
+                    )
+                },
+                dense_graph_config={"sequence__ec": ["seq_mv__ec", "seq_mv__lengths"]},
+                save_dir=dead_save_dir,
+                input_tile=False,
+            )
+        dead_aoti = torch._inductor.aoti_load_package(
+            os.path.join(dead_save_dir, "aoti", "aoti_model.pt2")
+        )
+        dead_spec = treespec_loads(dead_aoti.loader.get_call_spec()[0])
+        self.assertEqual(list(dead_spec.child(0).child(0).context), ["seq_mv"])
+
+        hist_cfg = feature_pb2.FeatureConfig(
+            sequence_raw_feature=feature_pb2.RawFeature(
+                feature_name="hist", expression="user:hist"
+            )
+        )
+        beh_cfg = feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="beh",
+                expression="user:beh",
+                num_buckets=16,
+                embedding_dim=8,
+                sequence_length=4,
+            )
+        )
+        model_dir = os.path.join(self.test_dir, "genrec_ckpt")
+        base_model, _ = create_genrec_test_model(
+            model_dir,
+            feature_configs=[hist_cfg, beh_cfg],
+            prompt="H {{hist}} B {{beh}} P :",
+        )
+        init_parameters(base_model, device=device)
+        with acc_utils.export_env_scope(use_distributed_embedding=True, input_tile="0"):
+            frontend = ScriptWrapper(GenRecFrontEnd(base_model)).to(device).eval()
+            data = {
+                "hist.values": torch.tensor(
+                    [[1.0], [2.0], [3.0]], dtype=torch.float32, device=device
+                ),
+                "hist.lengths": torch.tensor([2, 1], dtype=torch.int64, device=device),
+                "beh.values": torch.zeros(3, dtype=torch.int64, device=device),
+                "beh.lengths": torch.tensor([2, 1], dtype=torch.int64, device=device),
+            }
+            gm, _, dense_cfg = build_dense_graph_module(frontend, data, device=device)
+            genrec_dir = os.path.join(self.test_dir, "genrec_zero_len")
+            export_distributed_dense_model_aot(
+                model=frontend,
+                gm=gm,
+                data=data,
+                sparse_kts={},
+                seq_jts={
+                    "beh": JaggedTensor(
+                        values=torch.randn(3, 8, device=device),
+                        lengths=data["beh.lengths"],
+                    )
+                },
+                dense_graph_config=dense_cfg,
+                save_dir=genrec_dir,
+                input_tile=False,
+            )
+        genrec_aoti = torch._inductor.aoti_load_package(
+            os.path.join(genrec_dir, "aoti", "aoti_model.pt2")
+        )
+        genrec_spec = treespec_loads(genrec_aoti.loader.get_call_spec()[0])
+        genrec_keys = list(genrec_spec.child(0).child(0).context)
+        gm_eval = gm.to(device).eval()
+        for bs in (1, 3):
+            cold_case = {
+                "beh": torch.empty((0, 8), dtype=torch.float32, device=device),
+                "beh.values": torch.empty(0, dtype=torch.int64, device=device),
+                "beh.lengths": torch.zeros(bs, dtype=torch.int64, device=device),
+                "beh__lengths": torch.zeros(bs, dtype=torch.int32, device=device),
+                "hist.values": torch.empty((0, 1), dtype=torch.float32, device=device),
+                "hist.lengths": torch.zeros(bs, dtype=torch.int64, device=device),
+            }
+            aot_inputs = {k: cold_case[k] for k in genrec_keys}
+            with torch.no_grad():
+                expected = gm_eval(cold_case, device)
+                actual = genrec_aoti(aot_inputs)
+            for k, val in expected.items():
+                torch.testing.assert_close(actual[k], val, atol=1e-5, rtol=1e-5)
 
 
 if __name__ == "__main__":

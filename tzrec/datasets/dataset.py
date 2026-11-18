@@ -107,6 +107,11 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         debug_level (int): dataset debug level, when mode=predict and
             debug_level > 0, will dump fg encoded data to debug_str
         compiled_prompt (CompiledPrompt, optional): compiled prompt assembly contract.
+        world_size (int, optional): explicit world size override for local export.
+        rank (int, optional): explicit rank override for local export.
+        input_tile (str, optional): explicit INPUT_TILE override.
+        input_tile_3_online (bool, optional): explicit INPUT_TILE_3_ONLINE override.
+        use_distributed_embedding (bool, optional): explicit dist emb flag override.
     """
 
     def __init__(
@@ -118,8 +123,15 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         mode: Mode = Mode.EVAL,
         debug_level: int = 0,
         compiled_prompt: Optional[CompiledPrompt] = None,
+        world_size: Optional[int] = None,
+        rank: Optional[int] = None,
+        input_tile: Optional[str] = None,
+        input_tile_3_online: Optional[bool] = None,
+        use_distributed_embedding: Optional[bool] = None,
     ) -> None:
         super(BaseDataset, self).__init__()
+        self._world_size = world_size
+        self._rank = rank
         self._prompt_assembler = (
             PromptAssembler(
                 compiled_prompt.prompt_plan,
@@ -153,6 +165,10 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             fg_threads=data_config.fg_threads,
             force_base_data_group=data_config.force_base_data_group,
             sampler_type=self.sampler_type,
+            rank=rank,
+            input_tile=input_tile,
+            input_tile_3_online=input_tile_3_online,
+            use_distributed_embedding=use_distributed_embedding,
         )
 
         self._input_fields: Optional[List[pa.Field]] = None
@@ -319,11 +335,16 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             num_workers = worker_info.num_workers
 
         # NOTE: Export warm-up is local even while the training group is live.
-        if dist.is_initialized() and int(os.environ.get("WORLD_SIZE", 1)) > 1:
+        resolved_world_size = (
+            int(os.environ.get("WORLD_SIZE", 1))
+            if self._world_size is None
+            else self._world_size
+        )
+        if dist.is_initialized() and resolved_world_size > 1:
             rank = dist.get_rank()
             world_size = dist.get_world_size()
         else:
-            rank = 0
+            rank = 0 if self._rank is None else self._rank
             world_size = 1
 
         return rank * num_workers + worker_id, num_workers * world_size, world_size
@@ -583,6 +604,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         batch_cost_size: Optional[int] = None,
         min_batch_size: int = 0,
         equalize_rank_steps: bool = False,
+        world_size: Optional[int] = None,
+        rank: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         self._input_path = input_path
@@ -595,6 +618,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._shuffle_buffer_size = shuffle_buffer_size
         self._sample_cost_field = sample_cost_field
         self._batch_cost_size = batch_cost_size
+        self._world_size = world_size
+        self._rank = rank
         self._use_sample_cost = False
         self._checkpoint_state: Optional[Dict[str, Any]] = None
         if self._batch_cost_size is not None and self._batch_cost_size > 0:
@@ -878,6 +903,11 @@ def create_dataloader(
     debug_level: int = 0,
     checkpoint_state: Optional[Dict[str, Any]] = None,
     compiled_prompt: Optional[CompiledPrompt] = None,
+    world_size: Optional[int] = None,
+    rank: Optional[int] = None,
+    input_tile: Optional[str] = None,
+    input_tile_3_online: Optional[bool] = None,
+    use_distributed_embedding: Optional[bool] = None,
 ) -> DataLoader:
     """Build dataloader.
 
@@ -894,6 +924,11 @@ def create_dataloader(
             eager ``iter()`` forks workers so it reaches them.
         compiled_prompt (CompiledPrompt, optional): when set, each batch carries
             the assembled prompt streams in ``additional_infos``.
+        world_size (int, optional): explicit world size override for local export.
+        rank (int, optional): explicit rank override for local export.
+        input_tile (str, optional): explicit INPUT_TILE override.
+        input_tile_3_online (bool, optional): explicit INPUT_TILE_3_ONLINE override.
+        use_distributed_embedding (bool, optional): explicit dist emb flag override.
 
     Return:
         dataloader (dataloader): a DataLoader.
@@ -923,6 +958,11 @@ def create_dataloader(
         mode=mode,
         debug_level=debug_level,
         compiled_prompt=compiled_prompt,
+        world_size=world_size,
+        rank=rank,
+        input_tile=input_tile,
+        input_tile_3_online=input_tile_3_online,
+        use_distributed_embedding=use_distributed_embedding,
     )
     if checkpoint_state:
         dataset.load_state_dict(dict(checkpoint_state))
@@ -935,9 +975,13 @@ def create_dataloader(
         # check number of files is valid or not for file based dataset.
         num_files = dataset._reader.num_files()
         if num_files is not None:
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            if num_files >= world_size:
-                num_files_per_worker = num_files // world_size
+            resolved_world_size = (
+                int(os.environ.get("WORLD_SIZE", 1))
+                if world_size is None
+                else world_size
+            )
+            if num_files >= resolved_world_size:
+                num_files_per_worker = num_files // resolved_world_size
                 if num_files_per_worker < num_workers:
                     logger.info(
                         f"data_config.num_workers reset to {num_files_per_worker}"
@@ -946,7 +990,7 @@ def create_dataloader(
             else:
                 raise ValueError(
                     f"Number of files in the dataset[{input_path}] must greater "
-                    f"than world_size: {world_size}, but got {num_files}"
+                    f"than world_size: {resolved_world_size}, but got {num_files}"
                 )
 
         kwargs["num_workers"] = num_workers

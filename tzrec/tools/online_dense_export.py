@@ -9,11 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2026, Alibaba Group;
-# Licensed under the Apache License, Version 2.0 (the "License");
-
 import argparse
 import os
+import re
 import shutil
 from typing import Any, Dict, Optional
 
@@ -21,6 +19,7 @@ import torch
 
 from tzrec.acc import utils as acc_utils
 from tzrec.main import _create_features, _create_model
+from tzrec.models.genrec_model import BaseGenRecModel
 from tzrec.models.match_model import MatchModel
 from tzrec.models.model import ScriptWrapper
 from tzrec.models.tdm import TDM
@@ -40,7 +39,10 @@ from tzrec.utils.online_dense_export_util import (
     _utc_now,
     make_version,
     resolve_dense_export_root,
+    validate_online_dense_export_pipeline_config,
 )
+
+_VALID_DENSE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 
 
 def export_online_dense_model(
@@ -86,9 +88,23 @@ def export_online_dense_model(
             "ONLINE_DENSE_EXPORT with ENABLE_AOT requires a CUDA device."
         )
 
-    ensure_input_tile_for_distributed_embedding()
-
     version = version or make_version()
+    if not _VALID_DENSE_VERSION_RE.fullmatch(version):
+        raise ValueError(
+            f"Invalid dense export version {version!r}; must match "
+            r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$."
+        )
+
+    pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+    validate_online_dense_export_pipeline_config(pipeline_config)
+
+    features = _create_features(
+        list(pipeline_config.feature_configs), pipeline_config.data_config
+    )
+    use_dist_emb, resolved_input_tile = ensure_input_tile_for_distributed_embedding(
+        pipeline_config, features=features
+    )
+
     if checkpoint_step is None:
         checkpoint_step = _get_checkpoint_step(checkpoint_path)
     export_root = resolve_dense_export_root(model_dir)
@@ -101,70 +117,73 @@ def export_online_dense_model(
     if os.path.exists(tmp_dir):
         shutil.rmtree(tmp_dir)
     os.makedirs(versions_root, exist_ok=True)
-
-    pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
-    features = _create_features(
-        list(pipeline_config.feature_configs), pipeline_config.data_config
-    )
-    model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(pipeline_config.data_config.label_fields),
-        sampler_type=None,
-    )
-    model.set_is_inference(True)
-    if isinstance(model, (MatchModel, TDM)):
-        # The full export emits per-tower (MatchModel) or per-module (TDM)
-        # artifacts; a single monolithic dense export cannot mirror that
-        # layout, so a hot swap would load an incompatible artifact.
-        raise RuntimeError(
-            f"ONLINE_DENSE_EXPORT does not support {type(model).__name__} "
-            "models; use the full export (export_model) instead."
+    with acc_utils.export_env_scope(
+        use_distributed_embedding=use_dist_emb,
+        input_tile=resolved_input_tile,
+    ):
+        model = _create_model(
+            pipeline_config.model_config,
+            features,
+            list(pipeline_config.data_config.label_fields),
+            sampler_type=None,
         )
-    scripted_model = ScriptWrapper(model)
-
-    try:
-        if is_aot:
-            device = torch.device("cuda:0")
-            torch.cuda.set_device(device)
-            acc_utils.allow_tf32_for_export(pipeline_config)
-            mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
-            _export_dense_model_on_device(
-                pipeline_config=pipeline_config,
-                model=scripted_model,
-                checkpoint_path=checkpoint_path,
-                save_dir=tmp_dir,
-                device=device,
-                mixed_precision=mixed_precision,
+        model.set_is_inference(True)
+        if isinstance(model, (MatchModel, TDM, BaseGenRecModel)):
+            # The full export emits per-tower (MatchModel) or per-module
+            # (TDM) artifacts, or HF assets (BaseGenRecModel); a single
+            # monolithic dense export cannot mirror that layout.
+            raise RuntimeError(
+                f"ONLINE_DENSE_EXPORT does not support {type(model).__name__} "
+                "models; use the full export (export_model) instead."
             )
-            required_files = [
-                os.path.join("aoti", "aoti_model.pt2"),
-                "dense_meta.json",
-            ]
-        else:
-            export_dense_model_cpu(
-                pipeline_config=pipeline_config,
-                model=scripted_model,
-                checkpoint_path=checkpoint_path,
-                save_dir=tmp_dir,
-            )
-            required_files = ["scripted_model.pt", "dense_meta.json"]
+        scripted_model = ScriptWrapper(model)
 
-        for file_name in required_files:
-            file_path = os.path.join(tmp_dir, file_name)
-            if not os.path.exists(file_path):
-                raise RuntimeError(f"missing dense export artifact: {file_path}")
+        try:
+            if is_aot:
+                device = torch.device("cuda:0")
+                torch.cuda.set_device(device)
+                acc_utils.allow_tf32_for_export(pipeline_config)
+                mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
+                _export_dense_model_on_device(
+                    pipeline_config=pipeline_config,
+                    model=scripted_model,
+                    checkpoint_path=checkpoint_path,
+                    save_dir=tmp_dir,
+                    device=device,
+                    mixed_precision=mixed_precision,
+                    input_tile=resolved_input_tile,
+                    use_distributed_embedding=use_dist_emb,
+                )
+                required_files = [
+                    os.path.join("aoti", "aoti_model.pt2"),
+                    "dense_meta.json",
+                ]
+            else:
+                export_dense_model_cpu(
+                    pipeline_config=pipeline_config,
+                    model=scripted_model,
+                    checkpoint_path=checkpoint_path,
+                    save_dir=tmp_dir,
+                    input_tile=resolved_input_tile,
+                    use_distributed_embedding=use_dist_emb,
+                )
+                required_files = ["scripted_model.pt", "dense_meta.json"]
 
-        ready_path = os.path.join(tmp_dir, "READY")
-        with open(ready_path, "w") as f:
-            f.write(_utc_now())
-            f.write("\n")
+            for file_name in required_files:
+                file_path = os.path.join(tmp_dir, file_name)
+                if not os.path.exists(file_path):
+                    raise RuntimeError(f"missing dense export artifact: {file_path}")
 
-        os.rename(tmp_dir, version_dir)
-    except BaseException:
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir)
-        raise
+            ready_path = os.path.join(tmp_dir, "READY")
+            with open(ready_path, "w") as f:
+                f.write(_utc_now())
+                f.write("\n")
+
+            os.rename(tmp_dir, version_dir)
+        except BaseException:
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
+            raise
 
     # Manifest v2 for bootstrap: the FeatureStore full load and this
     # checkpoint are same-source, so sparse_step mirrors checkpoint_step and

@@ -9,9 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2026, Alibaba Group;
-# Licensed under the Apache License, Version 2.0 (the "License");
-
 import datetime
 import json
 import os
@@ -40,6 +37,7 @@ from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed.device_mesh import init_device_mesh
 from torch.utils._pytree import treespec_loads
 
+from tzrec.acc import utils as acc_utils
 from tzrec.features.feature import create_features
 from tzrec.models.model import ScriptWrapper
 from tzrec.models.multi_tower import MultiTower
@@ -235,10 +233,12 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
 
         def fake_warmup(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             seen["world_size"] = os.environ.get("WORLD_SIZE")
+            seen["data_world_size"] = kwargs.get("world_size")
             return {}
 
         def fake_finalize(*args: Any, **kwargs: Any) -> None:
-            seen["input_tile"] = os.environ.get("INPUT_TILE")
+            seen["input_tile"] = acc_utils.get_input_tile()
+            seen["env_input_tile"] = os.environ.get("INPUT_TILE")
 
         fake_gm = mock.Mock()
         fake_gm.state_dict.return_value = {}
@@ -276,7 +276,9 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     )
                     mgr.close()
                 self.assertEqual(seen["input_tile"], "3")
-                self.assertEqual(seen["world_size"], "1")
+                self.assertIsNone(seen["env_input_tile"])
+                self.assertEqual(seen["data_world_size"], 1)
+                self.assertEqual(seen["world_size"], "4")
                 self.assertNotIn("INPUT_TILE", os.environ)
                 self.assertEqual(os.environ["WORLD_SIZE"], "4")
 
@@ -1360,8 +1362,8 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 for call in observed:
                     self.assertEqual(call["device"], torch.device("cuda:0"))
                     self.assertEqual(call["mixed_precision"], "BF16")
-                    self.assertFalse(call["cudnn_tf32"])
-                    self.assertFalse(call["matmul_tf32"])
+                    self.assertTrue(call["cudnn_tf32"])
+                    self.assertTrue(call["matmul_tf32"])
                 self.assertFalse(observed[0]["has_dense_model_traced"])
                 self.assertIs(observed[1]["dense_model_traced"], fake_gm)
                 self.assertIs(observed[0]["input_tile"], True)
@@ -1739,6 +1741,100 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
         finally:
             torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
             torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+
+    def test_rejects_genrec_before_create_model(self) -> None:
+        from tzrec.protos import pipeline_pb2, prompt_pb2
+        from tzrec.protos.models import genrec_model_pb2
+        from tzrec.tools import online_dense_export as online_dense_export_tool
+
+        prompt_cfg = pipeline_pb2.EasyRecConfig(prompt_config=prompt_pb2.PromptConfig())
+        genrec_model_cfg = pipeline_pb2.EasyRecConfig(
+            model_config=model_pb2.ModelConfig(
+                genrec_causal_lm_model=genrec_model_pb2.GenRecCausalLMModel()
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(tmp_dir)
+            for name, cfg in (
+                ("prompt_config", prompt_cfg),
+                ("genrec_causal_lm_model", genrec_model_cfg),
+            ):
+                with self.subTest(case=name):
+                    with (
+                        mock.patch.dict(os.environ, env, clear=True),
+                        mock.patch(
+                            _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                            return_value=cfg,
+                        ),
+                        mock.patch(
+                            "tzrec.tools.online_dense_export."
+                            "config_util.load_pipeline_config",
+                            return_value=cfg,
+                        ),
+                        mock.patch("tzrec.main._create_model") as create_model_mock,
+                        mock.patch(
+                            "tzrec.tools.online_dense_export._create_model"
+                        ) as cli_create_model_mock,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "does not support BaseGenRecModel"
+                        ):
+                            OnlineDenseExportManager(
+                                model_dir=tmp_dir,
+                                pipeline_config_path=os.path.join(
+                                    tmp_dir, "pipeline.config"
+                                ),
+                                model=_mock_model({}),
+                            )
+                        create_model_mock.assert_not_called()
+
+                        with self.assertRaisesRegex(
+                            RuntimeError, "does not support BaseGenRecModel"
+                        ):
+                            online_dense_export_tool.export_online_dense_model(
+                                pipeline_config_path=os.path.join(
+                                    tmp_dir, "pipeline.config"
+                                ),
+                                checkpoint_path=tmp_dir,
+                                model_dir=tmp_dir,
+                            )
+                        cli_create_model_mock.assert_not_called()
+
+    def test_export_online_dense_model_version_validation(self) -> None:
+        from tzrec.tools import online_dense_export as online_dense_export_tool
+
+        invalid_versions = ["../bad", ".bad", "bad/ver", "bad ver", "a" * 256]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for bad in invalid_versions:
+                with self.subTest(version=bad):
+                    with (
+                        mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                        self.assertRaisesRegex(
+                            ValueError, "Invalid dense export version"
+                        ),
+                    ):
+                        online_dense_export_tool.export_online_dense_model(
+                            pipeline_config_path="unused",
+                            checkpoint_path="unused",
+                            model_dir=tmp_dir,
+                            version=bad,
+                        )
+
+            # A valid version passes validation before reaching config load.
+            with (
+                mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                mock.patch(
+                    "tzrec.tools.online_dense_export.config_util.load_pipeline_config",
+                    side_effect=RuntimeError("reached_config_load"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "reached_config_load"):
+                    online_dense_export_tool.export_online_dense_model(
+                        pipeline_config_path="unused",
+                        checkpoint_path="unused",
+                        model_dir=tmp_dir,
+                        version="v1.0_alpha-2",
+                    )
 
 
 if __name__ == "__main__":

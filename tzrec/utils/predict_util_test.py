@@ -61,6 +61,7 @@ from tzrec.utils.predict_util import (
     _encode_keys,
     _gpu_cache_ratio,
     _key_tag,
+    _load_scripted_model,
     _wrap_batch_predict_model,
     load_predict_model,
 )
@@ -1833,6 +1834,160 @@ class LoadPredictModelTest(unittest.TestCase):
         self.assertEqual(list(actual), list(expected))
         for k, v in expected.items():
             torch.testing.assert_close(actual[k], v, rtol=0, atol=0, msg=k)
+
+
+class DistributedScriptGenRecTest(unittest.TestCase):
+    """Non-AOTI TorchScript distributed prediction and env isolation tests."""
+
+    def setUp(self) -> None:
+        self.model_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.model_dir, ignore_errors=True)
+
+    def test_load_scripted_model_does_not_mutate_texpr_env(self) -> None:
+        torch.jit.script(_Model()).save(
+            os.path.join(self.model_dir, "scripted_model.pt")
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            loaded = _load_scripted_model(self.model_dir, torch.device("cpu"))
+            self.assertIsNotNone(loaded)
+            self.assertNotIn("PYTORCH_TENSOREXPR_FALLBACK", os.environ)
+
+    def test_distributed_embedding_script_model_genrec_raw_sparse_passthrough(
+        self,
+    ) -> None:
+        from tzrec.protos import feature_pb2
+        from tzrec.protos.prompt_pb2 import PromptSlot
+        from tzrec.utils import export_util
+        from tzrec.utils.state_dict_util import init_parameters
+
+        hist_cfg = feature_pb2.FeatureConfig(
+            sequence_raw_feature=feature_pb2.RawFeature(
+                feature_name="hist", expression="user:hist"
+            )
+        )
+        beh_cfg = feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="beh",
+                expression="user:beh",
+                num_buckets=16,
+                embedding_dim=8,
+                sequence_length=4,
+            )
+        )
+        age_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="age",
+                expression="user:age",
+                num_buckets=16,
+                embedding_dim=8,
+            )
+        )
+        ref_model, _ = create_genrec_test_model(
+            self.model_dir,
+            feature_configs=[hist_cfg, beh_cfg, age_cfg],
+            prompt="U {{user_slot}} H {{hist}} B {{beh}} P :",
+            slots=[PromptSlot(name="user_slot", feature_names=["age"])],
+        )
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        init_parameters(ref_model, device=device)
+        ref_model.eval()
+        eval_model = copy.deepcopy(ref_model)
+        eval_frontend = ScriptWrapper(GenRecFrontEnd(eval_model)).to(device).eval()
+        # build_dense_graph_module shrinks sparse tables to 1 row in place.
+        frontend = ScriptWrapper(GenRecFrontEnd(ref_model)).to(device).eval()
+        warmup_data = {
+            "hist.values": torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float32),
+            "hist.lengths": torch.tensor([2, 1], dtype=torch.int64),
+            "beh.values": torch.zeros(3, dtype=torch.int64),
+            "beh.lengths": torch.tensor([2, 1], dtype=torch.int64),
+            "age.values": torch.zeros(2, dtype=torch.int64),
+            "age.lengths": torch.tensor([1, 1], dtype=torch.int64),
+        }
+        with export_util.acc_utils.export_env_scope(
+            use_distributed_embedding=True, input_tile="0", input_tile_3_online=False
+        ):
+            gm, _, dense_cfg = export_util.build_dense_graph_module(
+                frontend,
+                warmup_data,
+                device=device,
+            )
+            traced_dense = export_util.symbolic_trace(gm)
+            export_util.eliminate_dense_dead_code(traced_dense.graph)
+            traced_dense.recompile()
+            torch.jit.script(traced_dense).save(
+                os.path.join(self.model_dir, "scripted_model.pt")
+            )
+
+        with open(os.path.join(self.model_dir, "dense_meta.json"), "w") as f:
+            json.dump(dict(dense_cfg), f)
+        with open(os.path.join(self.model_dir, "model_acc.json"), "w") as f:
+            json.dump(
+                {
+                    "DISTRIBUTED_EMBEDDING": "1",
+                    "INPUT_TILE": "0",
+                    "ENABLE_AOT": "0",
+                },
+                f,
+            )
+
+        emb_sd = eval_model.embedding_group.state_dict()
+        age_w = next(v for k, v in emb_sd.items() if k.endswith(".age_emb.weight")).to(
+            device
+        )
+        beh_w = next(v for k, v in emb_sd.items() if k.endswith(".beh_emb.weight")).to(
+            device
+        )
+
+        class _FakeLookup:
+            def __call__(self, batch: Batch, target_device: torch.device):
+                kjt = batch.sparse_features["kjt"]
+                age_jt = kjt["age"]
+                beh_jt = kjt["beh"]
+                age_emb = age_w[age_jt.values().to(target_device)].to(torch.float32)
+                return {
+                    "user_slot__ebc": age_emb,
+                    "beh": beh_w[beh_jt.values().to(target_device)].to(torch.float32),
+                    "beh__lengths": beh_jt.lengths().to(target_device, torch.int64),
+                }
+
+        with mock.patch(
+            "tzrec.utils.predict_util.DistributedEmbeddingLookup",
+            return_value=_FakeLookup(),
+        ):
+            dist_model = DistributedEmbeddingModel(
+                self.model_dir, [device], log_model=False
+            )
+
+        # bs > 1 with one 0-length cold-start row and int32 CPU inputs.
+        batch = Batch(
+            sparse_features={
+                "kjt": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["age", "beh"],
+                    values=torch.tensor([1, 2, 3, 2, 5, 7], dtype=torch.int32),
+                    lengths=torch.tensor([1, 1, 1, 0, 2, 1], dtype=torch.int32),
+                )
+            },
+            sequence_dense_features={
+                "hist": JaggedTensor(
+                    values=torch.tensor([[1.0], [3.0], [4.0]], dtype=torch.float32),
+                    lengths=torch.tensor([0, 2, 1], dtype=torch.int64),
+                )
+            },
+            labels={},
+        )
+        with torch.no_grad():
+            out = dist_model(batch, torch.tensor(3, dtype=torch.int64), device)
+            raw_inputs = {
+                k: v.to(device)
+                for k, v in batch.to_dict(sparse_dtype=torch.int64).items()
+            }
+            expected = eval_frontend(raw_inputs, device)
+
+        self.assertIn(SLOT_EMBEDS, out)
+        self.assertIn(HOLE_POSITIONS, out)
+        self.assertEqual(out[CU_SEQLENS].numel(), 4)
+        for key in expected:
+            torch.testing.assert_close(out[key], expected[key], rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

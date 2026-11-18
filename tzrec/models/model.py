@@ -646,6 +646,6 @@ class UnifiedAOTIModelWrapper(nn.Module):
         torch.cuda.set_device(device)
         with cast(Any, self._lock):
             flat_outputs = cast(Any, self.model).loader.boxed_run(
-                [data[k].cpu().contiguous() for k in key_order]
+                [acc_utils.canonical_contiguous(data[k].cpu()) for k in key_order]
             )
         return pytree.tree_unflatten(flat_outputs, self._out_spec)

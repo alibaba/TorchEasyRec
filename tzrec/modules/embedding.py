@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union, cast
@@ -34,7 +33,7 @@ from torchrec.modules.mc_modules import (
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
-from tzrec.acc.utils import is_input_tile, is_input_tile_emb
+from tzrec.acc.utils import is_input_tile, is_input_tile_3_online, is_input_tile_emb
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature, get_hard_search_input_tile_features
 from tzrec.modules.dense_embedding_collection import (
@@ -1904,7 +1903,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 fx_mark_tensor(f"{group_name}__query", query_cat_t, keys=query_t_keys)
                 results[f"{group_name}.query"] = query_cat_t
 
-        tile3_online = int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1
+        tile3_online = is_input_tile_3_online()
         for group_name, v in self._group_to_shared_sequence.items():
             seq_t_list = []
             seq_t_keys = []

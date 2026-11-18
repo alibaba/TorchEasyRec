@@ -48,7 +48,7 @@ torchrun --master_addr=localhost --master_port=32555 \
   - **INPUT_TILE=3**：user侧fg和embedding计算仅一次，适用于user侧特征比较多的情况
 - HARD_SEARCH_INPUT_TILE：复用同一请求中候选 key 相同的 hard-search 历史，减少重复的 FG 和 embedding 计算，默认关闭。
   - **HARD_SEARCH_INPUT_TILE=0**：每个候选分别进行历史侧的 FG 和 embedding 计算。
-  - **HARD_SEARCH_INPUT_TILE=1**：相同候选 key 共享历史侧计算，attention 仍按各自候选计算。
+  - **HARD_SEARCH_INPUT_TILE=1**：相同候选 key 共享历史侧计算，attention 仍按各自候选计算。**当前仅支持 Python `tzrec.predict` 离线预测，`TorchRecProcessor` 在线推理启动时会直接拒绝加载开启 `HARD_SEARCH_INPUT_TILE=1` 的模型。**
   - 当前仅支持在 `INPUT_TILE=2/3` 下开启，具体用法和限制见 [hard-search](#hard-search)。
 - INPUT_TILE_3_ONLINE: 配合INPUT_TILE=3使用，对User侧序列特征使用在线推理模式，序列特征在线模型服务中推理性能更好，但导出的模型无法用于离线预测
   - **INPUT_TILE_3_ONLINE=1**：启用序列特征的在线推理模式
@@ -65,7 +65,8 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ENABLE_AOT: 使用AOT(Ahead Of Time)编译优化导出的模型，可显著提升推理性能。**AOT 编译产物与导出机器的 GPU 架构强绑定，在线服务的 GPU 类型必须与导出时使用的 GPU 类型完全一致**，详见下文 [在 PAI 上导出 AOT 模型](#export-aot-on-pai) 章节
   - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（普通导出下 sparse 部分用 JIT，dense 部分用 AOTI；在 `USE_DISTRIBUTED_EMBEDDING=1` 下与 `ENABLE_AOT=2` 行为一致，仅导出单阶段 CUDA dense `aoti/aoti_model.pt2`）
   - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化（普通导出下 sparse + dense 融合为单一 `.pt2`；在 `USE_DISTRIBUTED_EMBEDDING=1` 下导出单阶段 CUDA dense `aoti/aoti_model.pt2` 配合 `sparse/` 外置查表）
-- TORCHINDUCTOR_CACHE_DIR: 指定 TorchInductor 与 Triton 编译缓存目录。开启 `ENABLE_AOT`（尤其是 `ONLINE_DENSE_EXPORT=1` + `ENABLE_AOT=2` 训练内热导出）时，建议挂载容器本地持久化路径以复用已编译算子内核，显著缩短重编译耗时
+- TORCHINDUCTOR_CACHE_DIR: 指定 TorchInductor 与 Triton 编译缓存目录。开启 `ENABLE_AOT`（尤其是 `ONLINE_DENSE_EXPORT=1` + `ENABLE_AOT=2` 训练内热导出）时，建议挂载容器本地持久化路径以复用已编译算子内核，显著缩短重编译耗时；导出流程会在该目录下通过跨进程文件锁串行化编译与 `.pt2` 打包，避免同构并发导出互相覆盖 `.so` 缓存
+- AOTI_PORTABLE_CPU / AOTI_CPU_MARCH: 可选配置。默认情况下 AOTI C++ 包装库使用 `-march=native` 编译，若导出机 CPU 具备高阶指令集（如 `AMX_TILE` / `AVX-512`）而线上推理节点 CPU 机型异构，可能引发 `SIGILL` 非法指令崩溃；跨机型部署时可设置 **AOTI_PORTABLE_CPU=1**（x86_64 默认采用 `core-avx2` 与 256-bit SIMD，避开 `AVX-512`/`AMX_TILE`），或通过 **AOTI_CPU_MARCH**（如 `core-avx2`、`x86-64`）及可选 **AOTI_CPU_SIMDLEN** 显式指定目标指令集
 
 (dynamic-embedding-full-export)=
 
@@ -163,8 +164,8 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 - ONLINE_DENSE_EXPORT_DIR: 在线服务读取的根目录（必填）。导出产物发布在 `<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export` 下，必须为本地路径（发布依赖 `os.rename` 原子换版）；`model_dir` 可以是远端（如 OSS）
 - ONLINE_DENSE_EXPORT_KEEP_VERSIONS: 保留的历史版本数，默认 0（不删除任何已导出的版本）。大于 0 时保留最新 K 个版本，且 K 最小为 3（serving 需要当前版本 + 上一版本用于原子切换）。`current.json` 指向的版本永远不被清理
 - ONLINE_DENSE_EXPORT_TIMEOUT: 单次导出的预算秒数，默认 3600。超时不会中断导出线程，仅打印告警，并用于训练结束时 drain 的等待上限
-- ENABLE_AOT: 在 `ONLINE_DENSE_EXPORT=1` 下设置 `ENABLE_AOT=2`（兼容 `ENABLE_AOT=1`）时，版本目录交付 `versions/<yyyyMMddHHmmss>/aoti/aoti_model.pt2` 替代 `scripted_model.pt`。Rank 0 需具备 CUDA（`cuda:0`）及 `CUDA_HOME`（含 `nvcc`），后台线程在独立 CUDA Stream 中执行导出；**训练 Rank 0 节点的 GPU SM 架构必须与在线服务节点完全一致**，且同一服务进程运行期不可混用 `.pt` 与 `.pt2` 版本
-- TORCHINDUCTOR_CACHE_DIR: 建议在 `ONLINE_DENSE_EXPORT=1` + `ENABLE_AOT=2` 下指向本地持久化缓存目录，利用启动试运行预热 Triton/C++ 编译缓存以加速后续各轮重打包
+- ENABLE_AOT: 在 `ONLINE_DENSE_EXPORT=1` 下设置 `ENABLE_AOT=2`（兼容 `ENABLE_AOT=1`）时，版本目录交付 `versions/<yyyyMMddHHmmss>/aoti/aoti_model.pt2` 替代 `scripted_model.pt`。Rank 0 需具备 CUDA（`cuda:0`）及 `CUDA_HOME`（含 `nvcc`），后台线程在独立 CUDA Stream 中执行导出；**训练 Rank 0 节点的 GPU SM 架构必须与在线服务节点完全一致**（若训练与推理节点 CPU ISA 存在差异，如导出节点带 `AMX_TILE`，请同时配置 `AOTI_PORTABLE_CPU=1` 或 `AOTI_CPU_MARCH`），且同一服务进程运行期不可混用 `.pt` 与 `.pt2` 版本
+- TORCHINDUCTOR_CACHE_DIR: 建议在 `ONLINE_DENSE_EXPORT=1` + `ENABLE_AOT=2` 下指向本地持久化缓存目录，利用启动试运行预热 Triton/C++ 编译缓存以加速后续各轮重打包；若多个导出进程共享同一缓存目录，导出会自动通过目录内的跨进程文件锁保护编译与 `.pt2` 打包过程
 
 ### 运行与排障说明
 
@@ -321,5 +322,6 @@ export HARD_SEARCH_INPUT_TILE=1
 
 ### 使用限制
 
+- **适用范围：`HARD_SEARCH_INPUT_TILE=1` 当前仅支持 Python `tzrec.predict` 离线预测；`TorchRecProcessor` 暂不支持该特性，会在服务启动阶段直接报错拒绝。**
 - 当前支持 FX/TorchScript、统一 AOT（ENABLE_AOT=2）和 distributed embedding（含搭配 ENABLE_AOT=2/1），不支持普通导出下的 ENABLE_AOT=1、TRT、RTP、HSTU。
 - 历史派生特征只能依赖同一份 hard-search 历史及共享用户输入或常量。若还依赖候选自身的 `item:` / `context:` 字段，或另一组历史，不能开启 `HARD_SEARCH_INPUT_TILE`。
