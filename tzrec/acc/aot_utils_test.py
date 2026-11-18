@@ -23,6 +23,7 @@ from tzrec.acc.aot_utils import (
     export_unified_model_aot,
     load_model_aot,
 )
+from tzrec.datasets.data_parser import DataParser
 from tzrec.features.feature import FgMode, create_features
 from tzrec.models.model import ScriptWrapper
 from tzrec.models.multi_tower_din import MultiTowerDIN
@@ -326,6 +327,114 @@ class AotUtilsTest(unittest.TestCase):
             padded["u_seq__mv.values"].numel(),
         )
 
+        # 0-step sequence sample (total_steps == 0 -> pad_steps == 2)
+        zero_step_data = {
+            "u_seq__id.values": torch.empty(0, dtype=torch.int64),
+            "u_seq__id.lengths": torch.tensor([0], dtype=torch.int64),
+            "u_seq__raw.values": torch.empty((0, 2), dtype=torch.float32),
+            "u_seq__raw.lengths": torch.tensor([0], dtype=torch.int64),
+            "u_seq__mv.values": torch.empty(0, dtype=torch.int64),
+            "u_seq__mv.lengths": torch.tensor([0], dtype=torch.int64),
+            "u_seq__mv.key_lengths": torch.empty(0, dtype=torch.int64),
+        }
+        padded_zero = _pad_empty_sparse_values(zero_step_data, features)
+        for suffix in ("id", "raw", "mv"):
+            self.assertEqual(int(padded_zero[f"u_seq__{suffix}.lengths"].sum()), 2)
+        self.assertEqual(padded_zero["u_seq__id.values"].shape, (2,))
+        self.assertEqual(padded_zero["u_seq__raw.values"].shape, (2, 2))
+        self.assertEqual(padded_zero["u_seq__mv.key_lengths"].shape, (2,))
+        self.assertGreaterEqual(padded_zero["u_seq__mv.values"].numel(), 2)
+        self.assertEqual(
+            int(padded_zero["u_seq__mv.key_lengths"].sum()),
+            padded_zero["u_seq__mv.values"].numel(),
+        )
+
+    def test_resolve_tile_size_fallbacks(self):
+        # 1) All candidate features are hard-search -> falls back to inverse_indices.
+        hsk_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="user_id",
+                    expression="user:user_id",
+                    num_buckets=16,
+                    embedding_dim=4,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="click_seq",
+                    sequence_length=4,
+                    hard_search_key="item:cat_a",
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="id",
+                                expression="item:id",
+                                num_buckets=16,
+                                embedding_dim=4,
+                            )
+                        )
+                    ],
+                )
+            ),
+        ]
+        with mock.patch.dict(
+            os.environ,
+            {"INPUT_TILE": "3", "HARD_SEARCH_INPUT_TILE": "1", "ENABLE_AOT": "2"},
+            clear=False,
+        ):
+            parser_hsk = DataParser(create_features(hsk_cfgs, fg_mode=FgMode.FG_DAG))
+            self.assertEqual(
+                parser_hsk._tile_keys,
+                ("click_seq__inverse_indices", "user_id.lengths"),
+            )
+            self.assertEqual(
+                parser_hsk._resolve_tile_size(
+                    {
+                        "user_id.lengths": torch.tensor([1], dtype=torch.int64),
+                        "click_seq__inverse_indices": torch.tensor(
+                            [0, 0, 0], dtype=torch.int64
+                        ),
+                        "batch_size": torch.tensor(3, dtype=torch.int64),
+                    }
+                ),
+                3,
+            )
+            with self.assertRaises(ValueError):
+                parser_hsk._resolve_tile_size(
+                    {
+                        "user_id.lengths": torch.tensor([1, 1], dtype=torch.int64),
+                        "click_seq__inverse_indices": torch.tensor(
+                            [0, 0, 0], dtype=torch.int64
+                        ),
+                    }
+                )
+            with self.assertRaises(ValueError):
+                parser_hsk._resolve_tile_size(
+                    {
+                        "user_id.lengths": torch.empty(0, dtype=torch.int64),
+                        "click_seq__inverse_indices": torch.tensor(
+                            [0, 0], dtype=torch.int64
+                        ),
+                    }
+                )
+
+        # 2) Only user features -> warns and falls back to batch_size.item().
+        user_only_cfgs = [hsk_cfgs[0]]
+        with mock.patch.dict(os.environ, {"INPUT_TILE": "2"}, clear=False):
+            parser_user_only = DataParser(
+                create_features(user_only_cfgs, fg_mode=FgMode.FG_DAG)
+            )
+            self.assertIsNone(parser_user_only._tile_keys)
+            with self.assertLogs("tzrec", level="WARNING") as logs:
+                tile = parser_user_only._resolve_tile_size(
+                    {"batch_size": torch.tensor(4, dtype=torch.int64)}
+                )
+            self.assertEqual(tile, 4)
+            self.assertTrue(
+                any("falling back to batch_size.item()" in msg for msg in logs.output)
+            )
+
     @parameterized.expand(
         [
             ("input_tile_2", "2", "0"),
@@ -466,6 +575,11 @@ class AotUtilsTest(unittest.TestCase):
             for key, val in expected_cold.items():
                 torch.testing.assert_close(actual_cold[key], val)
                 torch.testing.assert_close(actual_cold_cuda[key], val)
+
+            bad_tile = dict(online_data)
+            bad_tile["u_w.lengths"] = torch.tensor([1, 1], dtype=torch.int64)
+            with self.assertRaises(ValueError):
+                aoti_model(bad_tile, device)
 
             # 3) Offline batch_size=1 with u_bs == i_bs == 4 and an extra ignored key.
             if online == "0":
@@ -614,6 +728,10 @@ class AotUtilsTest(unittest.TestCase):
                         actual = aoti_model(data, device)
                     for key, val in expected.items():
                         torch.testing.assert_close(actual[key], val)
+
+            bad_hsk = _make_inputs([2, 0, 1], [0, 1])
+            with self.assertRaises(ValueError):
+                aoti_model(bad_hsk, device)
 
 
 if __name__ == "__main__":

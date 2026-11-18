@@ -10,8 +10,9 @@
 # limitations under the License.
 
 
+import json
 import os
-from typing import Any, Dict, List, Optional, Set, Union, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
 import torch
 import torch._inductor.codecache  # noqa: F401 -- populate torch._inductor.codecache so torch.export.pt2_archive._package._load_aoti can read it on PPU torch (host torch auto-imports it; PPU's tzrec-test:1.1-ppu image does not).
@@ -72,7 +73,21 @@ def load_model_aot(
             aoti_model_path,
             device_index=device.index,
         )
-        return UnifiedAOTIModelWrapper(model)
+        tile_keys: Optional[Tuple[str, str]] = None
+        hsk_checks: Optional[List[Tuple[str, str]]] = None
+        meta_path = os.path.join(model_path, "aoti", "aoti_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                aoti_meta = json.load(f)
+            raw_tile_keys = aoti_meta.get("tile_keys")
+            if raw_tile_keys is not None:
+                tile_keys = (raw_tile_keys[0], raw_tile_keys[1])
+            raw_hsk_checks = aoti_meta.get("hsk_checks")
+            if raw_hsk_checks is not None:
+                hsk_checks = [(pair[0], pair[1]) for pair in raw_hsk_checks]
+        return UnifiedAOTIModelWrapper(
+            model, tile_keys=tile_keys, hsk_checks=hsk_checks
+        )
     else:
         # Legacy two-stage path: sparse JIT + dense AOTI.
         # Disable TensorExpr fuser: its lazy first-call compile is not
@@ -430,6 +445,7 @@ def _build_dynamic_shapes(
     batch = torch.export.Dim("batch", min=1, max=499999999)
     user_batch: Optional[torch.export.Dim] = None
     hsk_batch_dims: Dict[str, torch.export.Dim] = {}
+    static_tile_keys: List[str] = []
     dynamic_shapes = {}
     group_to_dim: Dict[str, torch.export.Dim] = {}
     prefix_to_dim: Dict[str, torch.export.Dim] = {}
@@ -489,7 +505,9 @@ def _build_dynamic_shapes(
             dynamic_shapes[key] = {0: _get_seq_step_dim(prefix)}
         elif input_tile and prefix in hard_search_features:
             if tensor.size(0) < 2:
+                # torch.export specializes size < 2 and rejects a dynamic Dim.
                 dynamic_shapes[key] = {}
+                static_tile_keys.append(key)
             else:
                 seq_src = hard_search_features[prefix]
                 if seq_src not in hsk_batch_dims:
@@ -499,7 +517,9 @@ def _build_dynamic_shapes(
                 dynamic_shapes[key] = {0: hsk_batch_dims[seq_src]}
         elif input_tile and prefix in user_feat_names:
             if tensor.size(0) < 2:
+                # torch.export specializes size < 2 and rejects a dynamic Dim.
                 dynamic_shapes[key] = {}
+                static_tile_keys.append(key)
             else:
                 if user_batch is None:
                     user_batch = torch.export.Dim("user_batch", min=1, max=499999999)
@@ -507,6 +527,12 @@ def _build_dynamic_shapes(
         else:
             dynamic_shapes[key] = {0: batch}
 
+    if static_tile_keys:
+        logger.warning(
+            "Input-tile tensor(s) %s have <2 rows in the export sample; "
+            "freezing dim 0 as static in unified AOTI export.",
+            static_tile_keys,
+        )
     return dynamic_shapes
 
 
@@ -578,6 +604,22 @@ def export_unified_model_aot(
             exported_pg,
             package_path=os.path.join(aoti_dir, "aoti_model.pt2"),
         )
+        data_parser = getattr(model, "_data_parser", None)
+        aoti_meta: Dict[str, Any] = {}
+        if is_input_tile() and data_parser is not None:
+            if data_parser._tile_keys is not None:
+                aoti_meta["tile_keys"] = list(data_parser._tile_keys)
+            hsk_map = data_parser._hard_search_input_tile_features
+            hsk_checks = [
+                [f"{f.name}.lengths", f"{hsk_map[f.name]}__inverse_indices"]
+                for f in features
+                if not f.stub_type and f.is_sparse and f.name in hsk_map
+            ]
+            if hsk_checks:
+                aoti_meta["hsk_checks"] = hsk_checks
+        if aoti_meta:
+            with open(os.path.join(aoti_dir, "aoti_meta.json"), "w") as f:
+                json.dump(aoti_meta, f, indent=4)
 
     logger.info("unified AOTI model exported to %s", save_dir)
     return save_dir

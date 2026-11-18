@@ -58,7 +58,7 @@ from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot, export_unified_model_aot
 from tzrec.acc.trt_utils import export_model_trt
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
-from tzrec.datasets.data_parser import _tile_size
+from tzrec.datasets.data_parser import _infer_tile_size, _tile_size
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
@@ -743,6 +743,13 @@ def _rewrite_dense_serving_graph(
             emb_name = name + "__ec"
             dense_graph_config["sequence__ec"].append(emb_name)
             dense_graph_config["sequence__ec"].append(name + "__lengths")
+        elif node.op == "call_function" and node.target == _infer_tile_size:
+            with graph.inserting_before(node):
+                batch_size_node = graph.call_function(
+                    operator.getitem, args=(input_node, "batch_size")
+                )
+                new_node = graph.call_function(_tile_size, args=(batch_size_node,))
+            node.replace_all_uses_with(new_node)
 
     graph.output(dict(zip(output_keys, output_values)))
     gm = torch.fx.GraphModule(root, graph)
