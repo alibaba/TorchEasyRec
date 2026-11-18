@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
 from tzrec.datasets import kafka_dataset
+from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.kafka_dataset import (
     KafkaDataset,
     KafkaReader,
@@ -879,7 +880,7 @@ class KafkaDatasetTest(unittest.TestCase):
         except Exception as e:
             logger.error(e)
 
-    def _create_test_table_and_feature_cfgs(self, embedded_schema=False):
+    def _create_test_topic(self):
         create_topic_req = alikafka_models.CreateTopicRequest(
             instance_id=self.instance_id,
             topic=self.test_topic,
@@ -902,6 +903,8 @@ class KafkaDatasetTest(unittest.TestCase):
                 break
             time.sleep(10)
 
+    def _create_test_table_and_feature_cfgs(self, embedded_schema=False):
+        self._create_test_topic()
         input_fields_str = (
             "unused:STRING;id_a:STRING;tag_b:STRING;raw_c:INT64;"
             "raw_d:DOUBLE;raw_e:INT32;raw_f:FLOAT;raw_g:ARRAY<FLOAT>;"
@@ -1181,6 +1184,125 @@ class KafkaDatasetTest(unittest.TestCase):
                 # New offset should be less than or equal to acc checkpoint offset
                 # (equal if we consumed the next message after checkpoint)
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
+
+    @parameterized.expand(
+        [
+            ("rolling", "SAMPLE_ROLLING", 2, False),
+            ("window", "SAMPLE_WINDOW", 2, False),
+            ("round_robin_no_workers", "SAMPLE_ROLLING", 0, True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipIf(
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
+    )
+    def test_sample_shuffle_checkpoint_resume(
+        self, _name, mode, num_workers, round_robin
+    ):
+        self._create_test_topic()
+        producer = Producer({"bootstrap.servers": self.brokers})
+        rows_per_message = 24
+        messages_per_partition = 16
+        metadata = {}
+        timestamp_ms = int(time.time() * 1000)
+
+        def on_delivery(row_start, event_time, error, message):
+            self.assertIsNone(error)
+            for row in range(row_start, row_start + rows_per_message):
+                metadata[row] = (
+                    f"{self.test_topic}:{message.partition()}",
+                    message.offset(),
+                    event_time / 1000.0,
+                )
+
+        for partition in range(4):
+            for offset in range(messages_per_partition):
+                row_start = (
+                    partition * messages_per_partition + offset
+                ) * rows_per_message
+                record_batch = pa.record_batch(
+                    {
+                        "raw_c": list(range(row_start, row_start + rows_per_message)),
+                        "label": [0] * rows_per_message,
+                    }
+                )
+                producer.produce(
+                    topic=self.test_topic,
+                    partition=partition,
+                    value=record_batch.serialize(),
+                    timestamp=timestamp_ms + offset,
+                    on_delivery=partial(on_delivery, row_start, timestamp_ms + offset),
+                )
+        self.assertEqual(producer.flush(30), 0)
+        self.assertEqual(len(metadata), 4 * messages_per_partition * rows_per_message)
+        cfg = utils.sample_data_config(
+            data_pb2.DatasetType.KafkaDataset,
+            mode,
+            num_workers,
+            kafka_partition_round_robin=round_robin,
+        )
+        cfg.input_fields.extend(
+            [
+                data_pb2.Field(input_name="raw_c", input_type=data_pb2.INT64),
+                data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
+            ]
+        )
+        path = (
+            f"kafka://{self.brokers}/{self.test_topic}"
+            "?group.id=tzrec_sample_shuffle&auto.offset.reset=earliest"
+        )
+
+        def alarm(signum, frame):
+            raise TimeoutError("timed out waiting for sample-shuffle batches")
+
+        old_handler = signal.signal(signal.SIGALRM, alarm)
+        self.addCleanup(signal.signal, signal.SIGALRM, old_handler)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        signal.setitimer(signal.ITIMER_REAL, 120)
+        state = {}
+        seen = set()
+        for resume in (False, True):
+            checkpoint = state.copy() if resume else {}
+            dataloader = create_dataloader(
+                cfg,
+                utils.raw_c_features(),
+                path,
+                mode=Mode.TRAIN,
+                checkpoint_state=checkpoint,
+            )
+            iterator = None
+            message_batches = {}
+            try:
+                iterator = dataloader.get_iterator()
+                for batch_index, batch in enumerate(iterator):
+                    values = [int(v) for v in batch.to_dict()["raw_c.values"]]
+                    self.assertEqual(len(values), 8)
+                    self.assertEqual(len(set(values)), 8)
+                    self.assertTrue(seen.isdisjoint(values))
+                    seen.update(values)
+                    expected = {}
+                    timestamps = []
+                    messages = set()
+                    for value in values:
+                        source, offset, event_time = metadata[value]
+                        if resume:
+                            self.assertGreater(offset, checkpoint[source])
+                        expected[source] = max(expected.get(source, -1), offset)
+                        timestamps.append(event_time)
+                        messages.add((source, offset))
+                    self.assertEqual(batch.checkpoint_info, expected)
+                    self.assertEqual(batch.data_timestamp, max(timestamps))
+                    for message in messages:
+                        message_batches[message] = message_batches.get(message, 0) + 1
+                    update_dataloder_state(state, batch.checkpoint_info)
+                    if (resume and batch_index >= 3) or (
+                        not resume and len(state) == 4
+                    ):
+                        break
+                self.assertTrue(any(count > 1 for count in message_batches.values()))
+            finally:
+                utils.stop_sample(dataloader, iterator)
+        self.assertEqual(len(state), 4)
 
     @unittest.skipIf(
         os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."

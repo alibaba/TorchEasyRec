@@ -226,62 +226,6 @@ class CsvDatasetTest(unittest.TestCase):
                 ],
             )
 
-
-class CsvWriterTest(unittest.TestCase):
-    def setUp(self):
-        self.test_dir = make_test_dir()
-
-    def tearDown(self):
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir)
-
-    def test_csv_writer(self):
-        def _writer_worker(rank):
-            os.environ["RANK"] = str(rank)
-            writer = CsvWriter(self.test_dir)
-            for _ in range(5):
-                writer.write(
-                    {
-                        "int_a": pa.array(np.random.randint(0, 100, 128)),
-                        "float_b": pa.array(np.random.random(128)),
-                    }
-                )
-            writer.close()
-
-        world_size = 2
-        procs = []
-        for rank in range(world_size):
-            p = mp.Process(
-                target=_writer_worker,
-                args=(rank,),
-            )
-            p.start()
-            procs.append(p)
-        for i, p in enumerate(procs):
-            p.join()
-            if p.exitcode != 0:
-                raise RuntimeError(f"writer worker-{i} failed.")
-        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "part-0.csv")))
-        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "part-1.csv")))
-
-    def test_csv_writer_chunked_array(self):
-        os.environ["RANK"] = "0"
-        writer = CsvWriter(self.test_dir)
-        writer.write(
-            {
-                "int_a": pa.chunked_array([pa.array([1, 2, 3]), pa.array([4, 5])]),
-                "float_b": pa.array([0.1, 0.2, 0.3, 0.4, 0.5]),
-            }
-        )
-        writer.close()
-        table = csv.read_csv(os.path.join(self.test_dir, "part-0.csv"))
-        self.assertEqual(table.num_rows, 5)
-        self.assertEqual(table.column("int_a").to_pylist(), [1, 2, 3, 4, 5])
-
-
-class CsvSampleShuffleTest(unittest.TestCase):
-    """Sample-level shuffle on the single-rank CSV path."""
-
     def _write_csv(self, test_dir, num_rows, num_files=2):
         rows_per_file = num_rows // num_files
         for f in range(num_files):
@@ -346,6 +290,58 @@ class CsvSampleShuffleTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "single rank"):
                 dataset._reader.create_read_plan(0, 2, 1)
+
+
+class CsvWriterTest(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = make_test_dir()
+
+    def tearDown(self):
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
+    def test_csv_writer(self):
+        def _writer_worker(rank):
+            os.environ["RANK"] = str(rank)
+            writer = CsvWriter(self.test_dir)
+            for _ in range(5):
+                writer.write(
+                    {
+                        "int_a": pa.array(np.random.randint(0, 100, 128)),
+                        "float_b": pa.array(np.random.random(128)),
+                    }
+                )
+            writer.close()
+
+        world_size = 2
+        procs = []
+        for rank in range(world_size):
+            p = mp.Process(
+                target=_writer_worker,
+                args=(rank,),
+            )
+            p.start()
+            procs.append(p)
+        for i, p in enumerate(procs):
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"writer worker-{i} failed.")
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "part-0.csv")))
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "part-1.csv")))
+
+    def test_csv_writer_chunked_array(self):
+        os.environ["RANK"] = "0"
+        writer = CsvWriter(self.test_dir)
+        writer.write(
+            {
+                "int_a": pa.chunked_array([pa.array([1, 2, 3]), pa.array([4, 5])]),
+                "float_b": pa.array([0.1, 0.2, 0.3, 0.4, 0.5]),
+            }
+        )
+        writer.close()
+        table = csv.read_csv(os.path.join(self.test_dir, "part-0.csv"))
+        self.assertEqual(table.num_rows, 5)
+        self.assertEqual(table.column("int_a").to_pylist(), [1, 2, 3, 4, 5])
 
 
 if __name__ == "__main__":
