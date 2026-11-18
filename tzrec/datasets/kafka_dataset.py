@@ -805,17 +805,11 @@ class KafkaReader(BaseReader):
     ) -> Generator[pa.RecordBatch, None, None]:
         """Read this worker's partitions in round-robin order, N messages per turn.
 
-        Partitions are sliced from the leader-ordered list resolved at
-        reader construction; each owned partition gets its own consumer,
-        assigned up front.  Every turn consumes up to ``msg_per_turn``
-        messages from the current partition, where the count is derived
-        from the estimated rows per message so that one full rotation
-        yields about one batch.  Messages confirmed to exist on the
-        broker (below its cached high watermark) are waited for, unless the
-        partition is at EOF.  EOF partitions are skipped until another message
-        arrives, even if pending transactions keep their last stable offset
-        below the high watermark.  While every partition is caught up, the
-        loop sleeps briefly per rotation to avoid busy spinning.
+        Each partition has its own consumer. Estimated rows per message set
+        the turn size so one rotation yields about one batch. Wait for unread
+        messages below the cached high watermark; skip caught-up or EOF
+        partitions. EOF can precede the high watermark with pending transactions.
+        Sleep briefly after an idle rotation to avoid busy spinning.
 
         Args:
             topic (str): kafka topic name.
@@ -870,21 +864,16 @@ class KafkaReader(BaseReader):
             def _take_events(
                 events: List[Message], idx: int
             ) -> Tuple[List[Message], int]:
-                """Split one consume() batch into messages to decode and a count.
+                """Update offset/EOF state and filter EOF events.
 
-                Normal messages advance ``next_offsets[idx]`` past the consumed
-                offset and clear its EOF status.  Partition-EOF events pin
-                ``next_offsets[idx]`` to the visible partition end, set its EOF
-                status and are dropped.  Any other error event is kept so
-                ``_decode_messages`` logs it as before.
+                Other errors remain in the result for ``_decode_messages`` to log.
 
                 Args:
                     events: events returned by one consume() call.
                     idx: index of the partition the events belong to.
 
                 Returns:
-                    retained messages (normal and error events) and the number
-                    of normal messages among them.
+                    retained messages and the number of non-error messages.
                 """
                 retained: List[Message] = []
                 got = 0
@@ -921,8 +910,7 @@ class KafkaReader(BaseReader):
                         owned_partitions[idx], cached=True
                     )
                     if next_offsets[idx] < 0 or high < 0:
-                        # nothing read yet (or watermark unknown): wait for the
-                        # first message or the EOF event
+                        # NOTE: Wait for a message or EOF before deciding to skip.
                         missing = 1
                     else:
                         missing = min(msg_per_turn - got, high - next_offsets[idx])
@@ -934,7 +922,6 @@ class KafkaReader(BaseReader):
                 t, num_decoded = self._decode_messages(messages, topic, projections)
                 if t is None:
                     if at_eof[idx] or 0 <= high <= next_offsets[idx]:
-                        # caught up with the partition end: nothing to wait for
                         idx = (idx + 1) % num_parts
                         idle_turns += 1
                         if idle_turns >= num_parts:
@@ -942,13 +929,11 @@ class KafkaReader(BaseReader):
                             idle_turns = 0
                     continue
                 idle_turns = 0
-                # estimate rows per message like the non-round-robin path
                 if rows_per_msg is None:
                     rows_per_msg = len(t) / num_decoded
                 else:
                     rows_per_msg = 0.9 * rows_per_msg + 0.1 * len(t) / num_decoded
-                # A zero-row message advances the rotation even though it
-                # yields no record batch.
+                # NOTE: Zero-row messages still advance the rotation.
                 for batch in t.to_batches():
                     yield batch
                 idx = (idx + 1) % num_parts
