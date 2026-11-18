@@ -23,12 +23,12 @@ from tzrec.acc.aot_utils import (
     export_unified_model_aot,
     load_model_aot,
 )
-from tzrec.datasets.data_parser import DataParser
+from tzrec.datasets.data_parser import DataParser, _infer_tile_size
 from tzrec.features.feature import FgMode, create_features
 from tzrec.models.model import ScriptWrapper
 from tzrec.models.multi_tower_din import MultiTowerDIN
 from tzrec.modules.embedding import EmbeddingGroup
-from tzrec.protos import feature_pb2, model_pb2, module_pb2, tower_pb2
+from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, tower_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
@@ -421,7 +421,9 @@ class AotUtilsTest(unittest.TestCase):
 
         # 2) Only user features -> warns and falls back to batch_size.item().
         user_only_cfgs = [hsk_cfgs[0]]
-        with mock.patch.dict(os.environ, {"INPUT_TILE": "2"}, clear=False):
+        with mock.patch.dict(
+            os.environ, {"INPUT_TILE": "2", "ENABLE_AOT": "2"}, clear=False
+        ):
             parser_user_only = DataParser(
                 create_features(user_only_cfgs, fg_mode=FgMode.FG_DAG)
             )
@@ -434,6 +436,41 @@ class AotUtilsTest(unittest.TestCase):
             self.assertTrue(
                 any("falling back to batch_size.item()" in msg for msg in logs.output)
             )
+
+        # 3) Non-unified export keeps reading batch_size without warning.
+        item_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="item_id",
+                expression="item:item_id",
+                num_buckets=16,
+                embedding_dim=4,
+            )
+        )
+        for env in ({"INPUT_TILE": "2"}, {"INPUT_TILE": "3", "ENABLE_AOT": "1"}):
+            with self.subTest(env=env):
+                with mock.patch.dict(os.environ, env, clear=False):
+                    parser = DataParser(
+                        create_features([hsk_cfgs[0], item_cfg], fg_mode=FgMode.FG_DAG)
+                    )
+                    self.assertIsNone(parser._tile_keys)
+                    with self.assertNoLogs("tzrec", level="WARNING"):
+                        tile = parser._resolve_tile_size(
+                            {
+                                "user_id.lengths": torch.tensor([1, 1]),
+                                "item_id.lengths": torch.tensor([1, 1]),
+                                "batch_size": torch.tensor(5, dtype=torch.int64),
+                            }
+                        )
+                    self.assertEqual(tile, 5)
+
+    def test_infer_tile_size_scripted_validation(self):
+        scripted = torch.jit.script(_infer_tile_size)
+        self.assertEqual(scripted(torch.ones(6), torch.ones(1)), 6)
+        self.assertEqual(scripted(torch.ones(6), torch.ones(6)), 1)
+        for user_bs in (0, 4, 7):
+            with self.subTest(user_bs=user_bs):
+                with self.assertRaises(torch.jit.Error):
+                    scripted(torch.ones(6), torch.ones(user_bs))
 
     @parameterized.expand(
         [
@@ -473,6 +510,11 @@ class AotUtilsTest(unittest.TestCase):
                     ],
                     final=module_pb2.MLP(hidden_units=[4]),
                 ),
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
             )
             inner = MultiTowerDIN(model_config, features, labels=[])
             init_parameters(inner, device)
@@ -545,6 +587,7 @@ class AotUtilsTest(unittest.TestCase):
             with torch.no_grad():
                 expected_online = wrapped(online_data, device)
                 actual_online = aoti_model(online_data, device)
+            self.assertEqual(expected_online["probs"].shape, (5,))
             for key, val in expected_online.items():
                 torch.testing.assert_close(actual_online[key], val)
 

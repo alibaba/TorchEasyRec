@@ -27,6 +27,7 @@ from tzrec.acc.utils import (
     is_input_tile,
     is_input_tile_3_online,
     is_input_tile_emb,
+    is_unified_aot,
 )
 from tzrec.constant import Mode
 from tzrec.datasets.utils import (
@@ -90,16 +91,15 @@ def _infer_tile_size(item_t: torch.Tensor, user_t: torch.Tensor) -> int:
     """Infer the tile factor from candidate and user batch dimensions."""
     item_bs = item_t.size(0)
     user_bs = user_t.size(0)
-    if not torch.jit.is_scripting():
-        if torch.compiler.is_compiling():
-            tile_size = item_bs // user_bs
-            torch._check(tile_size >= 1)
-            torch._check(user_bs * tile_size == item_bs)
-            return tile_size
-        if user_bs <= 0 or item_bs < user_bs or item_bs % user_bs != 0:
-            raise ValueError(
-                f"Invalid input-tile batch dims: item_bs={item_bs}, user_bs={user_bs}."
-            )
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        tile_size = item_bs // user_bs
+        torch._check(tile_size >= 1)
+        torch._check(user_bs * tile_size == item_bs)
+        return tile_size
+    if user_bs <= 0 or item_bs < user_bs or item_bs % user_bs != 0:
+        raise ValueError(
+            f"Invalid input-tile batch dims: item_bs={item_bs}, user_bs={user_bs}."
+        )
     return item_bs // user_bs
 
 
@@ -241,7 +241,8 @@ class DataParser:
                 for x in get_hard_search_inputs(self._features, self._fg_handler)
             }
             self.user_feats = set([x.name for x in self._features if x.is_user_feat])
-            self._tile_keys = self._find_tile_keys()
+            if is_unified_aot():
+                self._tile_keys = self._find_tile_keys()
             is_rank_zero = os.environ.get("RANK", "0") == "0"
             if is_rank_zero:
                 logger.info(f"self.user_feats: {self.user_feats}")
@@ -532,11 +533,14 @@ class DataParser:
         return None
 
     def _resolve_tile_size(self, input_data: Dict[str, torch.Tensor]) -> int:
-        """Resolve user-to-candidate tile factor using backed batch dims."""
+        """Resolve user-to-candidate tile factor.
+
+        Unified AOT infers it from backed batch dims; other paths read batch_size.
+        """
         if self._tile_keys is not None:
             item_key, user_key = self._tile_keys
             return _infer_tile_size(input_data[item_key], input_data[user_key])
-        if not self._warned_tile_fallback:
+        if is_unified_aot() and not self._warned_tile_fallback:
             self._warned_tile_fallback = True
             logger.warning(
                 "Cannot identify both non-hard-search user and candidate keys "
