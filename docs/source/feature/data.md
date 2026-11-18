@@ -396,7 +396,7 @@ pipeline.global-job-parameters: |
   - `SAMPLE_WINDOW`：样本级打散。同一rank内所有读取单元把原始样本汇入一个共享池，填满后冻结为一个窗口，窗口内样本全排列后连续切成完整batch输出；窗口输出期间到达的新样本进入下一窗口
   - `SAMPLE_ROLLING`：样本级打散。共享池填满后，每次随机抽取`batch_size`条样本输出并移出池，补满后再抽下一批
 - 仅训练（`Mode.TRAIN`）且`shuffle=true`时生效；评估、预测不生效
-- 支持的训练数据源：`ParquetDataset`；其他数据源启动时报错
+- 支持的训练数据源：`KafkaDataset`、`ParquetDataset`、`OdpsDataset`，以及单rank的`CsvDataset`
 - 每个rank独立维护一个样本池，样本只在本rank内混洗；不同rank之间不交换样本
 
 样本级打散配置示例：
