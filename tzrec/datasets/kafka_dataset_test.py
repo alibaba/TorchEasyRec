@@ -118,7 +118,13 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
     """Round-robin reading with mocked consumers."""
 
     def _make_reader(
-        self, consumers, partitions=(0, 1), leaders=None, round_robin=True, **kwargs
+        self,
+        consumers,
+        partitions=(0, 1),
+        leaders=None,
+        round_robin=True,
+        batch_size=1,
+        **kwargs,
     ):
         leaders = leaders or {partition: 0 for partition in partitions}
         query_consumer = mock.Mock()
@@ -147,7 +153,7 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         )
         return KafkaReader(
             "kafka://broker:9092/topic?group.id=g1",
-            1,
+            batch_size,
             input_fields=[pa.field("x", pa.int64())],
             kafka_partition_round_robin=round_robin,
             **kwargs,
@@ -172,16 +178,84 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
             [_msg(1, 0, 3)],
             [_msg(1, 1, 4)],
         ]
+        consumers[0].get_watermark_offsets.return_value = (0, 2)
+        consumers[1].get_watermark_offsets.side_effect = [(-1, -1), (0, 2)]
         gen = self._make_reader(consumers)._reader(0, 1)
         self.addCleanup(gen.close)
         observed = [next(gen).column("x")[0].as_py() for _ in expected]
         self.assertEqual(observed, expected)
         self.assertEqual(
-            consumers[0].consume.call_args_list, [mock.call(1, timeout=1.0)] * 2
+            [call.kwargs["timeout"] for call in consumers[0].consume.call_args_list],
+            [0, 0],
         )
         self.assertEqual(
-            consumers[1].consume.call_args_list, [mock.call(1, timeout=1.0)] * 4
+            [call.kwargs["timeout"] for call in consumers[1].consume.call_args_list],
+            [0, 1.0, 0, 0],
         )
+
+    def test_round_robin_skips_caught_up_partition_after_resume(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[0].consume.side_effect = [
+            [_msg(0, offset, offset + 1)] for offset in range(4)
+        ]
+        consumers[1].consume.side_effect = [
+            [],
+            [_msg(1, 5, 9)],
+            [],
+            [],
+            [_msg(1, 6, 10)],
+        ]
+        consumers[1].get_watermark_offsets.side_effect = [
+            (0, high) for high in (5, 6, 7)
+        ]
+        reader = self._make_reader(consumers)
+        reader.load_state_dict({"topic:1": 4})
+        gen = reader._reader(0, 1)
+        self.addCleanup(gen.close)
+        observed = [next(gen).column("x")[0].as_py() for _ in range(6)]
+        self.assertEqual(observed, [1, 2, 9, 3, 4, 10])
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in consumers[1].consume.call_args_list],
+            [0, 0, 0, 0, 1.0],
+        )
+
+    def test_round_robin_msg_per_turn_follows_rows_estimate(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[0].consume.side_effect = [
+            [_msg(0, offset, offset + 1, rows=2)] for offset in range(4)
+        ]
+        consumers[0].get_watermark_offsets.side_effect = [(0, 2), (0, 10)]
+        consumers[1].consume.side_effect = [
+            [_msg(1, offset, offset + 5, rows=2) for offset in range(start, start + 2)]
+            for start in (0, 2)
+        ]
+        gen = self._make_reader(consumers, batch_size=8)._reader(0, 1)
+        self.addCleanup(gen.close)
+        self.assertEqual([next(gen).num_rows for _ in range(5)], [2, 4, 2, 4, 4])
+        self.assertEqual(
+            consumers[0].consume.call_args_list,
+            [
+                mock.call(1, timeout=0),
+                mock.call(2, timeout=0),
+                mock.call(2, timeout=0),
+                mock.call(1, timeout=1.0),
+            ],
+        )
+
+    def test_round_robin_sleeps_when_all_caught_up(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        for consumer, offset in zip(consumers, (5, 7)):
+            consumer.consume.side_effect = [[]]
+            consumer.get_watermark_offsets.return_value = (offset, offset)
+        sleep = mock.Mock(side_effect=RuntimeError)
+        with mock.patch.object(kafka_dataset.time, "sleep", sleep):
+            gen = self._make_reader(consumers)._reader(0, 1)
+            self.addCleanup(gen.close)
+            with self.assertRaises(RuntimeError):
+                next(gen)
+        sleep.assert_called_once_with(0.01)
+        for consumer in consumers:
+            consumer.consume.assert_called_once_with(1, timeout=0)
 
     @parameterized.expand(
         [
@@ -372,7 +446,9 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
     )
     def test_idle_poll_parent_lifecycle(self, _name, round_robin, has_parent):
         consumer = mock.Mock()
-        consumer.consume.side_effect = [[], [_msg(0, 0, 7)]]
+        idle_polls = 2 if round_robin else 1
+        consumer.consume.side_effect = [[]] * idle_polls + [[_msg(0, 0, 7)]]
+        consumer.get_watermark_offsets.return_value = (0, 1)
         reader = self._make_reader([consumer], partitions=(0,), round_robin=round_robin)
         with (
             mock.patch.object(
@@ -391,7 +467,9 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
                     self.assertEqual(next(gen).column("x").to_pylist(), [7])
             finally:
                 gen.close()
-        self.assertEqual(consumer.consume.call_count, 1 if has_parent else 2)
+        self.assertEqual(
+            consumer.consume.call_count, idle_polls if has_parent else idle_polls + 1
+        )
         consumer.close.assert_called_once()
 
     def test_read_plan_uses_global_reader_ids(self):

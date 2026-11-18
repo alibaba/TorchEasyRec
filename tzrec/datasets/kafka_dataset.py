@@ -295,7 +295,10 @@ class KafkaReader(BaseReader):
         shuffle_buffer_size (int): buffer size for shuffle.
         input_fields (list): list of pa.Field for schema definition.
         kafka_partition_round_robin (bool): whether to read the partitions owned
-            by each worker in strict round-robin order.
+            by each worker in round-robin order, taking enough messages per
+            turn that one full rotation yields about one batch; partitions
+            already caught up with the broker are skipped instead of blocking
+            the rotation.
         kafka_log_every_n_messages (int): log per-worker decoded message counts
             every N messages, 0 disables.
     """
@@ -640,7 +643,7 @@ class KafkaReader(BaseReader):
         In a multiprocessing child, stop polling when the parent process exits.
 
         When partition round-robin is enabled the partitions owned by this
-        worker are read strictly in turn by :meth:`_round_robin_reader`.
+        worker are read in round-robin order by :meth:`_round_robin_reader`.
         Otherwise a background heartbeat thread monitors idle time (time since
         the last ``consume()`` call).  When the generator is blocked at
         ``yield`` for longer than 80% of ``max.poll.interval.ms``, the
@@ -799,12 +802,13 @@ class KafkaReader(BaseReader):
         worker_id: int,
         num_workers: int,
     ) -> Generator[pa.RecordBatch, None, None]:
-        """Read this worker's partitions strictly in round-robin order.
+        """Read this worker's partitions in round-robin order, N messages per turn.
 
-        Partitions are sliced from the leader-ordered list resolved at reader
-        construction, then read in ascending partition order.  Each owned
-        partition gets its own consumer, assigned up front.  The rotation
-        cursor does not advance while the current partition has no valid message.
+        Each partition has its own consumer. Estimated rows per message set
+        the turn size so one rotation yields about one batch. Wait for unread
+        messages below the cached high watermark and skip empty or caught-up
+        partitions.
+        Sleep briefly after an idle rotation to avoid busy spinning.
 
         Args:
             topic (str): kafka topic name.
@@ -829,8 +833,6 @@ class KafkaReader(BaseReader):
                     f"kafka topic {topic} has "
                     f"{len(self._round_robin_partition_order)} partition(s), "
                     f"fewer than the {num_workers} dataloader workers; "
-                    "kafka_partition_round_robin requires at least one partition "
-                    "per worker."
                 )
             owned_partitions = [
                 TopicPartition(topic, partition)
@@ -849,22 +851,67 @@ class KafkaReader(BaseReader):
             logger.info(f"{log_prefix} assignment: {owned_partitions}")
 
             projections: Dict[pa.Schema, Optional[List[int]]] = {}
+            num_parts = len(consumers)
+            next_offsets = [tp.offset for tp in owned_partitions]
+            rows_per_msg: Optional[float] = None
+            idle_turns = 0
+
+            def _record_offsets(messages: List[Message], idx: int) -> int:
+                """Record the next offset and return the number of data messages."""
+                got = 0
+                for msg in messages:
+                    if not msg.error():
+                        next_offsets[idx] = msg.offset() + 1
+                        got += 1
+                return got
+
             idx = 0
             while True:
                 if parent is not None and os.getppid() != parent.pid:
                     logger.error(f"{log_prefix}: owner process gone, exiting")
                     return
-                messages = consumers[idx].consume(1, timeout=1.0)
-                if not messages:
-                    continue
-                t, _ = self._decode_messages(messages, topic, projections)
+                msg_per_turn = (
+                    max(1, math.ceil(self._batch_size / (rows_per_msg * num_parts)))
+                    if rows_per_msg
+                    else 1
+                )
+                consumer = consumers[idx]
+                messages = consumer.consume(msg_per_turn, timeout=0)
+                got = _record_offsets(messages, idx)
+                caught_up = False
+                if got < msg_per_turn:
+                    low, high = consumer.get_watermark_offsets(
+                        owned_partitions[idx], cached=True
+                    )
+                    next_offset = next_offsets[idx]
+                    caught_up = high >= 0 and (low == high or next_offset >= high)
+                    if not caught_up:
+                        missing = (
+                            1
+                            if next_offset < 0 or high < 0
+                            else min(msg_per_turn - got, high - next_offset)
+                        )
+                        more = consumer.consume(missing, timeout=1.0)
+                        _record_offsets(more, idx)
+                        messages.extend(more)
+                t, num_decoded = self._decode_messages(messages, topic, projections)
                 if t is None:
+                    if caught_up:
+                        idx = (idx + 1) % num_parts
+                        idle_turns += 1
+                        if idle_turns >= num_parts:
+                            time.sleep(0.01)
+                            idle_turns = 0
                     continue
-                # A zero-row message advances the rotation even though it
-                # yields no record batch.
+                idle_turns = 0
+                if rows_per_msg is None:
+                    rows_per_msg = len(t) / num_decoded
+                else:
+                    rows_per_msg = 0.9 * rows_per_msg + 0.1 * len(t) / num_decoded
+                # NOTE: Zero-row messages still advance the rotation.
                 for batch in t.to_batches():
                     yield batch
-                idx = (idx + 1) % len(consumers)
+                idx = (idx + 1) % num_parts
         except Exception as e:
             logger.error(f"{log_prefix} exception: {e}")
             raise
