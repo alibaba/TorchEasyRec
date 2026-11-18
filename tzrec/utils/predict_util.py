@@ -576,7 +576,7 @@ class DistributedEmbeddingLookup:
 
     def __init__(self, model_path: str, devices: List[torch.device]) -> None:
         import pynve.nve as nve
-        from pynve.torch import nve_dtypes, nve_layers, nve_ps
+        from pynve.torch import nve_layers, nve_ps
 
         if not devices or any(d.type != "cuda" for d in devices):
             raise ValueError(
@@ -601,8 +601,8 @@ class DistributedEmbeddingLookup:
         self._used_feats = list(dict.fromkeys(used_feats))
 
         storage_types = {
-            "float32": torch.float32,
-            "float16": torch.float16,
+            "float32": nve.DataType_t.Float32,
+            "float16": nve.DataType_t.Float16,
             "QUint8RowwiseF16": nve.DataType_t.QUint8RowwiseF16,
         }
         with contextlib.ExitStack() as stack:
@@ -684,19 +684,10 @@ class DistributedEmbeddingLookup:
             group_rows = [
                 sum(emb_meta[e]["shape"][0] for e in group.members) for group in groups
             ]
-            if hasattr(nve, "row_size_in_bytes"):
-                storage_bytes = [
-                    rows
-                    * nve.row_size_in_bytes(
-                        nve_dtypes.resolve_data_type(storage_types[g.dtype]), g.dim
-                    )
-                    for rows, g in zip(group_rows, groups)
-                ]
-            else:
-                storage_bytes = [
-                    rows * nve_dtypes.stored_row_bytes(g.dim, storage_types[g.dtype])
-                    for rows, g in zip(group_rows, groups)
-                ]
+            storage_bytes = [
+                rows * nve.row_size_in_bytes(storage_types[g.dtype], g.dim)
+                for rows, g in zip(group_rows, groups)
+            ]
             ratio = _gpu_cache_ratio(devices, storage_bytes)
             # table name -> (group index, member tag)
             self._table_group: Dict[str, Tuple[int, int]] = {}
