@@ -12,7 +12,6 @@
 import contextlib
 import copy
 import glob
-import inspect
 import itertools
 import json
 import math
@@ -584,11 +583,6 @@ class DistributedEmbeddingLookup:
                 "predict of a distributed embedding export requires CUDA devices, "
                 f"got {devices}."
             )
-        # The published PPU wheel still uses the fork's `mode` keyword.
-        bag_parameters = inspect.signature(nve_layers.NVEmbeddingBag.forward).parameters
-        self._pooling_mode_kwarg = (
-            "mode_override" if "mode_override" in bag_parameters else "mode"
-        )
         sparse_dir = os.path.join(model_path, "sparse")
         with open(os.path.join(model_path, "dense_meta.json")) as f:
             self._dense_meta: Dict[str, List[str]] = json.load(f)
@@ -1071,11 +1065,9 @@ class DistributedEmbeddingLookup:
                 )
                 keys = _encode_keys(keys, key_tags, group.payload_bits)
             layer = layers[bucket.group_idx]
-            mode = "concat" if bucket.pooling == "NONE" else bucket.pooling.lower()
-            mode_kwargs = {self._pooling_mode_kwarg: mode}
             if bucket.pooling == "NONE":
                 # dequantized rows come back in fp16, the dense graph is fp32.
-                emb = layer(keys, **mode_kwargs).float()
+                emb = layer(keys, mode_override="concat").float()
                 for feat, e in zip(bucket.feats, emb.split(counts)):
                     out[_remove_suffix(feat)] = e
                 continue
@@ -1090,7 +1082,9 @@ class DistributedEmbeddingLookup:
                         use_weight, feat_lengths.sum(1), output_size=num_keys
                     )
                     bag_weights = torch.where(weighted, bag_weights, 1.0)
-            emb = layer(keys, offsets, bag_weights, **mode_kwargs).float()
+            emb = layer(
+                keys, offsets, bag_weights, mode_override=bucket.pooling.lower()
+            ).float()
             # bags are feature-major; lay them out as [batch, feature * dim].
             blocks.append(
                 emb.view(len(bucket.feats), stride, group.dim)
