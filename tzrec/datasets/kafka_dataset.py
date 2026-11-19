@@ -279,6 +279,8 @@ class KafkaDataset(BaseDataset):
             input_fields=input_fields if input_fields else None,
             kafka_partition_round_robin=self._data_config.kafka_partition_round_robin,
             kafka_log_every_n_messages=self._data_config.kafka_log_every_n_messages,
+            world_size=self._world_size,
+            rank=self._rank,
         )
 
 
@@ -314,6 +316,8 @@ class KafkaReader(BaseReader):
         input_fields: Optional[List[pa.Field]] = None,
         kafka_partition_round_robin: bool = False,
         kafka_log_every_n_messages: int = 0,
+        world_size: Optional[int] = None,
+        rank: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -323,6 +327,9 @@ class KafkaReader(BaseReader):
             drop_remainder,
             shuffle,
             shuffle_buffer_size,
+            world_size=world_size,
+            rank=rank,
+            **kwargs,
         )
 
         self._has_embedded_schema = False
@@ -428,7 +435,7 @@ class KafkaReader(BaseReader):
             ValueError: if topic metadata cannot be read.
         """
         topic, config, _ = _parse_kafka_uri(self._input_path)
-        pg = dist_util.get_dataset_process_group()
+        pg = dist_util.get_dataset_process_group(self._world_size)
         rank = dist.get_rank(pg) if pg is not None else 0
         result: List[Any] = [None, None]
         if rank == 0:

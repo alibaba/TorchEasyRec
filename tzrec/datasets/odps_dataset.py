@@ -438,6 +438,8 @@ class OdpsDataset(BaseDataset):
             min_batch_size=self._min_batch_size,
             equalize_rank_steps=self._mode != Mode.PREDICT,
             init_session_threads=max(self._data_config.num_workers, 1),
+            world_size=self._world_size,
+            rank=self._rank,
         )
 
 
@@ -551,7 +553,7 @@ class OdpsReader(BaseReader):
             batch_cost_size=batch_cost_size,
             **kwargs,
         )
-        self._pg = dist_util.get_dataset_process_group()
+        self._pg = dist_util.get_dataset_process_group(self._world_size)
         self._is_orderby_partition = is_orderby_partition
         self._init_session_threads = init_session_threads
         self._quota_name = quota_name
@@ -685,8 +687,12 @@ class OdpsReader(BaseReader):
 
     def _init_session(self) -> None:
         """Init table scan session."""
-        rank = int(os.environ.get("RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        rank = int(os.environ.get("RANK", 0)) if self._rank is None else self._rank
+        world_size = (
+            int(os.environ.get("WORLD_SIZE", 1))
+            if self._world_size is None
+            else self._world_size
+        )
         for input_path in self._input_path.split(","):
             _, table_name, partitions, _ = _parse_table_path(input_path)
             client = self._table_to_cli[table_name]

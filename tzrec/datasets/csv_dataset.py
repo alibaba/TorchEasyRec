@@ -99,6 +99,8 @@ class CsvDataset(BaseDataset):
             column_types=column_types,
             sample_cost_field=self._data_config.sample_cost_field,
             batch_cost_size=self._data_config.batch_cost_size,
+            world_size=self._world_size,
+            rank=self._rank,
         )
 
 
@@ -153,7 +155,7 @@ class CsvReader(BaseReader):
             ),
         )
         self._input_files = list_input_files(
-            self._input_path, dist_util.get_dataset_process_group()
+            self._input_path, dist_util.get_dataset_process_group(self._world_size)
         )
         if len(self._input_files) == 0:
             raise RuntimeError(f"No csv files exist in {self._input_path}.")

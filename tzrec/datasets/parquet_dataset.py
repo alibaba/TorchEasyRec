@@ -144,6 +144,8 @@ class ParquetDataset(BaseDataset):
             batch_cost_size=self._data_config.batch_cost_size,
             min_batch_size=self._min_batch_size,
             equalize_rank_steps=self._mode != Mode.PREDICT,
+            world_size=self._world_size,
+            rank=self._rank,
         )
 
 
@@ -175,6 +177,8 @@ class ParquetReader(BaseReader):
         rebalance: bool = True,
         sample_cost_field: Optional[str] = None,
         batch_cost_size: Optional[int] = None,
+        world_size: Optional[int] = None,
+        rank: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -186,9 +190,11 @@ class ParquetReader(BaseReader):
             shuffle_buffer_size,
             sample_cost_field=sample_cost_field,
             batch_cost_size=batch_cost_size,
+            world_size=world_size,
+            rank=rank,
             **kwargs,
         )
-        self._pg = dist_util.get_dataset_process_group()
+        self._pg = dist_util.get_dataset_process_group(self._world_size)
         self._rebalance = rebalance
 
         self._ordered_cols = None
@@ -210,8 +216,14 @@ class ParquetReader(BaseReader):
             self._schema = parquet_file.schema_arrow
         parquet_file.close()
 
-        rank = int(os.environ.get("RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        resolved_rank = (
+            int(os.environ.get("RANK", 0)) if self._rank is None else self._rank
+        )
+        resolved_world_size = (
+            int(os.environ.get("WORLD_SIZE", 1))
+            if self._world_size is None
+            else self._world_size
+        )
 
         # get parquet metadata
         self._parquet_metas = {}
@@ -220,11 +232,12 @@ class ParquetReader(BaseReader):
         if self._rebalance:
             with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
                 for k, v in executor.map(
-                    _get_metadata, self._input_files[rank::world_size]
+                    _get_metadata,
+                    self._input_files[resolved_rank::resolved_world_size],
                 ):
                     parquet_metas_per_rank[k] = v
             if self._pg is not None:
-                parquet_metas_list: List[Any] = [None] * world_size
+                parquet_metas_list: List[Any] = [None] * resolved_world_size
                 dist.all_gather_object(
                     parquet_metas_list, parquet_metas_per_rank, group=self._pg
                 )
