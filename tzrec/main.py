@@ -716,7 +716,15 @@ def _train_and_evaluate(
 
                     dump_decision = DumpDecision.NONE
                     if delta_embedding_dumper is not None:
-                        dump_decision = delta_embedding_dumper.maybe_dump(i_step)
+                        is_final_step = (
+                            i_step == train_config.num_steps - 1
+                            if use_step
+                            else i_epoch == train_config.num_epochs - 1
+                            and pipeline.input_drained
+                        )
+                        dump_decision = delta_embedding_dumper.maybe_dump(
+                            i_step, allow_dump=not is_final_step
+                        )
                 except StopIteration:
                     # Input exhaustion is reported after the pipeline drains.
                     # Run maintenance before the pass-end saves.
@@ -802,16 +810,6 @@ def _train_and_evaluate(
         # (save_checkpoints_steps/epochs = 0), so the tail final=True save below is
         # the only checkpoint and persists whatever on_train_end produced.
         _model.on_train_end()
-        final_dump_step = None
-        if delta_embedding_dumper is not None:
-            # Flush the trailing partial interval before the final checkpoint.
-            # final_dump does not re-dump boundary steps already written by
-            # maybe_dump (all ranks run the same step count, so every rank
-            # participated in those dumps and reaches the same final step) but
-            # still returns the step so the final export can pair with a
-            # sparse-only boundary.
-            final_dump_step = delta_embedding_dumper.final_dump(i_step)
-
         _log_train(
             i_step,
             losses,
@@ -840,6 +838,12 @@ def _train_and_evaluate(
             lr_schedulers=lr_scheduler,
         ):
             run_eval(i_step, i_epoch)
+        # Dump after checkpoint writeback to include tombstones for keys it evicted.
+        final_dump_step = (
+            delta_embedding_dumper.final_dump(i_step)
+            if delta_embedding_dumper is not None
+            else None
+        )
         if final_dump_step is not None:
             # Publish only paired versions: the final dense export uses the
             # step the trailing delta was actually dumped at; the exporter's

@@ -22,6 +22,7 @@ from pyarrow import csv
 
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import BaseDataset, BaseReader, BaseWriter
+from tzrec.datasets.sample_shuffle import ReadPlan, ReadTask
 from tzrec.datasets.utils import (
     FIELD_TYPE_TO_PA,
     get_input_fields_proto,
@@ -30,6 +31,27 @@ from tzrec.datasets.utils import (
 from tzrec.features.feature import BaseFeature
 from tzrec.protos import data_pb2
 from tzrec.utils import dist_util
+
+
+def _reader_iter(
+    input_files: List[str],
+    batch_size: int,
+    columns: Optional[List[str]],
+    csv_fmt: Any,
+) -> Iterator[pa.RecordBatch]:
+    """Read the csv files assigned to one reader slot.
+
+    Args:
+        input_files: files assigned to this slot.
+        batch_size: scanner batch size.
+        columns: selected columns in output order, or None for all.
+        csv_fmt: the dataset's picklable csv scanner format.
+
+    Yields:
+        csv record batches.
+    """
+    dataset = ds.dataset(input_files, format=csv_fmt)
+    yield from dataset.to_batches(batch_size=batch_size, columns=columns)
 
 
 class CsvDataset(BaseDataset):
@@ -154,6 +176,57 @@ class CsvReader(BaseReader):
         """Table schema."""
         return self._schema
 
+    def create_read_plan(
+        self, rank: int, world_size: int, num_readers: int
+    ) -> ReadPlan:
+        """Build the single-rank CSV read plan.
+
+        Files are assigned to the actual reader slots with a stride, like
+        the BATCH path. Their row count is unknown before reading, so the
+        coordinator drains the pool after EOF instead of enforcing a quota.
+
+        Args:
+            rank: this process's rank; must be 0.
+            world_size: number of ranks; CSV only supports one.
+            num_readers: number of reader processes on this rank.
+
+        Returns:
+            a finite read plan without a planned row count.
+
+        Raises:
+            ValueError: when more than one rank is used.
+        """
+        if world_size != 1:
+            raise ValueError(
+                "sample-level shuffle supports CsvDataset only on a single "
+                f"rank, got rank {rank} of {world_size}"
+            )
+
+        tasks = []
+        for reader_id in range(num_readers):
+            input_files = self._input_files[reader_id::num_readers]
+            tasks.append(
+                ReadTask(
+                    fn=_reader_iter,
+                    kwargs=dict(
+                        input_files=input_files,
+                        batch_size=self._batch_size,
+                        columns=self._ordered_cols,
+                        csv_fmt=self._csv_fmt,
+                    ),
+                    reader_id=reader_id,
+                )
+            )
+        return ReadPlan(
+            tasks=tasks,
+            # CSV has no checkpoint metadata: the row order of a file set is
+            # not stable enough to resume from, matching the BATCH path
+            schema=self._schema,
+            is_finite=True,
+            planned_rows=None,
+            num_readers=num_readers,
+        )
+
     def to_batches(
         self, worker_id: int = 0, num_workers: int = 1, world_size: Optional[int] = None
     ) -> Iterator[Dict[str, pa.Array]]:
@@ -162,11 +235,14 @@ class CsvReader(BaseReader):
         if self._shuffle:
             random.shuffle(input_files)
         if len(input_files) > 0:
-            dataset = ds.dataset(input_files, format=self._csv_fmt)
-            reader = dataset.to_batches(
-                batch_size=self._batch_size, columns=self._ordered_cols
+            yield from self._arrow_reader_iter(
+                _reader_iter(
+                    input_files,
+                    self._batch_size,
+                    self._ordered_cols,
+                    self._csv_fmt,
+                )
             )
-            yield from self._arrow_reader_iter(reader)
 
     def num_files(self) -> Optional[int]:
         """Get number of files in the dataset."""
