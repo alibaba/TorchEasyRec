@@ -207,8 +207,8 @@ def _pad_empty_sparse_values(
     """Pad <2-element sparse and sequence tensors before torch.export.
 
     When a non-sequence sparse feature or sequence feature has total nnz or
-    sequence steps < 2 in the example batch, torch.export specializes the axis
-    to 0 or 1, making it incompatible with a dynamic Dim spec. Padding to
+    total sequence length < 2 in the example batch, torch.export specializes the
+    axis to 0 or 1, making it incompatible with a dynamic Dim spec. Padding to
     >= 2 elements keeps the traced graph dynamic.
 
     This must be called AFTER model verification and BEFORE torch.export.
@@ -248,7 +248,7 @@ def _pad_empty_sparse_values(
                     ]
                 )
 
-    # Group sequence features so shared sequences stay step-aligned after padding.
+    # Group sequence features so shared sequences keep matching lengths after padding.
     seq_groups: Dict[str, List[BaseFeature]] = {}
     for feat in features:
         if not feat.is_sequence:
@@ -261,40 +261,49 @@ def _pad_empty_sparse_values(
         seq_groups.setdefault(group_key, []).append(feat)
 
     for group_feats in seq_groups.values():
-        present = [
+        features_in_batch = [
             feat
             for feat in group_feats
             if f"{feat.name}.lengths" in data and f"{feat.name}.values" in data
         ]
-        if not present:
+        if not features_in_batch:
             continue
-        ref_lengths = data[f"{present[0].name}.lengths"]
+        ref_lengths = data[f"{features_in_batch[0].name}.lengths"]
         if ref_lengths.numel() == 0:
             continue
-        total_steps = int(ref_lengths.sum().item())
-        if total_steps < 2:
-            pad_steps = 2 - total_steps
-            for feat in present:
+        total_sequence_length = int(ref_lengths.sum().item())
+        if total_sequence_length < 2:
+            sequence_length_padding = 2 - total_sequence_length
+            for feat in features_in_batch:
                 lengths_key = f"{feat.name}.lengths"
                 values_key = f"{feat.name}.values"
                 kl_key = f"{feat.name}.key_lengths"
                 weights_key = f"{feat.name}.weights"
 
                 new_lengths = data[lengths_key].clone()
-                new_lengths[0] = new_lengths[0] + pad_steps
+                new_lengths[0] = new_lengths[0] + sequence_length_padding
                 data[lengths_key] = new_lengths
 
                 values = data[values_key]
                 if kl_key in data:
                     kl = data[kl_key]
                     data[kl_key] = torch.cat(
-                        [kl, torch.ones(pad_steps, dtype=kl.dtype, device=kl.device)]
+                        [
+                            kl,
+                            torch.ones(
+                                sequence_length_padding,
+                                dtype=kl.dtype,
+                                device=kl.device,
+                            ),
+                        ]
                     )
                     data[values_key] = torch.cat(
                         [
                             values,
                             torch.zeros(
-                                pad_steps, dtype=values.dtype, device=values.device
+                                sequence_length_padding,
+                                dtype=values.dtype,
+                                device=values.device,
                             ),
                         ]
                     )
@@ -303,13 +312,20 @@ def _pad_empty_sparse_values(
                         [
                             values,
                             torch.zeros(
-                                pad_steps, dtype=values.dtype, device=values.device
+                                sequence_length_padding,
+                                dtype=values.dtype,
+                                device=values.device,
                             ),
                         ]
                     )
                 else:
                     data[values_key] = torch.cat(
-                        [values, values.new_zeros((pad_steps, *values.shape[1:]))],
+                        [
+                            values,
+                            values.new_zeros(
+                                (sequence_length_padding, *values.shape[1:])
+                            ),
+                        ],
                         dim=0,
                     )
                 if weights_key in data:
@@ -318,12 +334,14 @@ def _pad_empty_sparse_values(
                         [
                             weights,
                             torch.ones(
-                                pad_steps, dtype=weights.dtype, device=weights.device
+                                sequence_length_padding,
+                                dtype=weights.dtype,
+                                device=weights.device,
                             ),
                         ]
                     )
 
-        for feat in present:
+        for feat in features_in_batch:
             kl_key = f"{feat.name}.key_lengths"
             values_key = f"{feat.name}.values"
             if kl_key not in data:
@@ -366,10 +384,10 @@ def _build_dynamic_shapes(
     Uses structural knowledge from feature configs and feature groups:
     - .lengths -> batch dim (or user_batch / hard-search compact batch dim)
     - .values for non-sequence single-value sparse features -> own Dim (min=0)
-    - sequence step tensors (.values for single-value sparse or dense sequence
+    - sequence value tensors (.values for single-value sparse or dense sequence
       features, .key_lengths for multi-value sparse sequence features) -> shared
-      step Dim per SequenceFeature / JAGGED_SEQUENCE / SeqGroupConfig
-      (min=1 for JAGGED_SEQUENCE, min=0 otherwise)
+      total sequence length Dim per SequenceFeature / JAGGED_SEQUENCE /
+      SeqGroupConfig (min=1 for JAGGED_SEQUENCE, min=0 otherwise)
     - .values without a .lengths sibling -> batch dim (dense feature)
     - .weights -> shares Dim with corresponding .values (same prefix)
     - .values for multi-value sparse sequence features (with .key_lengths) ->
@@ -389,7 +407,7 @@ def _build_dynamic_shapes(
 
     # Step 1: Group grouped sequence features by their sequence_name.
     # Features in the same SequenceFeature config share per-sample lengths,
-    # so their step tensors (.values or .key_lengths) share a Dim.
+    # so their .values or .key_lengths tensors share a total sequence length Dim.
     # This takes precedence over FeatureGroupConfig because it reflects the
     # authoritative data structure (shared sequence), not model organization.
     feat_to_seq_dim_group: Dict[str, str] = {}
@@ -451,7 +469,7 @@ def _build_dynamic_shapes(
     prefix_to_dim: Dict[str, torch.export.Dim] = {}
     dim_counter = 0
 
-    def _get_seq_step_dim(feat_prefix: str) -> torch.export.Dim:
+    def _get_total_sequence_length_dim(feat_prefix: str) -> torch.export.Dim:
         nonlocal dim_counter
         if feat_prefix in feat_to_seq_dim_group:
             group = feat_to_seq_dim_group[feat_prefix]
@@ -463,9 +481,11 @@ def _build_dynamic_shapes(
                 dim_counter += 1
             return group_to_dim[group]
         min_len = 1 if feat_prefix in jagged_seq_feat_names else 0
-        step_dim = torch.export.Dim(f"g_{dim_counter}", min=min_len, max=999999993)
+        total_sequence_length_dim = torch.export.Dim(
+            f"g_{dim_counter}", min=min_len, max=999999993
+        )
         dim_counter += 1
-        return step_dim
+        return total_sequence_length_dim
 
     for key, tensor in data.items():
         if tensor.dim() == 0 or key == "batch_size":
@@ -484,7 +504,7 @@ def _build_dynamic_shapes(
 
         if is_sparse_values:
             if prefix in seq_feat_names and prefix not in key_lengths_prefixes:
-                dim = _get_seq_step_dim(prefix)
+                dim = _get_total_sequence_length_dim(prefix)
                 dynamic_shapes[key] = {0: dim}
                 prefix_to_dim[prefix] = dim
             else:
@@ -502,7 +522,7 @@ def _build_dynamic_shapes(
                 prefix_to_dim[prefix] = dim
             dynamic_shapes[key] = {0: dim}
         elif is_key_lengths:
-            dynamic_shapes[key] = {0: _get_seq_step_dim(prefix)}
+            dynamic_shapes[key] = {0: _get_total_sequence_length_dim(prefix)}
         elif input_tile and prefix in hard_search_features:
             if tensor.size(0) < 2:
                 # torch.export specializes size < 2 and rejects a dynamic Dim.

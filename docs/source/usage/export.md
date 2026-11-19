@@ -63,7 +63,7 @@ torchrun --master_addr=localhost --master_port=32555 \
   - 未设置 **DIST_QUANT** 时，不启用分布式 sparse embedding 量化
 - ENABLE_AOT: 使用AOT(Ahead Of Time)编译优化导出的模型，可显著提升推理性能。**AOT 编译产物与导出机器的 GPU 架构强绑定，在线服务的 GPU 类型必须与导出时使用的 GPU 类型完全一致**，详见下文 [在 PAI 上导出 AOT 模型](#export-aot-on-pai) 章节
   - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（sparse 部分用 JIT，dense 部分用 AOTI）
-  - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]；支持 `INPUT_TILE`、`HARD_SEARCH_INPUT_TILE` 和空序列特征（`JAGGED_SEQUENCE` 特征组在预测时仍要求每个 batch 至少有 1 个序列步长）
+  - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]；支持 `INPUT_TILE`、`HARD_SEARCH_INPUT_TILE` 和空序列特征（`JAGGED_SEQUENCE` 特征组在预测时仍要求每个 batch 的序列总长度至少为 1）
 
 (dynamic-embedding-full-export)=
 

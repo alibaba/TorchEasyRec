@@ -244,11 +244,21 @@ class HardSearchInputTileExpander(nn.Module):
 def _pool_sequence_values(
     values: torch.Tensor, lengths: torch.Tensor, pooling: str
 ) -> torch.Tensor:
-    """Pool sequence steps, including a batch with no steps at all."""
-    # Trailing 0-length segment keeps this branchless so torch.export doesn't
-    # specialize empty lengths; [:-1] drops the sentinel output.
-    lengths_pad = torch.nn.functional.pad(lengths, (0, 1))
-    pooled = torch.segment_reduce(values, pooling, lengths=lengths_pad)[:-1]
+    """Pool sequence values, including a batch with empty lengths."""
+    exporting = False
+    if not torch.jit.is_scripting():
+        exporting = torch.compiler.is_exporting()
+
+    if exporting:
+        # Trailing 0-length segment keeps empty and non-empty lengths on one
+        # path during torch.export; [:-1] drops the sentinel output.
+        lengths = torch.nn.functional.pad(lengths, (0, 1))
+    elif lengths.numel() == 0:
+        return values[:0]
+
+    pooled = torch.segment_reduce(values, pooling, lengths=lengths)
+    if exporting:
+        pooled = pooled[:-1]
     if pooling == "mean":
         pooled = torch.nan_to_num(pooled, nan=0.0)
     return pooled

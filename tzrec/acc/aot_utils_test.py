@@ -173,7 +173,8 @@ class AotUtilsTest(unittest.TestCase):
             dyn = _build_dynamic_shapes(data, features, feature_groups)
 
         self.assertEqual(dyn["batch_size"], {})
-        # Sequence dense raw values share step Dim with sparse sequence values, min=0.
+        # Sequence dense raw values share total sequence length Dim with sparse sequence
+        # values, min=0.
         self.assertEqual(dyn["u_seq__id.values"], dyn["u_seq__raw.values"])
         self.assertEqual(dyn["u_seq__id.values"][0].min, 0)
         self.assertNotEqual(dyn["u_seq__mv.values"], dyn["u_seq__id.values"])
@@ -298,7 +299,7 @@ class AotUtilsTest(unittest.TestCase):
 
     def test_pad_empty_sparse_values(self):
         features, _ = _create_din_input_tile_features_and_groups(include_multival=True)
-        # Step count == 1 for u_seq (e.g. INPUT_TILE_3_ONLINE=1 single user row)
+        # Sequence of length 1 for u_seq (e.g. INPUT_TILE_3_ONLINE=1 single user row)
         # and empty non-sequence weighted sparse u_w.
         raw_data = {
             "u_w.values": torch.empty(0, dtype=torch.int64),
@@ -327,8 +328,9 @@ class AotUtilsTest(unittest.TestCase):
             padded["u_seq__mv.values"].numel(),
         )
 
-        # 0-step sequence sample (total_steps == 0 -> pad_steps == 2)
-        zero_step_data = {
+        # Empty sequence sample (total_sequence_length == 0 ->
+        # sequence_length_padding == 2)
+        empty_sequence_data = {
             "u_seq__id.values": torch.empty(0, dtype=torch.int64),
             "u_seq__id.lengths": torch.tensor([0], dtype=torch.int64),
             "u_seq__raw.values": torch.empty((0, 2), dtype=torch.float32),
@@ -337,7 +339,7 @@ class AotUtilsTest(unittest.TestCase):
             "u_seq__mv.lengths": torch.tensor([0], dtype=torch.int64),
             "u_seq__mv.key_lengths": torch.empty(0, dtype=torch.int64),
         }
-        padded_zero = _pad_empty_sparse_values(zero_step_data, features)
+        padded_zero = _pad_empty_sparse_values(empty_sequence_data, features)
         for suffix in ("id", "raw", "mv"):
             self.assertEqual(int(padded_zero[f"u_seq__{suffix}.lengths"].sum()), 2)
         self.assertEqual(padded_zero["u_seq__id.values"].shape, (2,))
@@ -520,8 +522,8 @@ class AotUtilsTest(unittest.TestCase):
             init_parameters(inner, device)
             wrapped = ScriptWrapper(inner).to(device).eval()
 
-            # Sample export batch intentionally uses a 1-step user sequence in
-            # online mode to cover step-padding against 0/1 specialization.
+            # Sample export batch intentionally uses a sequence of length 1 in
+            # online mode to cover sequence-length padding against 0/1 specialization.
             if online == "1":
                 export_data = {
                     "batch_size": torch.tensor(3, dtype=torch.int64),
