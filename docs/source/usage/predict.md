@@ -35,10 +35,11 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 ### 预测分布式 embedding 导出模型
 
-`USE_DISTRIBUTED_EMBEDDING=1` 未开启 `ENABLE_AOT` 导出的模型同样用上文的 `--scripted_model_path` 命令预测，会根据 `model_acc.json` 自动识别。
+`USE_DISTRIBUTED_EMBEDDING=1` 导出的模型（包含开启 `ENABLE_AOT` 导出的模型）同样用上文的 `--scripted_model_path` 命令预测，会根据 `model_acc.json` 自动识别，无需额外命令行参数。
 
+- 预测开启 `ENABLE_AOT` 导出的模型时，预测机器的 GPU 类型（SM 架构）必须与导出机器完全一致
 - 建议每台机器只启动一个预测进程（`--nproc-per-node=1`），该进程使用本机全部 GPU，共享同一份 host 内存中的 embedding；每张 GPU 一个进程也能运行，但 host 内存占用随进程数成倍增加
-- `--predict_threads` 默认每张 GPU 一个前向线程；每多一个线程，GPU 上就多一份不计入 GPU 缓存预算的 embedding 查询缓冲区（大模型可达数 GB），设置更多线程时若显存不足请调低 `DIST_EMB_GPU_CACHE_RATIO`
+- `--predict_threads` 默认每张 GPU 一个前向线程；每多一个线程，GPU 上就多一份不计入 GPU 缓存预算的 embedding 查询缓冲区（大模型可达数 GB），设置更多线程或预测 AOTI 模型时若显存不足，请调低 `DIST_EMB_GPU_CACHE_RATIO` 或适当减小 `--batch_size` / `--predict_threads`
 
 ```bash
 torchrun --master_addr=localhost --master_port=32555 \

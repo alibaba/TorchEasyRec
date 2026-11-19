@@ -18,7 +18,8 @@ import threading
 import time
 import unittest
 import zlib
-from typing import Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Optional, Tuple
 from unittest import mock
 
 import numpy as np
@@ -45,6 +46,7 @@ from tzrec.utils.predict_util import (
     _encode_keys,
     _gpu_cache_ratio,
     _key_tag,
+    _load_scripted_model,
     _wrap_batch_predict_model,
     load_predict_model,
 )
@@ -513,6 +515,41 @@ class _DenseSum(torch.nn.Module):
     ) -> Dict[str, torch.Tensor]:
         p = data["deep"].sum(1) + data["x.values"].sum(1) + data["sd.lengths"]
         return {"p": p * data["batch_size"]}
+
+
+class _DenseAOTIRich(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = torch.nn.Linear(16, 4)
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, torch.Tensor]:
+        del device
+        deep_out = self.proj(data["deep"]).sum(1)
+        seq_sum = data["seq"].sum() + data["sd.values"].sum()
+        mv_kl_sum = data["mv.key_lengths"].to(torch.float32).sum()
+        row_terms = (
+            data["x.values"].sum(1)
+            + data["seq__lengths"].to(torch.float32)
+            + data["sd.lengths"].to(torch.float32)
+            + data["mv.lengths"].to(torch.float32)
+        )
+        p = (deep_out + row_terms + (seq_sum + mv_kl_sum) * 0.01) * data[
+            "batch_size"
+        ].to(torch.float32)
+        return {"p": p}
+
+
+class _DenseAOTISingleArg(torch.nn.Module):
+    def __init__(self, inner: torch.nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return self.inner(data)
 
 
 def _write_export(export_dir, tables, features, dense_meta):
@@ -1039,6 +1076,283 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
             atol=1e-5,
         )
 
+    def _build_rich_aoti_export(
+        self,
+        export_dir: str,
+        *,
+        enable_aot: str = "2",
+        ts_dir: Optional[str] = None,
+    ) -> Tuple[_Table, _Table, torch.nn.Module]:
+        dyn = _Table("model.ebc.dyn", 10, 8, False, dynamic=True)
+        static = _Table("model.ebc.static", 20, 8, False, dynamic=False)
+        features = {
+            "a__ebc": {
+                "embedding_name": dyn.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            },
+            "b__ebc": {
+                "embedding_name": static.name,
+                "pooling": "SUM",
+                "use_weight": False,
+            },
+            "seq__ec": {
+                "embedding_name": dyn.name,
+                "pooling": "NONE",
+                "use_weight": False,
+            },
+        }
+        dense_meta = {
+            "sequence__ec": ["seq__ec", "seq__lengths"],
+            "deep": ["a__ebc", "b__ebc"],
+        }
+        _write_export(export_dir, [dyn, static], features, dense_meta)
+
+        torch.manual_seed(42)
+        dense_mod = _DenseAOTIRich().cuda().eval()
+        single_arg = _DenseAOTISingleArg(dense_mod).cuda().eval()
+        device = torch.device("cuda:0")
+        sample = {
+            "deep": torch.randn(2, 16, device=device),
+            "seq": torch.randn(3, 8, device=device),
+            "seq__lengths": torch.tensor([2, 1], dtype=torch.int32, device=device),
+            "x.values": torch.randn(2, 2, device=device),
+            "sd.values": torch.randn(3, 4, device=device),
+            "sd.lengths": torch.tensor([2, 1], dtype=torch.int64, device=device),
+            "mv.lengths": torch.tensor([2, 1], dtype=torch.int64, device=device),
+            "mv.key_lengths": torch.tensor([1, 2, 1], dtype=torch.int64, device=device),
+            "batch_size": torch.tensor(1, dtype=torch.int64, device=device),
+        }
+        batch_dim = torch.export.Dim("batch", min=1, max=256)
+        seq_dim = torch.export.Dim("seq", min=0, max=1024)
+        sd_dim = torch.export.Dim("sd", min=0, max=1024)
+        mv_dim = torch.export.Dim("mv", min=0, max=1024)
+        dyn_shapes = {
+            "deep": {0: batch_dim},
+            "seq": {0: seq_dim},
+            "seq__lengths": {0: batch_dim},
+            "x.values": {0: batch_dim},
+            "sd.values": {0: sd_dim},
+            "sd.lengths": {0: batch_dim},
+            "mv.lengths": {0: batch_dim},
+            "mv.key_lengths": {0: mv_dim},
+            "batch_size": {},
+        }
+        ep = torch.export.export(
+            single_arg, args=(sample,), dynamic_shapes=(dyn_shapes,)
+        )
+        aoti_dir = os.path.join(export_dir, "aoti")
+        os.makedirs(aoti_dir, exist_ok=True)
+        torch._inductor.aoti_compile_and_package(
+            ep, package_path=os.path.join(aoti_dir, "aoti_model.pt2")
+        )
+        acc_cfg = {"DISTRIBUTED_EMBEDDING": "1", "ENABLE_AOT": enable_aot}
+        with open(os.path.join(export_dir, "model_acc.json"), "w") as f:
+            json.dump(acc_cfg, f)
+
+        if ts_dir is not None:
+            _write_export(ts_dir, [dyn, static], features, dense_meta)
+            torch.jit.script(dense_mod).save(os.path.join(ts_dir, "scripted_model.pt"))
+            with open(os.path.join(ts_dir, "model_acc.json"), "w") as f:
+                json.dump({"DISTRIBUTED_EMBEDDING": "1"}, f)
+
+        return dyn, static, dense_mod
+
+    @staticmethod
+    def _make_rich_batch(
+        dyn: _Table, bs: int, *, empty_seq: bool = False, seed: int = 0
+    ) -> Batch:
+        rng = torch.Generator().manual_seed(seed + bs + (100 if empty_seq else 0))
+        seq_bags = tuple(
+            [] if empty_seq else [dyn.keys[(i + j) % 5] for j in range((i % 2) + 1)]
+            for i in range(bs)
+        )
+        mv_bags = tuple(
+            [] if empty_seq else ([0, 1] if i % 2 == 0 else [2]) for i in range(bs)
+        )
+        bags = {
+            "a": tuple([dyn.keys[i % 5], -1] for i in range(bs)),
+            "b": tuple([i % 20] for i in range(bs)),
+            "seq": seq_bags,
+            "mv": mv_bags,
+        }
+        batch = _lookup_batch(bags, {})
+        batch.dense_features = {
+            "d": KeyedTensor(
+                keys=["x", "y"],
+                length_per_key=[2, 3],
+                values=torch.randn(bs, 5, generator=rng),
+            )
+        }
+        sd_lengths = (
+            torch.zeros(bs, dtype=torch.int32)
+            if empty_seq
+            else torch.tensor([(i % 2) + 1 for i in range(bs)], dtype=torch.int32)
+        )
+        batch.sequence_dense_features = {
+            "sd": JaggedTensor(
+                values=torch.randn(int(sd_lengths.sum()), 4, generator=rng),
+                lengths=sd_lengths,
+            )
+        }
+        mv_seq_list = (
+            [0] * bs if empty_seq else [1 if i % 2 == 0 else 0 for i in range(bs)]
+        )
+        mv_seq_lengths = torch.tensor(mv_seq_list, dtype=torch.int32)
+        mv_key_lengths = (
+            torch.zeros(0, dtype=torch.int32)
+            if empty_seq
+            else torch.full((int(mv_seq_lengths.sum()),), 2, dtype=torch.int32)
+        )
+        batch.sequence_mulval_lengths = {
+            "g_mv": KeyedJaggedTensor(
+                keys=["mv"],
+                values=mv_key_lengths,
+                lengths=mv_seq_lengths,
+            )
+        }
+        return batch
+
+    @parameterized.expand(
+        [
+            param("enable_aot_2", enable_aot="2"),
+            param("enable_aot_1", enable_aot="1"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_runs_aoti_dense_on_lookup(self, _name, enable_aot: str) -> None:
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        ts_dir = make_test_dir()
+        try:
+            dyn, _static, _dense_mod = self._build_rich_aoti_export(
+                self.export_dir,
+                enable_aot=enable_aot,
+                ts_dir=ts_dir,
+            )
+            device = torch.device("cuda:0")
+            aoti_model = load_predict_model(self.export_dir, [device], log_model=True)
+            ts_model = load_predict_model(ts_dir, [device])
+            self.assertIsInstance(aoti_model, DistributedEmbeddingModel)
+            self.assertTrue(aoti_model._is_aot)
+
+            cases = [
+                (1, False),
+                (3, False),
+                (7, False),
+                (3, True),
+                (1, True),
+            ]
+            for bs, empty_seq in cases:
+                batch = self._make_rich_batch(dyn, bs, empty_seq=empty_seq)
+                tile_bs = torch.tensor(2, dtype=torch.int64)
+                with mock.patch.object(
+                    predict_util, "batch_to_dict", wraps=predict_util.batch_to_dict
+                ) as spy_b2d:
+                    actual = aoti_model(batch, tile_bs, device)
+                self.assertEqual(spy_b2d.call_args.args[1], {})
+                expected = ts_model(batch, tile_bs, device)
+                self.assertEqual(actual["p"].device, device)
+                self.assertEqual(actual["p"].shape, (bs,))
+                torch.testing.assert_close(
+                    actual["p"], expected["p"], rtol=1e-5, atol=1e-5
+                )
+        finally:
+            shutil.rmtree(ts_dir, ignore_errors=True)
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
+    def test_aoti_multithread_concurrent_inference(self) -> None:
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        try:
+            dyn, _static, _dense_mod = self._build_rich_aoti_export(self.export_dir)
+            device = torch.device("cuda:0")
+            model = load_predict_model(self.export_dir, [device])
+            batches = [
+                self._make_rich_batch(dyn, bs, empty_seq=empty_seq, seed=i)
+                for i, (bs, empty_seq) in enumerate(
+                    [(1, False), (3, False), (7, False), (4, True)]
+                )
+            ]
+            tile_bs = torch.tensor(2, dtype=torch.int64)
+            refs = [model(b, tile_bs, device)["p"].cpu() for b in batches]
+
+            num_workers = 4
+            streams = [torch.cuda.Stream(device) for _ in range(num_workers)]
+
+            def _worker(worker_id: int) -> None:
+                stream = streams[worker_id]
+                with torch.cuda.stream(stream):
+                    for step in range(8):
+                        idx = (worker_id + step) % len(batches)
+                        out = model(batches[idx], tile_bs, device)["p"]
+                        stream.synchronize()
+                        torch.testing.assert_close(
+                            out.cpu(), refs[idx], rtol=1e-5, atol=1e-5
+                        )
+
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                futures = [pool.submit(_worker, wid) for wid in range(num_workers)]
+                for fut in futures:
+                    fut.result()
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "requires 2 GPUs")
+    @ci_resources(slots=2)
+    def test_aoti_multi_gpu_concurrent_inference(self) -> None:
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        try:
+            dyn, _static, _dense_mod = self._build_rich_aoti_export(self.export_dir)
+            devices = [torch.device("cuda:0"), torch.device("cuda:1")]
+            model = load_predict_model(self.export_dir, devices)
+            self.assertEqual(len(model._dense_aoti), 2)
+
+            batches = [
+                self._make_rich_batch(dyn, bs, empty_seq=empty_seq, seed=i)
+                for i, (bs, empty_seq) in enumerate(
+                    [(1, False), (3, False), (7, False), (3, True)]
+                )
+            ]
+            tile_bs = torch.tensor(2, dtype=torch.int64)
+            refs = [model(b, tile_bs, devices[0])["p"].cpu() for b in batches]
+
+            num_workers = 4
+            streams = [
+                torch.cuda.Stream(devices[wid % len(devices)])
+                for wid in range(num_workers)
+            ]
+
+            def _worker(worker_id: int) -> None:
+                dev = devices[worker_id % len(devices)]
+                stream = streams[worker_id]
+                with torch.cuda.stream(stream):
+                    for step in range(6):
+                        idx = (worker_id + step) % len(batches)
+                        out = model(batches[idx], tile_bs, dev)["p"]
+                        self.assertEqual(out.device, dev)
+                        stream.synchronize()
+                        torch.testing.assert_close(
+                            out.cpu(), refs[idx], rtol=1e-5, atol=1e-5
+                        )
+
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                futures = [pool.submit(_worker, wid) for wid in range(num_workers)]
+                for fut in futures:
+                    fut.result()
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
 
 class GenRecExportModelTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -1235,6 +1549,15 @@ class LoadPredictModelTest(unittest.TestCase):
         self.assertEqual(list(actual), list(expected))
         for k, v in expected.items():
             torch.testing.assert_close(actual[k], v, rtol=0, atol=0, msg=k)
+
+    def test_load_scripted_model_does_not_mutate_texpr_env(self) -> None:
+        torch.jit.script(_Model()).save(
+            os.path.join(self.model_dir, "scripted_model.pt")
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            loaded = _load_scripted_model(self.model_dir, torch.device("cpu"))
+            self.assertIsNotNone(loaded)
+            self.assertNotIn("PYTORCH_TENSOREXPR_FALLBACK", os.environ)
 
 
 if __name__ == "__main__":
