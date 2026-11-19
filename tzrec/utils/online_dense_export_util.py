@@ -9,9 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2026, Alibaba Group;
-# Licensed under the Apache License, Version 2.0 (the "License");
-
 r"""Utilities for exporting and atomically publishing online dense models.
 
 Serving publish contract:
@@ -20,7 +17,9 @@ Serving publish contract:
 ├── current.json                  # Atomic pointer to the latest version
 └── versions/
     └── <yyyyMMddHHmmss>/         # Immutable version directory
-        ├── scripted_model.pt     # TorchScript dense model
+        ├── scripted_model.pt     # TorchScript dense model (default)
+        ├── aoti/
+        │   └── aoti_model.pt2    # CUDA AOTInductor dense model (ENABLE_AOT)
         ├── dense_meta.json       # Placeholder -> serving embedding mapping
         ├── graph/                # Graph dump for debugging
         └── READY                 # Completion marker written before the switch
@@ -41,6 +40,10 @@ current.json (manifest v2):
 
 - Build each version under a temporary directory, write ``READY``, then rename
   it atomically into place.
+- When ``ENABLE_AOT`` is set (``ENABLE_AOT=1`` or ``2``), each version emits
+  ``aoti/aoti_model.pt2`` instead of ``scripted_model.pt``. The training/export
+  GPU SM architecture must match the online serving GPU SM architecture, and a
+  live serving process must not mix ``.pt`` and ``.pt2`` versions.
 - ``current.json`` flips only when the version's dense pairing step
   (``checkpoint_step``) is <= the cross-rank sparse upload watermark, and
   ``sparse_step`` records that watermark at flip time, so
@@ -58,6 +61,7 @@ current.json (manifest v2):
   superseded by a newer build before it was published is removed.
 """
 
+import contextlib
 import datetime
 import json
 import os
@@ -248,6 +252,36 @@ def _is_remote_path(path: str) -> bool:
     return split_protocol(path)[0] is not None
 
 
+def validate_online_dense_export_pipeline_config(
+    pipeline_config: Any,
+) -> None:
+    """Reject pipeline configs whose model layout is unsupported online.
+
+    Args:
+        pipeline_config: Loaded or stubbed pipeline config to validate.
+
+    Raises:
+        RuntimeError: When ``pipeline_config`` configures ``BaseGenRecModel``.
+    """
+    model_cfg = getattr(pipeline_config, "model_config", None)
+    model_type = (
+        model_cfg.WhichOneof("model")
+        if model_cfg is not None and hasattr(model_cfg, "WhichOneof")
+        else None
+    )
+    has_prompt = (
+        pipeline_config.HasField("prompt_config")
+        if hasattr(pipeline_config, "HasField")
+        else bool(getattr(pipeline_config, "prompt_config", None))
+    )
+    if has_prompt or model_type == "genrec_causal_lm_model":
+        raise RuntimeError(
+            "ONLINE_DENSE_EXPORT does not support BaseGenRecModel models "
+            "(requires compiled_prompt and HF weights layout); use the full "
+            "export (export_model) instead."
+        )
+
+
 class OnlineDenseExportManager:
     """In-process online-learning dense model export.
 
@@ -279,6 +313,9 @@ class OnlineDenseExportManager:
         publish_interval_minutes: Optional[int] = None,
     ) -> None:
         self._enabled = _online_dense_export_enabled()
+        self._is_aot = acc_utils.is_aot()
+        self._mixed_precision: Optional[str] = None
+        self._input_tile_3_online: Optional[bool] = None
         self._rank = int(os.environ.get("RANK", 0))
         self._cond = Condition()
         self._pending: Optional[Dict[str, Any]] = None
@@ -331,6 +368,10 @@ class OnlineDenseExportManager:
         if not acc_utils.use_distributed_embedding():
             raise RuntimeError(
                 "ONLINE_DENSE_EXPORT=1 requires USE_DISTRIBUTED_EMBEDDING=1."
+            )
+        if self._is_aot and not torch.cuda.is_available():
+            raise RuntimeError(
+                "ONLINE_DENSE_EXPORT=1 with ENABLE_AOT requires a CUDA device."
             )
         # fail fast on a misconfigured retention K instead of at prune time,
         # where the worker's exception guard would swallow it and silently
@@ -434,11 +475,12 @@ class OnlineDenseExportManager:
         """
         # lazy import: tzrec.main imports this module
         from tzrec.main import _create_features, _create_model
+        from tzrec.models.genrec_model import BaseGenRecModel
         from tzrec.models.match_model import MatchModel
         from tzrec.models.model import ScriptWrapper
         from tzrec.models.tdm import TDM
 
-        device = torch.device("cpu")
+        device = torch.device("cuda:0") if self._is_aot else torch.device("cpu")
         with acc_utils.export_env_scope(
             use_distributed_embedding=True,
             input_tile="3",
@@ -448,35 +490,46 @@ class OnlineDenseExportManager:
             pipeline_config = config_util.load_pipeline_config(
                 self._pipeline_config_path
             )
+            validate_online_dense_export_pipeline_config(pipeline_config)
             features = _create_features(
                 list(pipeline_config.feature_configs), pipeline_config.data_config
             )
+            self._input_tile_3_online = acc_utils.is_input_tile_3_online()
             twin_model = _create_model(
                 pipeline_config.model_config,
                 features,
                 list(pipeline_config.data_config.label_fields),
                 sampler_type=None,
             )
-            if isinstance(twin_model, (MatchModel, TDM)):
+            if isinstance(twin_model, (MatchModel, TDM, BaseGenRecModel)):
                 # The full export emits per-tower (MatchModel) or per-module
-                # (TDM) artifacts; a single monolithic dense export cannot
-                # mirror that layout, so a hot swap would load an
-                # incompatible artifact.
+                # (TDM) artifacts, or HF assets (BaseGenRecModel); a single
+                # monolithic dense export cannot mirror that layout.
                 raise RuntimeError(
                     f"ONLINE_DENSE_EXPORT does not support "
                     f"{type(twin_model).__name__} models; use the full export "
                     "(export_model) instead."
                 )
             twin_model = ScriptWrapper(twin_model)
+            if self._is_aot:
+                torch.cuda.set_device(device)
+                acc_utils.allow_tf32_for_export(pipeline_config, mutate_globals=False)
+                self._mixed_precision = acc_utils.mixed_precision_for_export(
+                    pipeline_config
+                )
             warmup_data = create_dense_export_warmup_data(
                 pipeline_config,
                 twin_model,
                 device,
             )
             gm, full_graph, dense_graph_config = build_dense_graph_module(
-                twin_model, warmup_data, device
+                twin_model,
+                warmup_data,
+                device,
+                mixed_precision=self._mixed_precision,
             )
-            # Fail fast on trace/script errors instead of at the first export.
+            # Fail fast on trace/script/AOTI errors instead of at the first
+            # export (and warm TORCHINDUCTOR_CACHE_DIR under ENABLE_AOT).
             # Tracing happens here on the main thread and the traced module is
             # reused by every export; fx-tracing on the worker would patch
             # nn.Module.__call__ process-wide and race training forwards.
@@ -491,6 +544,7 @@ class OnlineDenseExportManager:
                     device,
                     dry_run_dir,
                     dense_graph_config,
+                    mixed_precision=self._mixed_precision,
                 )
 
         source_keys = model.state_dict()
@@ -820,7 +874,7 @@ class OnlineDenseExportManager:
                 logger.exception("online dense export task failed; continuing")
 
     def _run_task(self, task: Dict[str, Any]) -> None:
-        """Load the snapshot into the resident graph, script it, mark it ready.
+        """Load the snapshot into the resident graph, compile it, mark it ready.
 
         Builds the immutable version directory (READY marker + atomic
         rename) but does not flip current.json: the finished version is
@@ -835,7 +889,7 @@ class OnlineDenseExportManager:
         versions_root = os.path.join(self._export_root, VERSIONS_DIR)
         version_dir = os.path.join(versions_root, version)
         tmp_dir = f"{version_dir}.tmp.{os.getpid()}"
-        device = torch.device("cpu")
+        device = torch.device("cuda:0") if self._is_aot else torch.device("cpu")
         start_time = time.monotonic()
         logger.info(
             "start online dense export version %s (step %s)", version, task["step"]
@@ -852,19 +906,41 @@ class OnlineDenseExportManager:
             assert self._warmup_data is not None
             assert self._dense_graph_config is not None
             assert self._dense_model_traced is not None
-            # load_state_dict copies in place and the traced module shares these
-            # parameters, so it carries the reloaded weights without re-tracing.
-            self._gm.load_state_dict(task["snapshot"])
-            finalize_dense_export(
-                self._twin_model,
-                self._full_graph,
-                self._gm,
-                self._warmup_data,
-                device,
-                tmp_dir,
-                self._dense_graph_config,
-                dense_model_traced=self._dense_model_traced,
+            export_stream: Optional[torch.cuda.Stream] = None
+            if self._is_aot:
+                torch.cuda.set_device(device)
+                # Isolate H2D snapshot copies and AOTI export on a dedicated
+                # stream so the worker does not serialize on training work.
+                export_stream = torch.cuda.Stream(device=device)
+            stream_ctx = (
+                torch.cuda.stream(export_stream)
+                if export_stream is not None
+                else contextlib.nullcontext()
             )
+            with (
+                stream_ctx,
+                acc_utils.export_env_scope(
+                    use_distributed_embedding=True,
+                    input_tile="3",
+                    input_tile_3_online=self._input_tile_3_online,
+                ),
+            ):
+                # load_state_dict copies in place; the traced module shares
+                # these parameters without re-tracing.
+                self._gm.load_state_dict(task["snapshot"])
+                finalize_dense_export(
+                    self._twin_model,
+                    self._full_graph,
+                    self._gm,
+                    self._warmup_data,
+                    device,
+                    tmp_dir,
+                    self._dense_graph_config,
+                    dense_model_traced=self._dense_model_traced,
+                    mixed_precision=self._mixed_precision,
+                )
+            if export_stream is not None:
+                export_stream.synchronize()
             ready_path = os.path.join(tmp_dir, "READY")
             with open(ready_path, "w") as f:
                 f.write(_utc_now())

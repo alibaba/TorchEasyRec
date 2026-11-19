@@ -554,33 +554,57 @@ def allow_tf32(config: Union[TrainConfig, ExportConfig]) -> None:
         torch.backends.cuda.matmul.allow_tf32 = config.cuda_matmul_allow_tf32
 
 
-def allow_tf32_for_export(pipeline_config: EasyRecConfig) -> None:
-    """Apply TF32 flags for AOTI export.
+def allow_tf32_for_export(
+    pipeline_config: EasyRecConfig, mutate_globals: bool = True
+) -> None:
+    """Apply or validate TF32 flags for AOTI export.
 
-    Warns when ``train_config`` and ``export_config`` are both
-    explicitly set on a field and disagree, then applies train_config
-    first and export_config second so train applies for fields export
-    leaves untouched and export wins where set. Must run BEFORE
-    ``torch.export.export()`` so AOTI captures the resolved
-    ``torch.backends`` globals into Triton ``ALLOW_TF32`` constexprs.
+    Args:
+        pipeline_config: pipeline config providing ``train_config`` and
+            ``export_config`` TF32 preferences.
+        mutate_globals: when True, applies ``train_config`` first and
+            ``export_config`` second (logging overrides when both disagree);
+            when False, leaves process-global ``torch.backends`` flags
+            untouched and warns if live training flags differ.
     """
     train_cfg = pipeline_config.train_config
     export_cfg = pipeline_config.export_config
-    for field in ("cudnn_allow_tf32", "cuda_matmul_allow_tf32"):
-        if (
-            train_cfg.HasField(field)
-            and export_cfg.HasField(field)
-            and getattr(train_cfg, field) != getattr(export_cfg, field)
-        ):
+    if mutate_globals:
+        for field in ("cudnn_allow_tf32", "cuda_matmul_allow_tf32"):
+            if (
+                train_cfg.HasField(field)
+                and export_cfg.HasField(field)
+                and getattr(train_cfg, field) != getattr(export_cfg, field)
+            ):
+                logger.warning(
+                    "export_config.%s=%s overrides train_config.%s=%s",
+                    field,
+                    getattr(export_cfg, field),
+                    field,
+                    getattr(train_cfg, field),
+                )
+        allow_tf32(train_cfg)
+        allow_tf32(export_cfg)
+        return
+
+    live_values = {
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+    }
+    for field, live in live_values.items():
+        desired: Optional[bool] = None
+        if export_cfg.HasField(field):
+            desired = getattr(export_cfg, field)
+        elif train_cfg.HasField(field):
+            desired = getattr(train_cfg, field)
+        if desired is not None and desired != live:
             logger.warning(
-                "export_config.%s=%s overrides train_config.%s=%s",
+                "Concurrent background AOTI export keeps live training %s=%s "
+                "(configured=%s) to avoid mutating process-global TF32 state.",
                 field,
-                getattr(export_cfg, field),
-                field,
-                getattr(train_cfg, field),
+                live,
+                desired,
             )
-    allow_tf32(train_cfg)
-    allow_tf32(export_cfg)
 
 
 def canonical_contiguous(tensor: torch.Tensor) -> torch.Tensor:
