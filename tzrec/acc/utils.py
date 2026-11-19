@@ -119,6 +119,18 @@ def is_input_tile_emb() -> bool:
     return False
 
 
+def is_input_tile_user_keyed_tensor(name: str) -> bool:
+    """Return whether a split KeyedTensor name is the INPUT_TILE=3 user side.
+
+    Args:
+        name: placeholder or KeyedTensor group name.
+
+    Returns:
+        True for ``__ebc_user`` or ``__mc_ebc_user`` suffixes.
+    """
+    return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
+
+
 def is_input_tile_3_online() -> bool:
     """Judge is the sequential tensor use jt.values() directly or not.
 
@@ -221,7 +233,18 @@ def is_unified_aot_predict(model_path: str) -> bool:
 
 
 def is_aot_predict(model_path: str) -> bool:
-    """Judge is aot or not in predict (ENABLE_AOT={1,2})."""
+    """Judge whether the exported model uses AOTI in predict (ENABLE_AOT={1,2}).
+
+    Reads ``ENABLE_AOT`` (or legacy ``UNIFIED_AOT``) from model_acc.json,
+    falling back to file presence (``aoti/aoti_model.pt2`` without
+    ``scripted_model.pt``) when model_acc.json is missing or omits both keys.
+
+    Args:
+        model_path: exported model directory.
+
+    Returns:
+        True when prediction should load an AOTInductor package.
+    """
     acc_json_path = os.path.join(model_path, "model_acc.json")
     if os.path.exists(acc_json_path):
         with open(acc_json_path, "r", encoding="utf-8") as file:

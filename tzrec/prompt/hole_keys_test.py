@@ -238,6 +238,48 @@ class HoleKeyBuilderTest(unittest.TestCase):
         self.assertEqual(keys.numel(), 0)
         self.assertEqual(keys.dtype, torch.int64)
 
+    def test_golden_hole_key_values(self) -> None:
+        """Exact int64 keys match the pre-refactor formula across builds."""
+        plan = _plan(
+            (
+                _slot(
+                    "ctx",
+                    feature_names=("ctx_id", "ctx_vec"),
+                    group_type=FeatureGroupType.DEEP,
+                    slot_id=0,
+                ),
+                _slot(
+                    "hist",
+                    feature_names=("hist_id", "hist_mv"),
+                    group_type=FeatureGroupType.JAGGED_SEQUENCE,
+                    slot_id=1,
+                ),
+            )
+        )
+        batch = _tensors(
+            {
+                "ctx_id.values": np.array([7, 11], dtype=np.int64),
+                "ctx_id.lengths": np.array([2, 0], dtype=np.int64),
+                "ctx_vec.values": np.array(
+                    [[0.5, float("-inf")], [float("nan"), -1.25]], dtype=np.float32
+                ),
+                "hist_id.values": np.array([100, 200], dtype=np.int64),
+                "hist_id.lengths": np.array([2, 0], dtype=np.int64),
+                "hist_mv.values": np.array([3, 4, 5], dtype=np.int64),
+                "hist_mv.lengths": np.array([2, 0], dtype=np.int64),
+                "hist_mv.key_lengths": np.array([2, 1], dtype=np.int64),
+            }
+        )
+        self.assertEqual(
+            HoleKeyBuilder(plan)(batch).tolist(),
+            [
+                5725696216062345785,
+                -7885223075814977969,
+                426601094493070354,
+                -556887799052857370,
+            ],
+        )
+
     def test_scripting_preserves_the_keys(self) -> None:
         """The exported front-end folds exactly what the eager module does."""
         module = HoleKeyBuilder(

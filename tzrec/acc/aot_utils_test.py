@@ -30,6 +30,7 @@ from tzrec.acc.aot_utils import (
     _build_distributed_dense_dynamic_shapes,
     _build_dynamic_shapes,
     _compile_and_package_aoti,
+    _pad_distributed_dense_sample_inputs,
     _pad_empty_sparse_values,
     _prepare_distributed_dense_sample_inputs,
     export_distributed_dense_model_aot,
@@ -991,7 +992,7 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
         gm = torch.fx.symbolic_trace(DummyDenseGraph())
         data = {
             "u_w.lengths": torch.ones(user_bs, dtype=torch.int64),
-            "u_seq__mv.lengths": torch.tensor([1, 0], dtype=torch.int64),
+            "u_seq__mv.lengths": torch.tensor([0, 0], dtype=torch.int64),
             "u_seq__mv.key_lengths": torch.empty(0, dtype=torch.int64),
             "u_seq__raw.values": torch.empty((0, 2), dtype=torch.float32),
             "u_seq__raw.lengths": torch.tensor([0, 0], dtype=torch.int64),
@@ -1103,6 +1104,34 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
             self.assertEqual(sample_data["u_seq__mv.key_lengths"].shape[0], 2)
             self.assertEqual(sample_data["u_seq__mv"].shape[0], 2)
             self.assertEqual(sample_data["j_seq__id"].shape[0], 2)
+            self.assertEqual(
+                int(sample_data["u_seq__mv.lengths"].sum()),
+                sample_data["u_seq__mv.key_lengths"].numel(),
+            )
+            self.assertEqual(
+                int(sample_data["u_seq__mv.key_lengths"].sum()),
+                sample_data["u_seq__mv"].shape[0],
+            )
+            self.assertEqual(
+                int(sample_data["u_seq__mv__lengths"].sum()),
+                sample_data["u_seq__mv"].shape[0],
+            )
+            self.assertEqual(
+                int(sample_data["u_seq__id__lengths"].sum()),
+                sample_data["u_seq__id"].shape[0],
+            )
+            self.assertEqual(
+                int(sample_data["u_seq__raw.lengths"].sum()),
+                sample_data["u_seq__raw.values"].shape[0],
+            )
+            self.assertEqual(
+                int(sample_data["i_id@seq__lengths"].sum()),
+                sample_data["i_id@seq"].shape[0],
+            )
+            self.assertEqual(
+                int(sample_data["j_seq__id__lengths"].sum()),
+                sample_data["j_seq__id"].shape[0],
+            )
 
             shapes = _build_distributed_dense_dynamic_shapes(
                 sample_data=sample_data,
@@ -1253,6 +1282,106 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
             self.assertEqual(
                 shapes["u_seq__id__lengths"][0],
                 shapes["u_seq__raw.lengths"][0],
+            )
+
+    def test_pad_distributed_dense_step3_zero_mulval_subtokens(self):
+        device = (
+            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        (
+            features,
+            feature_groups,
+            gm,
+            data,
+            sparse_kts,
+            seq_jts,
+            dense_graph_config,
+            _,
+        ) = self._build_distributed_dense_sample_fixture(user_bs=2, item_bs=4)
+
+        # Sequence has 2 steps on sample 1 ([0, 2]) so step-2 padding does not
+        # fire, while multi-value sub-token counts are all zero (key_lengths=[0, 0]).
+        data["u_seq__mv.lengths"] = torch.tensor([0, 2], dtype=torch.int64)
+        data["u_seq__mv.key_lengths"] = torch.tensor([0, 0], dtype=torch.int64)
+        data["u_seq__mv.values"] = torch.empty(0, dtype=torch.int64)
+        data["u_seq__raw.values"] = torch.zeros((2, 2), dtype=torch.float32)
+        data["u_seq__raw.lengths"] = torch.tensor([0, 2], dtype=torch.int64)
+        seq_jts["u_seq__id"] = JaggedTensor(
+            values=torch.zeros((2, 4), dtype=torch.float32),
+            lengths=torch.tensor([0, 2], dtype=torch.int64),
+        )
+        seq_jts["u_seq__mv"] = JaggedTensor(
+            values=torch.empty((0, 4), dtype=torch.float32),
+            lengths=torch.tensor([0, 0], dtype=torch.int64),
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "USE_DISTRIBUTED_EMBEDDING": "1",
+                "INPUT_TILE": "3",
+                "INPUT_TILE_3_ONLINE": "0",
+                "HARD_SEARCH_INPUT_TILE": "1",
+            },
+        ):
+            sample_data = _prepare_distributed_dense_sample_inputs(
+                gm=gm,
+                data=data,
+                sparse_kts=sparse_kts,
+                seq_jts=seq_jts,
+                features=features,
+                feature_groups=feature_groups,
+                device=device,
+            )
+            self.assertEqual(sample_data["u_seq__mv.lengths"].tolist(), [0, 2])
+            self.assertEqual(sample_data["u_seq__mv.key_lengths"].tolist(), [2, 0])
+            self.assertEqual(sample_data["u_seq__mv"].shape[0], 2)
+            self.assertEqual(sample_data["u_seq__mv__lengths"].tolist(), [0, 2])
+            self.assertEqual(
+                int(sample_data["u_seq__mv.key_lengths"].sum()),
+                sample_data["u_seq__mv"].shape[0],
+            )
+            self.assertEqual(
+                int(sample_data["u_seq__mv__lengths"].sum()),
+                sample_data["u_seq__mv"].shape[0],
+            )
+
+            # Also verify step-3 padding when raw .values is present (GenRec case).
+            raw_sample = dict(sample_data)
+            raw_sample["u_seq__mv"] = torch.empty(
+                (0, 4), dtype=torch.float32, device=device
+            )
+            raw_sample["u_seq__mv__lengths"] = torch.tensor(
+                [0, 0], dtype=torch.int32, device=device
+            )
+            raw_sample["u_seq__mv.key_lengths"] = torch.tensor(
+                [0, 0], dtype=torch.int64, device=device
+            )
+            raw_sample["u_seq__mv.values"] = torch.empty(
+                0, dtype=torch.int64, device=device
+            )
+            padded = _pad_distributed_dense_sample_inputs(
+                raw_sample, seq_jts, features, feature_groups
+            )
+            self.assertEqual(padded["u_seq__mv.key_lengths"].tolist(), [2, 0])
+            self.assertEqual(padded["u_seq__mv"].shape[0], 2)
+            self.assertEqual(padded["u_seq__mv.values"].shape[0], 2)
+            self.assertEqual(padded["u_seq__mv__lengths"].tolist(), [0, 2])
+
+            shapes = _build_distributed_dense_dynamic_shapes(
+                sample_data=sample_data,
+                gm=gm,
+                dense_graph_config=dense_graph_config,
+                features=features,
+                feature_groups=feature_groups,
+            )
+            self.assertEqual(
+                shapes["u_seq__id"][0],
+                shapes["u_seq__mv.key_lengths"][0],
+            )
+            self.assertNotEqual(
+                shapes["u_seq__mv"][0],
+                shapes["u_seq__mv.key_lengths"][0],
             )
 
     @parameterized.expand(

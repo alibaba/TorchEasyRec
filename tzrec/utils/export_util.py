@@ -62,7 +62,11 @@ from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot, export_unified_model_aot
 from tzrec.acc.trt_utils import export_model_trt
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
-from tzrec.datasets.data_parser import _infer_tile_size, _tile_size
+from tzrec.datasets.data_parser import (
+    _infer_tile_size,
+    _tile_size,
+    classify_raw_batch_dim_key,
+)
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
@@ -313,11 +317,6 @@ def ensure_input_tile_for_distributed_embedding(
         )
         resolved_input_tile = "3"
     return True, resolved_input_tile
-
-
-def _is_input_tile_user_keyed_tensor(name: str) -> bool:
-    """Whether a split KeyedTensor is the INPUT_TILE=3 user sparse side."""
-    return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
 
 
 def _dedup_key_files_by_realpath(key_files: List[str]) -> List[str]:
@@ -895,13 +894,16 @@ def _classify_serving_batch_node(
     feat_by_name: Dict[str, BaseFeature],
     hsk_feats: Set[str],
 ) -> Optional[str]:
-    """Classify a serving placeholder key as 'item', 'user', or None."""
+    """Classify a serving placeholder key as 'item', 'user', or None.
+
+    Handles rewritten distributed embedding keys directly and delegates raw
+    feature / ``__inverse_indices`` keys to ``classify_raw_batch_dim_key`` so
+    graph surgery and ``DataParser._resolve_tile_size`` share one contract.
+    """
     if key.endswith("__ebc") or key.endswith("__mc_ebc"):
         return "item"
-    if key.endswith("__ebc_user") or key.endswith("__mc_ebc_user"):
+    if acc_utils.is_input_tile_user_keyed_tensor(key):
         return "user"
-    if key.endswith("__inverse_indices"):
-        return "item"
     if key.endswith("__lengths"):
         raw_name = key[: -len("__lengths")].split("@", 1)[0]
         if raw_name in hsk_feats:
@@ -910,26 +912,9 @@ def _classify_serving_batch_node(
         if feat is not None and feat.is_user_feat:
             return "user"
         return "item"
-    if key.endswith(".values"):
-        feat_name = key[: -len(".values")]
-        if feat_name in hsk_feats:
-            return None
-        feat = feat_by_name.get(feat_name)
-        if feat is not None and not feat.is_sparse and not feat.is_sequence:
-            return "user" if feat.is_user_feat else "item"
-        return None
-    if key.endswith(".lengths"):
-        feat_name = key[: -len(".lengths")]
-        if feat_name in hsk_feats:
-            return None
-        feat = feat_by_name.get(feat_name)
-        if feat is not None and (
-            (not feat.is_sparse and feat.is_sequence)
-            or (feat.is_sparse and feat.is_sequence and feat.value_dim != 1)
-        ):
-            return "user" if feat.is_user_feat else "item"
-        return None
-    return None
+    return classify_raw_batch_dim_key(
+        key, feat_by_name, hsk_feats, use_distributed_embedding=True
+    )
 
 
 def _rewrite_tile_size_nodes(
@@ -984,6 +969,13 @@ def _rewrite_tile_size_nodes(
                 _infer_tile_size, args=(item_t, user_t)
             )
     else:
+        if acc_utils.is_input_tile_3_online():
+            missing_side = "item" if item_t is None else "user"
+            raise ValueError(
+                "INPUT_TILE_3_ONLINE=1 requires both user and item inputs in "
+                f"the dense graph to infer a dynamic tile factor, but no "
+                f"{missing_side} input remained."
+            )
         with graph.inserting_after(last_placeholder):
             batch_size_node = graph.call_function(
                 operator.getitem, args=(input_node, "batch_size")
@@ -991,6 +983,8 @@ def _rewrite_tile_size_nodes(
         with graph.inserting_after(batch_size_node):
             unified_tile_node = graph.call_function(_tile_size, args=(batch_size_node,))
 
+    # Keep wrapped tile helpers opaque across downstream symbolic_trace(gm).
+    unified_tile_node.meta["is_wrapped"] = True
     for tile_node in tile_nodes:
         tile_node.replace_all_uses_with(unified_tile_node)
 
@@ -1095,13 +1089,16 @@ def _rewrite_dense_serving_graph(
                     operator.getitem, args=(input_node, name)
                 )
                 values_node = getitem_node
-                if not disable_input_tile and _is_input_tile_user_keyed_tensor(name):
+                if not disable_input_tile and acc_utils.is_input_tile_user_keyed_tensor(
+                    name
+                ):
                     batch_size_node = graph.call_function(
                         operator.getitem, args=(input_node, "batch_size")
                     )
                     tile_size_node = graph.call_function(
                         _tile_size, args=(batch_size_node,)
                     )
+                    tile_size_node.meta["is_wrapped"] = True
                     values_node = graph.call_method(
                         "tile", args=(getitem_node, tile_size_node, 1)
                     )
@@ -3012,6 +3009,11 @@ def export_dense_model_cpu(
     exported model can never carry uninitialized weights.
     """
     del assets, use_local_cache_dir, kwargs
+    if acc_utils.is_aot():
+        raise ValueError(
+            "export_dense_model_cpu does not support ENABLE_AOT; AOTI dense "
+            "export requires a CUDA device."
+        )
     if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 

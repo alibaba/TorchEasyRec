@@ -378,8 +378,9 @@ class GenRecFrontEnd(nn.Module):
         ):
             raise ValueError(
                 "the genrec front-end is exported with TorchScript or distributed "
-                "AOT only: its prompt walk has data-dependent shapes, which unified "
-                "AOT, TRT and RTP export cannot capture. Unset ENABLE_AOT / "
+                "AOT only: its prompt walk has data-dependent shapes, which "
+                "non-distributed AOT, TRT and RTP export cannot capture. Set "
+                "USE_DISTRIBUTED_EMBEDDING=1 for AOT, or unset ENABLE_AOT / "
                 "ENABLE_TRT / USE_RTP."
             )
         self.embedding_group = model.embedding_group

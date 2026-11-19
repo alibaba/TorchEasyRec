@@ -31,6 +31,7 @@ from tzrec.acc.utils import (
     is_autotune_with_sample_inputs,
     is_input_tile,
     is_input_tile_3_online,
+    is_input_tile_user_keyed_tensor,
     is_portable_cpu_aot,
     is_unified_aot_predict,
 )
@@ -431,7 +432,16 @@ def _collect_sequence_dim_groups(
     features: List[BaseFeature],
     feature_groups: List[model_pb2.FeatureGroupConfig],
 ) -> Tuple[Dict[str, str], Set[str], Set[str], Set[str]]:
-    """Collect shared sequence Dim group mappings and JAGGED_SEQUENCE flags."""
+    """Collect shared sequence Dim group mappings and JAGGED_SEQUENCE flags.
+
+    Args:
+        features: model feature definitions.
+        feature_groups: model feature group configs.
+
+    Returns:
+        Tuple of ``(feat_to_seq_dim_group, seq_feat_names,
+        jagged_seq_feat_names, jagged_seq_groups)``.
+    """
     from tzrec.protos.model_pb2 import FeatureGroupType
 
     # Features in the same SequenceFeature config share per-sample lengths,
@@ -744,11 +754,6 @@ def export_unified_model_aot(
     return save_dir
 
 
-def _is_input_tile_user_keyed_tensor(name: str) -> bool:
-    """Whether a split KeyedTensor is the INPUT_TILE=3 user sparse side."""
-    return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
-
-
 def _extract_distributed_dense_consumed_keys(
     gm: torch.fx.GraphModule, data: Dict[str, torch.Tensor]
 ) -> Set[str]:
@@ -784,18 +789,32 @@ def _extract_distributed_dense_consumed_keys(
     return consumed_keys
 
 
+def _increment_length_at(
+    sample_data: Dict[str, torch.Tensor], key: str, index: int, delta: int
+) -> None:
+    """Increment one entry of a length tensor without mutating in place.
+
+    Args:
+        sample_data: sample tensor dictionary to update.
+        key: length tensor key in ``sample_data``.
+        index: element index in ``sample_data[key]`` to increment.
+        delta: positive length increment to add.
+    """
+    if key not in sample_data:
+        return
+    lengths = sample_data[key]
+    if index < 0 or index >= lengths.numel():
+        return
+    updated = lengths.clone()
+    updated[index] = updated[index] + delta
+    sample_data[key] = updated
+
+
 def _increment_first_length(
     sample_data: Dict[str, torch.Tensor], key: str, delta: int
 ) -> None:
     """Increment the first entry of a non-empty length tensor without mutating."""
-    if key not in sample_data:
-        return
-    lengths = sample_data[key]
-    if lengths.numel() == 0:
-        return
-    updated = lengths.clone()
-    updated[0] = updated[0] + delta
-    sample_data[key] = updated
+    _increment_length_at(sample_data, key, 0, delta)
 
 
 def _pad_rows_zeros(sample_data: Dict[str, torch.Tensor], key: str, pad_n: int) -> None:
@@ -920,12 +939,22 @@ def _pad_distributed_dense_sample_inputs(
             kl_key = f"{feat.name}.key_lengths"
             if kl_key not in sample_data or sample_data[kl_key].numel() == 0:
                 continue
+            seq_lengths_key = f"{feat.name}.lengths"
+            owner_sample = 0
+            if seq_lengths_key in sample_data:
+                nonzero = torch.nonzero(
+                    sample_data[seq_lengths_key] > 0, as_tuple=False
+                )
+                if nonzero.numel() > 0:
+                    owner_sample = int(nonzero[0].item())
             pad_delta = 0
             for ec_key in raw_name_to_ec_keys.get(feat.name, []):
                 if ec_key in sample_data and sample_data[ec_key].size(0) < 2:
                     pad_vals = 2 - int(sample_data[ec_key].size(0))
                     _pad_rows_zeros(sample_data, ec_key, pad_vals)
-                    _increment_first_length(sample_data, f"{ec_key}__lengths", pad_vals)
+                    _increment_length_at(
+                        sample_data, f"{ec_key}__lengths", owner_sample, pad_vals
+                    )
                     pad_delta = max(pad_delta, pad_vals)
             raw_vals_key = f"{feat.name}.values"
             if raw_vals_key in sample_data and sample_data[raw_vals_key].size(0) < 2:
@@ -1012,7 +1041,7 @@ def _prepare_distributed_dense_sample_inputs(
         if name not in consumed_keys:
             continue
         val = kt.values()
-        if _is_input_tile_user_keyed_tensor(name):
+        if is_input_tile_user_keyed_tensor(name):
             # EmbeddingGroupImpl marks __ebc_user / __mc_ebc_user after tiling;
             # slice back to pre-tile user_bs so sample inputs match the dense graph.
             target_rows = user_bs
@@ -1097,12 +1126,12 @@ def _build_distributed_dense_dynamic_shapes(
     ebc_item_names = {
         k
         for k in dense_graph_config
-        if k != "sequence__ec" and not _is_input_tile_user_keyed_tensor(k)
+        if k != "sequence__ec" and not is_input_tile_user_keyed_tensor(k)
     }
     ebc_user_names = {
         k
         for k in dense_graph_config
-        if k != "sequence__ec" and _is_input_tile_user_keyed_tensor(k)
+        if k != "sequence__ec" and is_input_tile_user_keyed_tensor(k)
     }
 
     batch = torch.export.Dim("batch", min=1, max=499999999)
@@ -1175,7 +1204,7 @@ def _build_distributed_dense_dynamic_shapes(
             dynamic_shapes[key] = {}
         elif key in ebc_item_names or key.endswith("__ebc") or key.endswith("__mc_ebc"):
             dynamic_shapes[key] = {0: batch}
-        elif key in ebc_user_names or _is_input_tile_user_keyed_tensor(key):
+        elif key in ebc_user_names or is_input_tile_user_keyed_tensor(key):
             dynamic_shapes[key] = (
                 {0: batch} if has_genrec else _user_batch_shape(key, tensor)
             )

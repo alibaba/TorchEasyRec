@@ -1252,6 +1252,43 @@ def _extract_script_required_keys(dense: torch.jit.ScriptModule) -> Set[str]:
     return required
 
 
+def _matches_sparse_copy_layout(
+    batch: Batch,
+    sparse_specs: List[Tuple[str, List[str]]],
+    mulval_specs: List[Tuple[str, List[str]]],
+    seq_dense_keys: List[str],
+) -> bool:
+    """Return whether ``batch`` matches the memoized KJT key layout.
+
+    Args:
+        batch: incoming predict batch.
+        sparse_specs: cached ``(group_name, kjt.keys())`` pairs.
+        mulval_specs: cached ``(group_name, kjt.keys())`` pairs for mulval lengths.
+        seq_dense_keys: cached sequence-dense feature keys.
+
+    Returns:
+        True when every group name and key order matches ``batch``.
+    """
+    if (
+        len(batch.sparse_features) != len(sparse_specs)
+        or len(batch.sequence_mulval_lengths) != len(mulval_specs)
+        or len(batch.sequence_dense_features) != len(seq_dense_keys)
+    ):
+        return False
+    for (name, keys), (b_name, kjt) in zip(sparse_specs, batch.sparse_features.items()):
+        if b_name != name or kjt.keys() != keys:
+            return False
+    for (name, keys), (b_name, kjt) in zip(
+        mulval_specs, batch.sequence_mulval_lengths.items()
+    ):
+        if b_name != name or kjt.keys() != keys:
+            return False
+    for name, b_name in zip(seq_dense_keys, batch.sequence_dense_features.keys()):
+        if b_name != name:
+            return False
+    return True
+
+
 class DistributedEmbeddingModel:
     """Predicts a distributed embedding export on a Batch.
 
@@ -1276,6 +1313,14 @@ class DistributedEmbeddingModel:
         self._required_keys: Set[str] = set()
         self._has_raw_sparse_candidates = False
         self._sparse_copy_keys_cache: Dict[Tuple[Any, ...], Tuple[str, ...]] = {}
+        self._fast_sparse_copy_entry: Optional[
+            Tuple[
+                List[Tuple[str, List[str]]],
+                List[Tuple[str, List[str]]],
+                List[str],
+                Tuple[str, ...],
+            ]
+        ] = None
 
         if self._is_aot:
             aoti_model_path = os.path.join(model_path, "aoti", "aoti_model.pt2")
@@ -1311,6 +1356,11 @@ class DistributedEmbeddingModel:
         """Return sparse KJT dict keys whose raw tensors the dense model reads."""
         if not self._has_raw_sparse_candidates or not batch.sparse_features:
             return ()
+        fast = self._fast_sparse_copy_entry
+        if fast is not None and _matches_sparse_copy_layout(
+            batch, fast[0], fast[1], fast[2]
+        ):
+            return fast[3]
         layout = (
             tuple(
                 (name, tuple(kjt.keys())) for name, kjt in batch.sparse_features.items()
@@ -1320,25 +1370,30 @@ class DistributedEmbeddingModel:
             ),
             tuple(batch.sequence_dense_features.keys()),
         )
-        cached = self._sparse_copy_keys_cache.get(layout)
-        if cached is not None:
-            return cached
-        mulval_or_seq_dense = set(layout[1]) | set(layout[2])
-        needed = tuple(
-            name
-            for name, keys in layout[0]
-            if any(
-                f"{k}.values" in self._required_keys
-                or f"{k}.weights" in self._required_keys
-                or f"{k}.key_lengths" in self._required_keys
-                or (
-                    f"{k}.lengths" in self._required_keys
-                    and k not in mulval_or_seq_dense
+        needed = self._sparse_copy_keys_cache.get(layout)
+        if needed is None:
+            mulval_or_seq_dense = set(layout[1]) | set(layout[2])
+            needed = tuple(
+                name
+                for name, keys in layout[0]
+                if any(
+                    f"{k}.values" in self._required_keys
+                    or f"{k}.weights" in self._required_keys
+                    or f"{k}.key_lengths" in self._required_keys
+                    or (
+                        f"{k}.lengths" in self._required_keys
+                        and k not in mulval_or_seq_dense
+                    )
+                    for k in keys
                 )
-                for k in keys
             )
+            self._sparse_copy_keys_cache[layout] = needed
+        self._fast_sparse_copy_entry = (
+            [(n, list(kjt.keys())) for n, kjt in batch.sparse_features.items()],
+            [(n, list(kjt.keys())) for n, kjt in batch.sequence_mulval_lengths.items()],
+            list(batch.sequence_dense_features.keys()),
+            needed,
         )
-        self._sparse_copy_keys_cache[layout] = needed
         return needed
 
     def __call__(

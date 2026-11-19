@@ -51,7 +51,7 @@ from torchrec.modules.mc_modules import (
 )
 
 from tzrec.acc import utils as acc_utils
-from tzrec.datasets.data_parser import DataParser
+from tzrec.datasets.data_parser import DataParser, _pad_hard_search_input_tile_lengths
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import FgMode, create_features
 from tzrec.models.deepfm import DeepFM
@@ -63,7 +63,12 @@ from tzrec.modules.dense_embedding_collection import (
     DenseEmbeddingCollection,
     MLPDenseEmbeddingConfig,
 )
-from tzrec.modules.embedding import EmbeddingGroup, EmbeddingGroupImpl
+from tzrec.modules.embedding import (
+    EmbeddingGroup,
+    EmbeddingGroupImpl,
+    _expand_hard_search_input_tile,
+)
+from tzrec.modules.utils import BaseModule
 from tzrec.protos import (
     data_pb2,
     feature_pb2,
@@ -4226,6 +4231,30 @@ class DistributedEmbeddingAOTExportTest(unittest.TestCase):
                 k: v for k, v in data.items() if not k.startswith(("u_id", "i_id"))
             }
             self.assertEqual(dp._resolve_tile_size(sparse_omitted), 3)
+            self.assertEqual(
+                dp._tile_size_keys_cache[True], ("i_dense.values", "u_dense.values")
+            )
+            with acc_utils.export_env_scope(use_distributed_embedding=False):
+                self.assertEqual(dp._resolve_tile_size(data), 3)
+                self.assertEqual(
+                    dp._tile_size_keys_cache[False], ("i_id.lengths", "u_id.lengths")
+                )
+
+            for bad_u, bad_i in ((0, 3), (2, 1), (2, 5)):
+                bad_data = {
+                    "u_dense.values": torch.randn(bad_u, 2),
+                    "i_dense.values": torch.randn(bad_i, 2),
+                }
+                with self.assertRaisesRegex(
+                    ValueError, "Invalid input-tile batch dims"
+                ):
+                    dp._resolve_tile_size(bad_data)
+
+            with self.assertRaisesRegex(ValueError, "inverse_indices length"):
+                _pad_hard_search_input_tile_lengths(
+                    torch.tensor([1, 2], dtype=torch.int64),
+                    torch.tensor([0], dtype=torch.int64),
+                )
 
             all_sparse = DataParser(create_features(cfgs[:2], fg_mode=FgMode.FG_DAG))
             self.assertEqual(
@@ -4312,6 +4341,144 @@ class DistributedEmbeddingAOTExportTest(unittest.TestCase):
             self.assertEqual(data["i_dense.values"].shape[0], 2)
             self.assertEqual(data["u_id.lengths"].numel(), 1 if online == "1" else 2)
             self.assertEqual(int(data["batch_size"]), 2 if online == "1" else 1)
+
+    @parameterized.expand(
+        [("offline_tile", "0"), ("online_tile", "1")],
+        name_func=parameterized_name_func,
+    )
+    def test_create_dense_export_warmup_data_duplicates_hard_search_inverse_indices(
+        self, _name, online
+    ):
+        cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="u_id",
+                    expression="user:u_id",
+                    num_buckets=16,
+                    embedding_dim=4,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="i_dense", expression="item:i_dense", value_dim=2
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="click_seq",
+                    sequence_length=4,
+                    hard_search_key="item:cat",
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="id",
+                                expression="item:id",
+                                num_buckets=16,
+                                embedding_dim=4,
+                            )
+                        )
+                    ],
+                )
+            ),
+        ]
+        fgs = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["u_id", "i_dense"],
+                group_type=model_pb2.DEEP,
+            ),
+            model_pb2.FeatureGroupConfig(
+                group_name="seq",
+                feature_names=["click_seq__id"],
+                group_type=model_pb2.SEQUENCE,
+            ),
+        ]
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ENABLE_AOT": "2",
+                "USE_DISTRIBUTED_EMBEDDING": "1",
+                "INPUT_TILE": "3",
+                "INPUT_TILE_3_ONLINE": online,
+                "HARD_SEARCH_INPUT_TILE": "1",
+                "MAX_EXPORT_BATCH_SIZE": "8",
+            },
+        ):
+            features = create_features(cfgs, fg_mode=FgMode.FG_DAG)
+
+            class TinyHskModel(BaseModule):
+                def __init__(self):
+                    super().__init__()
+                    self.features = features
+                    self.feature_groups = fgs
+                    self.embedding_group = EmbeddingGroup(features, fgs)
+
+                def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
+                    return self.embedding_group(batch)
+
+            hsk_model = TinyHskModel()
+            init_parameters(hsk_model, torch.device("cpu"))
+            wrapped = ScriptWrapper(hsk_model)
+            batch = Batch(
+                dense_features={
+                    BASE_DATA_GROUP: KeyedTensor.from_tensor_list(
+                        keys=["i_dense"], tensors=[torch.tensor([[0.5, -0.5]])]
+                    )
+                },
+                sparse_features={
+                    BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
+                        keys=["u_id", "click_seq__id"],
+                        values=torch.tensor([3, 5, 7]),
+                        lengths=torch.tensor([1, 2]),
+                    )
+                },
+                additional_infos={
+                    "batch_size": torch.tensor(1, dtype=torch.int64),
+                    "click_seq__id.lengths": torch.tensor([2], dtype=torch.int64),
+                    "click_seq__inverse_indices": torch.tensor([0], dtype=torch.int64),
+                },
+            )
+            cfg = EasyRecConfig(
+                train_input_path="dummy-path",
+                data_config=data_pb2.DataConfig(batch_size=128),
+            )
+            with mock.patch.object(
+                export_util, "create_dataloader", return_value=iter([batch])
+            ):
+                data = create_dense_export_warmup_data(
+                    cfg, wrapped, torch.device("cpu")
+                )
+
+            self.assertEqual(data["click_seq__inverse_indices"].tolist(), [0, 1])
+            self.assertEqual(data["click_seq__id.lengths"].tolist(), [2, 2])
+            compact = KeyedTensor(
+                keys=["click_seq__id"],
+                length_per_key=[1],
+                values=torch.tensor([[10.0], [20.0]]),
+            )
+            expanded = _expand_hard_search_input_tile(
+                compact,
+                [(0, 1, "click_seq__inverse_indices")],
+                data,
+            )
+            torch.testing.assert_close(
+                expanded.values(), torch.tensor([[10.0], [20.0]])
+            )
+            out = wrapped(data)
+            self.assertEqual(out["seq.sequence"].shape[0], 2)
+
+    def test_export_dense_model_cpu_rejects_enable_aot(self):
+        cfg = EasyRecConfig()
+        with (
+            mock.patch.dict(os.environ, {"ENABLE_AOT": "2"}),
+            self.assertRaisesRegex(ValueError, "export_dense_model_cpu"),
+        ):
+            export_dense_model_cpu(
+                pipeline_config=cfg,
+                model=torch.nn.Identity(),
+                checkpoint_path=os.path.join(self.test_dir, "ckpt"),
+                save_dir=self.export_dir,
+            )
 
     @parameterized.expand(
         [
@@ -4696,6 +4863,137 @@ class DistributedEmbeddingAOTExportTest(unittest.TestCase):
             with torch.no_grad():
                 out = aoti_model(test_in)
             self.assertEqual(out["probs"].shape[0], 5)
+
+    def test_rewrite_tile_size_nodes_infer_vs_batch_size_fallback(self):
+        cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="u_id",
+                    expression="user:u_id",
+                    num_buckets=16,
+                    embedding_dim=4,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="i_dense", expression="item:i_dense", value_dim=2
+                )
+            ),
+        ]
+        feats = create_features(cfgs, fg_mode=FgMode.FG_DAG)
+        device = torch.device("cpu")
+
+        class BothSidesModel(BaseModule):
+            def __init__(self):
+                super().__init__()
+                self.features = feats
+                self.embedding_group = EmbeddingGroup(
+                    feats,
+                    [
+                        model_pb2.FeatureGroupConfig(
+                            group_name="deep",
+                            feature_names=["u_id", "i_dense"],
+                            group_type=model_pb2.DEEP,
+                        )
+                    ],
+                )
+
+            def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
+                out = self.embedding_group(batch)
+                return {"probs": out["deep"]}
+
+        class UserOnlyConsumerModel(BaseModule):
+            def __init__(self):
+                super().__init__()
+                # Carry both user and item features so input-tile stays enabled,
+                # while only consuming u_id so item inputs are DCE-pruned.
+                self.features = feats
+                self.embedding_group = EmbeddingGroup(
+                    feats,
+                    [
+                        model_pb2.FeatureGroupConfig(
+                            group_name="deep",
+                            feature_names=["u_id"],
+                            group_type=model_pb2.DEEP,
+                        )
+                    ],
+                )
+
+            def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
+                out = self.embedding_group(batch)
+                return {"probs": out["deep"]}
+
+        data = {
+            "batch_size": torch.tensor(2, dtype=torch.int64, device=device),
+            "u_id.values": torch.zeros(2, dtype=torch.int64, device=device),
+            "u_id.lengths": torch.ones(2, dtype=torch.int64, device=device),
+            "i_dense.values": torch.randn(4, 2, device=device),
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "USE_DISTRIBUTED_EMBEDDING": "1",
+                "INPUT_TILE": "3",
+                "INPUT_TILE_3_ONLINE": "1",
+            },
+        ):
+            both = BothSidesModel()
+            init_parameters(both, device)
+            gm_both, _, cfg_both = build_dense_graph_module(
+                ScriptWrapper(both), data, device
+            )
+            self.assertIn("_infer_tile_size(", gm_both.code)
+            self.assertNotIn("data_parser__tile_size(", gm_both.code)
+            self.assertNotIn("batch_size", gm_both.code)
+            ebc_user_key = next(k for k in cfg_both if k.endswith("_user"))
+            out_both = gm_both(
+                {
+                    ebc_user_key: torch.randn(2, 4, device=device),
+                    "i_dense.values": torch.randn(6, 2, device=device),
+                    "batch_size": torch.tensor(99, dtype=torch.int64, device=device),
+                }
+            )
+            self.assertEqual(out_both["probs"].shape[0], 6)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "USE_DISTRIBUTED_EMBEDDING": "1",
+                "INPUT_TILE": "3",
+                "INPUT_TILE_3_ONLINE": "0",
+            },
+        ):
+            user_only = UserOnlyConsumerModel()
+            init_parameters(user_only, device)
+            gm_fb, _, cfg_fb = build_dense_graph_module(
+                ScriptWrapper(user_only), data, device
+            )
+            self.assertIn("_tile_size", gm_fb.code)
+            self.assertIn("batch_size", gm_fb.code)
+            ebc_user_key = next(k for k in cfg_fb if k.endswith("_user"))
+            out_fb = gm_fb(
+                {
+                    ebc_user_key: torch.randn(1, 4, device=device),
+                    "batch_size": torch.tensor(3, dtype=torch.int64, device=device),
+                }
+            )
+            self.assertEqual(out_fb["probs"].shape[0], 3)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "USE_DISTRIBUTED_EMBEDDING": "1",
+                    "INPUT_TILE": "3",
+                    "INPUT_TILE_3_ONLINE": "1",
+                },
+            ),
+            self.assertRaisesRegex(ValueError, "INPUT_TILE_3_ONLINE=1"),
+        ):
+            user_only_online = UserOnlyConsumerModel()
+            init_parameters(user_only_online, device)
+            build_dense_graph_module(ScriptWrapper(user_only_online), data, device)
 
     def test_genrec_export_forces_input_tile_zero_and_rejects_explicit_tile(
         self,

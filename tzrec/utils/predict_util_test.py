@@ -1989,6 +1989,90 @@ class DistributedScriptGenRecTest(unittest.TestCase):
         for key in expected:
             torch.testing.assert_close(out[key], expected[key], rtol=1e-5, atol=1e-5)
 
+    def test_needed_sparse_kjt_names_memoizes_steady_state_layout(self) -> None:
+        model = object.__new__(DistributedEmbeddingModel)
+        model._required_keys = {"a.values", "mv.lengths"}
+        model._has_raw_sparse_candidates = True
+        model._sparse_copy_keys_cache = {}
+        model._fast_sparse_copy_entry = None
+
+        batch1 = Batch(
+            sparse_features={
+                "g1": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["a", "b"],
+                    values=torch.tensor([1, 2]),
+                    lengths=torch.tensor([1, 1]),
+                ),
+                "g2": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["c"],
+                    values=torch.tensor([3]),
+                    lengths=torch.tensor([1]),
+                ),
+                "g3": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["mv"],
+                    values=torch.tensor([4]),
+                    lengths=torch.tensor([1]),
+                ),
+            },
+            sequence_mulval_lengths={
+                "g_mv": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["mv"],
+                    values=torch.tensor([1]),
+                    lengths=torch.tensor([1]),
+                )
+            },
+        )
+        self.assertEqual(model._needed_sparse_kjt_names(batch1), ("g1",))
+        self.assertIsNotNone(model._fast_sparse_copy_entry)
+        self.assertEqual(len(model._sparse_copy_keys_cache), 1)
+
+        # Same layout hits the zero-hash fast entry without re-populating cache.
+        batch1_repeat = Batch(
+            sparse_features={
+                "g1": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["a", "b"],
+                    values=torch.tensor([5, 6, 7]),
+                    lengths=torch.tensor([2, 1]),
+                ),
+                "g2": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["c"],
+                    values=torch.tensor([8]),
+                    lengths=torch.tensor([1]),
+                ),
+                "g3": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["mv"],
+                    values=torch.tensor([9]),
+                    lengths=torch.tensor([1]),
+                ),
+            },
+            sequence_mulval_lengths={
+                "g_mv": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["mv"],
+                    values=torch.tensor([1]),
+                    lengths=torch.tensor([1]),
+                )
+            },
+        )
+        with mock.patch.object(
+            model,
+            "_sparse_copy_keys_cache",
+            side_effect=AssertionError("steady-state layout should skip dict lookup"),
+        ):
+            self.assertEqual(model._needed_sparse_kjt_names(batch1_repeat), ("g1",))
+
+        # Different layout falls back and recomputes cleanly.
+        batch2 = Batch(
+            sparse_features={
+                "g2": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["c", "a"],
+                    values=torch.tensor([1, 2]),
+                    lengths=torch.tensor([1, 1]),
+                )
+            }
+        )
+        self.assertEqual(model._needed_sparse_kjt_names(batch2), ("g2",))
+        self.assertEqual(len(model._sparse_copy_keys_cache), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
