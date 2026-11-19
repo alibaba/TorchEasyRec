@@ -11,7 +11,7 @@
 
 import os
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Collection, Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -19,6 +19,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyfg
 import torch
+from torch.fx._symbolic_trace import is_fx_symbolic_tracing
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.modules.embedding_configs import PoolingType
 
@@ -93,11 +94,15 @@ def _infer_tile_size(item_t: torch.Tensor, user_t: torch.Tensor) -> int:
     """Infer the tile factor from candidate and user batch dimensions."""
     item_bs = item_t.size(0)
     user_bs = user_t.size(0)
-    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        tile_size = item_bs // user_bs
-        torch._check(tile_size >= 1)
-        torch._check(user_bs * tile_size == item_bs)
-        return tile_size
+    if not torch.jit.is_scripting():
+        if torch.compiler.is_compiling():
+            torch._check(user_bs >= 1)
+            tile_size = item_bs // user_bs
+            torch._check(tile_size >= 1)
+            torch._check(user_bs * tile_size == item_bs)
+            return tile_size
+        if is_fx_symbolic_tracing():
+            return item_bs // user_bs
     if user_bs <= 0 or item_bs < user_bs or item_bs % user_bs != 0:
         raise ValueError(
             f"Invalid input-tile batch dims: item_bs={item_bs}, user_bs={user_bs}."
@@ -113,12 +118,62 @@ def _pad_hard_search_input_tile_lengths(
     if not torch.jit.is_scripting():
         if torch.compiler.is_compiling():
             torch._check(indices.numel() >= lengths.numel())
-        elif indices.numel() < lengths.numel():
+        elif not is_fx_symbolic_tracing() and indices.numel() < lengths.numel():
             raise ValueError(
                 f"inverse_indices length ({indices.numel()}) must be >= "
                 f"compact feature lengths ({lengths.numel()})."
             )
     return torch.nn.functional.pad(lengths, (0, indices.numel() - lengths.numel()))
+
+
+def classify_raw_batch_dim_key(
+    key: str,
+    feat_by_name: Dict[str, BaseFeature],
+    hsk_feats: Collection[str],
+    use_distributed_embedding: bool,
+) -> Optional[str]:
+    """Classify a raw input dict key whose dim-0 equals 'item' or 'user' rows.
+
+    Shared with ``export_util._classify_serving_batch_node`` so DataParser's
+    tile-size resolution and the post-rewrite distributed dense graph stay
+    aligned on raw feature and ``__inverse_indices`` keys.
+
+    Args:
+        key: raw input dictionary key.
+        feat_by_name: non-stub feature map keyed by feature name.
+        hsk_feats: feature names excluded by ``HARD_SEARCH_INPUT_TILE``.
+        use_distributed_embedding: whether distributed embedding mode omits
+            ordinary sparse ``.lengths`` from the dense serving inputs.
+
+    Returns:
+        ``"item"``, ``"user"``, or None if ``key`` does not carry backed rows.
+    """
+    if key.endswith("__inverse_indices"):
+        seq_name = key[: -len("__inverse_indices")]
+        return "item" if seq_name else None
+    if key.endswith(".values"):
+        feat_name = key[: -len(".values")]
+        if feat_name in hsk_feats:
+            return None
+        feat = feat_by_name.get(feat_name)
+        if feat is not None and not feat.is_sparse and not feat.is_sequence:
+            return "user" if feat.is_user_feat else "item"
+        return None
+    if key.endswith(".lengths"):
+        feat_name = key[: -len(".lengths")]
+        if feat_name in hsk_feats:
+            return None
+        feat = feat_by_name.get(feat_name)
+        if feat is None:
+            return None
+        if not feat.is_sparse:
+            if feat.is_sequence:
+                return "user" if feat.is_user_feat else "item"
+            return None
+        if not use_distributed_embedding or (feat.is_sequence and feat.value_dim != 1):
+            return "user" if feat.is_user_feat else "item"
+        return None
+    return None
 
 
 class DataParser:
@@ -167,6 +222,10 @@ class DataParser:
             for f in features
             if not f.stub_type and f.name in hard_search_input_tile_features
         }
+        self._feat_by_name: Dict[str, BaseFeature] = {
+            f.name: f for f in features if not f.stub_type
+        }
+        self._tile_size_keys_cache: Dict[bool, Tuple[Optional[str], Optional[str]]] = {}
         self._labels = labels or []
         self._sample_weights = sample_weights or []
         self._mode = mode
@@ -261,8 +320,12 @@ class DataParser:
                 | set(self._fg_handler.sequence_input_to_name().keys())
             } - {self._to_real_input_name(x) for x in hs_inputs}
             self.user_feats = set([x.name for x in self._features if x.is_user_feat])
-            if is_unified_aot():
-                self._tile_keys = self._find_tile_keys()
+            if is_unified_aot() or self._use_distributed_embedding():
+                item_key, user_key = self._get_tile_size_keys(
+                    self._use_distributed_embedding()
+                )
+                if item_key is not None and user_key is not None:
+                    self._tile_keys = (item_key, user_key)
             is_rank_zero = (
                 os.environ.get("RANK", "0") == "0"
                 if self._rank is None
@@ -550,55 +613,59 @@ class DataParser:
                         )
                     output_data[f"{feat_name}.values"] = _to_tensor(dense_values)
 
-    def _find_tile_keys(self) -> Optional[Tuple[str, str]]:
-        """Identify candidate and user tensor keys for backed tile-size inference."""
+    def _get_tile_size_keys(
+        self, use_dist: bool
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Resolve and cache static (item_key, user_key) for tile inference."""
+        cached = self._tile_size_keys_cache.get(use_dist)
+        if cached is not None:
+            return cached
         item_key: Optional[str] = None
         user_key: Optional[str] = None
         hsk_feats = self._hard_search_input_tile_features
-
-        for keys in self.sparse_keys.values():
-            for k in keys:
-                if k in hsk_feats:
-                    continue
-                if k in self.user_feats:
-                    user_key = user_key or f"{k}.lengths"
-                else:
-                    item_key = item_key or f"{k}.lengths"
+        candidates: List[str] = []
+        if not use_dist:
+            for keys in self.sparse_keys.values():
+                candidates.extend(f"{k}.lengths" for k in keys)
         for keys in self.dense_keys.values():
-            for k in keys:
-                if k in hsk_feats:
-                    continue
-                if k in self.user_feats:
-                    user_key = user_key or f"{k}.values"
-                else:
-                    item_key = item_key or f"{k}.values"
-        for k in self.sequence_dense_keys:
-            if k in hsk_feats:
-                continue
-            if k in self.user_feats:
-                user_key = user_key or f"{k}.lengths"
-            else:
-                item_key = item_key or f"{k}.lengths"
-        if item_key is None and hsk_feats:
-            item_key = f"{min(hsk_feats.values())}__inverse_indices"
-        if item_key is not None and user_key is not None:
-            return item_key, user_key
-        return None
+            candidates.extend(f"{k}.values" for k in keys)
+        candidates.extend(f"{k}.lengths" for k in self.sequence_dense_keys)
+        if use_dist:
+            for keys in self.sequence_mulval_sparse_keys.values():
+                candidates.extend(f"{k}.lengths" for k in keys)
+        if hsk_feats:
+            candidates.append(f"{min(hsk_feats.values())}__inverse_indices")
+        for cand in candidates:
+            side = classify_raw_batch_dim_key(
+                cand, self._feat_by_name, hsk_feats, use_dist
+            )
+            if side == "item" and item_key is None:
+                item_key = cand
+            elif side == "user" and user_key is None:
+                user_key = cand
+            if item_key is not None and user_key is not None:
+                break
+        res = (item_key, user_key)
+        self._tile_size_keys_cache[use_dist] = res
+        return res
 
     def _resolve_tile_size(self, input_data: Dict[str, torch.Tensor]) -> int:
         """Resolve user-to-candidate tile factor.
 
-        Unified AOT infers it from backed batch dims; other paths read batch_size.
+        Unified AOT and distributed embedding infer it from backed batch dims;
+        other paths read batch_size.
         """
-        if self._tile_keys is not None:
-            item_key, user_key = self._tile_keys
-            return _infer_tile_size(input_data[item_key], input_data[user_key])
-        if is_unified_aot() and not self._warned_tile_fallback:
-            self._warned_tile_fallback = True
-            logger.warning(
-                "Cannot identify both non-hard-search user and candidate keys "
-                "for INPUT_TILE; falling back to batch_size.item()."
-            )
+        use_dist = self._use_distributed_embedding()
+        if is_unified_aot() or use_dist:
+            item_key, user_key = self._get_tile_size_keys(use_dist)
+            if item_key is not None and user_key is not None:
+                return _infer_tile_size(input_data[item_key], input_data[user_key])
+            if is_unified_aot() and not self._warned_tile_fallback:
+                self._warned_tile_fallback = True
+                logger.warning(
+                    "Cannot identify both non-hard-search user and candidate keys "
+                    "for INPUT_TILE; falling back to batch_size.item()."
+                )
         return _tile_size(input_data["batch_size"])
 
     def to_batch(
@@ -875,7 +942,7 @@ class DataParser:
     def _to_sparse_features_user1tile_itemb(
         self,
         input_data: Dict[str, torch.Tensor],
-        tile_size: int,
+        tile_size: Optional[int] = None,
     ) -> Tuple[Dict[str, KeyedJaggedTensor], Dict[str, KeyedJaggedTensor]]:
         """Convert batch sparse features user_bs = 1 then tile and item_bs = B.
 
@@ -885,7 +952,7 @@ class DataParser:
 
         Args:
             input_data (dict): input tensor dict.
-            tile_size (int): pre-resolved tile factor.
+            tile_size (int, optional): pre-resolved tile factor.
 
         Returns:
             sparse_features: a dict of KeyedJaggedTensor .
@@ -894,6 +961,8 @@ class DataParser:
         """
         sparse_features = {}
         sequence_mulval_lengths = {}
+        if tile_size is None:
+            tile_size = self._resolve_tile_size(input_data)
 
         for dg, keys in self.sparse_keys.items():
             values = []
