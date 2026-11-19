@@ -335,16 +335,18 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             num_workers = worker_info.num_workers
 
         # NOTE: Export warm-up is local even while the training group is live.
+        self_world_size = getattr(self, "_world_size", None)
+        self_rank = getattr(self, "_rank", None)
         resolved_world_size = (
             int(os.environ.get("WORLD_SIZE", 1))
-            if self._world_size is None
-            else self._world_size
+            if self_world_size is None
+            else self_world_size
         )
         if dist.is_initialized() and resolved_world_size > 1:
             rank = dist.get_rank()
             world_size = dist.get_world_size()
         else:
-            rank = 0 if self._rank is None else self._rank
+            rank = 0 if self_rank is None else self_rank
             world_size = 1
 
         return rank * num_workers + worker_id, num_workers * world_size, world_size

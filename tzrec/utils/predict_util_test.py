@@ -1991,7 +1991,7 @@ class DistributedScriptGenRecTest(unittest.TestCase):
 
     def test_needed_sparse_kjt_names_memoizes_steady_state_layout(self) -> None:
         model = object.__new__(DistributedEmbeddingModel)
-        model._required_keys = {"a.values", "mv.lengths"}
+        model._required_keys = {"a.values", "mv.lengths", "mv.key_lengths"}
         model._has_raw_sparse_candidates = True
         model._sparse_copy_keys_cache = {}
         model._fast_sparse_copy_entry = None

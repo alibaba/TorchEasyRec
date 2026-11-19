@@ -1230,7 +1230,7 @@ class _DistributedDenseAOTIWrapper(nn.Module):
         return pytree.tree_unflatten(flat_outputs, self._out_spec)
 
 
-_RAW_SPARSE_SUFFIXES = (".values", ".lengths", ".weights", ".key_lengths")
+_RAW_SPARSE_SUFFIXES = (".values", ".lengths", ".weights")
 
 
 def _extract_script_required_keys(dense: torch.jit.ScriptModule) -> Set[str]:
@@ -1379,7 +1379,6 @@ class DistributedEmbeddingModel:
                 if any(
                     f"{k}.values" in self._required_keys
                     or f"{k}.weights" in self._required_keys
-                    or f"{k}.key_lengths" in self._required_keys
                     or (
                         f"{k}.lengths" in self._required_keys
                         and k not in mulval_or_seq_dense

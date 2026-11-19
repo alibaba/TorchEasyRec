@@ -138,11 +138,20 @@ def _is_genrec_export(
     model: Optional[nn.Module] = None,
 ) -> bool:
     """Return whether export targets a GenRec model or GenRecFrontEnd module."""
-    if pipeline_config is not None and (
-        pipeline_config.HasField("prompt_config")
-        or pipeline_config.model_config.WhichOneof("model") == "genrec_causal_lm_model"
-    ):
-        return True
+    if pipeline_config is not None:
+        has_prompt_config = (
+            pipeline_config.HasField("prompt_config")
+            if hasattr(pipeline_config, "HasField")
+            else bool(getattr(pipeline_config, "prompt_config", None))
+        )
+        model_cfg = getattr(pipeline_config, "model_config", None)
+        is_genrec_model = (
+            model_cfg is not None
+            and hasattr(model_cfg, "WhichOneof")
+            and model_cfg.WhichOneof("model") == "genrec_causal_lm_model"
+        )
+        if has_prompt_config or is_genrec_model:
+            return True
     if model is not None:
         inner = getattr(model, "model", model)
         for mod in (model, inner):
@@ -411,12 +420,14 @@ def export_model(
         impl = export_model_normal
     fs, local_path = url_to_fs(save_dir)
     use_local_cache_dir = False
+    config_asset_dir: Optional[str] = None
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if fs is not None:
         # scripted model and safetensors use io in cpp,
         # so that we can not use fsspec to patch cpp io operations.
         cache_root = os.environ.get("LOCAL_CACHE_DIR")
+        config_asset_dir = cache_root or local_path
         if cache_root:
             os.makedirs(cache_root, exist_ok=True)
         if use_rtp:
@@ -447,6 +458,7 @@ def export_model(
                 data_input_path=data_input_path,
                 use_distributed_embedding=use_dist_embedding,
                 input_tile=resolved_input_tile,
+                config_asset_dir=config_asset_dir,
             )
             if use_local_cache_dir:
                 if use_rtp and dist.is_initialized():
@@ -506,6 +518,7 @@ def export_model_normal(
     use_distributed_embedding: Optional[bool] = None,
     input_tile: Optional[str] = None,
     rank: Optional[int] = None,
+    config_asset_dir: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on aliyun."""
@@ -670,7 +683,7 @@ def export_model_normal(
                 additional_export_config,
                 use_distributed_embedding=resolved_dist_emb,
                 input_tile=resolved_input_tile,
-                config_asset_dir=save_dir,
+                config_asset_dir=config_asset_dir or save_dir,
             )
 
 
@@ -2039,6 +2052,7 @@ def export_distributed_embedding(
     use_distributed_embedding: Optional[bool] = None,
     input_tile: Optional[str] = None,
     rank: Optional[int] = None,
+    config_asset_dir: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export dense and sparse artifacts for distributed embedding serving.
@@ -2240,7 +2254,7 @@ def export_distributed_embedding(
                     additional_export_config,
                     use_distributed_embedding=resolved_dist_emb,
                     input_tile=resolved_input_tile,
-                    config_asset_dir=save_dir,
+                    config_asset_dir=config_asset_dir or save_dir,
                 )
         except BaseException:
             if uploader is not None:

@@ -1582,7 +1582,9 @@ def predict(
         local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
         if int(os.environ.get("LOCAL_RANK", 0)) == 0:
             logger.info(f"downloading {scripted_model_path} to {local_path}.")
-            fs.download(scripted_model_path, local_path, recursive=True)
+            fs.download(
+                scripted_model_path.rstrip("/") + "/", local_path, recursive=True
+            )
         dist.barrier()
         scripted_model_path = local_path
 
