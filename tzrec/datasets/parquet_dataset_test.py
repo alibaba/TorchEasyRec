@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import multiprocessing as mp
 import os
 import shutil
@@ -22,7 +23,7 @@ from unittest import mock
 import numpy as np
 import pyarrow as pa
 import pyarrow.dataset as ds
-from parameterized import parameterized
+from parameterized import param, parameterized
 from pyarrow import parquet
 from torch import distributed as dist
 from torch.utils.data import DataLoader
@@ -655,7 +656,9 @@ class ParquetWriterTest(unittest.TestCase):
         self.assertEqual(table.column("int_a").to_pylist(), [1, 2, 3, 4, 5])
 
 
-def _write_unique_parquet(test_dir: str, num_rows: int) -> None:
+def _write_unique_parquet(
+    test_dir: str, num_rows: int, max_rows_per_file: int = 37
+) -> None:
     t = pa.Table.from_arrays(
         [
             pa.array([float(i) for i in range(num_rows)]),
@@ -667,9 +670,39 @@ def _write_unique_parquet(test_dir: str, num_rows: int) -> None:
         t,
         test_dir,
         format="parquet",
-        max_rows_per_file=37,
-        max_rows_per_group=17,
+        max_rows_per_file=max_rows_per_file,
+        max_rows_per_group=min(max_rows_per_file, 17),
     )
+
+
+def _multi_rank_worker(rank, port, input_path, out_path):
+    """Record one rank's batches and sample IDs.
+
+    Spawn ranks to avoid inheriting CUDA state; fork DataLoader workers
+    to avoid pickling the Gloo process group.
+    """
+    mp.set_start_method("fork", force=True)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = "2"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(backend="gloo")
+    try:
+        dataloader = create_dataloader(
+            sample_data_config(
+                data_pb2.DatasetType.ParquetDataset, "SAMPLE_ROLLING", 2
+            ),
+            raw_c_features(),
+            input_path,
+            mode=Mode.TRAIN,
+        )
+        iterator = dataloader.get_iterator()
+        sizes, values, _ = drain_sample(iterator)
+        stop_sample(dataloader, iterator)
+        with open(out_path, "w") as f:
+            json.dump({"sizes": sizes, "values": values}, f)
+    finally:
+        dist.destroy_process_group()
 
 
 class ParquetSampleShuffleTest(unittest.TestCase):
@@ -723,24 +756,34 @@ class ParquetSampleShuffleTest(unittest.TestCase):
         finally:
             stop_sample(dataloader, iterator)
 
-    @parameterized.expand([[3], [0]], name_func=parameterized_name_func)
-    def test_sample_shuffle_resume(self, leftover_rows_per_source):
+    @parameterized.expand(
+        [
+            param("leftover", 3, True),
+            param("no_leftover", 0, True),
+            param("in_order_false", 3, False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sample_shuffle_resume(self, _name, leftover_rows_per_source, in_order):
         resume_state = {
             f"{self.path}:0": 49 - leftover_rows_per_source,
             f"{self.path}:50": 100 - leftover_rows_per_source,
         }
-        dataloader = self._dataloader(checkpoint_state=resume_state)
+        dataloader = self._dataloader(checkpoint_state=resume_state, in_order=in_order)
         iterator = None
         try:
             iterator = dataloader.get_iterator()
-            _, values, _ = drain_sample(iterator)
+            sizes, values, _ = drain_sample(iterator)
             expected = list(range(50 - leftover_rows_per_source, 50)) + list(
                 range(101 - leftover_rows_per_source, 101)
             )
             self.assertEqual(sorted(values), expected)
+            self.assertEqual(sizes, [2 * leftover_rows_per_source] if expected else [])
             iterator = dataloader.get_iterator()
-            _, values, _ = drain_sample(iterator)
+            sizes, values, state = drain_sample(iterator)
             self.assertEqual(sorted(values), list(range(101)))
+            self.assertEqual(sorted(sizes), [5] + [8] * 12)
+            self.assertTrue(state)
         finally:
             stop_sample(dataloader, iterator)
 
@@ -768,6 +811,63 @@ class ParquetSampleShuffleTest(unittest.TestCase):
                 covered.extend(range(start, end))
             self.assertEqual(rows, plan.planned_rows)
         self.assertEqual(sorted(covered), list(range(101)))
+
+    def test_sample_shuffle_multi_rank_output(self):
+        """Verify actual samples and tail batches against each rank's plan."""
+        rank_dir = os.path.join(self.test_dir, "multi_rank")
+        _write_unique_parquet(rank_dir, 37, max_rows_per_file=10)
+        path = f"{rank_dir}/*.parquet"
+        config = sample_data_config(
+            data_pb2.DatasetType.ParquetDataset, "SAMPLE_ROLLING", 2
+        )
+        plans = [
+            ParquetDataset(
+                config, raw_c_features(), path, mode=Mode.TRAIN
+            )._reader.create_read_plan(rank, 2, 2)
+            for rank in range(2)
+        ]
+        self.assertEqual([p.planned_rows for p in plans], [19, 18])
+        expected = []
+        for plan in plans:
+            rows = set()
+            for task in plan.tasks:
+                rows |= set(range(task.kwargs["start"], task.kwargs["end"]))
+            expected.append(rows)
+
+        port = misc_util.get_free_port()
+        out_paths = [os.path.join(rank_dir, f"rank{rank}.json") for rank in range(2)]
+        procs = [
+            mp.get_context("spawn").Process(
+                target=_multi_rank_worker, args=(rank, port, path, out_paths[rank])
+            )
+            for rank in range(2)
+        ]
+        try:
+            for p in procs:
+                p.start()
+            for p in procs:
+                p.join(timeout=120)
+                self.assertFalse(p.is_alive(), f"rank worker did not finish: {p}")
+                self.assertEqual(p.exitcode, 0)
+        finally:
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
+
+        outputs = []
+        for out_path in out_paths:
+            with open(out_path) as f:
+                outputs.append(json.load(f))
+        self.assertEqual(sorted(outputs[0]["sizes"], reverse=True), [8, 8, 3])
+        self.assertEqual(sorted(outputs[1]["sizes"], reverse=True), [8, 8, 2])
+        self.assertEqual(len(outputs[0]["sizes"]), 3)
+        self.assertEqual(len(outputs[1]["sizes"]), 3)
+        self.assertEqual(set(outputs[0]["values"]), expected[0])
+        self.assertEqual(set(outputs[1]["values"]), expected[1])
+        self.assertTrue(set(outputs[0]["values"]).isdisjoint(outputs[1]["values"]))
+        self.assertEqual(
+            sorted(outputs[0]["values"] + outputs[1]["values"]), list(range(37))
+        )
 
     def test_start_failure_cleanup(self):
         """A post-spawn start failure stops and joins the coordinator."""

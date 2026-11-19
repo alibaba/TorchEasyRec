@@ -588,7 +588,7 @@ class DistributedEmbeddingLookup:
 
     def __init__(self, model_path: str, devices: List[torch.device]) -> None:
         import pynve.nve as nve
-        from pynve.torch import nve_dtypes, nve_layers, nve_ps
+        from pynve.torch import nve_layers, nve_ps
 
         if not devices or any(d.type != "cuda" for d in devices):
             raise ValueError(
@@ -613,8 +613,8 @@ class DistributedEmbeddingLookup:
         self._used_feats = list(dict.fromkeys(used_feats))
 
         storage_types = {
-            "float32": torch.float32,
-            "float16": torch.float16,
+            "float32": nve.DataType_t.Float32,
+            "float16": nve.DataType_t.Float16,
             "QUint8RowwiseF16": nve.DataType_t.QUint8RowwiseF16,
         }
         with contextlib.ExitStack() as stack:
@@ -697,7 +697,7 @@ class DistributedEmbeddingLookup:
                 sum(emb_meta[e]["shape"][0] for e in group.members) for group in groups
             ]
             storage_bytes = [
-                rows * nve_dtypes.stored_row_bytes(g.dim, storage_types[g.dtype])
+                rows * nve.row_size_in_bytes(storage_types[g.dtype], g.dim)
                 for rows, g in zip(group_rows, groups)
             ]
             ratio = _gpu_cache_ratio(devices, storage_bytes)
@@ -1070,7 +1070,7 @@ class DistributedEmbeddingLookup:
             layer = layers[bucket.group_idx]
             if bucket.pooling == "NONE":
                 # dequantized rows come back in fp16, the dense graph is fp32.
-                emb = layer(keys, mode="concat").float()
+                emb = layer(keys, mode_override="concat").float()
                 for feat, e in zip(bucket.feats, emb.split(counts)):
                     out[_remove_suffix(feat)] = e
                 continue
@@ -1085,7 +1085,9 @@ class DistributedEmbeddingLookup:
                         use_weight, feat_lengths.sum(1), output_size=num_keys
                     )
                     bag_weights = torch.where(weighted, bag_weights, 1.0)
-            emb = layer(keys, offsets, bag_weights, mode=bucket.pooling.lower()).float()
+            emb = layer(
+                keys, offsets, bag_weights, mode_override=bucket.pooling.lower()
+            ).float()
             # bags are feature-major; lay them out as [batch, feature * dim].
             blocks.append(
                 emb.view(len(bucket.feats), stride, group.dim)
