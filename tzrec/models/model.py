@@ -38,6 +38,7 @@ from tzrec.protos.model_pb2 import FeatureGroupConfig, ModelConfig
 from tzrec.utils import config_util
 from tzrec.utils.fx_util import fx_get_label
 from tzrec.utils.load_class import get_register_class_meta
+from tzrec.utils.logging_util import logger
 
 torch.fx.wrap(fx_get_label)
 
@@ -597,13 +598,25 @@ class UnifiedAOTIModelWrapper(nn.Module):
 
     Args:
         model (nn.Module): unified AOTInductor compiled model.
+        tile_keys (tuple, optional): ``(item_key, user_key)`` batch-dim keys
+            used to validate input-tile divisibility on the host.
+        hsk_checks (list, optional): ``(lengths_key, indices_key)`` pairs for
+            hard-search compact length validation on the host.
     """
 
     # Set through object.__setattr__, so declare the types here. _lock cannot be
     # declared: torch.jit.script rejects a threading.Lock annotation.
     _key_order: Optional[List[str]]
+    _tile_keys: Optional[Tuple[str, str]]
+    _hsk_checks: List[Tuple[str, str]]
+    _logged_extra_keys: bool
 
-    def __init__(self, model: nn.Module) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        tile_keys: Optional[Tuple[str, str]] = None,
+        hsk_checks: Optional[List[Tuple[str, str]]] = None,
+    ) -> None:
         super().__init__()
         self.model = model
         # Serializes forward to prevent GIL + C++ mutex deadlock.
@@ -612,13 +625,19 @@ class UnifiedAOTIModelWrapper(nn.Module):
         # the AOTI model-pool mutex, deadlocking with the first thread.
         # object.__setattr__ bypasses nn.Module's strict registration.
         object.__setattr__(self, "_lock", threading.Lock())
-        object.__setattr__(self, "_key_order", None)
+        in_spec, out_spec = cast(Any, model).loader.get_call_spec()
+        in_tree = pytree.treespec_loads(in_spec)
+        # Forward takes a single `(data,)` arg; read compiled key order from it.
+        key_order: Optional[List[str]] = None
+        args_children = in_tree.children()[0].children() if in_tree.children() else []
+        if len(args_children) == 1 and isinstance(args_children[0].context, list):
+            key_order = list(args_children[0].context)
+        object.__setattr__(self, "_key_order", key_order)
         # AOTICompiledModel.__call__ reparses the call spec on every call.
-        object.__setattr__(
-            self,
-            "_out_spec",
-            pytree.treespec_loads(cast(Any, model).loader.get_call_spec()[1]),
-        )
+        object.__setattr__(self, "_out_spec", pytree.treespec_loads(out_spec))
+        object.__setattr__(self, "_tile_keys", tile_keys)
+        object.__setattr__(self, "_hsk_checks", list(hsk_checks or []))
+        object.__setattr__(self, "_logged_extra_keys", False)
 
     def forward(
         self,
@@ -627,6 +646,10 @@ class UnifiedAOTIModelWrapper(nn.Module):
         device: torch.device = "cuda:0",
     ) -> Dict[str, torch.Tensor]:
         """Predict the model.
+
+        Inputs are normalized to contiguous CPU tensors before calling AOTI
+        because the exported graph was compiled on CPU sample inputs and
+        performs its own H2D copies.
 
         Args:
             data (dict): a dict of input data for Batch.
@@ -639,10 +662,32 @@ class UnifiedAOTIModelWrapper(nn.Module):
         if key_order is None:
             key_order = sorted(data.keys())
             object.__setattr__(self, "_key_order", key_order)
+        if not self._logged_extra_keys and len(data) != len(key_order):
+            extra_keys = sorted(set(data) - set(key_order))
+            if extra_keys:
+                logger.debug(
+                    "UnifiedAOTIModelWrapper ignoring extra input keys: %s",
+                    extra_keys,
+                )
+            object.__setattr__(self, "_logged_extra_keys", True)
+        if self._tile_keys is not None:
+            item_key, user_key = self._tile_keys
+            item_bs = data[item_key].size(0)
+            user_bs = data[user_key].size(0)
+            if user_bs <= 0 or item_bs < user_bs or item_bs % user_bs != 0:
+                raise ValueError(
+                    f"Invalid input-tile batch dims for {item_key}/{user_key}: "
+                    f"item_bs={item_bs}, user_bs={user_bs}."
+                )
+        for lengths_key, indices_key in self._hsk_checks:
+            if data[indices_key].numel() < data[lengths_key].numel():
+                raise ValueError(
+                    f"{indices_key} length ({data[indices_key].numel()}) must be >= "
+                    f"{lengths_key} length ({data[lengths_key].numel()})."
+                )
+        inputs = [data[k].cpu().contiguous() for k in key_order]
         # Force CUDA primary context creation on worker threads.
         torch.cuda.set_device(device)
         with cast(Any, self._lock):
-            flat_outputs = cast(Any, self.model).loader.boxed_run(
-                [data[k] for k in key_order]
-            )
+            flat_outputs = cast(Any, self.model).loader.boxed_run(inputs)
         return pytree.tree_unflatten(flat_outputs, self._out_spec)

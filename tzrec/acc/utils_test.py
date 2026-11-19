@@ -68,6 +68,35 @@ class AccUtilsTest(unittest.TestCase):
         finally:
             shutil.rmtree(test_dir)
 
+    def test_is_hard_search_input_tile(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(utils.is_hard_search_input_tile())
+
+        for tile in ("2", "3"):
+            for env in (
+                {"INPUT_TILE": tile, "HARD_SEARCH_INPUT_TILE": "1"},
+                {"INPUT_TILE": tile, "HARD_SEARCH_INPUT_TILE": "1", "ENABLE_AOT": "2"},
+                {
+                    "INPUT_TILE": tile,
+                    "HARD_SEARCH_INPUT_TILE": "1",
+                    "UNIFIED_AOT": "1",
+                },
+            ):
+                with self.subTest(env=env):
+                    with mock.patch.dict(os.environ, env, clear=True):
+                        self.assertTrue(utils.is_hard_search_input_tile())
+
+        for env in (
+            {"HARD_SEARCH_INPUT_TILE": "1"},
+            {"INPUT_TILE": "2", "HARD_SEARCH_INPUT_TILE": "1", "ENABLE_AOT": "1"},
+            {"INPUT_TILE": "3", "HARD_SEARCH_INPUT_TILE": "1", "ENABLE_TRT": "1"},
+            {"INPUT_TILE": "3", "HARD_SEARCH_INPUT_TILE": "1", "USE_RTP": "1"},
+        ):
+            with self.subTest(invalid_env=env):
+                with mock.patch.dict(os.environ, env, clear=True):
+                    with self.assertRaises(ValueError):
+                        utils.is_hard_search_input_tile()
+
 
 if __name__ == "__main__":
     unittest.main()

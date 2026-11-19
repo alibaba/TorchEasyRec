@@ -10,15 +10,20 @@
 # limitations under the License.
 
 
+import json
 import os
-from typing import Any, Dict, List, Optional, Set, Union, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
 import torch
 import torch._inductor.codecache  # noqa: F401 -- populate torch._inductor.codecache so torch.export.pt2_archive._package._load_aoti can read it on PPU torch (host torch auto-imports it; PPU's tzrec-test:1.1-ppu image does not).
 from torch import nn
 
-from tzrec.acc.utils import is_autotune_with_sample_inputs, is_unified_aot_predict
-from tzrec.features.feature import BaseFeature
+from tzrec.acc.utils import (
+    is_autotune_with_sample_inputs,
+    is_input_tile,
+    is_unified_aot_predict,
+)
+from tzrec.features.feature import BaseFeature, get_hard_search_input_tile_features
 from tzrec.models.model import (
     CombinedModelWrapper,
     CudaAutocastWrapper,
@@ -68,7 +73,21 @@ def load_model_aot(
             aoti_model_path,
             device_index=device.index,
         )
-        return UnifiedAOTIModelWrapper(model)
+        tile_keys: Optional[Tuple[str, str]] = None
+        hsk_checks: Optional[List[Tuple[str, str]]] = None
+        meta_path = os.path.join(model_path, "aoti", "aoti_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                aoti_meta = json.load(f)
+            raw_tile_keys = aoti_meta.get("tile_keys")
+            if raw_tile_keys is not None:
+                tile_keys = (raw_tile_keys[0], raw_tile_keys[1])
+            raw_hsk_checks = aoti_meta.get("hsk_checks")
+            if raw_hsk_checks is not None:
+                hsk_checks = [(pair[0], pair[1]) for pair in raw_hsk_checks]
+        return UnifiedAOTIModelWrapper(
+            model, tile_keys=tile_keys, hsk_checks=hsk_checks
+        )
     else:
         # Legacy two-stage path: sparse JIT + dense AOTI.
         # Disable TensorExpr fuser: its lazy first-call compile is not
@@ -183,21 +202,20 @@ def export_model_aot(
 
 def _pad_empty_sparse_values(
     data: Dict[str, torch.Tensor],
-    seq_feat_names: Set[str],
+    features: List[BaseFeature],
 ) -> Dict[str, torch.Tensor]:
-    """Pad 0-size non-sequence sparse .values tensors to have at least 1 element.
+    """Pad <2-element sparse and sequence tensors before torch.export.
 
-    When a non-sequence sparse feature has all-zero lengths in the example
-    batch, its .values tensor has size 0. torch.export traces the code with
-    this concrete size and specializes on 0, making the dimension incompatible
-    with a dynamic Dim spec. To avoid this, we inject a dummy value and set
-    one length entry to 1 so the total nnz becomes >= 1.
-
-    Only non-sequence sparse features are padded; sequence features are left
-    as-is.
+    When a non-sequence sparse feature or sequence feature has total nnz or
+    total sequence length < 2 in the example batch, torch.export specializes the
+    axis to 0 or 1, making it incompatible with a dynamic Dim spec. Padding to
+    >= 2 elements keeps the traced graph dynamic.
 
     This must be called AFTER model verification and BEFORE torch.export.
     """
+    data = dict(data)
+    seq_feat_names = {f.name for f in features if f.is_sequence}
+
     lengths_prefixes = set()
     for key in data:
         if key.endswith(".lengths"):
@@ -213,20 +231,145 @@ def _pad_empty_sparse_values(
         values = data[values_key]
         lengths = data[lengths_key]
         if values.numel() < 2 and lengths.numel() > 0:
-            # Pad to at least 2 elements — torch.export specializes on
-            # sizes 0 and 1 as special cases but treats >= 2 as dynamic.
             pad_n = 2 - values.numel()
-            data[values_key] = torch.zeros(2, dtype=values.dtype, device=values.device)
+            data[values_key] = torch.cat(
+                [values, torch.zeros(pad_n, dtype=values.dtype, device=values.device)]
+            )
             new_lengths = lengths.clone()
             new_lengths[0] = new_lengths[0] + pad_n
             data[lengths_key] = new_lengths
-            # Also pad .weights if present.
             weights_key = f"{prefix}.weights"
             if weights_key in data:
                 weights = data[weights_key]
-                data[weights_key] = torch.ones(
-                    2, dtype=weights.dtype, device=weights.device
+                data[weights_key] = torch.cat(
+                    [
+                        weights,
+                        torch.ones(pad_n, dtype=weights.dtype, device=weights.device),
+                    ]
                 )
+
+    # Group sequence features so shared sequences keep matching lengths after padding.
+    seq_groups: Dict[str, List[BaseFeature]] = {}
+    for feat in features:
+        if not feat.is_sequence:
+            continue
+        seq_name = getattr(feat, "sequence_name", None)
+        if getattr(feat, "_is_grouped_seq", False) and seq_name:
+            group_key = f"seq_{seq_name}"
+        else:
+            group_key = f"feat_{feat.name}"
+        seq_groups.setdefault(group_key, []).append(feat)
+
+    for group_feats in seq_groups.values():
+        features_in_batch = [
+            feat
+            for feat in group_feats
+            if f"{feat.name}.lengths" in data and f"{feat.name}.values" in data
+        ]
+        if not features_in_batch:
+            continue
+        ref_lengths = data[f"{features_in_batch[0].name}.lengths"]
+        if ref_lengths.numel() == 0:
+            continue
+        total_sequence_length = int(ref_lengths.sum().item())
+        if total_sequence_length < 2:
+            sequence_length_padding = 2 - total_sequence_length
+            for feat in features_in_batch:
+                lengths_key = f"{feat.name}.lengths"
+                values_key = f"{feat.name}.values"
+                kl_key = f"{feat.name}.key_lengths"
+                weights_key = f"{feat.name}.weights"
+
+                new_lengths = data[lengths_key].clone()
+                new_lengths[0] = new_lengths[0] + sequence_length_padding
+                data[lengths_key] = new_lengths
+
+                values = data[values_key]
+                if kl_key in data:
+                    kl = data[kl_key]
+                    data[kl_key] = torch.cat(
+                        [
+                            kl,
+                            torch.ones(
+                                sequence_length_padding,
+                                dtype=kl.dtype,
+                                device=kl.device,
+                            ),
+                        ]
+                    )
+                    data[values_key] = torch.cat(
+                        [
+                            values,
+                            torch.zeros(
+                                sequence_length_padding,
+                                dtype=values.dtype,
+                                device=values.device,
+                            ),
+                        ]
+                    )
+                elif feat.is_sparse:
+                    data[values_key] = torch.cat(
+                        [
+                            values,
+                            torch.zeros(
+                                sequence_length_padding,
+                                dtype=values.dtype,
+                                device=values.device,
+                            ),
+                        ]
+                    )
+                else:
+                    data[values_key] = torch.cat(
+                        [
+                            values,
+                            values.new_zeros(
+                                (sequence_length_padding, *values.shape[1:])
+                            ),
+                        ],
+                        dim=0,
+                    )
+                if weights_key in data:
+                    weights = data[weights_key]
+                    data[weights_key] = torch.cat(
+                        [
+                            weights,
+                            torch.ones(
+                                sequence_length_padding,
+                                dtype=weights.dtype,
+                                device=weights.device,
+                            ),
+                        ]
+                    )
+
+        for feat in features_in_batch:
+            kl_key = f"{feat.name}.key_lengths"
+            values_key = f"{feat.name}.values"
+            if kl_key not in data:
+                continue
+            values = data[values_key]
+            kl = data[kl_key]
+            if values.numel() < 2 and kl.numel() > 0:
+                pad_vals = 2 - values.numel()
+                new_kl = kl.clone()
+                new_kl[0] = new_kl[0] + pad_vals
+                data[kl_key] = new_kl
+                data[values_key] = torch.cat(
+                    [
+                        values,
+                        torch.zeros(pad_vals, dtype=values.dtype, device=values.device),
+                    ]
+                )
+                weights_key = f"{feat.name}.weights"
+                if weights_key in data:
+                    weights = data[weights_key]
+                    data[weights_key] = torch.cat(
+                        [
+                            weights,
+                            torch.ones(
+                                pad_vals, dtype=weights.dtype, device=weights.device
+                            ),
+                        ]
+                    )
 
     return data
 
@@ -239,15 +382,18 @@ def _build_dynamic_shapes(
     """Build dynamic shapes for the full model input.
 
     Uses structural knowledge from feature configs and feature groups:
-    - .lengths → batch dim (always)
-    - .values for non-sequence single-value sparse features → batch dim
-    - .values for sequence features → data-dependent Dim, shared by features
-      in the same FeatureGroupConfig (JAGGED_SEQUENCE/SEQUENCE) or SeqGroupConfig
-    - .values without a .lengths sibling → batch dim (dense feature)
-    - .weights → shares Dim with corresponding .values (same prefix)
-    - .key_lengths → data-dependent (own Dim)
-    - scalars → no dynamic dims
-    - everything else (labels, sample_weights) → batch dim
+    - .lengths -> batch dim (or user_batch / hard-search compact batch dim)
+    - .values for non-sequence single-value sparse features -> own Dim (min=0)
+    - sequence value tensors (.values for single-value sparse or dense sequence
+      features, .key_lengths for multi-value sparse sequence features) -> shared
+      total sequence length Dim per SequenceFeature / JAGGED_SEQUENCE /
+      SeqGroupConfig (min=1 for JAGGED_SEQUENCE, min=0 otherwise)
+    - .values without a .lengths sibling -> batch dim (dense feature)
+    - .weights -> shares Dim with corresponding .values (same prefix)
+    - .values for multi-value sparse sequence features (with .key_lengths) ->
+      own sub-token Dim (min=0)
+    - scalars and ``batch_size`` -> no dynamic dims
+    - everything else (labels, sample_weights, inverse_indices) -> batch dim
 
     Args:
         data: input tensor dict from Batch.to_dict().
@@ -261,72 +407,88 @@ def _build_dynamic_shapes(
 
     # Step 1: Group grouped sequence features by their sequence_name.
     # Features in the same SequenceFeature config share per-sample lengths,
-    # so their .values always have the same nnz — they must share a Dim.
+    # so their .values or .key_lengths tensors share a total sequence length Dim.
     # This takes precedence over FeatureGroupConfig because it reflects the
     # authoritative data structure (shared sequence), not model organization.
     feat_to_seq_dim_group: Dict[str, str] = {}
     seq_feat_names: set = set()
-    feat_by_name: Dict[str, Any] = {}
     for feat in features:
-        feat_by_name[feat.name] = feat
         if feat.is_sequence:
             seq_feat_names.add(feat.name)
             if getattr(feat, "_is_grouped_seq", False):
                 seq_name = getattr(feat, "sequence_name", None)
                 if seq_name:
-                    vdim = getattr(feat, "value_dim", 1)
-                    if vdim == 1:
-                        # Single-valued features share nnz within a sequence.
-                        feat_to_seq_dim_group[feat.name] = f"seq_{seq_name}"
-                    else:
-                        # Multi-valued (value_dim=0 variable, or >1 fixed multi)
-                        # have their own nnz, so they must NOT share a Dim.
-                        pass
-
-    def _is_single_valued(name: str) -> bool:
-        feat = feat_by_name.get(name)
-        if feat is None:
-            return True
-        return getattr(feat, "value_dim", 1) == 1
+                    feat_to_seq_dim_group[feat.name] = f"seq_{seq_name}"
 
     # Step 2: For standalone sequence features not yet grouped, fall back to
-    # feature_groups structure.
+    # feature_groups structure, and track JAGGED_SEQUENCE (min=1) members.
+    jagged_seq_feat_names: Set[str] = set()
+    jagged_seq_groups: Set[str] = set()
     for fg in feature_groups:
         if fg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
-            # In JAGGED_SEQUENCE groups, single-valued features share nnz.
-            # Multi-valued features have independent nnz and are NOT grouped.
             for name in fg.feature_names:
-                if name in seq_feat_names and name not in feat_to_seq_dim_group:
-                    if _is_single_valued(name):
+                if name in seq_feat_names:
+                    jagged_seq_feat_names.add(name)
+                    if name not in feat_to_seq_dim_group:
                         feat_to_seq_dim_group[name] = f"fg_{fg.group_name}"
+                    jagged_seq_groups.add(feat_to_seq_dim_group[name])
         # SEQUENCE (DIN-style) groups: standalone sequence features have
         # independent lengths, so don't auto-share. Only grouped sequence
         # features (from SequenceFeature config via sequence_groups) share nnz.
         for sg in fg.sequence_groups:
             for name in sg.feature_names:
-                # Only sequence features in seq_groups share nnz — non-sequence
-                # features mixed into seq_groups are candidates, not sequences.
                 if name in seq_feat_names and name not in feat_to_seq_dim_group:
-                    if _is_single_valued(name):
-                        feat_to_seq_dim_group[name] = (
-                            f"sg_{fg.group_name}_{sg.group_name}"
-                        )
+                    feat_to_seq_dim_group[name] = f"sg_{fg.group_name}_{sg.group_name}"
 
-    # Step 3: Collect prefixes with .lengths siblings (sparse/sequence features)
+    # Step 3: Collect prefixes with .lengths and .key_lengths siblings.
     lengths_prefixes = set()
+    key_lengths_prefixes = set()
     for key in data:
         if key.endswith(".lengths"):
             lengths_prefixes.add(key[: -len(".lengths")])
+        elif key.endswith(".key_lengths"):
+            key_lengths_prefixes.add(key[: -len(".key_lengths")])
 
     # Step 4: Build dynamic shapes
+    input_tile = is_input_tile()
+    user_feat_names: Set[str] = (
+        {f.name for f in features if f.is_user_feat} if input_tile else set()
+    )
+    hard_search_features: Dict[str, str] = (
+        get_hard_search_input_tile_features(cast(List[BaseFeature], features))
+        if input_tile
+        else {}
+    )
+
     batch = torch.export.Dim("batch", min=1, max=499999999)
+    user_batch: Optional[torch.export.Dim] = None
+    hsk_batch_dims: Dict[str, torch.export.Dim] = {}
+    static_tile_keys: List[str] = []
     dynamic_shapes = {}
     group_to_dim: Dict[str, torch.export.Dim] = {}
     prefix_to_dim: Dict[str, torch.export.Dim] = {}
     dim_counter = 0
 
+    def _get_total_sequence_length_dim(feat_prefix: str) -> torch.export.Dim:
+        nonlocal dim_counter
+        if feat_prefix in feat_to_seq_dim_group:
+            group = feat_to_seq_dim_group[feat_prefix]
+            if group not in group_to_dim:
+                min_len = 1 if group in jagged_seq_groups else 0
+                group_to_dim[group] = torch.export.Dim(
+                    f"g_{dim_counter}", min=min_len, max=999999993
+                )
+                dim_counter += 1
+            return group_to_dim[group]
+        min_len = 1 if feat_prefix in jagged_seq_feat_names else 0
+        total_sequence_length_dim = torch.export.Dim(
+            f"g_{dim_counter}", min=min_len, max=999999993
+        )
+        dim_counter += 1
+        return total_sequence_length_dim
+
     for key, tensor in data.items():
-        if tensor.dim() == 0:
+        if tensor.dim() == 0 or key == "batch_size":
             dynamic_shapes[key] = {}
             continue
 
@@ -341,29 +503,17 @@ def _build_dynamic_shapes(
         is_key_lengths = key.endswith(".key_lengths")
 
         if is_sparse_values:
-            if prefix in feat_to_seq_dim_group:
-                # Sequence feature: share Dim with same-group features
-                group = feat_to_seq_dim_group[prefix]
-                if group not in group_to_dim:
-                    group_to_dim[group] = torch.export.Dim(
-                        f"g_{dim_counter}", min=1, max=999999993
-                    )
-                    dim_counter += 1
-                dim = group_to_dim[group]
-                dynamic_shapes[key] = {0: dim}
-                prefix_to_dim[prefix] = dim
-            elif prefix in seq_feat_names:
-                # Ungrouped sequence feature: own Dim, min=1
-                dim = torch.export.Dim(f"g_{dim_counter}", min=1, max=999999993)
-                dim_counter += 1
+            if prefix in seq_feat_names and prefix not in key_lengths_prefixes:
+                dim = _get_total_sequence_length_dim(prefix)
                 dynamic_shapes[key] = {0: dim}
                 prefix_to_dim[prefix] = dim
             else:
-                # Non-sequence sparse feature: own Dim, min=0
-                dim = torch.export.Dim(f"g_{dim_counter}", min=0, max=999999993)
-                dim_counter += 1
+                dim = prefix_to_dim.get(prefix)
+                if dim is None:
+                    dim = torch.export.Dim(f"g_{dim_counter}", min=0, max=999999993)
+                    dim_counter += 1
+                    prefix_to_dim[prefix] = dim
                 dynamic_shapes[key] = {0: dim}
-                prefix_to_dim[prefix] = dim
         elif is_sparse_weights:
             dim = prefix_to_dim.get(prefix)
             if dim is None:
@@ -372,12 +522,37 @@ def _build_dynamic_shapes(
                 prefix_to_dim[prefix] = dim
             dynamic_shapes[key] = {0: dim}
         elif is_key_lengths:
-            dim = torch.export.Dim(f"g_{dim_counter}", min=1, max=999999993)
-            dim_counter += 1
-            dynamic_shapes[key] = {0: dim}
+            dynamic_shapes[key] = {0: _get_total_sequence_length_dim(prefix)}
+        elif input_tile and prefix in hard_search_features:
+            if tensor.size(0) < 2:
+                # torch.export specializes size < 2 and rejects a dynamic Dim.
+                dynamic_shapes[key] = {}
+                static_tile_keys.append(key)
+            else:
+                seq_src = hard_search_features[prefix]
+                if seq_src not in hsk_batch_dims:
+                    hsk_batch_dims[seq_src] = torch.export.Dim(
+                        f"hsk_{seq_src}_batch", min=1, max=499999999
+                    )
+                dynamic_shapes[key] = {0: hsk_batch_dims[seq_src]}
+        elif input_tile and prefix in user_feat_names:
+            if tensor.size(0) < 2:
+                # torch.export specializes size < 2 and rejects a dynamic Dim.
+                dynamic_shapes[key] = {}
+                static_tile_keys.append(key)
+            else:
+                if user_batch is None:
+                    user_batch = torch.export.Dim("user_batch", min=1, max=499999999)
+                dynamic_shapes[key] = {0: user_batch}
         else:
             dynamic_shapes[key] = {0: batch}
 
+    if static_tile_keys:
+        logger.warning(
+            "Input-tile tensor(s) %s have <2 rows in the export sample; "
+            "freezing dim 0 as static in unified AOTI export.",
+            static_tile_keys,
+        )
     return dynamic_shapes
 
 
@@ -413,16 +588,17 @@ def export_unified_model_aot(
     with open(os.path.join(save_dir, "gm.code"), "w") as f:
         f.write(full_gm.code)
 
-    # Pad any 0-size non-sequence sparse .values tensors so torch.export
-    # doesn't specialize on the empty size (which conflicts with dynamic Dims).
     features = cast(List[BaseFeature], model.features)
-    seq_feat_names = {f.name for f in features if f.is_sequence}
-    data = _pad_empty_sparse_values(data, seq_feat_names)
+    # Normalize KeyedTensor column slices so AOTI compiles for contiguous inputs.
+    data = {k: v.contiguous() for k, v in sorted(data.items())}
+    # Pad <2-element sparse/sequence tensors so torch.export does not specialize
+    # them as constants and reject dynamic Dim constraints.
+    data = _pad_empty_sparse_values(data, features)
 
     # Build dynamic shapes using feature metadata for correct Dim grouping
     dynamic_shapes = _build_dynamic_shapes(
         data,
-        features=model.features,
+        features=features,
         feature_groups=model.feature_groups,
     )
     logger.info("dynamic shapes=%s" % dynamic_shapes)
@@ -448,6 +624,22 @@ def export_unified_model_aot(
             exported_pg,
             package_path=os.path.join(aoti_dir, "aoti_model.pt2"),
         )
+        data_parser = getattr(model, "_data_parser", None)
+        aoti_meta: Dict[str, Any] = {}
+        if is_input_tile() and data_parser is not None:
+            if data_parser._tile_keys is not None:
+                aoti_meta["tile_keys"] = list(data_parser._tile_keys)
+            hsk_map = data_parser._hard_search_input_tile_features
+            hsk_checks = [
+                [f"{f.name}.lengths", f"{hsk_map[f.name]}__inverse_indices"]
+                for f in features
+                if not f.stub_type and f.is_sparse and f.name in hsk_map
+            ]
+            if hsk_checks:
+                aoti_meta["hsk_checks"] = hsk_checks
+        if aoti_meta:
+            with open(os.path.join(aoti_dir, "aoti_meta.json"), "w") as f:
+                json.dump(aoti_meta, f, indent=4)
 
     logger.info("unified AOTI model exported to %s", save_dir)
     return save_dir

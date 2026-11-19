@@ -63,7 +63,7 @@ torchrun --master_addr=localhost --master_port=32555 \
   - 未设置 **DIST_QUANT** 时，不启用分布式 sparse embedding 量化
 - ENABLE_AOT: 使用AOT(Ahead Of Time)编译优化导出的模型，可显著提升推理性能。**AOT 编译产物与导出机器的 GPU 架构强绑定，在线服务的 GPU 类型必须与导出时使用的 GPU 类型完全一致**，详见下文 [在 PAI 上导出 AOT 模型](#export-aot-on-pai) 章节
   - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（sparse 部分用 JIT，dense 部分用 AOTI）
-  - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]
+  - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]；支持 `INPUT_TILE`、`HARD_SEARCH_INPUT_TILE` 和空序列特征（`JAGGED_SEQUENCE` 特征组在预测时仍要求每个 batch 的序列总长度至少为 1）
 
 (dynamic-embedding-full-export)=
 
@@ -311,5 +311,5 @@ export HARD_SEARCH_INPUT_TILE=1
 
 ### 使用限制
 
-- 当前支持 FX/TorchScript 和 distributed embedding，不支持 AOT/TRT、RTP、HSTU。
+- 当前支持 FX/TorchScript、统一 AOT（ENABLE_AOT=2）和 distributed embedding，不支持 ENABLE_AOT=1、TRT、RTP、HSTU。
 - 历史派生特征只能依赖同一份 hard-search 历史及共享用户输入或常量。若还依赖候选自身的 `item:` / `context:` 字段，或另一组历史，不能开启 `HARD_SEARCH_INPUT_TILE`。
