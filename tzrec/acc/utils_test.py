@@ -15,6 +15,8 @@ import shutil
 import unittest
 from unittest import mock
 
+import torch
+
 from tzrec.acc import utils
 from tzrec.utils.test_util import make_test_dir
 
@@ -119,6 +121,29 @@ class AccUtilsTest(unittest.TestCase):
                 )
         finally:
             shutil.rmtree(test_dir)
+
+    def test_portable_cpu_aot_env_helpers(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(utils.is_portable_cpu_aot())
+            self.assertIsNone(utils.get_aot_cpu_march())
+        with mock.patch.dict(
+            os.environ,
+            {"AOTI_PORTABLE_CPU": "1", "AOTI_CPU_MARCH": "x86-64-v3"},
+            clear=True,
+        ):
+            self.assertTrue(utils.is_portable_cpu_aot())
+            self.assertEqual(utils.get_aot_cpu_march(), "x86-64-v3")
+
+    def test_canonical_contiguous_fixes_size_one_and_zero_strides(self):
+        sliced_one = torch.randn(1, 4)[:, 0:1]
+        self.assertTrue(sliced_one.is_contiguous())
+        self.assertEqual(sliced_one.stride(), (4, 1))
+        fixed = utils.canonical_contiguous(sliced_one)
+        self.assertEqual(fixed.stride(), (1, 1))
+        torch.testing.assert_close(fixed, sliced_one)
+
+        sliced_zero = torch.empty((0, 8))[:, :4]
+        self.assertEqual(utils.canonical_contiguous(sliced_zero).stride(), (4, 1))
 
     def test_is_hard_search_input_tile(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):

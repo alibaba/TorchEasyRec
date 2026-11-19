@@ -685,7 +685,7 @@ class UnifiedAOTIModelWrapper(nn.Module):
                     f"{indices_key} length ({data[indices_key].numel()}) must be >= "
                     f"{lengths_key} length ({data[lengths_key].numel()})."
                 )
-        inputs = [data[k].cpu().contiguous() for k in key_order]
+        inputs = [acc_utils.canonical_contiguous(data[k].cpu()) for k in key_order]
         # Force CUDA primary context creation on worker threads.
         torch.cuda.set_device(device)
         with cast(Any, self._lock):

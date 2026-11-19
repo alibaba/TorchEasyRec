@@ -200,11 +200,11 @@ def is_unified_aot() -> bool:
 def is_unified_aot_predict(model_path: str) -> bool:
     """Judge whether the exported model uses unified AOTI in predict.
 
-    Reads ``ENABLE_AOT`` from model_acc.json (=2 → unified). Falls back
+    Reads ``ENABLE_AOT`` from model_acc.json (=2 -> unified). Falls back
     to the legacy ``UNIFIED_AOT`` key for pre-fold exports, then to
     file presence (legacy two-stage exports produce
     scripted_sparse_model.pt; unified exports do not) when neither
-    JSON key is present — keeps unit tests that bypass the full export
+    JSON key is present -- keeps unit tests that bypass the full export
     pipeline working.
     """
     acc_json_path = os.path.join(model_path, "model_acc.json")
@@ -222,21 +222,38 @@ def is_unified_aot_predict(model_path: str) -> bool:
     if not os.path.exists(sparse_model_path):
         logger.warning(
             "model_acc.json missing ENABLE_AOT; falling back to file-presence "
-            "heuristic (no scripted_sparse_model.pt → unified)"
+            "heuristic (no scripted_sparse_model.pt -> unified)"
         )
         return True
     return False
 
 
 def is_aot_predict(model_path: str) -> bool:
-    """Judge is aot or not in predict (ENABLE_AOT={1,2})."""
-    with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
-        data = json.load(file)
-    enable_aot = data.get("ENABLE_AOT")
-    if enable_aot and str(enable_aot)[:1] in ("1", "2"):
-        return True
-    legacy = data.get("UNIFIED_AOT")
-    return bool(legacy) and str(legacy)[:1] == "1"
+    """Judge whether the exported model uses AOTI in predict (ENABLE_AOT={1,2}).
+
+    Reads ``ENABLE_AOT`` (or legacy ``UNIFIED_AOT``) from model_acc.json,
+    falling back to file presence (``aoti/aoti_model.pt2`` without
+    ``scripted_model.pt``) when model_acc.json is missing or omits both keys.
+
+    Args:
+        model_path: exported model directory.
+
+    Returns:
+        True when prediction should load an AOTInductor package.
+    """
+    acc_json_path = os.path.join(model_path, "model_acc.json")
+    if os.path.exists(acc_json_path):
+        with open(acc_json_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        enable_aot = data.get("ENABLE_AOT")
+        if enable_aot is not None:
+            return str(enable_aot)[:1] in ("1", "2")
+        legacy = data.get("UNIFIED_AOT")
+        if legacy is not None:
+            return str(legacy)[:1] == "1"
+    return os.path.exists(
+        os.path.join(model_path, "aoti", "aoti_model.pt2")
+    ) and not os.path.exists(os.path.join(model_path, "scripted_model.pt"))
 
 
 def is_trt() -> bool:
@@ -393,7 +410,7 @@ def mixed_precision_for_export(pipeline_config: EasyRecConfig) -> str:
 
     Compares ``train_config.mixed_precision`` with
     ``export_config.mixed_precision``; logs a warning when they differ.
-    Returns ``export_config.mixed_precision`` — does not fall back to
+    Returns ``export_config.mixed_precision`` -- does not fall back to
     train_config. The export-time AMP intent must be expressed
     explicitly on ``export_config``.
     """
@@ -479,6 +496,18 @@ def export_acc_config(
     return acc_config
 
 
+def is_portable_cpu_aot() -> bool:
+    """Return whether opt-in portable CPU ISA flags are enabled for AOTI."""
+    val = os.environ.get("AOTI_PORTABLE_CPU")
+    return bool(val) and val[0] == "1"
+
+
+def get_aot_cpu_march() -> Optional[str]:
+    """Return explicit ``-march`` target for AOTI host compilation when set."""
+    val = os.environ.get("AOTI_CPU_MARCH")
+    return val if val is not None else None
+
+
 def get_max_export_batch_size() -> int:
     """Get max export batch size.
 
@@ -533,3 +562,24 @@ def allow_tf32_for_export(pipeline_config: EasyRecConfig) -> None:
             )
     allow_tf32(train_cfg)
     allow_tf32(export_cfg)
+
+
+def canonical_contiguous(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a tensor with exact row-major C-order strides.
+
+    PyTorch treats size-0/size-1 dimensions as contiguous regardless of their
+    stride, so ``.contiguous()`` keeps outer strides (e.g. ``(4, 1)`` on shape
+    ``(1, 1)``) from stacked DataParser slices. AOTI runtime input checks
+    verify exact C-order strides, so clone into contiguous format when needed.
+    """
+    tensor = tensor.contiguous()
+    if tensor.dim() == 0:
+        return tensor
+    expected = 1
+    strides = tensor.stride()
+    shape = tensor.shape
+    for i in range(tensor.dim() - 1, -1, -1):
+        if strides[i] != expected:
+            return tensor.clone(memory_format=torch.contiguous_format)
+        expected *= shape[i]
+    return tensor

@@ -85,6 +85,7 @@ from tzrec.utils.feature_store_uploader import FeatureStoreFullUploader
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
     UNTRACEABLE_MODULES,
+    eliminate_dense_dead_code,
     fx_mark_keyed_tensor,
     fx_mark_seq_ec_jt,
     fx_mark_seq_len,
@@ -1074,22 +1075,7 @@ def _add_module_by_dotted_path(
     parent.add_module(parts[-1], module)
 
 
-def _eliminate_dense_dead_code(graph: torch.fx.Graph) -> None:
-    """Drop every node the dense graph's output does not depend on.
-
-    A dense graph is a pruned view of the full traced graph: the marked sparse
-    outputs are rewired to read the sparse model's output dict, which leaves the
-    original lookup subtree unreachable. Plain ``eliminate_dead_code`` no longer
-    removes it, because torch>=2.13 resolves an ``OpOverloadPacket`` target to
-    its default overload when deciding purity, so the zero-user
-    ``fbgemm.bounds_check_indices`` left behind by a quantized lookup now counts
-    as impure and pins the whole subtree -- which then reads raw feature keys
-    that exist only in the sparse model's input. The sparse half runs in the
-    sparse model, so here only placeholders and the output are anchors.
-    """
-    graph.eliminate_dead_code(
-        is_impure_node=lambda node: node.op in ("placeholder", "output")
-    )
+_eliminate_dense_dead_code = eliminate_dense_dead_code
 
 
 def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:

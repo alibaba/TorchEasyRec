@@ -14,12 +14,19 @@ import shutil
 import unittest
 from unittest import mock
 
+import filelock
 import torch
 from parameterized import parameterized
+from torch import nn
+from torch.utils._pytree import tree_flatten, treespec_dumps, treespec_loads
 
+from tzrec.acc import aot_utils
 from tzrec.acc.aot_utils import (
+    _aoti_compile_cfg,
     _build_dynamic_shapes,
+    _compile_and_package_aoti,
     _pad_empty_sparse_values,
+    export_model_aot,
     export_unified_model_aot,
     load_model_aot,
 )
@@ -625,7 +632,6 @@ class AotUtilsTest(unittest.TestCase):
             bad_tile["u_w.lengths"] = torch.tensor([1, 1], dtype=torch.int64)
             with self.assertRaises(ValueError):
                 aoti_model(bad_tile, device)
-
             # 3) Offline batch_size=1 with u_bs == i_bs == 4 and an extra ignored key.
             if online == "0":
                 offline_data = {
@@ -777,6 +783,201 @@ class AotUtilsTest(unittest.TestCase):
             bad_hsk = _make_inputs([2, 0, 1], [0, 1])
             with self.assertRaises(ValueError):
                 aoti_model(bad_hsk, device)
+
+    def test_load_model_aot_device_validation_and_index_normalization(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires a CUDA device"):
+            load_model_aot(self.test_dir, torch.device("cpu"))
+
+        _, in_spec = tree_flatten(({"a": torch.zeros(1)}, {}))
+        _, out_spec = tree_flatten({"p": torch.zeros(1)})
+        fake_pkg = mock.Mock()
+        fake_pkg.loader.get_call_spec.return_value = (
+            treespec_dumps(in_spec),
+            treespec_dumps(out_spec),
+        )
+        with (
+            mock.patch.object(aot_utils, "is_unified_aot_predict", return_value=True),
+            mock.patch.object(
+                torch._inductor, "aoti_load_package", return_value=fake_pkg
+            ) as load_pkg_mock,
+        ):
+            load_model_aot(self.test_dir, torch.device("cuda"))
+            load_pkg_mock.assert_called_once_with(
+                os.path.join(self.test_dir, "aoti", "aoti_model.pt2"),
+                device_index=-1,
+            )
+
+    def test_export_aot_requires_cuda_before_makedirs(self) -> None:
+        with mock.patch("torch.cuda.is_available", return_value=False):
+            for name, fn in (
+                (
+                    "legacy",
+                    lambda d: export_model_aot(mock.Mock(), mock.Mock(), {}, {}, d),
+                ),
+                ("unified", lambda d: export_unified_model_aot(mock.Mock(), {}, d)),
+            ):
+                with self.subTest(case=name):
+                    save_dir = os.path.join(self.test_dir, f"no_cuda_{name}")
+                    with self.assertRaisesRegex(RuntimeError, "requires a CUDA device"):
+                        fn(save_dir)
+                    self.assertFalse(os.path.exists(save_dir))
+
+    def test_aoti_compile_cfg_portable_cpu_and_cache_lock(self) -> None:
+        with mock.patch.dict(os.environ, {"AOTI_PORTABLE_CPU": "1"}, clear=True):
+            cfg = _aoti_compile_cfg()
+            self.assertIn("cpp.march", cfg)
+            self.assertIn("cpp.simdlen", cfg)
+
+        with mock.patch.dict(
+            os.environ,
+            {"AOTI_CPU_MARCH": "x86-64-v3", "AOTI_CPU_SIMDLEN": "128"},
+            clear=True,
+        ):
+            cfg = _aoti_compile_cfg()
+            self.assertEqual(cfg["cpp.march"], "x86-64-v3")
+            self.assertEqual(cfg["cpp.simdlen"], 128)
+
+        cache_dir = os.path.join(self.test_dir, "inductor_cache")
+        save_dir = os.path.join(self.test_dir, "lock_export")
+        events = []
+
+        class _RecordingLock:
+            def __init__(self, path: str) -> None:
+                self._path = path
+
+            def __enter__(self):
+                events.append(("enter", self._path))
+                return self
+
+            def __exit__(self, *args):
+                events.append(("exit", self._path))
+
+        def _fake_compile_and_package(exported_pg, *, package_path):
+            events.append(("compile", package_path))
+            return package_path
+
+        dummy_ep = mock.Mock()
+        dummy_ep.range_constraints = {}
+        with (
+            mock.patch.dict(os.environ, {"TORCHINDUCTOR_CACHE_DIR": cache_dir}),
+            mock.patch.object(filelock, "FileLock", side_effect=_RecordingLock),
+            mock.patch.object(
+                torch._inductor,
+                "aoti_compile_and_package",
+                side_effect=_fake_compile_and_package,
+            ),
+        ):
+            _compile_and_package_aoti(dummy_ep, save_dir)
+
+        expected_lock = os.path.join(cache_dir, ".tzrec_aoti_package.lock")
+        expected_pkg = os.path.join(save_dir, "aoti", "aoti_model.pt2")
+        self.assertEqual(
+            events,
+            [
+                ("enter", expected_lock),
+                ("compile", expected_pkg),
+                ("exit", expected_lock),
+            ],
+        )
+
+    def test_build_dynamic_shapes_warns_static_and_tracks_non_seq_hsk(self) -> None:
+        id_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="u_id",
+                expression="user:u_id",
+                num_buckets=16,
+                embedding_dim=4,
+            )
+        )
+        hsk_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="hsk_item",
+                expression="item:hsk_item",
+                num_buckets=16,
+                embedding_dim=4,
+            )
+        )
+        feats = create_features([id_cfg, hsk_cfg])
+        feats[1]._is_hard_search_feat = True
+        data = {
+            "u_id.values": torch.tensor([1, 2], dtype=torch.int64),
+            "u_id.lengths": torch.tensor([2], dtype=torch.int64),
+            "hsk_item.values": torch.tensor([1, 2], dtype=torch.int64),
+            "hsk_item.lengths": torch.tensor([1, 1], dtype=torch.int64),
+        }
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"INPUT_TILE": "3", "INPUT_TILE_3_ONLINE": "0"},
+                clear=True,
+            ),
+            mock.patch.object(
+                aot_utils,
+                "get_hard_search_input_tile_features",
+                return_value={"hsk_item": "user_ctx"},
+            ),
+            mock.patch.object(aot_utils.logger, "warning") as warn_log,
+        ):
+            shapes = _build_dynamic_shapes(data, feats, [])
+
+        self.assertEqual(shapes["u_id.lengths"], {})
+        self.assertEqual(shapes["hsk_item.lengths"][0].__name__, "hsk_user_ctx_batch")
+        self.assertTrue(
+            any(
+                "degraded to static" in str(call.args[0])
+                for call in warn_log.call_args_list
+            )
+        )
+
+    @mark_ci_scope("gpu")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_export_unified_model_aot_prunes_unused_keys(self) -> None:
+        id_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="item_id",
+                expression="item:item_id",
+                num_buckets=16,
+                embedding_dim=4,
+            )
+        )
+        feats = create_features([id_cfg])
+
+        class _UnusedBatchSizeModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.features = feats
+                self.feature_groups = []
+                self.emb = nn.Embedding(16, 4)
+
+            def set_is_inference(self, _is_inference: bool) -> None:
+                return None
+
+            def forward(self, batch, _device=None):
+                vals = batch["item_id.values"]
+                lens = batch["item_id.lengths"]
+                emb = self.emb(vals)
+                return {"out": emb.sum() + lens.sum().float()}
+
+        sample_data = {
+            "item_id.values": torch.tensor([1, 2], dtype=torch.int64),
+            "item_id.lengths": torch.tensor([1, 1], dtype=torch.int64),
+            "batch_size": torch.tensor(2, dtype=torch.int64),
+        }
+        save_dir = os.path.join(self.test_dir, "unified_pruned")
+        with mock.patch.dict(os.environ, {"ENABLE_AOT": "2"}):
+            export_unified_model_aot(_UnusedBatchSizeModel(), sample_data, save_dir)
+            loaded = load_model_aot(save_dir, torch.device("cuda"))
+
+        in_spec = treespec_loads(loaded.model.loader.get_call_spec()[0])
+        key_order = list(in_spec.child(0).child(0).context)
+        self.assertNotIn("batch_size", key_order)
+        self.assertEqual(set(key_order), {"item_id.values", "item_id.lengths"})
+        cold_in = {
+            "item_id.values": torch.empty(0, dtype=torch.int64),
+            "item_id.lengths": torch.tensor([0], dtype=torch.int64),
+        }
+        out = loaded(cold_in, torch.device("cuda:0"))
+        self.assertEqual(float(out["out"].item()), 0.0)
 
 
 if __name__ == "__main__":
