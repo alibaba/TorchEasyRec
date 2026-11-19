@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import io
 import json
 import os
@@ -31,12 +32,25 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, Keyed
 
 from tzrec.datasets.utils import Batch
 from tzrec.models.genrec_causal_lm_model import generate_codes, resolve_beam_config
-from tzrec.models.genrec_model import SLOT_EMBEDS
-from tzrec.models.model import CombinedModelWrapper
-from tzrec.prompt.assembler import CU_SEQLENS, HOLE_POSITIONS, INPUT_IDS
+from tzrec.models.genrec_model import SLOT_EMBEDS, GenRecFrontEnd
+from tzrec.models.model import CombinedModelWrapper, ScriptWrapper
+from tzrec.prompt.assembler import (
+    CU_SEQLENS,
+    HOLE_POSITIONS,
+    HOLE_SLOT_COUNTS,
+    INPUT_IDS,
+)
 from tzrec.prompt.compile import sid_bands
+from tzrec.prompt.hole_keys import HOLE_KEYS
+from tzrec.protos import feature_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.utils import config_util, npz_util, predict_util, quant_util
+from tzrec.protos.prompt_pb2 import PromptSlot
+from tzrec.utils import config_util, export_util, npz_util, predict_util, quant_util
+from tzrec.utils.export_util import (
+    build_dense_graph_module,
+    finalize_dense_export,
+    init_parameters,
+)
 from tzrec.utils.hf_export_util import SERVING_MODEL_TYPE
 from tzrec.utils.logging_util import logger
 from tzrec.utils.predict_util import (
@@ -50,7 +64,9 @@ from tzrec.utils.predict_util import (
     load_predict_model,
 )
 from tzrec.utils.test_util import (
+    GENREC_LONG_HIST_CODES,
     ci_resources,
+    create_genrec_test_model,
     create_tiny_causal_lm,
     make_test_dir,
     mark_ci_scope,
@@ -1333,6 +1349,269 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
             torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
             torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
 
+    def test_genrec_export_model_aoti_distributed(self) -> None:
+        device = torch.device("cuda:0")
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "USE_DISTRIBUTED_EMBEDDING": "1",
+                    "INPUT_TILE": "3",
+                    "ENABLE_AOT": "2",
+                },
+            ):
+                hist_cfg = feature_pb2.FeatureConfig(
+                    sequence_raw_feature=feature_pb2.RawFeature(
+                        feature_name="hist", expression="user:hist"
+                    )
+                )
+                beh_cfg = feature_pb2.FeatureConfig(
+                    sequence_id_feature=feature_pb2.IdFeature(
+                        feature_name="beh",
+                        expression="user:beh",
+                        num_buckets=32,
+                        embedding_dim=8,
+                        sequence_length=2,
+                    )
+                )
+                age_cfg = feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="age",
+                        expression="user:age",
+                        num_buckets=16,
+                        embedding_dim=4,
+                    )
+                )
+                genrec_model, _ = create_genrec_test_model(
+                    os.path.join(self.export_dir, "src"),
+                    feature_configs=[hist_cfg, beh_cfg, age_cfg],
+                    prompt=(
+                        "User : {{user_slot}} History : {{hist}} . {{beh}} Predict :"
+                    ),
+                    slots=[PromptSlot(name="user_slot", feature_names=["age"])],
+                )
+                init_parameters(genrec_model, device=device)
+                genrec_model.eval()
+                # build_dense_graph_module shrinks sparse tables on genrec_model
+                # in place, so snapshot a full-table reference copy beforehand.
+                ref_model = copy.deepcopy(genrec_model)
+                ref_wrapped = ScriptWrapper(GenRecFrontEnd(ref_model)).to(device).eval()
+                genrec_model.lm.save_pretrained(self.export_dir)
+                with open(os.path.join(self.export_dir, "config.json"), "w") as f:
+                    json.dump(
+                        {
+                            "model_type": SERVING_MODEL_TYPE,
+                            "text_config": json.loads(
+                                genrec_model.lm.config.to_json_string()
+                            ),
+                            "sid_space": {
+                                "codebook": [4, 4, 4],
+                                "base_vocab_size": 40,
+                            },
+                        },
+                        f,
+                    )
+                pipeline_cfg = EasyRecConfig()
+                pipeline_cfg.model_config.genrec_causal_lm_model.common.beam_widths.extend(
+                    [2, 2, 2]
+                )
+                config_util.save_message(
+                    pipeline_cfg, os.path.join(self.export_dir, "pipeline.config")
+                )
+
+                wrapped = ScriptWrapper(GenRecFrontEnd(genrec_model)).to(device).eval()
+                export_data = {
+                    "batch_size": torch.tensor(1, dtype=torch.int64, device=device),
+                    "hist.values": torch.tensor(
+                        GENREC_LONG_HIST_CODES * 2,
+                        dtype=torch.float32,
+                        device=device,
+                    ).reshape(-1, 1),
+                    "hist.lengths": torch.tensor(
+                        [6, 6], dtype=torch.int64, device=device
+                    ),
+                    "beh.values": torch.zeros(4, dtype=torch.int64, device=device),
+                    "beh.lengths": torch.tensor(
+                        [2, 2], dtype=torch.int64, device=device
+                    ),
+                    "age.values": torch.zeros(2, dtype=torch.int64, device=device),
+                    "age.lengths": torch.tensor(
+                        [1, 1], dtype=torch.int64, device=device
+                    ),
+                }
+                gm, full_graph, dense_meta = build_dense_graph_module(
+                    wrapped, export_data, device
+                )
+                finalize_dense_export(
+                    wrapped,
+                    full_graph,
+                    gm,
+                    export_data,
+                    device,
+                    self.export_dir,
+                    dense_meta,
+                )
+
+                emb_sd = ref_model.embedding_group.state_dict()
+                age_w = (
+                    emb_sd["emb_impls.__BASE__.ebc_user.embedding_bags.age_emb.weight"]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                beh_w = (
+                    emb_sd[
+                        "seq_emb_impls.__BASE__.ec_dict_user.8.embeddings.beh_emb.weight"
+                    ]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                sparse_dir = os.path.join(self.export_dir, "sparse")
+                os.makedirs(sparse_dir, exist_ok=True)
+                npz_util.savez_streaming(
+                    os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"),
+                    {"age_emb": age_w, "beh_emb": beh_w},
+                )
+                with open(os.path.join(sparse_dir, "sparse_embedding.json"), "w") as f:
+                    json.dump(
+                        {
+                            "age_emb": {
+                                "dense": False,
+                                "is_dynamic": False,
+                                "dimension": 4,
+                                "shape": list(age_w.shape),
+                                "dtype": "float32",
+                            },
+                            "beh_emb": {
+                                "dense": False,
+                                "is_dynamic": False,
+                                "dimension": 8,
+                                "shape": list(beh_w.shape),
+                                "dtype": "float32",
+                            },
+                        },
+                        f,
+                    )
+                with open(os.path.join(sparse_dir, "sparse_features.json"), "w") as f:
+                    json.dump(
+                        {
+                            "age__ebc": {
+                                "embedding_name": "age_emb",
+                                "pooling": "SUM",
+                                "use_weight": False,
+                            },
+                            "beh__ec": {
+                                "embedding_name": "beh_emb",
+                                "pooling": "NONE",
+                                "use_weight": False,
+                            },
+                        },
+                        f,
+                    )
+                with open(os.path.join(self.export_dir, "dense_meta.json"), "w") as f:
+                    json.dump(dict(dense_meta), f)
+                with open(os.path.join(self.export_dir, "model_acc.json"), "w") as f:
+                    json.dump(
+                        {
+                            "DISTRIBUTED_EMBEDDING": "1",
+                            "INPUT_TILE": "3",
+                            "ENABLE_AOT": "2",
+                        },
+                        f,
+                    )
+
+            predict_model = load_predict_model(self.export_dir, [device])
+            self.assertIsInstance(predict_model, GenRecExportModel)
+            self.assertIsInstance(predict_model._frontend, DistributedEmbeddingModel)
+            self.assertTrue(predict_model._frontend._is_aot)
+
+            for bs in (1, 3):
+                batch = Batch(
+                    sparse_features={
+                        "g0": KeyedJaggedTensor(
+                            keys=["age", "beh"],
+                            values=torch.cat(
+                                [
+                                    torch.arange(1, bs + 1, dtype=torch.int64),
+                                    torch.arange(2, 2 + 2 * bs, dtype=torch.int64),
+                                ]
+                            ),
+                            lengths=torch.cat(
+                                [
+                                    torch.ones(bs, dtype=torch.int32),
+                                    torch.full((bs,), 2, dtype=torch.int32),
+                                ]
+                            ),
+                        )
+                    },
+                    sequence_dense_features={
+                        "hist": JaggedTensor(
+                            values=torch.tensor(
+                                GENREC_LONG_HIST_CODES * bs, dtype=torch.float32
+                            ).reshape(-1, 1),
+                            lengths=torch.full((bs,), 6, dtype=torch.int32),
+                        )
+                    },
+                )
+                tile_bs = torch.tensor(1, dtype=torch.int64)
+                with (
+                    torch.no_grad(),
+                    mock.patch.dict(os.environ, {"INPUT_TILE": "3"}),
+                ):
+                    raw_inputs = {
+                        k: v.to(device)
+                        for k, v in batch.to_dict(sparse_dtype=torch.int64).items()
+                    }
+                    raw_inputs["batch_size"] = tile_bs.to(device)
+                    expected_frontend = ref_wrapped(raw_inputs, device)
+                with torch.no_grad():
+                    actual_frontend = predict_model._frontend(batch, tile_bs, device)
+                for key in (
+                    INPUT_IDS,
+                    CU_SEQLENS,
+                    HOLE_POSITIONS,
+                    HOLE_KEYS,
+                    HOLE_SLOT_COUNTS,
+                    SLOT_EMBEDS,
+                ):
+                    self.assertIn(key, actual_frontend)
+                    self.assertEqual(actual_frontend[key].device, device)
+                    torch.testing.assert_close(
+                        actual_frontend[key],
+                        expected_frontend[key],
+                        rtol=1e-5,
+                        atol=1e-5,
+                    )
+
+                with torch.no_grad():
+                    actual = predict_model(batch, tile_bs, device)
+                    ref_lm = ref_model.lm.to(device)
+                    embeds = ref_lm.get_input_embeddings()(expected_frontend[INPUT_IDS])
+                    embeds.index_copy_(
+                        0,
+                        expected_frontend[HOLE_POSITIONS],
+                        expected_frontend[SLOT_EMBEDS].to(embeds.dtype),
+                    )
+                    _, band_lo, band_hi = sid_bands([4, 4, 4], 40)
+                    expected_codes = generate_codes(
+                        ref_lm,
+                        embeds,
+                        expected_frontend[CU_SEQLENS],
+                        int(torch.diff(expected_frontend[CU_SEQLENS]).max()),
+                        [2, 2, 2],
+                        list(zip(band_lo, band_hi)),
+                    )
+                self.assertEqual(actual["generated_sids"].device, device)
+                self.assertTrue(torch.equal(actual["generated_sids"], expected_codes))
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
 
 class GenRecExportModelTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -1529,6 +1808,225 @@ class LoadPredictModelTest(unittest.TestCase):
         self.assertEqual(list(actual), list(expected))
         for k, v in expected.items():
             torch.testing.assert_close(actual[k], v, rtol=0, atol=0, msg=k)
+
+
+class DistributedScriptGenRecTest(unittest.TestCase):
+    """Non-AOTI TorchScript distributed prediction and GenRec tests."""
+
+    def setUp(self) -> None:
+        self.model_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.model_dir, ignore_errors=True)
+
+    def test_distributed_embedding_script_model_genrec_raw_sparse_passthrough(
+        self,
+    ) -> None:
+        hist_cfg = feature_pb2.FeatureConfig(
+            sequence_raw_feature=feature_pb2.RawFeature(
+                feature_name="hist", expression="user:hist"
+            )
+        )
+        beh_cfg = feature_pb2.FeatureConfig(
+            sequence_id_feature=feature_pb2.IdFeature(
+                feature_name="beh",
+                expression="user:beh",
+                num_buckets=16,
+                embedding_dim=8,
+                sequence_length=4,
+            )
+        )
+        age_cfg = feature_pb2.FeatureConfig(
+            id_feature=feature_pb2.IdFeature(
+                feature_name="age",
+                expression="user:age",
+                num_buckets=16,
+                embedding_dim=8,
+            )
+        )
+        ref_model, _ = create_genrec_test_model(
+            self.model_dir,
+            feature_configs=[hist_cfg, beh_cfg, age_cfg],
+            prompt="U {{user_slot}} H {{hist}} B {{beh}} P :",
+            slots=[PromptSlot(name="user_slot", feature_names=["age"])],
+        )
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        init_parameters(ref_model, device=device)
+        ref_model.eval()
+        eval_model = copy.deepcopy(ref_model)
+        eval_frontend = ScriptWrapper(GenRecFrontEnd(eval_model)).to(device).eval()
+        # build_dense_graph_module shrinks sparse tables to 1 row in place.
+        frontend = ScriptWrapper(GenRecFrontEnd(ref_model)).to(device).eval()
+        warmup_data = {
+            "hist.values": torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float32),
+            "hist.lengths": torch.tensor([2, 1], dtype=torch.int64),
+            "beh.values": torch.zeros(3, dtype=torch.int64),
+            "beh.lengths": torch.tensor([2, 1], dtype=torch.int64),
+            "age.values": torch.zeros(2, dtype=torch.int64),
+            "age.lengths": torch.tensor([1, 1], dtype=torch.int64),
+        }
+        with export_util.acc_utils.export_env_scope(
+            use_distributed_embedding=True, input_tile="0", input_tile_3_online=False
+        ):
+            gm, _, dense_cfg = export_util.build_dense_graph_module(
+                frontend,
+                warmup_data,
+                device=device,
+            )
+            traced_dense = export_util.symbolic_trace(gm)
+            export_util.eliminate_dense_dead_code(traced_dense.graph)
+            traced_dense.recompile()
+            torch.jit.script(traced_dense).save(
+                os.path.join(self.model_dir, "scripted_model.pt")
+            )
+
+        with open(os.path.join(self.model_dir, "dense_meta.json"), "w") as f:
+            json.dump(dict(dense_cfg), f)
+        with open(os.path.join(self.model_dir, "model_acc.json"), "w") as f:
+            json.dump(
+                {
+                    "DISTRIBUTED_EMBEDDING": "1",
+                    "INPUT_TILE": "0",
+                    "ENABLE_AOT": "0",
+                },
+                f,
+            )
+
+        emb_sd = eval_model.embedding_group.state_dict()
+        age_w = next(v for k, v in emb_sd.items() if k.endswith(".age_emb.weight")).to(
+            device
+        )
+        beh_w = next(v for k, v in emb_sd.items() if k.endswith(".beh_emb.weight")).to(
+            device
+        )
+
+        class _FakeLookup:
+            def __call__(self, batch: Batch, target_device: torch.device):
+                kjt = batch.sparse_features["kjt"]
+                age_jt = kjt["age"]
+                beh_jt = kjt["beh"]
+                age_emb = age_w[age_jt.values().to(target_device)].to(torch.float32)
+                return {
+                    "user_slot__ebc": age_emb,
+                    "beh": beh_w[beh_jt.values().to(target_device)].to(torch.float32),
+                    "beh__lengths": beh_jt.lengths().to(target_device, torch.int64),
+                }
+
+        with mock.patch(
+            "tzrec.utils.predict_util.DistributedEmbeddingLookup",
+            return_value=_FakeLookup(),
+        ):
+            dist_model = DistributedEmbeddingModel(
+                self.model_dir, [device], log_model=False
+            )
+
+        # bs > 1 with one 0-length cold-start row and int32 CPU inputs.
+        batch = Batch(
+            sparse_features={
+                "kjt": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["age", "beh"],
+                    values=torch.tensor([1, 2, 3, 2, 5, 7], dtype=torch.int32),
+                    lengths=torch.tensor([1, 1, 1, 0, 2, 1], dtype=torch.int32),
+                )
+            },
+            sequence_dense_features={
+                "hist": JaggedTensor(
+                    values=torch.tensor([[1.0], [3.0], [4.0]], dtype=torch.float32),
+                    lengths=torch.tensor([0, 2, 1], dtype=torch.int64),
+                )
+            },
+            labels={},
+        )
+        with torch.no_grad():
+            out = dist_model(batch, torch.tensor(3, dtype=torch.int64), device)
+            raw_inputs = {
+                k: v.to(device)
+                for k, v in batch.to_dict(sparse_dtype=torch.int64).items()
+            }
+            expected = eval_frontend(raw_inputs, device)
+
+        self.assertIn(SLOT_EMBEDS, out)
+        self.assertIn(HOLE_POSITIONS, out)
+        self.assertEqual(out[CU_SEQLENS].numel(), 4)
+        for key in expected:
+            torch.testing.assert_close(out[key], expected[key], rtol=1e-5, atol=1e-5)
+
+    def test_needed_sparse_kjt_names_caches_layout(self) -> None:
+        model = object.__new__(DistributedEmbeddingModel)
+        model._required_keys = {"a.values", "mv.lengths", "mv.key_lengths"}
+        model._has_raw_sparse_candidates = True
+        model._sparse_copy_keys_cache = {}
+
+        batch1 = Batch(
+            sparse_features={
+                "g1": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["a", "b"],
+                    values=torch.tensor([1, 2]),
+                    lengths=torch.tensor([1, 1]),
+                ),
+                "g2": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["c"],
+                    values=torch.tensor([3]),
+                    lengths=torch.tensor([1]),
+                ),
+                "g3": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["mv"],
+                    values=torch.tensor([4]),
+                    lengths=torch.tensor([1]),
+                ),
+            },
+            sequence_mulval_lengths={
+                "g_mv": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["mv"],
+                    values=torch.tensor([1]),
+                    lengths=torch.tensor([1]),
+                )
+            },
+        )
+        self.assertEqual(model._needed_sparse_kjt_names(batch1), ("g1",))
+        self.assertEqual(len(model._sparse_copy_keys_cache), 1)
+
+        # Same layout hits the cache without recomputing from _required_keys.
+        batch1_repeat = Batch(
+            sparse_features={
+                "g1": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["a", "b"],
+                    values=torch.tensor([5, 6, 7]),
+                    lengths=torch.tensor([2, 1]),
+                ),
+                "g2": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["c"],
+                    values=torch.tensor([8]),
+                    lengths=torch.tensor([1]),
+                ),
+                "g3": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["mv"],
+                    values=torch.tensor([9]),
+                    lengths=torch.tensor([1]),
+                ),
+            },
+            sequence_mulval_lengths={
+                "g_mv": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["mv"],
+                    values=torch.tensor([1]),
+                    lengths=torch.tensor([1]),
+                )
+            },
+        )
+        with mock.patch.object(model, "_required_keys", set()):
+            self.assertEqual(model._needed_sparse_kjt_names(batch1_repeat), ("g1",))
+        self.assertEqual(len(model._sparse_copy_keys_cache), 1)
+
+        # Different layout misses the cache and recomputes cleanly.
+        batch2 = Batch(
+            sparse_features={
+                "g2": KeyedJaggedTensor.from_lengths_sync(
+                    keys=["c", "a"],
+                    values=torch.tensor([1, 2]),
+                    lengths=torch.tensor([1, 1]),
+                )
+            }
+        )
+        self.assertEqual(model._needed_sparse_kjt_names(batch2), ("g2",))
+        self.assertEqual(len(model._sparse_copy_keys_cache), 2)
 
 
 if __name__ == "__main__":

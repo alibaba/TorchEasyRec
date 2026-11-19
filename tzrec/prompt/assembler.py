@@ -19,7 +19,7 @@ The walk is prompt structure only; ``hole_keys.py`` folds the prefix-cache
 identity of each hole beside it.
 """
 
-from typing import Dict, Final, List, Tuple
+from typing import Dict, Final, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -51,32 +51,29 @@ OUTPUT_KEYS = (
 )
 
 
-@torch.jit.script
 def _exclusive_cumsum(values: torch.Tensor) -> torch.Tensor:
     """Exclusive prefix sum along dim 0."""
     return torch.cumsum(values, dim=0) - values
 
 
-@torch.jit.script
-def _row_ids(lengths: torch.Tensor) -> torch.Tensor:
+def _row_ids(lengths: torch.Tensor, output_size: Optional[int] = None) -> torch.Tensor:
     """Row index of every element in a jagged buffer described by lengths."""
     return torch.repeat_interleave(
         torch.arange(lengths.numel(), dtype=torch.int64, device=lengths.device),
         lengths,
+        output_size=output_size,
     )
 
 
-@torch.jit.script
-def _within_row_index(lengths: torch.Tensor) -> torch.Tensor:
+def _within_row_index(
+    lengths: torch.Tensor, output_size: Optional[int] = None
+) -> torch.Tensor:
     """Position of every element inside its own row."""
-    total = int(torch.sum(lengths))
     starts = _exclusive_cumsum(lengths)
-    return torch.arange(
-        total, dtype=torch.int64, device=lengths.device
-    ) - torch.repeat_interleave(starts, lengths)
+    repeated_starts = torch.repeat_interleave(starts, lengths, output_size=output_size)
+    return (torch.cumsum(torch.ones_like(repeated_starts), dim=0) - 1) - repeated_starts
 
 
-@torch.jit.script
 def batch_device(batch: Dict[str, torch.Tensor]) -> torch.device:
     """Device the batch already lives on, so nothing is built on the wrong one."""
     for value in batch.values():
@@ -84,10 +81,11 @@ def batch_device(batch: Dict[str, torch.Tensor]) -> torch.device:
     return torch.device("cpu")
 
 
-@torch.jit.script
 def _destinations(seg_start: torch.Tensor, seg_len: torch.Tensor) -> torch.Tensor:
     """Absolute index of every value of one segment in the packed stream."""
-    return torch.repeat_interleave(seg_start, seg_len) + _within_row_index(seg_len)
+    row_starts = _exclusive_cumsum(seg_len)
+    repeated_base = torch.repeat_interleave(seg_start - row_starts, seg_len)
+    return repeated_base + (torch.cumsum(torch.ones_like(repeated_base), dim=0) - 1)
 
 
 class PromptAssembler(nn.Module):
@@ -205,12 +203,17 @@ class PromptAssembler(nn.Module):
         """
         if self.anchor == "":
             if "batch_size" in batch:
+                if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+                    batch_size = batch["batch_size"].item()
+                    torch._check(batch_size >= 1)
+                    # pyre-ignore [7]
+                    return batch_size
                 return int(batch["batch_size"])
             return 0
         key = self.anchor + ".lengths"
         if key in batch:
-            return int(batch[key].numel())
-        return int(batch[self.anchor + ".values"].size(0))
+            return batch[key].numel()
+        return batch[self.anchor + ".values"].size(0)
 
     def _inline_counts(
         self, batch: Dict[str, torch.Tensor], index: int, batch_size: int
@@ -227,7 +230,9 @@ class PromptAssembler(nn.Module):
         if key in batch:
             key_lengths = batch[key].to(torch.int64).reshape(-1)
             counts = torch.zeros(batch_size, dtype=torch.int64, device=lengths.device)
-            lengths = counts.index_add_(0, _row_ids(lengths), key_lengths)
+            lengths = counts.index_add_(
+                0, _row_ids(lengths, output_size=key_lengths.numel()), key_lengths
+            )
         return lengths
 
     def _segment(
@@ -257,12 +262,21 @@ class PromptAssembler(nn.Module):
 
         if self.is_sequences[index]:
             seg_len = batch[member + ".lengths"].to(torch.int64)
-        else:
-            seg_len = torch.ones(batch_size, dtype=torch.int64, device=device)
-        total = int(torch.sum(seg_len))
-        return seg_len, torch.full(
-            (total,), self.sentinel, dtype=torch.int64, device=seg_len.device
+            sentinels = torch.repeat_interleave(
+                torch.full(
+                    (batch_size,),
+                    self.sentinel,
+                    dtype=torch.int64,
+                    device=seg_len.device,
+                ),
+                seg_len,
+            )
+            return seg_len, sentinels
+        seg_len = torch.ones(batch_size, dtype=torch.int64, device=device)
+        sentinels = torch.full(
+            (batch_size,), self.sentinel, dtype=torch.int64, device=device
         )
+        return seg_len, sentinels
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Assemble one batch.
@@ -293,9 +307,6 @@ class PromptAssembler(nn.Module):
         row_start = _exclusive_cumsum(row_total)
         seg_offsets = torch.cumsum(stacked, dim=0) - stacked
 
-        total_tokens = int(torch.sum(row_total))
-        out = torch.zeros(total_tokens, dtype=torch.int64, device=device)
-
         # one entry per projected occurrence, and an empty stream under
         # Pattern I, where the concatenation below would otherwise have
         # nothing to join
@@ -315,7 +326,12 @@ class PromptAssembler(nn.Module):
                 hole_parts[slot + 1] = dest
             if i >= self.num_body:
                 response_lengths = response_lengths + seg_lens[i]
-        out.index_copy_(0, torch.cat(dests, dim=0), torch.cat(seg_values, dim=0))
+        flat_dests = torch.cat(dests, dim=0)
+        flat_values = torch.cat(seg_values, dim=0)
+        if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+            torch._check(flat_dests.size(0) == flat_values.size(0))
+        out = torch.zeros_like(flat_values)
+        out.index_copy_(0, flat_dests, flat_values)
 
         if self.num_segments > self.num_body:
             # the first response token is predicted by the one before it, so a

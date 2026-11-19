@@ -32,7 +32,6 @@ from tzrec.protos.model_pb2 import FeatureGroupType
 HOLE_KEYS = "hole_keys"
 
 
-@torch.jit.script
 def mix64(z: torch.Tensor) -> torch.Tensor:
     """A SplitMix64-shaped avalanche over int64, wrapping.
 
@@ -86,33 +85,49 @@ class HoleKeyBuilder(nn.Module):
     member_names: List[List[str]]
     is_sequences: List[bool]
     salts: List[int]
+    member_salts: List[List[int]]
 
     def __init__(self, prompt_plan: PromptPlan) -> None:
         super().__init__()
         self.member_names = []
         self.is_sequences = []
         self.salts = []
+        self.member_salts = []
         for seg in prompt_plan.projected_slots:
-            self.member_names.append(list(seg.feature_names))
+            names = list(seg.feature_names)
+            self.member_names.append(names)
             self.is_sequences.append(seg.group_type == FeatureGroupType.JAGGED_SEQUENCE)
             # 1-based: slot 0 must not salt to zero, or its empty hole
             # would fold to zero as an unsalted accumulator did
-            self.salts.append(_wrap64(self.C_SLOT * (int(seg.slot_id) + 1)))
+            salt = _wrap64(self.C_SLOT * (int(seg.slot_id) + 1))
+            self.salts.append(salt)
+            self.member_salts.append(
+                [
+                    _wrap64(m_idx * self.MEMBER_STRIDE * self.C_INDEX + salt)
+                    for m_idx in range(len(names))
+                ]
+            )
         self.num_slots = len(self.member_names)
 
     def _fold_slot(self, batch: Dict[str, torch.Tensor], index: int) -> torch.Tensor:
         """One projected occurrence's keys, one per hole, in sample order."""
         salt = self.salts[index]
+        m_salts = self.member_salts[index]
         members = self.member_names[index]
         is_sequence = self.is_sequences[index]
         # the assembler's hole count: one per item of a sequence slot, one per
         # sample of a DEEP slot; a dense member has one row per hole either way
         first = batch[members[0] + ".values"]
         if first.is_floating_point():
-            num_holes = int(first.size(0))
+            num_holes = first.size(0)
+        elif is_sequence:
+            kl_key = members[0] + ".key_lengths"
+            if kl_key in batch:
+                num_holes = batch[kl_key].numel()
+            else:
+                num_holes = first.numel()
         else:
-            lengths = batch[members[0] + ".lengths"].to(torch.int64)
-            num_holes = int(torch.sum(lengths)) if is_sequence else int(lengths.numel())
+            num_holes = batch[members[0] + ".lengths"].numel()
         # seeded with the salt, not zero: a hole no value reaches -- an empty
         # DEEP member, a zero-length item -- is still that slot's hole
         keys = torch.full((num_holes,), salt, dtype=torch.int64, device=first.device)
@@ -140,12 +155,27 @@ class HoleKeyBuilder(nn.Module):
                     + 2 * torch.isneginf(floats).to(torch.int64)
                 )
                 values = torch.where(finite, encoded, special).reshape(-1)
-                hole = torch.arange(
-                    rows, dtype=torch.int64, device=raw.device
-                ).repeat_interleave(width)
+                hole = (
+                    (
+                        torch.cumsum(
+                            torch.ones((rows, 1), dtype=torch.int64, device=raw.device),
+                            dim=0,
+                        )
+                        - 1
+                    )
+                    .expand(rows, width)
+                    .reshape(-1)
+                )
                 local = (
-                    torch.arange(width, dtype=torch.int64, device=raw.device)
-                    .unsqueeze(0)
+                    (
+                        torch.cumsum(
+                            torch.ones(
+                                (1, width), dtype=torch.int64, device=raw.device
+                            ),
+                            dim=1,
+                        )
+                        - 1
+                    )
                     .expand(rows, width)
                     .reshape(-1)
                 )
@@ -154,20 +184,30 @@ class HoleKeyBuilder(nn.Module):
                 key_length_key = member + ".key_lengths"
                 if not is_sequence:
                     lengths = batch[member + ".lengths"].to(torch.int64)
-                    hole = _row_ids(lengths)
-                    local = _within_row_index(lengths)
+                    output_size = values.numel()
+                    hole = _row_ids(lengths, output_size=output_size)
+                    local = _within_row_index(lengths, output_size=output_size)
                 elif key_length_key in batch:
                     key_lengths = batch[key_length_key].to(torch.int64).reshape(-1)
-                    hole = _row_ids(key_lengths)
-                    local = _within_row_index(key_lengths)
+                    output_size = values.numel()
+                    hole = _row_ids(key_lengths, output_size=output_size)
+                    local = _within_row_index(key_lengths, output_size=output_size)
                 else:
-                    hole = torch.arange(
-                        values.numel(), dtype=torch.int64, device=values.device
-                    )
+                    hole = torch.cumsum(torch.ones_like(values), dim=0) - 1
                     local = torch.zeros_like(hole)
 
-            local = local + member_index * self.MEMBER_STRIDE
-            mixed = mix64(values * self.C_VALUE + local * self.C_INDEX + salt)
+            # Break SymPy IndexPropagation so Inductor emits tl.full(..., tl.int64).
+            local = local ^ 0
+            c_idx = torch.full(
+                (), self.C_INDEX, dtype=torch.int64, device=values.device
+            )
+            c_val = torch.full(
+                (), self.C_VALUE, dtype=torch.int64, device=values.device
+            )
+            m_salt = torch.full(
+                (), m_salts[member_index], dtype=torch.int64, device=values.device
+            )
+            mixed = mix64(values * c_val + local * c_idx + m_salt)
             keys.index_add_(0, hole, mixed)
         return keys
 
