@@ -12,7 +12,7 @@
 import os
 import shutil
 import unittest
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 from unittest import mock
 
 import torch
@@ -187,6 +187,32 @@ class ExportGraphOptTest(unittest.TestCase):
         opt_gm = optimize_fx_for_export(gm)
         self.assertIn("self.drop", opt_gm.code)
         self.assertTrue(mod.drop.training)
+        self.assertTrue(opt_gm.drop.training)
+
+        class _SubDropout(nn.Dropout):
+            def forward(self, input: torch.Tensor) -> torch.Tensor:
+                return input * 2.0
+
+        class _SubIdentity(nn.Identity):
+            def forward(self, input: torch.Tensor) -> torch.Tensor:
+                return input + 1.0
+
+        class SubclassMod(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.sub_drop = _SubDropout(0.5)
+                self.sub_id = _SubIdentity()
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.sub_id(self.sub_drop(x))
+
+        sub_mod = SubclassMod().eval()
+        sub_gm = symbolic_trace(sub_mod, leaf_modules=["_SubDropout", "_SubIdentity"])
+        sub_opt = optimize_fx_for_export(sub_gm)
+        self.assertIn("self.sub_drop", sub_opt.code)
+        self.assertIn("self.sub_id", sub_opt.code)
+        x = torch.randn(2, 4)
+        torch.testing.assert_close(sub_opt(x), sub_mod(x), atol=1e-5, rtol=1e-5)
 
     def test_pass2_linear_bn_2d_and_3d_including_leaf_transpose_and_no_bias(
         self,
@@ -306,6 +332,45 @@ class ExportGraphOptTest(unittest.TestCase):
         for r, o in zip(ref, out):
             torch.testing.assert_close(o, r, atol=1e-5, rtol=1e-5)
 
+        # Exercise ATen mode on DiceGallery (covers unsqueeze_1d=True).
+        opt_aten = optimize_fx_for_export(gm, emit_jit_anchors=False)
+        self.assertNotIn("_tzrec_eval_bn_dice", opt_aten.code)
+        self.assertIn("unsqueeze", opt_aten.code)
+        for r, o in zip(ref, opt_aten(x2, x3)):
+            torch.testing.assert_close(o, r, atol=1e-5, rtol=1e-5)
+        ep = torch.export.export(opt_aten, (x2, x3))
+        for r, o in zip(ref, ep.module()(x2, x3)):
+            torch.testing.assert_close(o, r, atol=1e-5, rtol=1e-5)
+
+        # Verify Perceptron(use_bn=False, activation="Dice") keeps Dice.bn for Pass 3.
+        class PerceptronDiceNoBn(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.p2 = Perceptron(4, 4, activation="Dice", use_bn=False, dim=2)
+                self.p3 = Perceptron(4, 4, activation="Dice", use_bn=False, dim=3)
+                _init_bn_stats(self.p2.perceptron[1].bn, seed=34)
+                _init_bn_stats(self.p3.perceptron[1].bn, seed=35)
+                self.p2.perceptron[1].alpha.data.fill_(0.2)
+                self.p3.perceptron[1].alpha.data.fill_(-0.25)
+
+            def forward(
+                self, x2_in: torch.Tensor, x3_in: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                return self.p2(x2_in), self.p3(x3_in)
+
+        p_mod = PerceptronDiceNoBn().eval()
+        p_opt = optimize_fx_for_export(symbolic_trace(p_mod), emit_jit_anchors=True)
+        p_dice_nodes = [
+            n
+            for n in p_opt.graph.nodes
+            if n.op == "call_function" and n.target is _tzrec_eval_bn_dice
+        ]
+        self.assertEqual(len(p_dice_nodes), 2)
+        self.assertEqual([n.args[4] for n in p_dice_nodes], [False, True])
+        p_x3 = torch.randn(3, 5, 4)
+        for r, o in zip(p_mod(x2, p_x3), p_opt(x2, p_x3)):
+            torch.testing.assert_close(o, r, atol=1e-5, rtol=1e-5)
+
     def test_pass4_standalone_bn_2d_3d_and_non_paired_3d(self) -> None:
         class StandaloneBnModel(nn.Module):
             def __init__(self) -> None:
@@ -349,7 +414,18 @@ class ExportGraphOptTest(unittest.TestCase):
 
         x2 = torch.randn(3, 4)
         x3 = torch.randn(3, 5, 4)
-        for r, o in zip(mod(x2, x3), scripted(x2, x3)):
+        ref = mod(x2, x3)
+        for r, o in zip(ref, scripted(x2, x3)):
+            torch.testing.assert_close(o, r, atol=1e-5, rtol=1e-5)
+
+        # Verify zero-transpose ATen BN for 2D, paired 3D, and channel-first 3D.
+        opt_aten = optimize_fx_for_export(gm, emit_jit_anchors=False)
+        self.assertNotIn("_tzrec_eval_bn", opt_aten.code)
+        self.assertNotIn("transpose(1, -1)", opt_aten.code)
+        for r, o in zip(ref, opt_aten(x2, x3)):
+            torch.testing.assert_close(o, r, atol=1e-5, rtol=1e-5)
+        ep = torch.export.export(opt_aten, (x2, x3))
+        for r, o in zip(ref, ep.module()(x2, x3)):
             torch.testing.assert_close(o, r, atol=1e-5, rtol=1e-5)
 
     @parameterized.expand(
@@ -471,14 +547,18 @@ class ExportGraphOptTest(unittest.TestCase):
                 torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
 
         # Fallback: missing user or item keys leaves _tile_size untouched.
-        opt_fallback = optimize_fx_for_export(
-            gm,
-            emit_jit_anchors=True,
-            user_input_keys={"u__ebc_user"},
-            item_input_keys=set(),
-        )
-        self.assertIn("_tile_size", opt_fallback.code)
-        self.assertNotIn("_infer_tile_size", opt_fallback.code)
+        for u_keys, it_keys in (
+            ({"u__ebc_user"}, set()),
+            (set(), {"it__ebc"}),
+        ):
+            opt_fallback = optimize_fx_for_export(
+                gm,
+                emit_jit_anchors=True,
+                user_input_keys=u_keys,
+                item_input_keys=it_keys,
+            )
+            self.assertIn("_tile_size", opt_fallback.code)
+            self.assertNotIn("_infer_tile_size", opt_fallback.code)
 
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")
@@ -506,6 +586,7 @@ class ExportGraphOptTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TZREC_DISABLE_EXPORT_GRAPH_OPT": "1"}):
             opt_gm = optimize_fx_for_export(gm)
         self.assertIs(opt_gm, gm)
+        self.assertIs(optimize_fx_for_export(cast(Any, mod)), mod)
 
     def test_non_mutation_and_multi_round_online_dense_export(self) -> None:
         tables = [
@@ -836,24 +917,48 @@ class ExportGraphOptTest(unittest.TestCase):
                 self.lin = nn.Linear(5, 4)
                 self.bn_eval = nn.BatchNorm1d(4)
                 self.bn_train = nn.BatchNorm1d(4)
+                self.bn_notrack = nn.BatchNorm1d(4, track_running_stats=False)
                 _init_bn_stats(self.bn_eval, seed=301)
                 _init_bn_stats(self.bn_train, seed=302)
-                self.bn_eval.eval()
-                self.bn_train.train()
 
-            def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            def forward(
+                self, x: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 h_eval = torch.transpose(
                     self.bn_eval(torch.transpose(self.lin(x), 1, 2)), 2, 1
                 )
                 h_train = self.bn_train(h_eval.transpose(1, 2)).transpose(1, 2)
-                return h_eval, h_train
+                h_notrack = self.bn_notrack(h_eval.transpose(1, 2)).transpose(1, 2)
+                return h_eval, h_train, h_notrack
 
-        mod = FnTransposeAndTrainBn()
+        mod = FnTransposeAndTrainBn().eval()
+        mod.bn_train.train()
         gm = symbolic_trace(mod)
         opt_gm = optimize_fx_for_export(gm, emit_jit_anchors=False)
-        self.assertIn("self.bn_train", opt_gm.code)
+        self.assertIn("_opt_fused_linear", opt_gm.code)
+        self.assertNotIn("self.lin", opt_gm.code)
         self.assertNotIn("self.bn_eval", opt_gm.code)
+        self.assertIn("self.bn_train", opt_gm.code)
+        self.assertIn("self.bn_notrack", opt_gm.code)
         self.assertTrue(mod.bn_train.training)
+        self.assertTrue(opt_gm.bn_train.training)
+        self.assertFalse(opt_gm.training)
+
+        x3_in = torch.randn(3, 6, 5)
+        assert mod.bn_train.running_mean is not None
+        orig_rm = mod.bn_train.running_mean.clone()
+        with torch.no_grad():
+            opt_out = opt_gm(x3_in)
+        self.assertTrue(torch.equal(mod.bn_train.running_mean, orig_rm))
+        # Reset running stats so mod(x3_in) sees identical initial bn_train state.
+        with torch.no_grad():
+            _init_bn_stats(mod.bn_train, seed=302)
+            assert opt_gm.bn_train.running_mean is not None
+            opt_gm_rm = opt_gm.bn_train.running_mean.clone()
+            ref_out = mod(x3_in)
+        self.assertFalse(torch.equal(opt_gm_rm, orig_rm))
+        for r, o in zip(ref_out, opt_out):
+            torch.testing.assert_close(o, r, atol=1e-5, rtol=1e-5)
 
         # Standard ATen emit_jit_anchors=False tower compiles via torch.export.export.
         tower = _DenseTower().eval()
@@ -881,6 +986,148 @@ class ExportGraphOptTest(unittest.TestCase):
             )
             self.assertEqual(u_keys, set())
             self.assertEqual(it_keys, set())
+
+    def test_collect_dense_and_normal_export_tile_input_keys(self) -> None:
+        feat_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="user_id",
+                    expression="user:user_id",
+                    embedding_dim=4,
+                    num_buckets=8,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="item_id",
+                    expression="item:item_id",
+                    embedding_dim=4,
+                    num_buckets=8,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="u_raw",
+                    expression="user:u_raw",
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="i_raw",
+                    expression="item:i_raw",
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(feature_name="amb_raw")
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="u_seq",
+                    sequence_length=3,
+                    sequence_delim=";",
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="u_hist",
+                                expression="user:u_hist",
+                                embedding_dim=4,
+                                num_buckets=8,
+                            )
+                        )
+                    ],
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_id_feature=feature_pb2.IdFeature(
+                    feature_name="i_seq",
+                    expression="item:i_hist",
+                    embedding_dim=4,
+                    num_buckets=8,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                sequence_feature=feature_pb2.SequenceFeature(
+                    sequence_name="hs_seq",
+                    sequence_length=3,
+                    sequence_delim=";",
+                    sequence_pk="user:hs_seq",
+                    hard_search_key="item:cate_id",
+                    features=[
+                        feature_pb2.SeqFeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="hs_item",
+                                expression="item:hs_seq__hs_item",
+                                embedding_dim=4,
+                                num_buckets=8,
+                            )
+                        )
+                    ],
+                )
+            ),
+        ]
+        features = create_features(feat_cfgs)
+
+        class DummyModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.features = features
+
+        dense_graph_config = {
+            "hs_only_grp": [
+                "hs_seq__hs_item__ebc",
+                "hs_seq__hs_item@shared__ebc",
+            ],
+            "mixed_grp": ["hs_seq__hs_item__ebc", "item_id__ebc"],
+            "user_grp__ebc_user": ["user_id__ebc"],
+            "sequence__ec": [
+                "u_seq__u_hist__ec",
+                "u_seq__u_hist__lengths",
+                "i_seq__ec",
+                "i_seq@shared__lengths",
+                "hs_seq__hs_item__ec",
+                "hs_seq__hs_item__lengths",
+            ],
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"INPUT_TILE": "3", "HARD_SEARCH_INPUT_TILE": "1", "USE_RTP": "0"},
+        ):
+            user_keys, item_keys = export_util._collect_dense_export_tile_input_keys(
+                cast(Any, DummyModel()), dense_graph_config
+            )
+            self.assertEqual(
+                user_keys,
+                {"user_grp__ebc_user", "u_seq__u_hist__lengths", "u_raw.values"},
+            )
+            self.assertEqual(
+                item_keys,
+                {
+                    "mixed_grp",
+                    "i_seq@shared__lengths",
+                    "i_raw.values",
+                    "hs_seq__inverse_indices",
+                },
+            )
+            self.assertNotIn("hs_only_grp", user_keys | item_keys)
+            self.assertNotIn("hs_seq__hs_item__lengths", user_keys | item_keys)
+            self.assertNotIn("amb_raw.values", user_keys | item_keys)
+
+            n_user, n_item = export_util._collect_normal_export_tile_input_keys(
+                features
+            )
+            self.assertEqual(
+                n_user,
+                {"user_id.lengths", "u_raw.values", "u_seq__u_hist.lengths"},
+            )
+            self.assertEqual(
+                n_item,
+                {
+                    "item_id.lengths",
+                    "i_raw.values",
+                    "i_seq.lengths",
+                    "hs_seq__inverse_indices",
+                },
+            )
 
 
 if __name__ == "__main__":

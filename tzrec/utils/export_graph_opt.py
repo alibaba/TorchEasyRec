@@ -34,23 +34,26 @@ def _tzrec_eval_bn_dice(
     alpha: torch.Tensor,
     channel_last: bool = False,
 ) -> torch.Tensor:
-    """Standard PyTorch fallback and TorchScript IR anchor for fused BN + Dice."""
+    """Standard PyTorch fallback and TorchScript IR anchor for fused BN + Dice.
+
+    ``scale``, ``shift``, and ``alpha`` are 1D contiguous FP32 buffers matching the
+    downstream TorchScript custom-op ABI. Fallback execution accumulates in FP32 to
+    match native ``batch_norm`` and fused serving kernel precision before casting
+    back to ``x.dtype``.
+    """
     x_f = x.float()
     s = scale.float()
     b = shift.float()
     a = alpha.float()
-    if channel_last:
-        norm_x = x_f * s + b
-        p = torch.sigmoid(norm_x)
-        return ((p + a * (1.0 - p)) * x_f).to(dtype=x.dtype)
-    if x_f.dim() == 3:
-        norm_x = x_f * s.unsqueeze(1) + b.unsqueeze(1)
-        p = torch.sigmoid(norm_x)
-        a_3d = a.unsqueeze(1)
-        return ((p + a_3d * (1.0 - p)) * x_f).to(dtype=x.dtype)
-    norm_x = x_f * s + b
+    one_minus_a = 1.0 - a
+    if not channel_last and x_f.dim() == 3:
+        s = s.unsqueeze(1)
+        b = b.unsqueeze(1)
+        a = a.unsqueeze(1)
+        one_minus_a = one_minus_a.unsqueeze(1)
+    norm_x = torch.addcmul(b, x_f, s)
     p = torch.sigmoid(norm_x)
-    return ((p + a * (1.0 - p)) * x_f).to(dtype=x.dtype)
+    return (torch.addcmul(a, p, one_minus_a) * x_f).to(dtype=x.dtype)
 
 
 @torch.fx.wrap
@@ -60,22 +63,24 @@ def _tzrec_eval_bn(
     shift: torch.Tensor,
     channel_last: bool = False,
 ) -> torch.Tensor:
-    """Standard PyTorch fallback and TorchScript IR anchor for standalone eval BN1d."""
+    """Standard PyTorch fallback and TorchScript IR anchor for standalone eval BN1d.
+
+    ``scale`` and ``shift`` are 1D contiguous FP32 buffers matching the downstream
+    TorchScript custom-op ABI. Fallback execution accumulates in FP32 to match
+    native ``batch_norm`` and fused serving kernel precision before casting back to
+    ``x.dtype``.
+    """
     x_f = x.float()
     s = scale.float()
     b = shift.float()
     if channel_last or x_f.dim() == 2:
-        return (x_f * s + b).to(dtype=x.dtype)
-    return (x_f * s.unsqueeze(1) + b.unsqueeze(1)).to(dtype=x.dtype)
+        return torch.addcmul(b, x_f, s).to(dtype=x.dtype)
+    return torch.addcmul(b.unsqueeze(1), x_f, s.unsqueeze(1)).to(dtype=x.dtype)
 
 
 @torch.fx.wrap
 def _infer_tile_size(user_ref: torch.Tensor, item_ref: torch.Tensor) -> int:
     """Derive user-feature tile factor from TensorImpl dim-0 without .item()."""
-    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        if user_ref.size(0) == item_ref.size(0):
-            return 1
-        return item_ref.size(0)
     return 1 if user_ref.size(0) == item_ref.size(0) else item_ref.size(0)
 
 
@@ -134,54 +139,63 @@ class _OptContext:
         return getattr(parent, attr_name)
 
 
-def _clone_module_eval_nograd(mod: nn.Module) -> nn.Module:
-    """Shallow-clone ``mod`` in eval/no-grad without copying tensor storage."""
+def _clone_module_nograd(mod: nn.Module) -> nn.Module:
+    """Shallow-clone ``mod`` in no-grad while preserving per-module training flags."""
     cloned = copy.copy(mod)
     cloned._parameters = {
         k: (None if v is None else nn.Parameter(v.detach(), requires_grad=False))
         for k, v in mod._parameters.items()
     }
     cloned._buffers = {
-        k: (None if v is None else (v.detach() if v.requires_grad else v))
+        k: (
+            None
+            if v is None
+            else (
+                v.detach().clone()
+                if mod.training
+                else (v.detach() if v.requires_grad else v)
+            )
+        )
         for k, v in mod._buffers.items()
     }
     cloned._modules = {
-        k: (None if v is None else _clone_module_eval_nograd(v))
+        k: (None if v is None else _clone_module_nograd(v))
         for k, v in mod._modules.items()
     }
     if hasattr(mod, "_non_persistent_buffers_set"):
         cloned._non_persistent_buffers_set = set(mod._non_persistent_buffers_set)
-    cloned.training = False
     return cloned
 
 
-def _add_module_by_dotted_path(
-    root: nn.Module, dotted_path: str, module: nn.Module
-) -> None:
-    """Attach ``module`` at ``dotted_path`` under ``root``."""
-    parts = dotted_path.split(".")
-    parent = root
-    for part in parts[:-1]:
-        child = parent._modules.get(part)
-        if child is None:
-            child = nn.Module()
-            parent.add_module(part, child)
-        parent = child
-    parent.add_module(parts[-1], module)
-
-
-def _ensure_container_by_dotted_path(root: nn.Module, dotted_path: str) -> nn.Module:
-    """Ensure empty container modules exist down to ``dotted_path``."""
+def _ensure_container_by_dotted_path(
+    root: nn.Module, dotted_path: str, ctx: _OptContext
+) -> nn.Module:
+    """Ensure container modules exist down to ``dotted_path``."""
     if dotted_path == "":
         return root
     parent = root
+    prefix_parts: List[str] = []
     for part in dotted_path.split("."):
+        prefix_parts.append(part)
         child = parent._modules.get(part)
         if child is None:
             child = nn.Module()
+            orig_sub = ctx.get_module(".".join(prefix_parts))
+            child.training = (
+                orig_sub.training if orig_sub is not None else ctx.orig_gm.training
+            )
             parent.add_module(part, child)
         parent = child
     return parent
+
+
+def _add_module_by_dotted_path(
+    root: nn.Module, dotted_path: str, module: nn.Module, ctx: _OptContext
+) -> None:
+    """Attach ``module`` at ``dotted_path`` under ``root``."""
+    parent_path, _, leaf_name = dotted_path.rpartition(".")
+    parent = _ensure_container_by_dotted_path(root, parent_path, ctx)
+    parent.add_module(leaf_name, module)
 
 
 def _is_constant_one(val: Any) -> bool:
@@ -221,7 +235,7 @@ def _match_transpose_12(
         return None
     if node.op == "call_module" and isinstance(node.target, str):
         mod = get_mod(node.target)
-        if isinstance(mod, Transpose) and {mod.dim0, mod.dim1} == {1, 2}:
+        if type(mod) is Transpose and {mod.dim0, mod.dim1} == {1, 2}:
             x_arg = node.args[0] if len(node.args) >= 1 else node.kwargs.get("x")
             if isinstance(x_arg, torch.fx.Node):
                 return x_arg
@@ -378,11 +392,19 @@ def _match_commutative_pair(
 
 
 def _extract_alpha_node(
-    ctx: _OptContext, node: Any, expected_c: int
+    ctx: _OptContext,
+    node: Any,
+    expected_c: int,
+    target_device: torch.device,
 ) -> Optional[Tuple[torch.Tensor, bool, List[torch.fx.Node]]]:
     """Extract Dice ``alpha`` tensor (1D `[C]`) and unsqueeze-node cleanup list."""
     if not isinstance(node, torch.fx.Node):
         return None
+
+    raw_tensor: Optional[torch.Tensor] = None
+    was_unsqueezed = False
+    cleanup_nodes: List[torch.fx.Node] = []
+
     if node.op == "get_attr" and isinstance(node.target, str):
         tensor = ctx.get_attr(node.target)
         if (
@@ -395,48 +417,46 @@ def _extract_alpha_node(
                 or (tensor.dim() == 3 and tensor.shape[1] == expected_c)
             )
         ):
-            alpha_1d = (
-                tensor.detach()
-                .to(device=tensor.device, dtype=torch.float32)
-                .contiguous()
-                .view(expected_c)
-            )
-            alpha_1d.requires_grad_(False)
-            return alpha_1d, tensor.dim() > 1, []
-        return None
+            raw_tensor = tensor
+            was_unsqueezed = tensor.dim() > 1
+    else:
+        inner: Any = None
+        dim_arg: Any = None
+        if node.op == "call_method" and node.target == "unsqueeze":
+            inner = node.args[0] if len(node.args) >= 1 else None
+            dim_arg = node.args[1] if len(node.args) >= 2 else node.kwargs.get("dim")
+        elif node.op == "call_function" and node.target is torch.unsqueeze:
+            inner = node.args[0] if len(node.args) >= 1 else node.kwargs.get("input")
+            dim_arg = node.args[1] if len(node.args) >= 2 else node.kwargs.get("dim")
 
-    inner: Any = None
-    dim_arg: Any = None
-    if node.op == "call_method" and node.target == "unsqueeze":
-        inner = node.args[0] if len(node.args) >= 1 else None
-        dim_arg = node.args[1] if len(node.args) >= 2 else node.kwargs.get("dim")
-    elif node.op == "call_function" and node.target is torch.unsqueeze:
-        inner = node.args[0] if len(node.args) >= 1 else node.kwargs.get("input")
-        dim_arg = node.args[1] if len(node.args) >= 2 else node.kwargs.get("dim")
-
-    if (
-        type(dim_arg) is int
-        and dim_arg == 1
-        and isinstance(inner, torch.fx.Node)
-        and inner.op == "get_attr"
-        and isinstance(inner.target, str)
-    ):
-        tensor = ctx.get_attr(inner.target)
         if (
-            isinstance(tensor, torch.Tensor)
-            and not tensor.is_meta
-            and tensor.dim() == 1
-            and tensor.numel() == expected_c
+            type(dim_arg) is int
+            and dim_arg == 1
+            and isinstance(inner, torch.fx.Node)
+            and inner.op == "get_attr"
+            and isinstance(inner.target, str)
         ):
-            alpha_1d = (
-                tensor.detach()
-                .to(device=tensor.device, dtype=torch.float32)
-                .contiguous()
-                .view(expected_c)
-            )
-            alpha_1d.requires_grad_(False)
-            return alpha_1d, True, [node]
-    return None
+            tensor = ctx.get_attr(inner.target)
+            if (
+                isinstance(tensor, torch.Tensor)
+                and not tensor.is_meta
+                and tensor.dim() == 1
+                and tensor.numel() == expected_c
+            ):
+                raw_tensor = tensor
+                was_unsqueezed = True
+                cleanup_nodes = [node]
+
+    if raw_tensor is None:
+        return None
+    alpha_1d = (
+        raw_tensor.detach()
+        .to(device=target_device, dtype=torch.float32)
+        .contiguous()
+        .view(expected_c)
+    )
+    alpha_1d.requires_grad_(False)
+    return alpha_1d, was_unsqueezed, cleanup_nodes
 
 
 @dataclass
@@ -457,6 +477,7 @@ def _match_three_factor_product(
     x_bn: torch.fx.Node,
     one_minus_xp: torch.fx.Node,
     expected_c: int,
+    target_device: torch.device,
 ) -> Optional[
     Tuple[
         torch.Tensor,
@@ -497,7 +518,9 @@ def _match_three_factor_product(
         if len(x_idx) != 1 or len(omp_idx) != 1 or x_idx[0] == omp_idx[0]:
             continue
         alpha_idx = (set((0, 1, 2)) - {x_idx[0], omp_idx[0]}).pop()
-        alpha_info = _extract_alpha_node(ctx, leaves[alpha_idx], expected_c)
+        alpha_info = _extract_alpha_node(
+            ctx, leaves[alpha_idx], expected_c, target_device
+        )
         if alpha_info is None:
             continue
         alpha_1d, was_unsqueezed, opt_nodes = alpha_info
@@ -506,7 +529,10 @@ def _match_three_factor_product(
 
 
 def _match_dice_from_bn(
-    ctx: _OptContext, bn_node: torch.fx.Node, expected_c: int
+    ctx: _OptContext,
+    bn_node: torch.fx.Node,
+    expected_c: int,
+    target_device: torch.device,
 ) -> Optional[_DiceMatch]:
     """Match a 2D or 3D Dice activation subgraph anchored at ``bn_node``."""
     if len(bn_node.args) != 1 or bn_node.kwargs:
@@ -538,7 +564,7 @@ def _match_dice_from_bn(
         ok_add, term1 = _match_commutative_pair(dice_out, "add", sig_other)
         if ok_add:
             prod = _match_three_factor_product(
-                ctx, term1, x_bn, one_minus_xp, expected_c
+                ctx, term1, x_bn, one_minus_xp, expected_c, target_device
             )
             if prod is not None:
                 alpha_1d, was_unsqueezed, mul_nodes, opt_nodes, x_term1_user = prod
@@ -566,7 +592,9 @@ def _match_dice_from_bn(
                 term_a, "mul", one_minus_xp
             )
             if ok_alpha_mul:
-                alpha_info = _extract_alpha_node(ctx, alpha_leaf, expected_c)
+                alpha_info = _extract_alpha_node(
+                    ctx, alpha_leaf, expected_c, target_device
+                )
                 if alpha_info is not None:
                     dice_out = next(iter(sig_other.users))
                     ok_out, out_other = _match_commutative_pair(
@@ -598,7 +626,8 @@ def _pass1_eliminate_eval_identities(ctx: _OptContext) -> None:
         if node.op == "call_module" and isinstance(node.target, str):
             mod = ctx.get_module(node.target)
             if (
-                isinstance(mod, (nn.Dropout, nn.Dropout1d, nn.Identity))
+                mod is not None
+                and type(mod) in (nn.Dropout, nn.Dropout1d, nn.Identity)
                 and not mod.training
             ):
                 x_arg = node.args[0] if node.args else node.kwargs.get("input")
@@ -695,6 +724,7 @@ def _emit_std_dice(
     scale_node: torch.fx.Node,
     shift_node: torch.fx.Node,
     alpha_node: torch.fx.Node,
+    one_minus_alpha_node: torch.fx.Node,
     unsqueeze_1d: bool,
 ) -> torch.fx.Node:
     """Emit standard ATen FP32-computed Dice expression without custom anchors."""
@@ -702,13 +732,15 @@ def _emit_std_dice(
         scale_node = graph.call_method("unsqueeze", args=(scale_node, 1))
         shift_node = graph.call_method("unsqueeze", args=(shift_node, 1))
         alpha_node = graph.call_method("unsqueeze", args=(alpha_node, 1))
+        one_minus_alpha_node = graph.call_method(
+            "unsqueeze", args=(one_minus_alpha_node, 1)
+        )
     x_f = graph.call_method("float", args=(x_in,))
-    scaled = graph.call_function(operator.mul, args=(x_f, scale_node))
-    norm_x = graph.call_function(operator.add, args=(scaled, shift_node))
+    norm_x = graph.call_function(torch.addcmul, args=(shift_node, x_f, scale_node))
     p = graph.call_function(torch.sigmoid, args=(norm_x,))
-    one_minus_p = graph.call_function(operator.sub, args=(1.0, p))
-    alpha_term = graph.call_function(operator.mul, args=(alpha_node, one_minus_p))
-    gate = graph.call_function(operator.add, args=(p, alpha_term))
+    gate = graph.call_function(
+        torch.addcmul, args=(alpha_node, p, one_minus_alpha_node)
+    )
     out_f = graph.call_function(operator.mul, args=(gate, x_f))
     return graph.call_method("type_as", args=(out_f, x_in))
 
@@ -728,7 +760,7 @@ def _pass3_fuse_bn_dice(ctx: _OptContext, emit_jit_anchors: bool) -> None:
         assert bn_mod.running_mean is not None
         num_c = bn_mod.running_mean.size(0)
 
-        match = _match_dice_from_bn(ctx, bn_node, num_c)
+        match = _match_dice_from_bn(ctx, bn_node, num_c, bn_mod.running_mean.device)
         if match is None:
             continue
 
@@ -754,7 +786,7 @@ def _pass3_fuse_bn_dice(ctx: _OptContext, emit_jit_anchors: bool) -> None:
                 replace_target = cand_t2
 
         scale, shift = _compute_eval_bn_scale_shift(bn_mod)
-        alpha_1d = match.alpha_1d.to(device=scale.device, dtype=torch.float32)
+        alpha_1d = match.alpha_1d
 
         scale_name = ctx.alloc_name("_opt_dice_scale")
         shift_name = ctx.alloc_name("_opt_dice_shift")
@@ -762,6 +794,12 @@ def _pass3_fuse_bn_dice(ctx: _OptContext, emit_jit_anchors: bool) -> None:
         ctx.new_buffers[scale_name] = scale
         ctx.new_buffers[shift_name] = shift
         ctx.new_buffers[alpha_name] = alpha_1d
+        one_minus_alpha_name: Optional[str] = None
+        if not emit_jit_anchors:
+            one_minus_alpha = (1.0 - alpha_1d).contiguous()
+            one_minus_alpha.requires_grad_(False)
+            one_minus_alpha_name = ctx.alloc_name("_opt_dice_one_minus_alpha")
+            ctx.new_buffers[one_minus_alpha_name] = one_minus_alpha
 
         with ctx.graph.inserting_before(replace_target):
             scale_node = ctx.graph.get_attr(scale_name)
@@ -779,12 +817,15 @@ def _pass3_fuse_bn_dice(ctx: _OptContext, emit_jit_anchors: bool) -> None:
                     ),
                 )
             else:
+                assert one_minus_alpha_name is not None
+                one_minus_alpha_node = ctx.graph.get_attr(one_minus_alpha_name)
                 out_node = _emit_std_dice(
                     ctx.graph,
                     x_in,
                     scale_node,
                     shift_node,
                     alpha_node,
+                    one_minus_alpha_node,
                     unsqueeze_1d=(not channel_last and match.alpha_was_unsqueezed),
                 )
 
@@ -854,18 +895,20 @@ def _pass4_rewrite_standalone_bn(ctx: _OptContext, emit_jit_anchors: bool) -> No
                     args=(x_in, scale_node, shift_node, channel_last),
                 )
             else:
-                x_work = (
-                    x_in
-                    if channel_last
-                    else ctx.graph.call_method("transpose", args=(x_in, 1, -1))
-                )
-                x_f = ctx.graph.call_method("float", args=(x_work,))
-                scaled = ctx.graph.call_function(operator.mul, args=(x_f, scale_node))
-                norm_x = ctx.graph.call_function(
-                    operator.add, args=(scaled, shift_node)
-                )
-                if not channel_last:
-                    norm_x = ctx.graph.call_method("transpose", args=(norm_x, 1, -1))
+                x_f = ctx.graph.call_method("float", args=(x_in,))
+                if channel_last:
+                    norm_x = ctx.graph.call_function(
+                        torch.addcmul, args=(shift_node, x_f, scale_node)
+                    )
+                else:
+                    x_u = ctx.graph.call_method("unsqueeze", args=(x_f, -1))
+                    x_3d = ctx.graph.call_method("flatten", args=(x_u, 2))
+                    s_u = ctx.graph.call_method("unsqueeze", args=(scale_node, 1))
+                    b_u = ctx.graph.call_method("unsqueeze", args=(shift_node, 1))
+                    norm_3d = ctx.graph.call_function(
+                        torch.addcmul, args=(b_u, x_3d, s_u)
+                    )
+                    norm_x = ctx.graph.call_method("reshape_as", args=(norm_3d, x_in))
                 out_node = ctx.graph.call_method("type_as", args=(norm_x, x_in))
 
         replace_target.replace_all_uses_with(out_node)
@@ -945,11 +988,18 @@ def _pass5_replace_tile_size(
             )
         tile_node.replace_all_uses_with(infer_node)
         ctx.graph.erase_node(tile_node)
+    logger.info(
+        "Rewrote %d _tile_size call(s) to _infer_tile_size(user_key=%r, item_key=%r).",
+        len(tile_nodes),
+        user_ref.args[1],
+        item_ref.args[1],
+    )
 
 
 def _build_isolated_root(ctx: _OptContext) -> nn.Module:
-    """Build an isolated eval/no-grad root module owning only live FX references."""
+    """Build an isolated no-grad root module owning only live FX references."""
     root = nn.Module()
+    root.training = ctx.orig_gm.training
     call_module_paths: List[str] = []
     seen_modules: Set[str] = set()
     get_attr_paths: List[str] = []
@@ -970,17 +1020,15 @@ def _build_isolated_root(ctx: _OptContext) -> nn.Module:
         if src_mod is None:
             raise AttributeError(f"Missing FX submodule target [{path}]")
         mod_obj = (
-            src_mod
-            if path in ctx.new_submodules
-            else _clone_module_eval_nograd(src_mod)
+            src_mod if path in ctx.new_submodules else _clone_module_nograd(src_mod)
         )
-        _add_module_by_dotted_path(root, path, mod_obj)
+        _add_module_by_dotted_path(root, path, mod_obj, ctx)
 
     for path in get_attr_paths:
         module_path, _, attr_name = path.rpartition(".")
         if module_path in seen_modules:
             continue
-        parent = _ensure_container_by_dotted_path(root, module_path)
+        parent = _ensure_container_by_dotted_path(root, module_path, ctx)
         if hasattr(parent, attr_name):
             continue
         obj = ctx.get_attr(path)
@@ -998,7 +1046,7 @@ def _build_isolated_root(ctx: _OptContext) -> nn.Module:
 
 
 def _pass6_finalize_graph_module(ctx: _OptContext) -> torch.fx.GraphModule:
-    """Pass 6: Eliminate dead code, prune unused state, and freeze grad/eval flags."""
+    """Pass 6: Eliminate dead code, prune unused state, and freeze parameter grads."""
     tmp_root = _build_isolated_root(ctx)
     tmp_gm = torch.fx.GraphModule(tmp_root, ctx.graph)
     tmp_gm.graph.eliminate_dead_code()
@@ -1009,7 +1057,7 @@ def _pass6_finalize_graph_module(ctx: _OptContext) -> torch.fx.GraphModule:
         param.requires_grad_(False)
     for buf in opt_gm.buffers():
         buf.requires_grad_(False)
-    opt_gm.eval()
+    opt_gm.training = ctx.orig_gm.training
     opt_gm.graph.lint()
     opt_gm.recompile()
     return opt_gm
@@ -1027,15 +1075,18 @@ def optimize_fx_for_export(
         gm: Traced ``torch.fx.GraphModule`` to optimize. Left unmutated.
         emit_jit_anchors: Whether to emit ``_tzrec_eval_bn_dice`` /
             ``_tzrec_eval_bn`` anchor calls for TorchScript export. Set False
-            for TRT / AOTI paths to emit pure standard PyTorch/ATen ops.
+            when the optimized graph feeds ``torch.export``-based backends
+            (such as TRT or AOTI) to emit pure standard PyTorch/ATen ops.
         user_input_keys: Confirmed user-side top-level input dict keys (dim-0 is
             1 online, B offline) for zero-sync ``_infer_tile_size`` rewriting.
         item_input_keys: Confirmed item-side top-level input dict keys (dim-0 is
             B online and offline) for zero-sync ``_infer_tile_size`` rewriting.
 
     Returns:
-        An isolated, eval-mode, non-trainable ``torch.fx.GraphModule`` (or the
-        original ``gm`` if ``TZREC_DISABLE_EXPORT_GRAPH_OPT=1``).
+        An isolated, non-trainable ``torch.fx.GraphModule`` preserving
+        per-module training flags (or ``gm`` unchanged if
+        ``TZREC_DISABLE_EXPORT_GRAPH_OPT=1`` or ``gm`` is not a
+        ``torch.fx.GraphModule``).
     """
     if os.environ.get("TZREC_DISABLE_EXPORT_GRAPH_OPT", "0") == "1":
         logger.info("TZREC_DISABLE_EXPORT_GRAPH_OPT=1, skipping FX export graph opt.")
@@ -1045,6 +1096,8 @@ def optimize_fx_for_export(
 
     ctx = _OptContext.from_graph_module(gm)
     _pass1_eliminate_eval_identities(ctx)
+    # NOTE: Dice reads pre-BN x on its skip branch (len(users) >= 2), so Pass 2
+    # leaves Dice.bn intact for Pass 3 even when Perceptron(use_bn=False).
     _pass2_fuse_linear_bn(ctx)
     _pass3_fuse_bn_dice(ctx, emit_jit_anchors=emit_jit_anchors)
     _pass4_rewrite_standalone_bn(ctx, emit_jit_anchors=emit_jit_anchors)
