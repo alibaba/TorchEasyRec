@@ -285,138 +285,148 @@ class HardSearchExportTest(unittest.TestCase):
         )
         env.start()
         self.addCleanup(env.stop)
-        export_util.ensure_input_tile_for_distributed_embedding()
-        self.assertEqual(os.environ["INPUT_TILE"], "3" if distributed else tile)
+        use_dist, resolved_tile = (
+            export_util.ensure_input_tile_for_distributed_embedding()
+        )
+        self.assertEqual(resolved_tile, "3" if distributed else tile)
+        self.assertEqual(os.environ["INPUT_TILE"], tile)
         config = _create_hard_search_export_config()
         original_config = copy.deepcopy(config)
-        features = create_features(list(config.feature_configs))
-        expected_fg = export_util.create_fg_json(features)
-        name_to_feature = {feature.name: feature for feature in features}
-        self.assertFalse(name_to_feature["click_seq__id"].is_user_feat)
-        self.assertFalse(name_to_feature["click_seq__score"].is_user_feat)
-        self.assertTrue(name_to_feature["user_id"].is_user_feat)
-        self.assertTrue(name_to_feature["user_score"].is_user_feat)
-
-        class TinyModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.features = features
-                self.feature_groups = list(config.model_config.feature_groups)
-                self.embedding_group = EmbeddingGroup(
-                    features, self.feature_groups, device=torch.device("cpu")
-                )
-                self.scale = torch.nn.Parameter(torch.tensor(2.0))
-                with torch.no_grad():
-                    for module in self.embedding_group.modules():
-                        if isinstance(module, EmbeddingBagCollection):
-                            tables = module.embedding_bags.values()
-                        elif isinstance(module, EmbeddingCollection):
-                            tables = module.embeddings.values()
-                        else:
-                            continue
-                        for table in tables:
-                            table.weight.copy_(
-                                torch.arange(8).float().view(-1, 1)
-                                + torch.tensor([0.0, 0.25])
-                            )
-
-            def predict(self, batch):
-                grouped = self.embedding_group(batch)
-                return {
-                    "score": self.scale
-                    * (
-                        grouped["deep"].sum(dim=1)
-                        + grouped["hsk.sequence"].sum(dim=(1, 2))
-                    ),
-                    "lengths": grouped["hsk.sequence_length"],
-                }
-
-        model = ScriptWrapper(TinyModel()).eval()
-        checkpoint_state = {
-            name: value.detach().clone() for name, value in model.state_dict().items()
-        }
-        fx_model = export_util.symbolic_trace(model)
-        lengths_cases = ([2, 0, 1], [0], [3, 1], [0, 0])
-        indices_cases = ([2, 0, 2, 1, 0], [0, 0, 0], [1, 0, 1], [1, 0, 1])
-
-        def make_inputs(lengths, indices):
-            data = _hard_search_export_inputs(lengths)
-            if hard_search_input_tile:
-                data["click_seq__inverse_indices"] = torch.tensor(indices)
-                count = len(indices)
-                data["item_id.values"] = torch.arange(1, count + 1)
-                data["item_id.lengths"] = torch.ones(count, dtype=torch.int64)
-                data["batch_size"] = torch.tensor(count)
-            return data
-
-        expected_outputs = []
-        for lengths, indices in zip(lengths_cases, indices_cases):
-            data = make_inputs(lengths, indices)
-            scores = []
-            offset = 0
-            for index, length in enumerate(lengths):
-                sequence_sum = sum(
-                    2 * ((position % 7) + 1) + 0.25 + (position + 1) / 2
-                    for position in range(offset, offset + length)
-                )
-                scores.append(2 * (2 * (index + 1) + 0.25 + 4.25 + 0.75 + sequence_sum))
-                offset += length
-            if hard_search_input_tile:
-                scores = [
-                    scores[source] + 4 * (target - source)
-                    for target, source in enumerate(indices)
-                ]
-            expected = {
-                "score": torch.tensor(scores),
-                "lengths": torch.tensor(lengths)[indices]
-                if hard_search_input_tile
-                else torch.tensor(lengths),
-            }
-            expected_outputs.append(expected)
-            self.assertEqual(data["click_seq__id.lengths"].numel(), len(lengths))
-            self.assertEqual(data["user_id.lengths"].numel(), 1)
-            self.assertEqual(data["user_score.values"].shape, (1, 1))
-            torch.testing.assert_close(model(data), expected)
-            torch.testing.assert_close(fx_model(data), expected)
-
-        data = make_inputs(lengths_cases[0], indices_cases[0])
-        batch = model._data_parser.to_batch(data, force_no_tile=True)
-
-        class ExportDataloader:
-            def __iter__(self):
-                return iter([batch])
-
-            def get_iterator(self):
-                return iter(self)
-
-        def restore_model(checkpoint_path, module, **kwargs):
-            module.load_state_dict(
-                {name: checkpoint_state[name] for name in module.state_dict()},
-                strict=True,
-            )
-
-        def load_sparse(state_dict, **kwargs):
-            with torch.no_grad():
-                for name, value in state_dict.items():
-                    value.copy_(checkpoint_state[name])
-
-        if not distributed:
-            dist.init_process_group(
-                "gloo", store=dist.HashStore(), world_size=1, rank=0
-            )
-            self.addCleanup(dist.destroy_process_group)
-        checkpoint_path = os.path.join(self.test_dir, "checkpoint")
-        os.mkdir(checkpoint_path)
-        with (
-            mock.patch.object(
-                export_util, "create_dataloader", return_value=ExportDataloader()
-            ),
-            mock.patch.object(
-                checkpoint_util, "restore_model", side_effect=restore_model
-            ),
-            mock.patch.object(checkpoint_util, "load", side_effect=load_sparse),
+        with acc_utils.export_env_scope(
+            use_distributed_embedding=use_dist,
+            input_tile=resolved_tile,
         ):
-            export_util.export_model(config, model, checkpoint_path, self.save_dir)
+            features = create_features(list(config.feature_configs))
+            expected_fg = export_util.create_fg_json(features)
+            name_to_feature = {feature.name: feature for feature in features}
+            self.assertFalse(name_to_feature["click_seq__id"].is_user_feat)
+            self.assertFalse(name_to_feature["click_seq__score"].is_user_feat)
+            self.assertTrue(name_to_feature["user_id"].is_user_feat)
+            self.assertTrue(name_to_feature["user_score"].is_user_feat)
+
+            class TinyModel(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.features = features
+                    self.feature_groups = list(config.model_config.feature_groups)
+                    self.embedding_group = EmbeddingGroup(
+                        features, self.feature_groups, device=torch.device("cpu")
+                    )
+                    self.scale = torch.nn.Parameter(torch.tensor(2.0))
+                    with torch.no_grad():
+                        for module in self.embedding_group.modules():
+                            if isinstance(module, EmbeddingBagCollection):
+                                tables = module.embedding_bags.values()
+                            elif isinstance(module, EmbeddingCollection):
+                                tables = module.embeddings.values()
+                            else:
+                                continue
+                            for table in tables:
+                                table.weight.copy_(
+                                    torch.arange(8).float().view(-1, 1)
+                                    + torch.tensor([0.0, 0.25])
+                                )
+
+                def predict(self, batch):
+                    grouped = self.embedding_group(batch)
+                    return {
+                        "score": self.scale
+                        * (
+                            grouped["deep"].sum(dim=1)
+                            + grouped["hsk.sequence"].sum(dim=(1, 2))
+                        ),
+                        "lengths": grouped["hsk.sequence_length"],
+                    }
+
+            model = ScriptWrapper(TinyModel()).eval()
+            checkpoint_state = {
+                name: value.detach().clone()
+                for name, value in model.state_dict().items()
+            }
+            fx_model = export_util.symbolic_trace(model)
+            lengths_cases = ([2, 0, 1], [0], [3, 1], [0, 0])
+            indices_cases = ([2, 0, 2, 1, 0], [0, 0, 0], [1, 0, 1], [1, 0, 1])
+
+            def make_inputs(lengths, indices):
+                data = _hard_search_export_inputs(lengths)
+                if hard_search_input_tile:
+                    data["click_seq__inverse_indices"] = torch.tensor(indices)
+                    count = len(indices)
+                    data["item_id.values"] = torch.arange(1, count + 1)
+                    data["item_id.lengths"] = torch.ones(count, dtype=torch.int64)
+                    data["batch_size"] = torch.tensor(count)
+                return data
+
+            expected_outputs = []
+            for lengths, indices in zip(lengths_cases, indices_cases):
+                data = make_inputs(lengths, indices)
+                scores = []
+                offset = 0
+                for index, length in enumerate(lengths):
+                    sequence_sum = sum(
+                        2 * ((position % 7) + 1) + 0.25 + (position + 1) / 2
+                        for position in range(offset, offset + length)
+                    )
+                    scores.append(
+                        2 * (2 * (index + 1) + 0.25 + 4.25 + 0.75 + sequence_sum)
+                    )
+                    offset += length
+                if hard_search_input_tile:
+                    scores = [
+                        scores[source] + 4 * (target - source)
+                        for target, source in enumerate(indices)
+                    ]
+                expected = {
+                    "score": torch.tensor(scores),
+                    "lengths": torch.tensor(lengths)[indices]
+                    if hard_search_input_tile
+                    else torch.tensor(lengths),
+                }
+                expected_outputs.append(expected)
+                self.assertEqual(data["click_seq__id.lengths"].numel(), len(lengths))
+                self.assertEqual(data["user_id.lengths"].numel(), 1)
+                self.assertEqual(data["user_score.values"].shape, (1, 1))
+                torch.testing.assert_close(model(data), expected)
+                torch.testing.assert_close(fx_model(data), expected)
+
+            data = make_inputs(lengths_cases[0], indices_cases[0])
+            batch = model._data_parser.to_batch(data, force_no_tile=True)
+
+            class ExportDataloader:
+                def __iter__(self):
+                    return iter([batch])
+
+                def get_iterator(self):
+                    return iter(self)
+
+            def restore_model(checkpoint_path, module, **kwargs):
+                module.load_state_dict(
+                    {name: checkpoint_state[name] for name in module.state_dict()},
+                    strict=True,
+                )
+
+            def load_sparse(state_dict, **kwargs):
+                with torch.no_grad():
+                    for name, value in state_dict.items():
+                        value.copy_(checkpoint_state[name])
+
+            if not distributed:
+                dist.init_process_group(
+                    "gloo", store=dist.HashStore(), world_size=1, rank=0
+                )
+                self.addCleanup(dist.destroy_process_group)
+            checkpoint_path = os.path.join(self.test_dir, "checkpoint")
+            os.mkdir(checkpoint_path)
+            with (
+                mock.patch.object(
+                    export_util, "create_dataloader", return_value=ExportDataloader()
+                ),
+                mock.patch.object(
+                    checkpoint_util, "restore_model", side_effect=restore_model
+                ),
+                mock.patch.object(checkpoint_util, "load", side_effect=load_sparse),
+            ):
+                export_util.export_model(config, model, checkpoint_path, self.save_dir)
 
         self.assertEqual(config, original_config)
         saved_config = config_util.load_pipeline_config(
@@ -883,9 +893,9 @@ class ExportUtilTest(unittest.TestCase):
 
             self.assertTrue(_prepare_single_rank_distributed_embedding_export())
             self.assertEqual(os.environ["RANK"], "0")
-            self.assertEqual(os.environ["LOCAL_RANK"], "0")
-            self.assertEqual(os.environ["WORLD_SIZE"], "1")
-            self.assertEqual(os.environ["LOCAL_WORLD_SIZE"], "1")
+            self.assertEqual(os.environ["LOCAL_RANK"], "2")
+            self.assertEqual(os.environ["WORLD_SIZE"], "4")
+            self.assertEqual(os.environ["LOCAL_WORLD_SIZE"], "4")
         finally:
             for key, value in old_env.items():
                 if value is None:
@@ -3513,20 +3523,23 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
         real_empty_like = torch.empty_like
         real_dense_export = export_util._export_dense_model_on_device
 
+        staged_dir: Dict[str, str] = {}
+
         def guarded_dense_export(*args, **kwargs):
+            stage_dir = str(kwargs["save_dir"] if "save_dir" in kwargs else args[3])
+            staged_dir["path"] = stage_dir
             self.assertTrue(
                 os.path.exists(
-                    os.path.join(
-                        self.export_dir, "sparse", "sparse_embeddings-00-of-01.npz"
-                    )
+                    os.path.join(stage_dir, "sparse", "sparse_embeddings-00-of-01.npz")
                 )
             )
+            self.assertFalse(os.path.exists(os.path.join(self.export_dir, "sparse")))
             uploader.start.assert_not_called()
             real_dense_export(*args, **kwargs)
 
         def start_upload(*args, **kwargs):
             self.assertTrue(
-                os.path.exists(os.path.join(self.export_dir, "scripted_model.pt"))
+                os.path.exists(os.path.join(staged_dir["path"], "scripted_model.pt"))
             )
 
         uploader.start.side_effect = start_upload
@@ -3619,16 +3632,9 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
 
         sparse_dir = os.path.join(self.export_dir, "sparse")
         if failure:
-            self.assertTrue(
-                os.path.exists(
-                    os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz")
-                )
-            )
-            self.assertFalse(
-                os.path.exists(os.path.join(sparse_dir, "sparse_embedding.json"))
-            )
+            self.assertFalse(os.path.exists(sparse_dir))
+            self.assertEqual(glob.glob(f"{self.export_dir}.tmp.*"), [])
             uploader.close.assert_called_with(raise_on_error=False)
-            self.assertFalse(any(".part." in name for name in os.listdir(sparse_dir)))
             return
         if upload:
             uploader.close.assert_called_once_with()
@@ -3995,11 +4001,15 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             else:
                 os.environ["USE_DISTRIBUTED_EMBEDDING"] = initial_dist_emb
 
-            export_util.ensure_input_tile_for_distributed_embedding(config)
-            self.assertEqual(
-                os.environ.get("USE_DISTRIBUTED_EMBEDDING"), expected_dist_emb
+            use_dist_emb, resolved_input_tile = (
+                export_util.ensure_input_tile_for_distributed_embedding(config)
             )
-            self.assertEqual(os.environ["INPUT_TILE"], expected_input_tile)
+            self.assertEqual("1" if use_dist_emb else "0", expected_dist_emb)
+            self.assertEqual(resolved_input_tile, expected_input_tile)
+            self.assertEqual(
+                os.environ.get("USE_DISTRIBUTED_EMBEDDING"), initial_dist_emb
+            )
+            self.assertEqual(os.environ["INPUT_TILE"], "0")
             if has_dynamicemb and initial_dist_emb is None:
                 info_log.assert_called_once()
                 warn_log.assert_called_once_with(
@@ -4038,9 +4048,13 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
                 self.checkpoint_dir,
                 self.export_dir,
             )
-            self.assertEqual(os.environ["USE_DISTRIBUTED_EMBEDDING"], "1")
-            self.assertEqual(os.environ["INPUT_TILE"], "3")
+            self.assertEqual(os.environ["USE_DISTRIBUTED_EMBEDDING"], "0")
+            self.assertEqual(os.environ["INPUT_TILE"], "0")
             dist_export.assert_called_once()
+            self.assertIs(
+                dist_export.call_args.kwargs["use_distributed_embedding"], True
+            )
+            self.assertEqual(dist_export.call_args.kwargs["input_tile"], "3")
             normal_export.assert_not_called()
 
         static_config = copy.deepcopy(self.pipeline_config)
@@ -4090,6 +4104,187 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             rtp_export.assert_called_once()
             dist_export.assert_not_called()
             normal_export.assert_not_called()
+
+
+class DistributedEmbeddingAOTExportTest(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
+        self.ckpt_dir = os.path.join(self.test_dir, "model.ckpt-0")
+        self.export_dir = os.path.join(self.test_dir, "export")
+
+    def test_genrec_export_forces_input_tile_zero_and_rejects_explicit_tile(
+        self,
+    ) -> None:
+        from tzrec.protos import prompt_pb2
+        from tzrec.protos.models import genrec_model_pb2
+
+        prompt_cfg = EasyRecConfig(prompt_config=prompt_pb2.PromptConfig())
+        genrec_cfg = EasyRecConfig(
+            model_config=model_pb2.ModelConfig(
+                genrec_causal_lm_model=genrec_model_pb2.GenRecCausalLMModel()
+            )
+        )
+        for name, cfg in (
+            ("prompt_config", prompt_cfg),
+            ("genrec_causal_lm_model", genrec_cfg),
+        ):
+            with self.subTest(cfg=name):
+                with mock.patch.dict(
+                    os.environ,
+                    {"USE_DISTRIBUTED_EMBEDDING": "1", "INPUT_TILE": "0"},
+                    clear=True,
+                ):
+                    use_dist, tile = (
+                        export_util.ensure_input_tile_for_distributed_embedding(cfg)
+                    )
+                    self.assertTrue(use_dist)
+                    self.assertEqual(tile, "0")
+                for bad_tile in ("2", "3"):
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {
+                                "USE_DISTRIBUTED_EMBEDDING": "1",
+                                "INPUT_TILE": bad_tile,
+                            },
+                            clear=True,
+                        ),
+                        self.assertRaisesRegex(ValueError, "BaseGenRecModel"),
+                    ):
+                        export_util.ensure_input_tile_for_distributed_embedding(cfg)
+
+        with mock.patch.object(
+            export_util.acc_utils,
+            "export_acc_config",
+            side_effect=lambda **kw: {
+                "INPUT_TILE": export_util.acc_utils.get_input_tile()
+            },
+        ):
+            export_dir = os.path.join(self.test_dir, "genrec_meta")
+            os.makedirs(export_dir, exist_ok=True)
+            export_util._write_export_metadata(
+                prompt_cfg,
+                [],
+                export_dir,
+                assets=None,
+                additional_export_config=None,
+                use_distributed_embedding=True,
+                input_tile="0",
+            )
+            with open(os.path.join(export_dir, "model_acc.json")) as f:
+                self.assertEqual(json.load(f)["INPUT_TILE"], "0")
+
+    def test_remote_local_cache_dir_preserves_siblings_and_cleans_subdir(
+        self,
+    ) -> None:
+        cache_root = os.path.join(self.test_dir, "shared_cache")
+        os.makedirs(os.path.join(cache_root, "keep_dir"), exist_ok=True)
+        keep_file = os.path.join(cache_root, "keep.txt")
+        keep_nested = os.path.join(cache_root, "keep_dir", "file.txt")
+        with open(keep_file, "w") as f:
+            f.write("keep")
+        with open(keep_nested, "w") as f:
+            f.write("nested")
+
+        seen_local_dirs = []
+        fake_fs = mock.Mock()
+
+        def _fake_export_normal(
+            pipeline_config, model, checkpoint_path, save_dir, **kwargs
+        ):
+            seen_local_dirs.append(save_dir)
+            self.assertTrue(os.path.basename(save_dir).startswith("tzrec_export_"))
+            self.assertTrue(os.path.samefile(os.path.dirname(save_dir), cache_root))
+            with open(os.path.join(save_dir, "artifact.txt"), "w") as f:
+                f.write("ok")
+
+        with (
+            mock.patch.dict(
+                os.environ, {"LOCAL_CACHE_DIR": cache_root, "USE_RTP": "0"}
+            ),
+            mock.patch.object(
+                export_util, "url_to_fs", return_value=(fake_fs, "bucket/out")
+            ),
+            mock.patch.object(
+                export_util, "export_model_normal", side_effect=_fake_export_normal
+            ),
+        ):
+            export_util.export_model(
+                EasyRecConfig(), mock.Mock(), "ckpt", "oss://bucket/out"
+            )
+            fake_fs.upload.assert_called_once()
+            self.assertFalse(os.path.exists(seen_local_dirs[0]))
+            self.assertTrue(os.path.exists(keep_file))
+            self.assertTrue(os.path.exists(keep_nested))
+
+            with (
+                mock.patch.object(
+                    export_util,
+                    "export_model_normal",
+                    side_effect=RuntimeError("boom"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "boom"),
+            ):
+                export_util.export_model(
+                    EasyRecConfig(), mock.Mock(), "ckpt", "oss://bucket/out"
+                )
+            self.assertTrue(os.path.exists(keep_file))
+            self.assertTrue(os.path.exists(keep_nested))
+
+    def test_local_atomic_staging_cleans_up_on_failure_and_allows_retry(
+        self,
+    ) -> None:
+        target_dir = os.path.join(self.test_dir, "staged_export")
+        with self.assertRaisesRegex(RuntimeError, "mid_export_fail"):
+            with export_util._staged_export_dir(target_dir, use_staging=True) as stage:
+                with open(os.path.join(stage, "partial.txt"), "w") as f:
+                    f.write("incomplete")
+                raise RuntimeError("mid_export_fail")
+
+        self.assertFalse(os.path.exists(target_dir))
+        self.assertEqual(glob.glob(f"{target_dir}.tmp.*"), [])
+
+        with export_util._staged_export_dir(target_dir, use_staging=True) as stage:
+            with open(os.path.join(stage, "final.txt"), "w") as f:
+                f.write("complete")
+        self.assertTrue(os.path.exists(os.path.join(target_dir, "final.txt")))
+        with self.assertRaisesRegex(RuntimeError, "already exists and is not empty"):
+            with export_util._staged_export_dir(target_dir, use_staging=True):
+                pass
+
+        staged_meta_dir = os.path.join(self.test_dir, "staged_meta")
+        vocab_path = os.path.join(self.test_dir, "vocab.txt")
+        with open(vocab_path, "w") as f:
+            f.write("a\nb\n")
+        meta_cfg = EasyRecConfig()
+        meta_cfg.feature_configs.append(
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="f_vocab",
+                    expression="user:f_vocab",
+                    vocab_file=vocab_path,
+                    default_bucketize_value=0,
+                    embedding_dim=4,
+                )
+            )
+        )
+        meta_feats = create_features(list(meta_cfg.feature_configs))
+        with export_util._staged_export_dir(staged_meta_dir, use_staging=True) as stage:
+            export_util._write_export_metadata(
+                meta_cfg,
+                meta_feats,
+                stage,
+                assets=[],
+                additional_export_config=None,
+                config_asset_dir=staged_meta_dir,
+            )
+        loaded_meta = config_util.load_pipeline_config(
+            os.path.join(staged_meta_dir, "pipeline.config")
+        )
+        self.assertEqual(
+            loaded_meta.feature_configs[0].id_feature.asset_dir, staged_meta_dir
+        )
 
 
 if __name__ == "__main__":

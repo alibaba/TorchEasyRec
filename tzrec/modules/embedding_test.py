@@ -2033,6 +2033,74 @@ class EmbeddingGroupTest(unittest.TestCase):
         self.assertEqual(result["buy.sequence"].size(), (2, 2, 17))
         self.assertEqual(result["buy.sequence_length"].size(), (2,))
 
+    def test_sequence_embedding_group_impl_respects_export_env_scope_tile3_online(
+        self,
+    ) -> None:
+        from tzrec.acc import utils as acc_utils
+
+        features = _create_test_sequence_features(has_zch=False, has_mulval=False)
+        feature_groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="buy",
+                feature_names=["cat_a", "int_a", "buy_seq__cat_a", "buy_seq__int_a"],
+                group_type=model_pb2.FeatureGroupType.SEQUENCE,
+            ),
+        ]
+        sparse_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["cat_a", "cat_b"],
+            values=torch.tensor([0, 1]),
+            lengths=torch.tensor([1, 1]),
+        )
+        sparse_feature_user = KeyedJaggedTensor.from_lengths_sync(
+            keys=["buy_seq__cat_a", "buy_seq__cat_b"],
+            values=torch.tensor([0, 1, 2, 3, 4, 5]),
+            lengths=torch.tensor([2, 1, 2, 1]),
+        )
+        dense_feature = KeyedTensor.from_tensor_list(
+            keys=["int_a"], tensors=[torch.tensor([[0.2]])]
+        )
+        sequence_dense_feature = KeyedJaggedTensor.from_lengths_sync(
+            keys=["buy_seq__int_a"],
+            values=torch.tensor([[0.0], [1.0], [2.0]], dtype=torch.float32),
+            lengths=torch.tensor([2, 1]),
+        ).to_dict()
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with acc_utils.export_env_scope(input_tile="3", input_tile_3_online=True):
+                group_online = SequenceEmbeddingGroupImpl(
+                    features, feature_groups, device=torch.device("cpu")
+                )
+                out_online = group_online(
+                    sparse_feature,
+                    dense_feature,
+                    sequence_dense_feature,
+                    EMPTY_KJT,
+                    sparse_feature_user,
+                    EMPTY_KJT,
+                    1,
+                )
+            self.assertEqual(out_online["buy.sequence"].size(), (1, 3, 17))
+            self.assertEqual(os.environ, {})
+
+        with mock.patch.dict(
+            os.environ, {"INPUT_TILE": "3", "INPUT_TILE_3_ONLINE": "1"}, clear=True
+        ):
+            with acc_utils.export_env_scope(input_tile="3", input_tile_3_online=False):
+                group_padded = SequenceEmbeddingGroupImpl(
+                    features, feature_groups, device=torch.device("cpu")
+                )
+                out_padded = group_padded(
+                    sparse_feature,
+                    dense_feature,
+                    sequence_dense_feature,
+                    EMPTY_KJT,
+                    sparse_feature_user,
+                    EMPTY_KJT,
+                    1,
+                )
+            self.assertEqual(out_padded["buy.sequence"].size(), (2, 2, 17))
+            self.assertEqual(os.environ["INPUT_TILE_3_ONLINE"], "1")
+
 
 @mark_ci_scope("gpu")
 class HardSearchEmbeddingGroupTest(unittest.TestCase):

@@ -419,12 +419,14 @@ class GenRecIntegrationTest(unittest.TestCase):
         for name in ("config.json", "model.safetensors", "tokenizer.json"):
             self.assertTrue(os.path.exists(os.path.join(dist_dir, name)), name)
         with open(os.path.join(dist_dir, "model_acc.json"), "r") as f:
-            self.assertEqual(json.load(f)["DISTRIBUTED_EMBEDDING"], "1")
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg["DISTRIBUTED_EMBEDDING"], "1")
+            self.assertEqual(acc_cfg["INPUT_TILE"], "0")
         with open(os.path.join(dist_dir, "dense_meta.json"), "r") as f:
             dense_meta = json.load(f)
         # collections form per dim, so tags__text joins tag_a's; the dense
         # score member has no sparse-stage entry and rides on its raw values;
-        # all-user DEEP groups are the input-tiled `_user` variant
+        # BaseGenRecModel disables INPUT_TILE so profile__ctx__ebc stays untiled.
         self.assertEqual(
             dense_meta,
             {
@@ -436,7 +438,7 @@ class GenRecIntegrationTest(unittest.TestCase):
                     "tags__tag_b__ec",
                     "tags__tag_b__lengths",
                 ],
-                "profile__ctx__ebc_user": [
+                "profile__ctx__ebc": [
                     "age__ebc",
                     "city__ebc",
                     "home_city__ebc",

@@ -9,10 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) Alibaba, Inc. and its affiliates.
+import contextlib
+import contextvars
 import json
 import os
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Iterator, Optional, Union
 
 import torch
 
@@ -22,10 +23,64 @@ from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import env_util, quant_util
 from tzrec.utils.logging_util import logger
 
+_USE_DISTRIBUTED_EMBEDDING_CTX: contextvars.ContextVar[Optional[bool]] = (
+    contextvars.ContextVar("tzrec_use_distributed_embedding", default=None)
+)
+_INPUT_TILE_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "tzrec_input_tile", default=None
+)
+_INPUT_TILE_3_ONLINE_CTX: contextvars.ContextVar[Optional[bool]] = (
+    contextvars.ContextVar("tzrec_input_tile_3_online", default=None)
+)
+
+
+@contextlib.contextmanager
+def export_env_scope(
+    use_distributed_embedding: Optional[bool] = None,
+    input_tile: Optional[str] = None,
+    input_tile_3_online: Optional[bool] = None,
+) -> Iterator[None]:
+    """Scope export acc flags in contextvars without mutating ``os.environ``."""
+    dist_tok = (
+        _USE_DISTRIBUTED_EMBEDDING_CTX.set(use_distributed_embedding)
+        if use_distributed_embedding is not None
+        else None
+    )
+    tile_tok = _INPUT_TILE_CTX.set(input_tile) if input_tile is not None else None
+    online_tok = (
+        _INPUT_TILE_3_ONLINE_CTX.set(input_tile_3_online)
+        if input_tile_3_online is not None
+        else None
+    )
+    try:
+        yield
+    finally:
+        if online_tok is not None:
+            _INPUT_TILE_3_ONLINE_CTX.reset(online_tok)
+        if tile_tok is not None:
+            _INPUT_TILE_CTX.reset(tile_tok)
+        if dist_tok is not None:
+            _USE_DISTRIBUTED_EMBEDDING_CTX.reset(dist_tok)
+
+
+def _is_distributed_embedding_enabled() -> bool:
+    ctx = _USE_DISTRIBUTED_EMBEDDING_CTX.get()
+    if ctx is not None:
+        return ctx
+    return os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1"
+
 
 def use_distributed_embedding() -> bool:
     """Export model for distributed embedding mode of EAS processor."""
-    return os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1"
+    return _is_distributed_embedding_enabled()
+
+
+def get_input_tile() -> Optional[str]:
+    """Return active ``INPUT_TILE`` value from export scope or ``os.environ``."""
+    ctx = _INPUT_TILE_CTX.get()
+    if ctx is not None:
+        return ctx
+    return os.environ.get("INPUT_TILE")
 
 
 def is_distributed_embedding_predict(model_path: str) -> bool:
@@ -37,7 +92,7 @@ def is_distributed_embedding_predict(model_path: str) -> bool:
 
 def is_input_tile() -> bool:
     """Judge is input file or not."""
-    input_tile = os.environ.get("INPUT_TILE")
+    input_tile = get_input_tile()
     if input_tile and (input_tile[0] == "2" or input_tile[0] == "3"):
         return True
     return False
@@ -58,10 +113,22 @@ def is_input_tile_emb() -> bool:
 
     Embedding Split user/item
     """
-    input_tile = os.environ.get("INPUT_TILE")
+    input_tile = get_input_tile()
     if input_tile and input_tile[0] == "3":
         return True
     return False
+
+
+def is_input_tile_user_keyed_tensor(name: str) -> bool:
+    """Return whether a split KeyedTensor name is the INPUT_TILE=3 user side.
+
+    Args:
+        name: placeholder or KeyedTensor group name.
+
+    Returns:
+        True for ``__ebc_user`` or ``__mc_ebc_user`` suffixes.
+    """
+    return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
 
 
 def is_input_tile_3_online() -> bool:
@@ -70,10 +137,24 @@ def is_input_tile_3_online() -> bool:
     If INPUT_TILE_3_ONLINE=1, sequential tensor use jt.values() directly,
     offline prediction for the model will not be supported.
     """
+    ctx = _INPUT_TILE_3_ONLINE_CTX.get()
+    if ctx is not None:
+        return ctx
     input_tile_3_online = os.environ.get("INPUT_TILE_3_ONLINE")
     if input_tile_3_online and input_tile_3_online[0] == "1":
         return True
     return False
+
+
+def is_input_tile_3_online_predict(model_path: str) -> bool:
+    """Return whether exported model enabled ``INPUT_TILE_3_ONLINE``."""
+    acc_json_path = os.path.join(model_path, "model_acc.json")
+    if not os.path.exists(acc_json_path):
+        return False
+    with open(acc_json_path, "r", encoding="utf-8") as file:
+        data = json.load(file)
+    val = data.get("INPUT_TILE_3_ONLINE")
+    return bool(val) and str(val)[:1] == "1"
 
 
 def is_hard_search_input_tile() -> bool:
@@ -336,6 +417,9 @@ def mixed_precision_for_export(pipeline_config: EasyRecConfig) -> str:
 def export_acc_config(
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     hard_search_input_tile_features: Optional[Dict[str, str]] = None,
+    use_distributed_embedding: Optional[bool] = None,
+    input_tile: Optional[str] = None,
+    input_tile_3_online: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Export acc config for model online inference.
 
@@ -344,16 +428,32 @@ def export_acc_config(
             into the acc config.
         hard_search_input_tile_features (dict, optional): hard-search feature to
             sequence mapping for HARD_SEARCH_INPUT_TILE.
+        use_distributed_embedding (bool, optional): explicit distributed
+            embedding flag overriding context/env.
+        input_tile (str, optional): explicit INPUT_TILE value overriding
+            context/env.
+        input_tile_3_online (bool, optional): explicit INPUT_TILE_3_ONLINE
+            value overriding env when specified.
     """
+    dist_emb = (
+        _is_distributed_embedding_enabled()
+        if use_distributed_embedding is None
+        else use_distributed_embedding
+    )
+    resolved_input_tile = get_input_tile() if input_tile is None else input_tile
     # use int64 sparse id as input
     acc_config: Dict[str, Any] = {"SPARSE_INT64": "1"}
-    if "INPUT_TILE" in os.environ:
-        acc_config["INPUT_TILE"] = os.environ["INPUT_TILE"]
+    if resolved_input_tile is not None:
+        acc_config["INPUT_TILE"] = resolved_input_tile
+    if input_tile_3_online is not None:
+        acc_config["INPUT_TILE_3_ONLINE"] = "1" if input_tile_3_online else "0"
+    elif "INPUT_TILE_3_ONLINE" in os.environ:
+        acc_config["INPUT_TILE_3_ONLINE"] = os.environ["INPUT_TILE_3_ONLINE"]
     if "QUANT_EMB" in os.environ:
         acc_config["QUANT_EMB"] = os.environ["QUANT_EMB"]
     if "QUANT_EC_EMB" in os.environ:
         acc_config["QUANT_EC_EMB"] = os.environ["QUANT_EC_EMB"]
-    if use_distributed_embedding() and is_distributed_sparse_quant():
+    if dist_emb and is_distributed_sparse_quant():
         acc_config["DIST_QUANT"] = "INT8"
     if "ENABLE_TRT" in os.environ:
         acc_config["ENABLE_TRT"] = os.environ["ENABLE_TRT"]
@@ -363,13 +463,13 @@ def export_acc_config(
         ]
     if "MAX_EXPORT_BATCH_SIZE" in os.environ:
         acc_config["MAX_EXPORT_BATCH_SIZE"] = os.environ["MAX_EXPORT_BATCH_SIZE"]
-    # Normalize ENABLE_AOT — write "2" whenever the resolved mode is unified
+    # Normalize ENABLE_AOT -- write "2" whenever the resolved mode is unified
     # (whether via the new env or the legacy UNIFIED_AOT=1).
     if is_aot():
         acc_config["ENABLE_AOT"] = "2" if is_unified_aot() else "1"
     if additional_export_config:
         acc_config.update(additional_export_config)
-    if use_distributed_embedding():
+    if dist_emb:
         acc_config["DISTRIBUTED_EMBEDDING"] = "1"
     if hard_search_input_tile_features:
         acc_config["hard_search_input_tile"] = {

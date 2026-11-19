@@ -19,7 +19,7 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from queue import Queue
 from threading import Event, Thread
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union, cast
 
 import pyarrow as pa
 import torch
@@ -1302,7 +1302,9 @@ def export(
         config_util.edit_config(pipeline_config, json.loads(edit_config_json))
     ori_pipeline_config = copy.copy(pipeline_config)
 
-    ensure_input_tile_for_distributed_embedding(pipeline_config)
+    use_dist_emb, base_input_tile = ensure_input_tile_for_distributed_embedding(
+        pipeline_config
+    )
 
     # AOTI bakes allow_tf32 into Triton constexprs at trace time.
     acc_utils.allow_tf32_for_export(pipeline_config)
@@ -1329,33 +1331,63 @@ def export(
 
     data_config = pipeline_config.data_config
 
-    # Build feature
-    features = _create_features(list(pipeline_config.feature_configs), data_config)
+    with acc_utils.export_env_scope(
+        use_distributed_embedding=use_dist_emb, input_tile=base_input_tile
+    ):
+        # Build feature
+        features = _create_features(list(pipeline_config.feature_configs), data_config)
+        compiled_prompt = _compile_prompt(pipeline_config, features)
 
-    compiled_prompt = _compile_prompt(pipeline_config, features)
-
-    # Build model
-    model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(data_config.label_fields),
-        sampler_type=None,
-        compiled_prompt=compiled_prompt,
+    use_dist_emb, model_input_tile = ensure_input_tile_for_distributed_embedding(
+        pipeline_config,
+        features=features,
+        use_distributed_embedding=use_dist_emb,
+        input_tile=os.environ.get("INPUT_TILE"),
     )
-    InferWrapper = ScriptWrapper
-    # Flip to inference *before* wrapping so view-dependent state
-    # (e.g. HSTUMatchItemTower's lazy properties, wrapper EmbeddingGroups)
-    # is snapshot from the scalar view.
-    model.set_is_inference(True)
-    model = InferWrapper(model)
+    is_match_cfg = pipeline_config.model_config.WhichOneof("model") == "match_model"
+    create_input_tile = "0" if is_match_cfg else model_input_tile
+
+    with acc_utils.export_env_scope(
+        use_distributed_embedding=use_dist_emb, input_tile=create_input_tile
+    ):
+        # Build model
+        model = _create_model(
+            pipeline_config.model_config,
+            features,
+            list(data_config.label_fields),
+            sampler_type=None,
+            compiled_prompt=compiled_prompt,
+        )
+        InferWrapper = ScriptWrapper
+        # Flip to inference *before* wrapping so view-dependent state
+        # (e.g. HSTUMatchItemTower's lazy properties, wrapper EmbeddingGroups)
+        # is snapshot from the scalar view.
+        model.set_is_inference(True)
+        model = InferWrapper(model)
 
     if isinstance(model.model, MatchModel):
         for name, module in model.model.named_children():
             if isinstance(module, MatchTower) or isinstance(module, MatchTowerWoEG):
+                tower_dist_emb, tower_input_tile = (
+                    ensure_input_tile_for_distributed_embedding(
+                        ori_pipeline_config,
+                        model=module,
+                        features=cast(
+                            Optional[List[BaseFeature]],
+                            getattr(module, "features", None),
+                        ),
+                        use_distributed_embedding=use_dist_emb,
+                        input_tile=os.environ.get("INPUT_TILE"),
+                    )
+                )
                 wrapper = (
                     TowerWrapper if isinstance(module, MatchTower) else TowerWoEGWrapper
                 )
-                tower = InferWrapper(wrapper(module, name))
+                with acc_utils.export_env_scope(
+                    use_distributed_embedding=tower_dist_emb,
+                    input_tile=tower_input_tile,
+                ):
+                    tower = InferWrapper(wrapper(module, name))
                 tower_export_dir = os.path.join(export_dir, name.replace("_tower", ""))
                 # item-tower-only; user tower falls back to `train_input_path`.
                 tower_data_input_path = (
@@ -1369,16 +1401,24 @@ def export(
                     assets=assets,
                     additional_export_config=additional_export_config,
                     data_input_path=tower_data_input_path,
+                    use_distributed_embedding=tower_dist_emb,
+                    input_tile=tower_input_tile,
                 )
     elif isinstance(model.model, TDM):
         for name, module in model.model.named_children():
             if isinstance(module, EmbeddingGroup):
-                emb_module = InferWrapper(TDMEmbedding(module, name))
+                with acc_utils.export_env_scope(
+                    use_distributed_embedding=use_dist_emb,
+                    input_tile=model_input_tile,
+                ):
+                    emb_module = InferWrapper(TDMEmbedding(module, name))
                 export_model(
                     ori_pipeline_config,
                     emb_module,
                     checkpoint_path,
                     os.path.join(export_dir, "embedding"),
+                    use_distributed_embedding=use_dist_emb,
+                    input_tile=model_input_tile,
                 )
                 break
         export_model(
@@ -1387,6 +1427,8 @@ def export(
             checkpoint_path,
             os.path.join(export_dir, "model"),
             assets=assets,
+            use_distributed_embedding=use_dist_emb,
+            input_tile=model_input_tile,
         )
     elif isinstance(model.model, BaseGenRecModel):
         # tzrec serves the prompt front-end; the LM rides beside it as
@@ -1401,7 +1443,11 @@ def export(
             )
         if not checkpoint_path:
             raise ValueError("HF export: no checkpoint found to convert.")
-        front_end = InferWrapper(GenRecFrontEnd(model.model))
+        with acc_utils.export_env_scope(
+            use_distributed_embedding=use_dist_emb,
+            input_tile=model_input_tile,
+        ):
+            front_end = InferWrapper(GenRecFrontEnd(model.model))
         # the front-end carries no backbone: the engine serves the LM from the
         # HuggingFace weights, so the copy built here is dead weight on every
         # rank once its config is read
@@ -1423,6 +1469,8 @@ def export(
             export_dir,
             assets=assets,
             additional_export_config=additional_export_config,
+            use_distributed_embedding=use_dist_emb,
+            input_tile=model_input_tile,
         )
         if is_rank_zero:
             export_hf_assets(
@@ -1440,6 +1488,8 @@ def export(
             export_dir,
             assets=assets,
             additional_export_config=additional_export_config,
+            use_distributed_embedding=use_dist_emb,
+            input_tile=model_input_tile,
         )
 
 
@@ -1532,7 +1582,9 @@ def predict(
         local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
         if int(os.environ.get("LOCAL_RANK", 0)) == 0:
             logger.info(f"downloading {scripted_model_path} to {local_path}.")
-            fs.download(scripted_model_path, local_path, recursive=True)
+            fs.download(
+                scripted_model_path.rstrip("/") + "/", local_path, recursive=True
+            )
         dist.barrier()
         scripted_model_path = local_path
 
@@ -1556,6 +1608,13 @@ def predict(
     if edit_config_json:
         edit_config_json = json.loads(edit_config_json)
         config_util.edit_config(pipeline_config, edit_config_json)
+    if acc_utils.is_input_tile_3_online_predict(scripted_model_path):
+        if config_util.get_inference_batch_size(pipeline_config.data_config) > 1:
+            raise ValueError(
+                "Offline prediction with batch_size > 1 is not supported for "
+                "models exported with INPUT_TILE_3_ONLINE=1; set batch_size=1 "
+                "or re-export with INPUT_TILE_3_ONLINE=0."
+            )
     if is_trt:
         # predict batch_size too large may out of range
         data_config = pipeline_config.data_config
