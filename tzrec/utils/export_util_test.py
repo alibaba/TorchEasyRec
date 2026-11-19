@@ -83,7 +83,6 @@ from tzrec.utils import (
     checkpoint_util,
     config_util,
     export_util,
-    misc_util,
     npz_util,
 )
 from tzrec.utils import (
@@ -433,9 +432,8 @@ class HardSearchExportTest(unittest.TestCase):
                         value.copy_(checkpoint_state[name])
 
             if not distributed:
-                port = misc_util.get_free_port()
                 dist.init_process_group(
-                    "gloo", init_method=f"tcp://127.0.0.1:{port}", world_size=1, rank=0
+                    "gloo", store=dist.HashStore(), world_size=1, rank=0
                 )
                 self.addCleanup(dist.destroy_process_group)
             checkpoint_path = os.path.join(self.test_dir, "checkpoint")
@@ -555,6 +553,9 @@ class HardSearchExportTest(unittest.TestCase):
             with self.subTest(lengths=lengths):
                 data = make_inputs(lengths, indices)
                 serving_data = dict(data)
+                for raw_prefix in ("item_id", "user_id", "click_seq__id"):
+                    serving_data.pop(f"{raw_prefix}.values", None)
+                    serving_data.pop(f"{raw_prefix}.lengths", None)
                 for group_name, feature_names in dense_meta.items():
                     if group_name == "sequence__ec":
                         for feature_name in feature_names:
@@ -2598,10 +2599,9 @@ class ExportUtilTest(unittest.TestCase):
 
             ckpt_dir = os.path.join(test_dir, "model.ckpt-0")
             export_dir = os.path.join(test_dir, "dense_export")
-            port = misc_util.get_free_port()
             dist.init_process_group(
                 backend="gloo",
-                init_method=f"tcp://127.0.0.1:{port}",
+                store=dist.HashStore(),
                 world_size=1,
                 rank=0,
             )
@@ -2738,10 +2738,9 @@ class ExportUtilTest(unittest.TestCase):
             ckpt_dir = os.path.join(test_dir, "model.ckpt-0")
             ckpt_export_dir = os.path.join(test_dir, "dense_export_ckpt")
             inproc_export_dir = os.path.join(test_dir, "dense_export_inproc")
-            port = misc_util.get_free_port()
             dist.init_process_group(
                 backend="gloo",
-                init_method=f"tcp://127.0.0.1:{port}",
+                store=dist.HashStore(),
                 world_size=1,
                 rank=0,
             )
@@ -3237,10 +3236,9 @@ class ExportUtilTest(unittest.TestCase):
 
             ckpt_dir = os.path.join(test_dir, "model.ckpt-0")
             export_dir = os.path.join(test_dir, "dense_export")
-            port = misc_util.get_free_port()
             dist.init_process_group(
                 backend="gloo",
-                init_method=f"tcp://127.0.0.1:{port}",
+                store=dist.HashStore(),
                 world_size=1,
                 rank=0,
             )
@@ -3495,10 +3493,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             )
             expected_defaults[name] = weight[-1:]
         checkpoint_state = checkpoint_model.state_dict()
-        port = misc_util.get_free_port()
-        dist.init_process_group(
-            "gloo", init_method=f"tcp://127.0.0.1:{port}", world_size=1, rank=0
-        )
+        dist.init_process_group("gloo", store=dist.HashStore(), world_size=1, rank=0)
         self.addCleanup(dist.destroy_process_group)
         with mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False):
             checkpoint_util.save_model(self.checkpoint_dir, checkpoint_model)
@@ -4234,7 +4229,10 @@ class DistributedEmbeddingAOTExportTest(unittest.TestCase):
             self.assertEqual(
                 dp._tile_size_keys_cache[True], ("i_dense.values", "u_dense.values")
             )
-            with acc_utils.export_env_scope(use_distributed_embedding=False):
+            with (
+                acc_utils.export_env_scope(use_distributed_embedding=False),
+                mock.patch.dict(os.environ, {"ENABLE_AOT": "2"}),
+            ):
                 self.assertEqual(dp._resolve_tile_size(data), 3)
                 self.assertEqual(
                     dp._tile_size_keys_cache[False], ("i_id.lengths", "u_id.lengths")
@@ -4599,9 +4597,8 @@ class DistributedEmbeddingAOTExportTest(unittest.TestCase):
                 init_parameters(inner, torch.device("cpu"))
                 return ScriptWrapper(inner)
 
-            port = misc_util.get_free_port()
             dist.init_process_group(
-                "gloo", init_method=f"tcp://127.0.0.1:{port}", world_size=1, rank=0
+                "gloo", store=dist.HashStore(), world_size=1, rank=0
             )
             self.addCleanup(dist.destroy_process_group)
 

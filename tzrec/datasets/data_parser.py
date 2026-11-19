@@ -29,6 +29,7 @@ from tzrec.acc.utils import (
     is_input_tile,
     is_input_tile_3_online,
     is_input_tile_emb,
+    is_unified_aot,
     use_distributed_embedding,
 )
 from tzrec.constant import Mode
@@ -303,6 +304,8 @@ class DataParser:
 
         self.user_inputs = set()
         self.user_feats = set()
+        self._tile_keys: Optional[Tuple[str, str]] = None
+        self._warned_tile_fallback: bool = False
         if self._is_input_tile():
             self._init_fg_hander()
             with export_env_scope(
@@ -317,6 +320,12 @@ class DataParser:
                 | set(self._fg_handler.sequence_input_to_name().keys())
             } - {self._to_real_input_name(x) for x in hs_inputs}
             self.user_feats = set([x.name for x in self._features if x.is_user_feat])
+            if is_unified_aot() or self._use_distributed_embedding():
+                item_key, user_key = self._get_tile_size_keys(
+                    self._use_distributed_embedding()
+                )
+                if item_key is not None and user_key is not None:
+                    self._tile_keys = (item_key, user_key)
             is_rank_zero = (
                 os.environ.get("RANK", "0") == "0"
                 if self._rank is None
@@ -625,7 +634,7 @@ class DataParser:
             for keys in self.sequence_mulval_sparse_keys.values():
                 candidates.extend(f"{k}.lengths" for k in keys)
         if hsk_feats:
-            candidates.append(f"{next(iter(hsk_feats.values()))}__inverse_indices")
+            candidates.append(f"{min(hsk_feats.values())}__inverse_indices")
         for cand in candidates:
             side = classify_raw_batch_dim_key(
                 cand, self._feat_by_name, hsk_feats, use_dist
@@ -641,10 +650,22 @@ class DataParser:
         return res
 
     def _resolve_tile_size(self, input_data: Dict[str, torch.Tensor]) -> int:
-        """Resolve user-to-candidate tile factor using backed batch dims."""
-        item_key, user_key = self._get_tile_size_keys(self._use_distributed_embedding())
-        if item_key is not None and user_key is not None:
-            return _infer_tile_size(input_data[item_key], input_data[user_key])
+        """Resolve user-to-candidate tile factor.
+
+        Unified AOT and distributed embedding infer it from backed batch dims;
+        other paths read batch_size.
+        """
+        use_dist = self._use_distributed_embedding()
+        if is_unified_aot() or use_dist:
+            item_key, user_key = self._get_tile_size_keys(use_dist)
+            if item_key is not None and user_key is not None:
+                return _infer_tile_size(input_data[item_key], input_data[user_key])
+            if is_unified_aot() and not self._warned_tile_fallback:
+                self._warned_tile_fallback = True
+                logger.warning(
+                    "Cannot identify both non-hard-search user and candidate keys "
+                    "for INPUT_TILE; falling back to batch_size.item()."
+                )
         return _tile_size(input_data["batch_size"])
 
     def to_batch(
