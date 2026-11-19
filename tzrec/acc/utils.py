@@ -201,10 +201,14 @@ def is_hard_search_input_tile() -> bool:
         return False
     if not is_input_tile():
         raise ValueError("HARD_SEARCH_INPUT_TILE=1 requires INPUT_TILE=2 or 3.")
-    if is_trt() or (is_aot() and not is_unified_aot()) or env_util.use_rtp():
+    if (
+        is_trt()
+        or (is_aot() and not (is_unified_aot() or use_distributed_embedding()))
+        or env_util.use_rtp()
+    ):
         raise ValueError(
-            "HARD_SEARCH_INPUT_TILE only supports FX/TorchScript or unified AOT "
-            "(ENABLE_AOT=2) export."
+            "HARD_SEARCH_INPUT_TILE only supports FX/TorchScript, unified AOT "
+            "(ENABLE_AOT=2), or distributed AOT export."
         )
     return True
 
@@ -489,10 +493,9 @@ def export_acc_config(
         ]
     if "MAX_EXPORT_BATCH_SIZE" in os.environ:
         acc_config["MAX_EXPORT_BATCH_SIZE"] = os.environ["MAX_EXPORT_BATCH_SIZE"]
-    # Normalize ENABLE_AOT -- write "2" whenever the resolved mode is unified
-    # (whether via the new env or the legacy UNIFIED_AOT=1).
+    # Write "2" for single-stage .pt2 exports (unified or distributed dense).
     if is_aot():
-        acc_config["ENABLE_AOT"] = "2" if is_unified_aot() else "1"
+        acc_config["ENABLE_AOT"] = "2" if is_unified_aot() or dist_emb else "1"
     if additional_export_config:
         acc_config.update(additional_export_config)
     if dist_emb:
