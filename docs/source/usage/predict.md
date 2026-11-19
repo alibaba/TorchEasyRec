@@ -30,6 +30,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 
 - 该预测方式预测的模型前向逻辑已经固化在导出模型中，预测结果不受模型代码的变更影响
 - DynamicEmb 模型导出时会自动启用分布式 embedding 模式（`USE_DISTRIBUTED_EMBEDDING=1`），其导出产物的预测方式见下文 [预测分布式 embedding 导出模型](#predict-distributed-embedding)
+- 离线预测现已将序列稠密特征的 `.lengths` 统一转为 `int64`（与稀疏特征及在线推理保持一致）；若历史导出的模型固化了 `int32` 长度类型（如含序列稠密特征的旧版 `ENABLE_TRT=1` 导出产物），请使用对应版本预测或重新导出
 
 (predict-distributed-embedding)=
 

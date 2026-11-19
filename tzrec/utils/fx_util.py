@@ -103,6 +103,24 @@ def symbolic_trace(
     return gm
 
 
+def eliminate_dense_dead_code(graph: torch.fx.Graph) -> None:
+    """Drop every node the dense graph's output does not depend on.
+
+    A dense graph is a pruned view of the full traced graph: the marked sparse
+    outputs are rewired to read the sparse model's output dict, which leaves the
+    original lookup subtree unreachable. Plain ``eliminate_dead_code`` no longer
+    removes it, because torch>=2.13 resolves an ``OpOverloadPacket`` target to
+    its default overload when deciding purity, so the zero-user
+    ``fbgemm.bounds_check_indices`` left behind by a quantized lookup now counts
+    as impure and pins the whole subtree -- which then reads raw feature keys
+    that exist only in the sparse model's input. The sparse half runs in the
+    sparse model, so here only placeholders and the output are anchors.
+    """
+    graph.eliminate_dead_code(
+        is_impure_node=lambda node: node.op in ("placeholder", "output")
+    )
+
+
 @torch.fx.wrap
 def fx_get_label(
     labels: Dict[str, torch.Tensor],
