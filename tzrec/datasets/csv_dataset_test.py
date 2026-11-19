@@ -22,10 +22,18 @@ from parameterized import parameterized
 from pyarrow import csv
 from torch.utils.data import DataLoader
 
+from tzrec.constant import Mode
 from tzrec.datasets.csv_dataset import CsvDataset, CsvWriter
+from tzrec.datasets.dataset import create_dataloader
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
-from tzrec.utils.test_util import make_test_dir
+from tzrec.tests.utils import (
+    drain_sample,
+    raw_c_features,
+    sample_data_config,
+    stop_sample,
+)
+from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
 class CsvDatasetTest(unittest.TestCase):
@@ -217,6 +225,71 @@ class CsvDatasetTest(unittest.TestCase):
                     "tag_b.values",
                 ],
             )
+
+    def _write_csv(self, test_dir, num_rows, num_files=2):
+        rows_per_file = num_rows // num_files
+        for f in range(num_files):
+            path = os.path.join(test_dir, f"part-{f}.csv")
+            with open(path, "w") as fh:
+                fh.write("raw_c,label\n")
+                for i in range(f * rows_per_file, (f + 1) * rows_per_file):
+                    fh.write(f"{float(i)},{i % 2}\n")
+
+    @parameterized.expand(
+        [
+            ("rolling_workers", "SAMPLE_ROLLING", 2, 2, None),
+            ("window_workers", "SAMPLE_WINDOW", 2, 2, None),
+            ("rolling_no_workers", "SAMPLE_ROLLING", 0, 2, None),
+            # one file caps the requested four workers at one
+            ("single_file_worker_cap", "SAMPLE_ROLLING", 4, 1, 1),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sample_shuffle_epochs(
+        self, _name, mode, num_workers, num_files, actual_workers
+    ):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._write_csv(test_dir, 100, num_files=num_files)
+            dataloader = create_dataloader(
+                sample_data_config(
+                    data_pb2.DatasetType.CsvDataset, mode, num_workers, with_header=True
+                ),
+                raw_c_features(),
+                f"{test_dir}/*.csv",
+                mode=Mode.TRAIN,
+            )
+            if actual_workers is not None:
+                self.assertEqual(dataloader.num_workers, actual_workers)
+                self.assertEqual(
+                    dataloader.dataset._sample_shuffle._num_consumers, actual_workers
+                )
+            iterator = None
+            try:
+                for _ in range(2):
+                    iterator = dataloader.get_iterator()
+                    sizes, values, _ = drain_sample(iterator)
+                    self.assertEqual(sum(sizes), 100)
+                    self.assertEqual(sorted(sizes), [4] + [8] * 12)
+                    self.assertEqual(sorted(values), list(range(100)))
+            finally:
+                stop_sample(dataloader, iterator)
+
+    def test_sample_shuffle_rejects_multi_rank(self):
+        with tempfile.TemporaryDirectory(prefix="tzrec_") as test_dir:
+            self._write_csv(test_dir, 20)
+            dataset = CsvDataset(
+                sample_data_config(
+                    data_pb2.DatasetType.CsvDataset,
+                    "SAMPLE_ROLLING",
+                    1,
+                    with_header=True,
+                ),
+                raw_c_features(),
+                f"{test_dir}/*.csv",
+                mode=Mode.TRAIN,
+            )
+            with self.assertRaisesRegex(ValueError, "single rank"):
+                dataset._reader.create_read_plan(0, 2, 1)
 
 
 class CsvWriterTest(unittest.TestCase):

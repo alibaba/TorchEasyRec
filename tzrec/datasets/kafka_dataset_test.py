@@ -12,8 +12,11 @@
 
 import io
 import os
+import pickle
+import signal
 import time
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
@@ -28,6 +31,8 @@ from parameterized import param, parameterized
 from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
+from tzrec.datasets import kafka_dataset
+from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.kafka_dataset import (
     KafkaDataset,
     KafkaReader,
@@ -35,8 +40,10 @@ from tzrec.datasets.kafka_dataset import (
     _offsets_for_times_batched,
     _parse_kafka_uri,
 )
+from tzrec.datasets.utils import DATA_TIMESTAMP
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
+from tzrec.tests import utils
 from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.logging_util import logger
 from tzrec.utils.misc_util import random_name
@@ -110,7 +117,15 @@ def _decoded_logs(mock_logger):
 class KafkaReaderRoundRobinTest(unittest.TestCase):
     """Round-robin reading with mocked consumers."""
 
-    def _make_reader(self, consumers, partitions=(0, 1), leaders=None, **kwargs):
+    def _make_reader(
+        self,
+        consumers,
+        partitions=(0, 1),
+        leaders=None,
+        round_robin=True,
+        batch_size=1,
+        **kwargs,
+    ):
         leaders = leaders or {partition: 0 for partition in partitions}
         query_consumer = mock.Mock()
         query_consumer.list_topics.return_value = SimpleNamespace(
@@ -127,7 +142,7 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         self.enterContext(
             mock.patch(
                 "tzrec.datasets.kafka_dataset.Consumer",
-                side_effect=[query_consumer] + consumers,
+                side_effect=([query_consumer] if round_robin else []) + consumers,
             )
         )
         self.enterContext(
@@ -138,9 +153,9 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         )
         return KafkaReader(
             "kafka://broker:9092/topic?group.id=g1",
-            1,
+            batch_size,
             input_fields=[pa.field("x", pa.int64())],
-            kafka_partition_round_robin=True,
+            kafka_partition_round_robin=round_robin,
             **kwargs,
         )
 
@@ -163,16 +178,84 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
             [_msg(1, 0, 3)],
             [_msg(1, 1, 4)],
         ]
+        consumers[0].get_watermark_offsets.return_value = (0, 2)
+        consumers[1].get_watermark_offsets.side_effect = [(-1, -1), (0, 2)]
         gen = self._make_reader(consumers)._reader(0, 1)
         self.addCleanup(gen.close)
         observed = [next(gen).column("x")[0].as_py() for _ in expected]
         self.assertEqual(observed, expected)
         self.assertEqual(
-            consumers[0].consume.call_args_list, [mock.call(1, timeout=1.0)] * 2
+            [call.kwargs["timeout"] for call in consumers[0].consume.call_args_list],
+            [0, 0],
         )
         self.assertEqual(
-            consumers[1].consume.call_args_list, [mock.call(1, timeout=1.0)] * 4
+            [call.kwargs["timeout"] for call in consumers[1].consume.call_args_list],
+            [0, 1.0, 0, 0],
         )
+
+    def test_round_robin_skips_caught_up_partition_after_resume(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[0].consume.side_effect = [
+            [_msg(0, offset, offset + 1)] for offset in range(4)
+        ]
+        consumers[1].consume.side_effect = [
+            [],
+            [_msg(1, 5, 9)],
+            [],
+            [],
+            [_msg(1, 6, 10)],
+        ]
+        consumers[1].get_watermark_offsets.side_effect = [
+            (0, high) for high in (5, 6, 7)
+        ]
+        reader = self._make_reader(consumers)
+        reader.load_state_dict({"topic:1": 4})
+        gen = reader._reader(0, 1)
+        self.addCleanup(gen.close)
+        observed = [next(gen).column("x")[0].as_py() for _ in range(6)]
+        self.assertEqual(observed, [1, 2, 9, 3, 4, 10])
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in consumers[1].consume.call_args_list],
+            [0, 0, 0, 0, 1.0],
+        )
+
+    def test_round_robin_msg_per_turn_follows_rows_estimate(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        consumers[0].consume.side_effect = [
+            [_msg(0, offset, offset + 1, rows=2)] for offset in range(4)
+        ]
+        consumers[0].get_watermark_offsets.side_effect = [(0, 2), (0, 10)]
+        consumers[1].consume.side_effect = [
+            [_msg(1, offset, offset + 5, rows=2) for offset in range(start, start + 2)]
+            for start in (0, 2)
+        ]
+        gen = self._make_reader(consumers, batch_size=8)._reader(0, 1)
+        self.addCleanup(gen.close)
+        self.assertEqual([next(gen).num_rows for _ in range(5)], [2, 4, 2, 4, 4])
+        self.assertEqual(
+            consumers[0].consume.call_args_list,
+            [
+                mock.call(1, timeout=0),
+                mock.call(2, timeout=0),
+                mock.call(2, timeout=0),
+                mock.call(1, timeout=1.0),
+            ],
+        )
+
+    def test_round_robin_sleeps_when_all_caught_up(self):
+        consumers = [mock.Mock(), mock.Mock()]
+        for consumer, offset in zip(consumers, (5, 7)):
+            consumer.consume.side_effect = [[]]
+            consumer.get_watermark_offsets.return_value = (offset, offset)
+        sleep = mock.Mock(side_effect=RuntimeError)
+        with mock.patch.object(kafka_dataset.time, "sleep", sleep):
+            gen = self._make_reader(consumers)._reader(0, 1)
+            self.addCleanup(gen.close)
+            with self.assertRaises(RuntimeError):
+                next(gen)
+        sleep.assert_called_once_with(0.01)
+        for consumer in consumers:
+            consumer.consume.assert_called_once_with(1, timeout=0)
 
     @parameterized.expand(
         [
@@ -352,6 +435,58 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
             self._construct_with_dist(1, consumer_cls, _broadcast)
         consumer_cls.assert_not_called()
 
+    @parameterized.expand(
+        [
+            ("subscribe_parent_exit", False, True),
+            ("round_robin_parent_exit", True, True),
+            ("subscribe_main_process", False, False),
+            ("round_robin_main_process", True, False),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_idle_poll_parent_lifecycle(self, _name, round_robin, has_parent):
+        consumer = mock.Mock()
+        idle_polls = 2 if round_robin else 1
+        consumer.consume.side_effect = [[]] * idle_polls + [[_msg(0, 0, 7)]]
+        consumer.get_watermark_offsets.return_value = (0, 1)
+        reader = self._make_reader([consumer], partitions=(0,), round_robin=round_robin)
+        with (
+            mock.patch.object(
+                kafka_dataset.mp,
+                "parent_process",
+                return_value=SimpleNamespace(pid=123) if has_parent else None,
+            ),
+            mock.patch.object(kafka_dataset.os, "getppid", side_effect=[123, 456]),
+        ):
+            gen = reader._reader()
+            try:
+                if has_parent:
+                    with self.assertRaises(StopIteration):
+                        next(gen)
+                else:
+                    self.assertEqual(next(gen).column("x").to_pylist(), [7])
+            finally:
+                gen.close()
+        self.assertEqual(
+            consumer.consume.call_count, idle_polls if has_parent else idle_polls + 1
+        )
+        consumer.close.assert_called_once()
+
+    def test_read_plan_uses_global_reader_ids(self):
+        reader = self._make_reader([], partitions=(0, 1, 2, 3))
+        reader.load_state_dict({"topic:0": 12})
+        plan = pickle.loads(pickle.dumps(reader.create_read_plan(1, 2, 2)))
+        self.assertEqual(plan.num_readers, 2)
+        self.assertEqual([task.reader_id for task in plan.tasks], [0, 1])
+        self.assertEqual([task.kwargs["worker_id"] for task in plan.tasks], [2, 3])
+        self.assertEqual([task.kwargs["num_workers"] for task in plan.tasks], [4, 4])
+        for task in plan.tasks:
+            task_reader = task.kwargs["reader"]
+            self.assertEqual(task_reader._checkpoint_state, {"topic:0": 12})
+            self.assertEqual(task_reader._round_robin_partition_order, [0, 1, 2, 3])
+        self.assertFalse(plan.is_finite)
+        self.assertIn(DATA_TIMESTAMP, plan.schema.names)
+
 
 class KafkaReaderDecodedMessageLogTest(unittest.TestCase):
     """Decoded-message counting and periodic logging in normal consumption."""
@@ -430,11 +565,16 @@ class KafkaReaderDecodedMessageLogTest(unittest.TestCase):
         consumer = mock.Mock()
         consumer.consume.return_value = [_msg(0, 0, 1)]
         reader = self._make_reader(consumer, kafka_log_every_n_messages=100)
+        reader.load_state_dict({"topic:0": 9})
         gen = reader._reader(0, 1)
         self.addCleanup(gen.close)
         next(gen)
         on_assign = consumer.subscribe.call_args.kwargs["on_assign"]
         on_assign(consumer, [TopicPartition("topic", 0)])
+        # the callback re-seeks to the offset after the checkpointed one
+        consumer.assign.assert_called_once()
+        (tp,) = consumer.assign.call_args.args[0]
+        self.assertEqual((tp.topic, tp.partition, tp.offset), ("topic", 0, 10))
         self.assertEqual(reader._decoded_message_count, 1)
         self.assertEqual(reader._decoded_partition_counts, {"topic:0": 1})
         next(gen)
@@ -751,7 +891,7 @@ class KafkaDatasetTest(unittest.TestCase):
         except Exception as e:
             logger.error(e)
 
-    def _create_test_table_and_feature_cfgs(self, embedded_schema=False):
+    def _create_test_topic(self):
         create_topic_req = alikafka_models.CreateTopicRequest(
             instance_id=self.instance_id,
             topic=self.test_topic,
@@ -774,6 +914,8 @@ class KafkaDatasetTest(unittest.TestCase):
                 break
             time.sleep(10)
 
+    def _create_test_table_and_feature_cfgs(self, embedded_schema=False):
+        self._create_test_topic()
         input_fields_str = (
             "unused:STRING;id_a:STRING;tag_b:STRING;raw_c:INT64;"
             "raw_d:DOUBLE;raw_e:INT32;raw_f:FLOAT;raw_g:ARRAY<FLOAT>;"
@@ -1053,6 +1195,125 @@ class KafkaDatasetTest(unittest.TestCase):
                 # New offset should be less than or equal to acc checkpoint offset
                 # (equal if we consumed the next message after checkpoint)
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
+
+    @parameterized.expand(
+        [
+            ("rolling", "SAMPLE_ROLLING", 2, False),
+            ("window", "SAMPLE_WINDOW", 2, False),
+            ("round_robin_no_workers", "SAMPLE_ROLLING", 0, True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipIf(
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
+    )
+    def test_sample_shuffle_checkpoint_resume(
+        self, _name, mode, num_workers, round_robin
+    ):
+        self._create_test_topic()
+        producer = Producer({"bootstrap.servers": self.brokers})
+        rows_per_message = 24
+        messages_per_partition = 16
+        metadata = {}
+        timestamp_ms = int(time.time() * 1000)
+
+        def on_delivery(row_start, event_time, error, message):
+            self.assertIsNone(error)
+            for row in range(row_start, row_start + rows_per_message):
+                metadata[row] = (
+                    f"{self.test_topic}:{message.partition()}",
+                    message.offset(),
+                    event_time / 1000.0,
+                )
+
+        for partition in range(4):
+            for offset in range(messages_per_partition):
+                row_start = (
+                    partition * messages_per_partition + offset
+                ) * rows_per_message
+                record_batch = pa.record_batch(
+                    {
+                        "raw_c": list(range(row_start, row_start + rows_per_message)),
+                        "label": [0] * rows_per_message,
+                    }
+                )
+                producer.produce(
+                    topic=self.test_topic,
+                    partition=partition,
+                    value=record_batch.serialize(),
+                    timestamp=timestamp_ms + offset,
+                    on_delivery=partial(on_delivery, row_start, timestamp_ms + offset),
+                )
+        self.assertEqual(producer.flush(30), 0)
+        self.assertEqual(len(metadata), 4 * messages_per_partition * rows_per_message)
+        cfg = utils.sample_data_config(
+            data_pb2.DatasetType.KafkaDataset,
+            mode,
+            num_workers,
+            kafka_partition_round_robin=round_robin,
+        )
+        cfg.input_fields.extend(
+            [
+                data_pb2.Field(input_name="raw_c", input_type=data_pb2.INT64),
+                data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
+            ]
+        )
+        path = (
+            f"kafka://{self.brokers}/{self.test_topic}"
+            "?group.id=tzrec_sample_shuffle&auto.offset.reset=earliest"
+        )
+
+        def alarm(signum, frame):
+            raise TimeoutError("timed out waiting for sample-shuffle batches")
+
+        old_handler = signal.signal(signal.SIGALRM, alarm)
+        self.addCleanup(signal.signal, signal.SIGALRM, old_handler)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        signal.setitimer(signal.ITIMER_REAL, 120)
+        state = {}
+        seen = set()
+        for resume in (False, True):
+            checkpoint = state.copy() if resume else {}
+            dataloader = create_dataloader(
+                cfg,
+                utils.raw_c_features(),
+                path,
+                mode=Mode.TRAIN,
+                checkpoint_state=checkpoint,
+            )
+            iterator = None
+            message_batches = {}
+            try:
+                iterator = dataloader.get_iterator()
+                for batch_index, batch in enumerate(iterator):
+                    values = [int(v) for v in batch.to_dict()["raw_c.values"]]
+                    self.assertEqual(len(values), 8)
+                    self.assertEqual(len(set(values)), 8)
+                    self.assertTrue(seen.isdisjoint(values))
+                    seen.update(values)
+                    expected = {}
+                    timestamps = []
+                    messages = set()
+                    for value in values:
+                        source, offset, event_time = metadata[value]
+                        if resume:
+                            self.assertGreater(offset, checkpoint[source])
+                        expected[source] = max(expected.get(source, -1), offset)
+                        timestamps.append(event_time)
+                        messages.add((source, offset))
+                    self.assertEqual(batch.checkpoint_info, expected)
+                    self.assertEqual(batch.data_timestamp, max(timestamps))
+                    for message in messages:
+                        message_batches[message] = message_batches.get(message, 0) + 1
+                    update_dataloder_state(state, batch.checkpoint_info)
+                    if (resume and batch_index >= 3) or (
+                        not resume and len(state) == 4
+                    ):
+                        break
+                self.assertTrue(any(count > 1 for count in message_batches.values()))
+            finally:
+                utils.stop_sample(dataloader, iterator)
+        self.assertEqual(len(state), 4)
 
     @unittest.skipIf(
         os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."

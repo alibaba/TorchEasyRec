@@ -13,7 +13,7 @@ import copy
 import os
 from datetime import timedelta
 from queue import Queue
-from typing import Callable, Dict, Iterator, List, Optional, Tuple, Type, cast
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Type, Union, cast
 
 import torch
 from torch import distributed as dist
@@ -36,8 +36,8 @@ from torchrec.distributed.model_parallel import DataParallelWrapper
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel as _DistributedModelParallel,
 )
-from torchrec.distributed.train_pipeline import TrainPipeline, TrainPipelineContext
 from torchrec.distributed.train_pipeline import TrainPipelineBase as _TrainPipelineBase
+from torchrec.distributed.train_pipeline import TrainPipelineContext
 from torchrec.distributed.train_pipeline import (
     TrainPipelineSparseDist as _TrainPipelineSparseDist,
 )
@@ -243,6 +243,11 @@ def _pipeline_backward(losses: torch.Tensor, optimizer: torch.optim.Optimizer) -
 class TrainPipelineBase(_TrainPipelineBase):
     """TorchEasyRec's TrainPipelineBase, make backward support grad scaler."""
 
+    @property
+    def input_drained(self) -> bool:
+        """Whether the input is exhausted and its last batch has been processed."""
+        return self._data_iter_stopped and self._cur_batch is None
+
     def _backward(self, losses: torch.Tensor) -> None:
         _pipeline_backward(losses, self._optimizer)
 
@@ -328,6 +333,11 @@ class TrainPipelineSparseDist(_TrainPipelineSparseDist):
                     self._dataloader_exhausted = True
         return batch
 
+    @property
+    def input_drained(self) -> bool:
+        """Whether the input is exhausted and its last batch has been processed."""
+        return self._dataloader_exhausted and not self.batches
+
     def _backward(self, losses: torch.Tensor) -> None:
         _pipeline_backward(losses, self._optimizer)
 
@@ -366,7 +376,7 @@ def create_train_pipeline(
     model: nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     check_all_workers_data_status: bool = False,
-) -> TrainPipeline:
+) -> Union[TrainPipelineBase, TrainPipelineSparseDist]:
     """Create TrainPipeline.
 
     Args:

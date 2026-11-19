@@ -983,6 +983,7 @@ feature_configs {
 其中：
 
 - `hard_search_key: "item:cate"`：使用当前候选物品的 `cate` 字段筛选历史，格式为 `item:<field>`。
+- `sequence_length`：设置为正整数，作为筛选后的历史最大长度。
 - `expression: "item:iid"`：历史物品 ID 字段，对应原始输入列 `click_same_cate__iid`。
 - `sequence_pk`：使用独立名称，不能与其他原始输入列或序列组的 PK 同名。
 
