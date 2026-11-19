@@ -14,12 +14,13 @@ import json
 import os
 import shutil
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
 from pyarrow import dataset as ds
 
-from tzrec.acc import trt_utils
+from tzrec.acc import aot_utils, trt_utils
 from tzrec.constant import Mode
 from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.utils import calc_remaining_intervals
@@ -456,7 +457,7 @@ class RankIntegrationTest(unittest.TestCase):
                     result_gpu_input_tile[k].to(device), v, rtol=1e-4, atol=1e-4
                 )
 
-    def _test_rank_with_fg_aot_input_tile(self, pipeline_config_path):
+    def _test_rank_with_fg_aot_input_tile(self, pipeline_config_path, aot_mode="1"):
         self.success = utils.test_train_eval(
             pipeline_config_path, self.test_dir, user_id="user_id", item_id="item_id"
         )
@@ -470,13 +471,21 @@ class RankIntegrationTest(unittest.TestCase):
         pred_output = os.path.join(self.test_dir, "predict_result")
         tile_pred_output = os.path.join(self.test_dir, "predict_result_tile")
         tile_pred_output_emb = os.path.join(self.test_dir, "predict_result_tile_emb")
+        eval_glob = (
+            r"eval_data/\*.parquet" if aot_mode == "2" else r"eval_data/part-0.parquet"
+        )
+        base_env = (
+            f"QUANT_EC_EMB=1 ENABLE_AOT={aot_mode}"
+            if aot_mode == "2"
+            else f"ENABLE_AOT={aot_mode}"
+        )
 
         # export quant and no-input-tile
         if self.success:
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 self.test_dir,
-                env_str="ENABLE_AOT=1",
+                env_str=base_env,
             )
         if self.success:
             self.success = utils.test_predict(
@@ -493,14 +502,12 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir,
-                env_str="QUANT_EC_EMB=1 INPUT_TILE=2 ENABLE_AOT=1",
+                env_str=f"QUANT_EC_EMB=1 INPUT_TILE=2 ENABLE_AOT={aot_mode}",
             )
         if self.success:
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(input_tile_dir, "export"),
-                predict_input_path=os.path.join(
-                    self.test_dir, r"eval_data/part-0.parquet"
-                ),
+                predict_input_path=os.path.join(self.test_dir, eval_glob),
                 predict_output_path=tile_pred_output,
                 reserved_columns="user_id,item_id,clk",
                 output_columns="probs",
@@ -512,14 +519,12 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = utils.test_export(
                 os.path.join(self.test_dir, "pipeline.config"),
                 input_tile_dir_emb,
-                env_str="QUANT_EC_EMB=1 INPUT_TILE=3 ENABLE_AOT=1",
+                env_str=f"QUANT_EC_EMB=1 INPUT_TILE=3 ENABLE_AOT={aot_mode}",
             )
         if self.success:
             self.success = utils.test_predict(
                 scripted_model_path=os.path.join(input_tile_dir_emb, "export"),
-                predict_input_path=os.path.join(
-                    self.test_dir, r"eval_data/part-0.parquet"
-                ),
+                predict_input_path=os.path.join(self.test_dir, eval_glob),
                 predict_output_path=tile_pred_output_emb,
                 reserved_columns="user_id,item_id,clk",
                 output_columns="probs",
@@ -527,17 +532,84 @@ class RankIntegrationTest(unittest.TestCase):
             )
 
         self.assertTrue(self.success)
-        self.assertTrue(
-            os.path.exists(os.path.join(self.test_dir, "export/aoti/aoti_model.pt2"))
-        )
-        self.assertTrue(
-            os.path.exists(os.path.join(input_tile_dir, "export/aoti/aoti_model.pt2"))
-        )
-        self.assertTrue(
-            os.path.exists(
-                os.path.join(input_tile_dir_emb, "export/aoti/aoti_model.pt2")
+        self.success = False
+        for export_root in (self.test_dir, input_tile_dir, input_tile_dir_emb):
+            export_dir = os.path.join(export_root, "export")
+            self.assertTrue(
+                os.path.exists(os.path.join(export_dir, "aoti/aoti_model.pt2"))
             )
-        )
+            with open(os.path.join(export_dir, "model_acc.json")) as f:
+                self.assertEqual(json.load(f).get("ENABLE_AOT"), aot_mode)
+            if aot_mode == "2":
+                self.assertFalse(
+                    os.path.exists(os.path.join(export_dir, "scripted_sparse_model.pt"))
+                )
+                self.assertFalse(
+                    os.path.exists(os.path.join(export_dir, "scripted_model.pt"))
+                )
+
+        if aot_mode == "2":
+            df = ds.dataset(pred_output, format="parquet").to_table().to_pandas()
+            df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
+            for tile_out in (tile_pred_output, tile_pred_output_emb):
+                df_t = ds.dataset(tile_out, format="parquet").to_table().to_pandas()
+                df_t = df_t.sort_values(by=list(df_t.columns)).reset_index(drop=True)
+                self.assertTrue(dfs_are_close(df, df_t, 1e-4))
+
+            # Verify online-tiled forward (user_bs=1, batch_size=512) matches no-tile.
+            pipeline_config = config_util.load_pipeline_config(
+                os.path.join(self.test_dir, "pipeline.config")
+            )
+            features = _create_features(
+                pipeline_config.feature_configs, pipeline_config.data_config
+            )
+            utils.create_predict_data(
+                pipeline_config_path=os.path.join(self.test_dir, "pipeline.config"),
+                batch_size=512,
+                item_id="item_id",
+                output_dir=os.path.join(self.test_dir, "predict"),
+            )
+            device = torch.device("cuda:0")
+            predict_parquet = os.path.join(self.test_dir, "predict", "*.parquet")
+            with mock.patch.dict(os.environ, {"INPUT_TILE": "1"}):
+                dl = create_dataloader(
+                    pipeline_config.data_config,
+                    features,
+                    predict_parquet,
+                    mode=Mode.PREDICT,
+                )
+                batch_no_tile = next(iter(dl)).to_dict(sparse_dtype=torch.int64)
+            model_no_tile = aot_utils.load_model_aot(
+                os.path.join(self.test_dir, "export"), device
+            )
+            with torch.no_grad():
+                res_no_tile = model_no_tile(batch_no_tile, device)
+
+            for tile_val, tile_root in (
+                ("2", input_tile_dir),
+                ("3", input_tile_dir_emb),
+            ):
+                with mock.patch.dict(
+                    os.environ, {"INPUT_TILE": tile_val, "INPUT_TILE_3_ONLINE": "1"}
+                ):
+                    dl_tile = create_dataloader(
+                        pipeline_config.data_config,
+                        features,
+                        predict_parquet,
+                        mode=Mode.PREDICT,
+                    )
+                    batch_tile = next(iter(dl_tile)).to_dict(sparse_dtype=torch.int64)
+                self.assertEqual(batch_tile["user_id.lengths"].numel(), 1)
+                self.assertEqual(int(batch_tile["batch_size"].item()), 512)
+                model_tile = aot_utils.load_model_aot(
+                    os.path.join(tile_root, "export"), device
+                )
+                with torch.no_grad():
+                    res_tile = model_tile(batch_tile, device)
+                torch.testing.assert_close(
+                    res_tile["probs"], res_no_tile["probs"], rtol=1e-4, atol=1e-4
+                )
+        self.success = True
 
     def _test_rank_with_fg_trt(self, pipeline_config_path, predict_columns):
         # Random-label mock trains to logit~=0, where TRT's per-process reduction
@@ -917,6 +989,13 @@ class RankIntegrationTest(unittest.TestCase):
     def test_multi_tower_din_with_fg_train_eval_aot_export_input_tile(self):
         self._test_rank_with_fg_aot_input_tile(
             "tzrec/tests/configs/multi_tower_din_fg_mock.config"
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
+    def test_multi_tower_din_with_fg_train_eval_unified_aot_export_input_tile(self):
+        self._test_rank_with_fg_aot_input_tile(
+            "tzrec/tests/configs/multi_tower_din_fg_mock.config", aot_mode="2"
         )
 
     def test_dbmtl_has_sequence_variational_dropout_train_eval_export(self):
