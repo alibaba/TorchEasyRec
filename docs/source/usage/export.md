@@ -64,6 +64,8 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ENABLE_AOT: 使用AOT(Ahead Of Time)编译优化导出的模型，可显著提升推理性能。**AOT 编译产物与导出机器的 GPU 架构强绑定，在线服务的 GPU 类型必须与导出时使用的 GPU 类型完全一致**，详见下文 [在 PAI 上导出 AOT 模型](#export-aot-on-pai) 章节
   - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（sparse 部分用 JIT，dense 部分用 AOTI）
   - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]；支持 `INPUT_TILE`、`HARD_SEARCH_INPUT_TILE` 和空序列特征（`JAGGED_SEQUENCE` 特征组在预测时仍要求每个 batch 的序列总长度至少为 1）
+- TZREC_DISABLE_EXPORT_GRAPH_OPT: 关闭导出阶段的 FX 计算图优化（包括 eval Dropout/Identity 消除、Linear+BN 融合、BN+Dice 融合及 `_infer_tile_size` 改写），默认不开启（即默认执行图优化）
+  - **TZREC_DISABLE_EXPORT_GRAPH_OPT=1**：跳过 FX 导出图优化，回退到原始符号追踪图进行 TorchScript 导出（适用于 `tzrec.export` 与在线 dense 热导出的排障回退）
 
 (dynamic-embedding-full-export)=
 

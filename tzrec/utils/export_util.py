@@ -64,6 +64,7 @@ from tzrec.datasets.dataset import (
 )
 from tzrec.features.feature import (
     BaseFeature,
+    InvalidFgInputError,
     create_feature_configs,
     create_fg_json,
     get_hard_search_input_tile_features,
@@ -77,6 +78,7 @@ from tzrec.utils.dynamic_embedding_export import (
     get_dynamic_embedding_export,
     get_sharded_dynamic_embedding_export,
 )
+from tzrec.utils.export_graph_opt import optimize_fx_for_export
 from tzrec.utils.feature_store_uploader import FeatureStoreFullUploader
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
@@ -441,7 +443,19 @@ def export_model_normal(
             with open(os.path.join(save_dir, "gm.code"), "w") as f:
                 f.write(gm.code)
 
-            scripted_model = torch.jit.script(gm)
+            user_input_keys, item_input_keys = _collect_normal_export_tile_input_keys(
+                features
+            )
+            opt_gm = optimize_fx_for_export(
+                gm,
+                emit_jit_anchors=True,
+                user_input_keys=user_input_keys,
+                item_input_keys=item_input_keys,
+            )
+            with open(os.path.join(save_dir, "gm_opt.code"), "w") as f:
+                f.write(opt_gm.code)
+
+            scripted_model = torch.jit.script(opt_gm)
             scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
 
         _write_export_metadata(
@@ -710,6 +724,8 @@ def _rewrite_dense_serving_graph(
                     tile_size_node = graph.call_function(
                         _tile_size, args=(batch_size_node,)
                     )
+                    # Keep _tile_size opaque when finalize_dense_export re-traces gm.
+                    tile_size_node.meta["is_wrapped"] = True
                     values_node = graph.call_method(
                         "tile", args=(getitem_node, tile_size_node, 1)
                     )
@@ -749,6 +765,7 @@ def _rewrite_dense_serving_graph(
                     operator.getitem, args=(input_node, "batch_size")
                 )
                 new_node = graph.call_function(_tile_size, args=(batch_size_node,))
+                new_node.meta["is_wrapped"] = True
             node.replace_all_uses_with(new_node)
 
     graph.output(dict(zip(output_keys, output_values)))
@@ -2286,6 +2303,101 @@ def build_dense_graph_module(
     return gm, full_graph, dense_graph_config
 
 
+def _classify_confirmed_feature_side(
+    feature: BaseFeature, hard_search_features: Dict[str, str]
+) -> Optional[str]:
+    """Classify a feature as confirmed 'user' or 'item' for tile-size inference."""
+    if feature.stub_type or feature.name in hard_search_features:
+        return None
+    try:
+        side_inputs = feature.side_inputs
+    except InvalidFgInputError:
+        side_inputs = []
+    has_side = any(side in ("user", "item") for side, _ in side_inputs)
+    if feature._is_user_feat is None and not has_side:
+        return None
+    return "user" if feature.is_user_feat else "item"
+
+
+def _collect_normal_export_tile_input_keys(
+    features: List[BaseFeature],
+) -> Tuple[Optional[Set[str]], Optional[Set[str]]]:
+    """Collect confirmed user and item placeholder keys for normal export."""
+    if not acc_utils.is_input_tile() or not features:
+        return None, None
+    hard_search_features = get_hard_search_input_tile_features(features)
+    user_keys: Set[str] = set()
+    item_keys: Set[str] = set()
+    for feature in features:
+        side = _classify_confirmed_feature_side(feature, hard_search_features)
+        if side is None:
+            continue
+        key = (
+            f"{feature.name}.lengths"
+            if (feature.is_sparse or feature.is_sequence)
+            else f"{feature.name}.values"
+        )
+        if side == "user":
+            user_keys.add(key)
+        else:
+            item_keys.add(key)
+    for seq_name in set(hard_search_features.values()):
+        item_keys.add(f"{seq_name}__inverse_indices")
+    return user_keys, item_keys
+
+
+def _collect_dense_export_tile_input_keys(
+    model: BaseModule, dense_graph_config: Dict[str, Any]
+) -> Tuple[Set[str], Set[str]]:
+    """Collect confirmed user and item placeholder keys for dense export."""
+    features = list(cast(List[BaseFeature], getattr(model, "features", []) or []))
+    name_to_feature = {f.name: f for f in features}
+    hard_search_features = (
+        get_hard_search_input_tile_features(features) if features else {}
+    )
+    user_keys: Set[str] = set()
+    item_keys: Set[str] = set()
+
+    for key, entries in dense_graph_config.items():
+        if key == "sequence__ec":
+            for entry in entries or []:
+                if not entry.endswith("__lengths"):
+                    continue
+                raw_name = entry[: -len("__lengths")].split("@", 1)[0]
+                feat = name_to_feature.get(raw_name)
+                if feat is None:
+                    continue
+                side = _classify_confirmed_feature_side(feat, hard_search_features)
+                if side == "user":
+                    user_keys.add(entry)
+                elif side == "item":
+                    item_keys.add(entry)
+        elif _is_input_tile_user_keyed_tensor(key):
+            user_keys.add(key)
+        else:
+            raw_names = [
+                item[: -len("__ebc")].split("@", 1)[0]
+                for item in (entries or [])
+                if item.endswith("__ebc")
+            ]
+            if not raw_names or any(r not in hard_search_features for r in raw_names):
+                item_keys.add(key)
+
+    for feat in features:
+        if feat.is_sparse or feat.is_sequence:
+            continue
+        side = _classify_confirmed_feature_side(feat, hard_search_features)
+        if side == "user":
+            user_keys.add(f"{feat.name}.values")
+        elif side == "item":
+            item_keys.add(f"{feat.name}.values")
+
+    for seq_name in set(hard_search_features.values()):
+        item_keys.add(f"{seq_name}__inverse_indices")
+
+    return user_keys, item_keys
+
+
 def finalize_dense_export(
     model: BaseModule,
     full_graph: torch.fx.Graph,
@@ -2343,7 +2455,18 @@ def finalize_dense_export(
         dense_model_traced = symbolic_trace(gm)
     with open(os.path.join(save_dir, "gm_dense.code"), "w") as f:
         f.write(dense_model_traced.code)
-    dense_model_scripted = torch.jit.script(dense_model_traced)
+    user_input_keys, item_input_keys = _collect_dense_export_tile_input_keys(
+        model, dense_graph_config
+    )
+    opt_gm = optimize_fx_for_export(
+        dense_model_traced,
+        emit_jit_anchors=True,
+        user_input_keys=user_input_keys,
+        item_input_keys=item_input_keys,
+    )
+    with open(os.path.join(save_dir, "gm_dense_opt.code"), "w") as f:
+        f.write(opt_gm.code)
+    dense_model_scripted = torch.jit.script(opt_gm)
     dense_model_scripted.save(os.path.join(save_dir, "scripted_model.pt"))
     return dense_model_traced
 
