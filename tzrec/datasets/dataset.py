@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import copy
-import os
 import random
 import weakref
 from collections import OrderedDict
@@ -22,6 +21,7 @@ import pyarrow.compute as pc
 from torch import distributed as dist
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
+from tzrec.acc import utils as acc_utils
 from tzrec.constant import Mode
 from tzrec.datasets.data_parser import DataParser
 from tzrec.datasets.sample_shuffle import (
@@ -120,6 +120,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         compiled_prompt: Optional[CompiledPrompt] = None,
     ) -> None:
         super(BaseDataset, self).__init__()
+        self._world_size = acc_utils.get_world_size()
+        self._rank = acc_utils.get_rank()
         self._prompt_assembler = (
             PromptAssembler(
                 compiled_prompt.prompt_plan,
@@ -319,7 +321,7 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
             num_workers = worker_info.num_workers
 
         # NOTE: Export warm-up is local even while the training group is live.
-        if dist.is_initialized() and int(os.environ.get("WORLD_SIZE", 1)) > 1:
+        if dist.is_initialized() and self._world_size > 1:
             rank = dist.get_rank()
             world_size = dist.get_world_size()
         else:
@@ -595,6 +597,8 @@ class BaseReader(metaclass=_reader_meta_cls):
         self._shuffle_buffer_size = shuffle_buffer_size
         self._sample_cost_field = sample_cost_field
         self._batch_cost_size = batch_cost_size
+        self._world_size = acc_utils.get_world_size()
+        self._rank = acc_utils.get_rank()
         self._use_sample_cost = False
         self._checkpoint_state: Optional[Dict[str, Any]] = None
         if self._batch_cost_size is not None and self._batch_cost_size > 0:
@@ -935,7 +939,7 @@ def create_dataloader(
         # check number of files is valid or not for file based dataset.
         num_files = dataset._reader.num_files()
         if num_files is not None:
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            world_size = acc_utils.get_world_size()
             if num_files >= world_size:
                 num_files_per_worker = num_files // world_size
                 if num_files_per_worker < num_workers:

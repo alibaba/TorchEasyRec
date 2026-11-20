@@ -415,16 +415,11 @@ class OnlineDenseExportManager:
     def _build_export_graph(self, model: nn.Module) -> List[Tuple[str, str]]:
         """Build the resident dense export graph once, before training starts.
 
-        Runs inside a scoped ``INPUT_TILE=3`` / ``WORLD_SIZE=1`` env window:
-        the export-side model has user-side twin modules the training process
-        never builds, and INPUT_TILE is read at model construction and
-        batch-parse time. WORLD_SIZE gives the warm-up dataloader the same
-        single-rank view the full export runs under. Dataset readers exchange
-        file, partition, or session metadata on the Gloo group when
-        WORLD_SIZE > 1. This rank-zero-only build must skip those collectives
-        because no other rank participates. The training model and its dataloader
-        workers are already constructed by the time this runs, so the window
-        cannot affect them.
+        Runs inside ``export_env_scope(use_distributed_embedding=True,
+        input_tile="3", world_size=1, rank=0)``: the export-side model has
+        user-side twin modules the training process never builds, and
+        ``INPUT_TILE`` / ``WORLD_SIZE`` are read at model construction and
+        warm-up dataloader initialization without mutating ``os.environ``.
 
         Fails fast (before training) on any trace/script error via a dry-run
         finalize, and on any dense-graph state key with no gatherable source
@@ -444,11 +439,12 @@ class OnlineDenseExportManager:
         from tzrec.models.tdm import TDM
 
         device = torch.device("cpu")
-        prev_input_tile = os.environ.get("INPUT_TILE")
-        prev_world_size = os.environ.get("WORLD_SIZE")
-        os.environ["INPUT_TILE"] = "3"
-        os.environ["WORLD_SIZE"] = "1"
-        try:
+        with acc_utils.export_env_scope(
+            use_distributed_embedding=True,
+            input_tile="3",
+            world_size=1,
+            rank=0,
+        ):
             pipeline_config = config_util.load_pipeline_config(
                 self._pipeline_config_path
             )
@@ -473,7 +469,9 @@ class OnlineDenseExportManager:
                 )
             twin_model = ScriptWrapper(twin_model)
             warmup_data = create_dense_export_warmup_data(
-                pipeline_config, twin_model, device
+                pipeline_config,
+                twin_model,
+                device,
             )
             gm, full_graph, dense_graph_config = build_dense_graph_module(
                 twin_model, warmup_data, device
@@ -494,15 +492,6 @@ class OnlineDenseExportManager:
                     dry_run_dir,
                     dense_graph_config,
                 )
-        finally:
-            if prev_input_tile is None:
-                os.environ.pop("INPUT_TILE", None)
-            else:
-                os.environ["INPUT_TILE"] = prev_input_tile
-            if prev_world_size is None:
-                os.environ.pop("WORLD_SIZE", None)
-            else:
-                os.environ["WORLD_SIZE"] = prev_world_size
 
         source_keys = model.state_dict()
         pairs: List[Tuple[str, str]] = []

@@ -323,6 +323,7 @@ class KafkaReader(BaseReader):
             drop_remainder,
             shuffle,
             shuffle_buffer_size,
+            **kwargs,
         )
 
         self._has_embedded_schema = False
@@ -428,7 +429,7 @@ class KafkaReader(BaseReader):
             ValueError: if topic metadata cannot be read.
         """
         topic, config, _ = _parse_kafka_uri(self._input_path)
-        pg = dist_util.get_dataset_process_group()
+        pg = dist_util.get_dataset_process_group(self._world_size)
         rank = dist.get_rank(pg) if pg is not None else 0
         result: List[Any] = [None, None]
         if rank == 0:

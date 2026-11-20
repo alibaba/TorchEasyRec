@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -23,11 +22,13 @@ from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.modules.embedding_configs import PoolingType
 
 from tzrec.acc.utils import (
+    get_rank,
     is_cuda_export,
     is_input_tile,
     is_input_tile_3_online,
     is_input_tile_emb,
     is_unified_aot,
+    use_distributed_embedding,
 )
 from tzrec.constant import Mode
 from tzrec.datasets.utils import (
@@ -144,6 +145,10 @@ class DataParser:
         sampler_type: Optional[str] = None,
     ) -> None:
         self._features = features
+        self._is_input_tile_enabled = is_input_tile()
+        self._is_input_tile_emb_enabled = is_input_tile_emb()
+        self._is_input_tile_3_online_enabled = is_input_tile_3_online()
+        self._use_distributed_embedding_enabled = use_distributed_embedding()
         hard_search_input_tile_features = get_hard_search_input_tile_features(features)
         self._hard_search_input_tile_features = {
             f.name: hard_search_input_tile_features[f.name]
@@ -230,20 +235,18 @@ class DataParser:
         self.user_feats = set()
         self._tile_keys: Optional[Tuple[str, str]] = None
         self._warned_tile_fallback: bool = False
-        if is_input_tile():
+        if self._is_input_tile_enabled:
             self._init_fg_hander()
+            hs_inputs = get_hard_search_inputs(self._features, self._fg_handler)
             self.user_inputs = {
                 self._to_real_input_name(x)
                 for x in self._fg_handler.user_inputs()
                 | set(self._fg_handler.sequence_input_to_name().keys())
-            } - {
-                self._to_real_input_name(x)
-                for x in get_hard_search_inputs(self._features, self._fg_handler)
-            }
+            } - {self._to_real_input_name(x) for x in hs_inputs}
             self.user_feats = set([x.name for x in self._features if x.is_user_feat])
             if is_unified_aot():
                 self._tile_keys = self._find_tile_keys()
-            is_rank_zero = os.environ.get("RANK", "0") == "0"
+            is_rank_zero = get_rank() == 0
             if is_rank_zero:
                 logger.info(f"self.user_feats: {self.user_feats}")
                 logger.info(f"self.user_inputs: {self.user_inputs}")
@@ -273,8 +276,8 @@ class DataParser:
             output_data (dict): parsed feature data.
         """
         output_data = {}
-        if is_input_tile():
-            if is_input_tile_3_online():
+        if self._is_input_tile_enabled:
+            if self._is_input_tile_3_online_enabled:
                 # When INPUT_TILE_3_ONLINE=1, the sequential tensor (seq_t) is retrieved
                 # via jt.values() rather than jt.to_padded_dense(seq_len) in
                 # embedding.py. Setting tile_size to 1 would result in an incorrect
@@ -560,8 +563,8 @@ class DataParser:
         Returns:
             an instance of Batch.
         """
-        input_tile = is_input_tile()
-        input_tile_emb = is_input_tile_emb()
+        input_tile = self._is_input_tile_enabled
+        input_tile_emb = self._is_input_tile_emb_enabled
 
         tile_size = -1
         if input_tile:

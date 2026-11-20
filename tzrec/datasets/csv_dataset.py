@@ -153,7 +153,7 @@ class CsvReader(BaseReader):
             ),
         )
         self._input_files = list_input_files(
-            self._input_path, dist_util.get_dataset_process_group()
+            self._input_path, dist_util.get_dataset_process_group(self._world_size)
         )
         if len(self._input_files) == 0:
             raise RuntimeError(f"No csv files exist in {self._input_path}.")

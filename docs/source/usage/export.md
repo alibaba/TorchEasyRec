@@ -50,9 +50,9 @@ torchrun --master_addr=localhost --master_port=32555 \
   - **HARD_SEARCH_INPUT_TILE=0**：每个候选分别进行历史侧的 FG 和 embedding 计算。
   - **HARD_SEARCH_INPUT_TILE=1**：相同候选 key 共享历史侧计算，attention 仍按各自候选计算。
   - 当前仅支持在 `INPUT_TILE=2/3` 下开启，具体用法和限制见 [hard-search](#hard-search)。
-- INPUT_TILE_3_ONLINE: 配合INPUT_TILE=3使用，对User侧序列特征使用在线推理模式，序列特征在线模型服务中推理性能更好，但导出的模型无法用于离线预测
+- INPUT_TILE_3_ONLINE: 配合INPUT_TILE=3使用，对User侧序列特征使用在线推理模式，序列特征在线模型服务中推理性能更好，离线预测仅支持 `batch_size=1`（`tzrec.predict` 在 `batch_size > 1` 时会直接报错）
   - **INPUT_TILE_3_ONLINE=1**：启用序列特征的在线推理模式
-- USE_DISTRIBUTED_EMBEDDING: 开启分布式 embedding 导出模式，导出 dense graph 与分片 sparse embedding 参数；该模式会自动使用 `INPUT_TILE=3`
+- USE_DISTRIBUTED_EMBEDDING: 开启分布式 embedding 导出模式，导出 dense graph 与分片 sparse embedding 参数；默认启用 `INPUT_TILE=3`（GenRec 模型与不含候选非 user 特征的纯 user 塔，如 `MatchModel` 的 `user_tower`，会自动使用 `INPUT_TILE=0`）
   - **USE_DISTRIBUTED_EMBEDDING=1**：启用分布式 embedding 导出；配置了 `dynamicemb` 的特征会在非 RTP 导出时自动开启该模式
   - 普通 sparse、ZCH 和原生 dynemb 模型使用统一导出流程；`dynamic_embedding` 仅调整 dynemb 读取和上传参数
   - 配置了 zch 的特征会自动转换为动态表导出，详见 [零冲突Hash Embedding](../feature/zch.md) 的分布式 Embedding 导出章节

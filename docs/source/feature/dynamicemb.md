@@ -11,7 +11,7 @@ dynamicemb安装方式:
 
 注：同一个 FeatureGroup 中若存在多个配置了 DynamicEmbedding 的特征，底层 dynamicemb 会自动将这些表融合到同一份存储里（table fusion），共享 cache/admission counter，降低显存占用并减少内存碎片，无需额外配置。
 
-注：配置了 DynamicEmbedding 的模型在非 RTP 导出时会自动启用分布式 embedding 导出模式（`USE_DISTRIBUTED_EMBEDDING=1` 及 `INPUT_TILE=3`），详见[模型导出](../usage/export.md)的环境变量章节。
+注：配置了 DynamicEmbedding 的模型在非 RTP 导出时会自动启用分布式 embedding 导出模式（`USE_DISTRIBUTED_EMBEDDING=1`；默认使用 `INPUT_TILE=3`，GenRec 模型或无候选非 user 特征的纯 user 塔会使用 `INPUT_TILE=0`），详见[模型导出](../usage/export.md)的环境变量章节。
 
 以id_feature的配置为例，DynamicEmbedding 只需在id_feature新增一个dynamicemb的配置字段
 

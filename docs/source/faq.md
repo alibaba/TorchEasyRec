@@ -87,9 +87,9 @@ def forward(self, data : typing_Dict[str,torch.Tensor], device: device = 'cpu') 
 RuntimeError: KeyError: batch_size
 ```
 
-**原因：** `INPUT_TILE_3_ONLINE=1` 导出的模型，或未携带 `model_acc.json` 的旧版 `INPUT_TILE` 导出模型，无法用于 `tzrec.predict` 离线预测；未开启 `INPUT_TILE_3_ONLINE=1` 的 `INPUT_TILE=2/3` 模型（含 `ENABLE_AOT=2`）在存在 `model_acc.json` 时支持离线预测
+**原因：** `INPUT_TILE_3_ONLINE=1` 导出的模型离线预测仅支持 `batch_size=1`（`batch_size > 1` 会在 `tzrec.predict` 中报错），未携带 `model_acc.json` 的旧版 `INPUT_TILE` 导出模型无法用于 `tzrec.predict` 离线预测；未开启 `INPUT_TILE_3_ONLINE=1` 的 `INPUT_TILE=2/3` 模型（含 `ENABLE_AOT=2`）在存在 `model_acc.json` 时支持离线预测
 
-**解决方法：** 若需支持 `tzrec.predict` 离线预测，请确保未设置 `INPUT_TILE_3_ONLINE=1`（或去掉 `INPUT_TILE` 环境变量）重新导出模型
+**解决方法：** 对 `INPUT_TILE_3_ONLINE=1` 导出模型，离线预测请传入 `batch_size=1`；若需更大 batch 离线预测，请确保未设置 `INPUT_TILE_3_ONLINE=1`（或去掉 `INPUT_TILE` 环境变量）重新导出模型
 
 ______________________________________________________________________
 

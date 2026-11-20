@@ -9,9 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2026, Alibaba Group;
-# Licensed under the Apache License, Version 2.0 (the "License");
-
 import datetime
 import json
 import os
@@ -36,6 +33,7 @@ from torch.distributed._shard.sharded_tensor.metadata import (
 from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed.device_mesh import init_device_mesh
 
+from tzrec.acc import utils as acc_utils
 from tzrec.optim.ema import DenseEMA
 from tzrec.utils import misc_util
 from tzrec.utils.online_dense_export_util import (
@@ -212,10 +210,13 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
 
         def fake_warmup(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             seen["world_size"] = os.environ.get("WORLD_SIZE")
+            seen["data_world_size"] = acc_utils.get_world_size()
+            seen["data_rank"] = acc_utils.get_rank()
             return {}
 
         def fake_finalize(*args: Any, **kwargs: Any) -> None:
-            seen["input_tile"] = os.environ.get("INPUT_TILE")
+            seen["input_tile"] = acc_utils.get_input_tile()
+            seen["env_input_tile"] = os.environ.get("INPUT_TILE")
 
         fake_gm = mock.Mock()
         fake_gm.state_dict.return_value = {}
@@ -253,7 +254,10 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     )
                     mgr.close()
                 self.assertEqual(seen["input_tile"], "3")
-                self.assertEqual(seen["world_size"], "1")
+                self.assertIsNone(seen["env_input_tile"])
+                self.assertEqual(seen["data_world_size"], 1)
+                self.assertEqual(seen["data_rank"], 0)
+                self.assertEqual(seen["world_size"], "4")
                 self.assertNotIn("INPUT_TILE", os.environ)
                 self.assertEqual(os.environ["WORLD_SIZE"], "4")
 

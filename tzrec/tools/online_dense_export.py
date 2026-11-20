@@ -77,9 +77,15 @@ def export_online_dense_model(
     if not acc_utils.use_distributed_embedding():
         raise RuntimeError("ONLINE_DENSE_EXPORT requires USE_DISTRIBUTED_EMBEDDING=1.")
 
-    ensure_input_tile_for_distributed_embedding()
-
     version = version or make_version()
+    pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+    features = _create_features(
+        list(pipeline_config.feature_configs), pipeline_config.data_config
+    )
+    use_dist_emb, resolved_input_tile = ensure_input_tile_for_distributed_embedding(
+        pipeline_config, features=features
+    )
+
     if checkpoint_step is None:
         checkpoint_step = _get_checkpoint_step(checkpoint_path)
     export_root = resolve_dense_export_root(model_dir)
@@ -93,51 +99,53 @@ def export_online_dense_model(
         shutil.rmtree(tmp_dir)
     os.makedirs(versions_root, exist_ok=True)
 
-    pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
-    features = _create_features(
-        list(pipeline_config.feature_configs), pipeline_config.data_config
-    )
-    model = _create_model(
-        pipeline_config.model_config,
-        features,
-        list(pipeline_config.data_config.label_fields),
-        sampler_type=None,
-    )
-    model.set_is_inference(True)
-    if isinstance(model, (MatchModel, TDM)):
-        # The full export emits per-tower (MatchModel) or per-module (TDM)
-        # artifacts; a single monolithic dense export cannot mirror that
-        # layout, so a hot swap would load an incompatible artifact.
-        raise RuntimeError(
-            f"ONLINE_DENSE_EXPORT does not support {type(model).__name__} "
-            "models; use the full export (export_model) instead."
+    with acc_utils.export_env_scope(
+        use_distributed_embedding=use_dist_emb,
+        input_tile=resolved_input_tile,
+        world_size=1,
+        rank=0,
+    ):
+        model = _create_model(
+            pipeline_config.model_config,
+            features,
+            list(pipeline_config.data_config.label_fields),
+            sampler_type=None,
         )
-    scripted_model = ScriptWrapper(model)
+        model.set_is_inference(True)
+        if isinstance(model, (MatchModel, TDM)):
+            # The full export emits per-tower (MatchModel) or per-module
+            # (TDM) artifacts; a single monolithic dense export cannot mirror
+            # that layout, so a hot swap would load an incompatible artifact.
+            raise RuntimeError(
+                f"ONLINE_DENSE_EXPORT does not support {type(model).__name__} "
+                "models; use the full export (export_model) instead."
+            )
+        scripted_model = ScriptWrapper(model)
 
-    try:
-        export_dense_model_cpu(
-            pipeline_config=pipeline_config,
-            model=scripted_model,
-            checkpoint_path=checkpoint_path,
-            save_dir=tmp_dir,
-        )
+        try:
+            export_dense_model_cpu(
+                pipeline_config=pipeline_config,
+                model=scripted_model,
+                checkpoint_path=checkpoint_path,
+                save_dir=tmp_dir,
+            )
 
-        required_files = ["scripted_model.pt", "dense_meta.json"]
-        for file_name in required_files:
-            file_path = os.path.join(tmp_dir, file_name)
-            if not os.path.exists(file_path):
-                raise RuntimeError(f"missing dense export artifact: {file_path}")
+            required_files = ["scripted_model.pt", "dense_meta.json"]
+            for file_name in required_files:
+                file_path = os.path.join(tmp_dir, file_name)
+                if not os.path.exists(file_path):
+                    raise RuntimeError(f"missing dense export artifact: {file_path}")
 
-        ready_path = os.path.join(tmp_dir, "READY")
-        with open(ready_path, "w") as f:
-            f.write(_utc_now())
-            f.write("\n")
+            ready_path = os.path.join(tmp_dir, "READY")
+            with open(ready_path, "w") as f:
+                f.write(_utc_now())
+                f.write("\n")
 
-        os.rename(tmp_dir, version_dir)
-    except BaseException:
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir)
-        raise
+            os.rename(tmp_dir, version_dir)
+        except BaseException:
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
+            raise
 
     # Manifest v2 for bootstrap: the FeatureStore full load and this
     # checkpoint are same-source, so sparse_step mirrors checkpoint_step and
