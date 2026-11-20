@@ -11,16 +11,24 @@
 
 
 import json
+import operator
 import os
+import platform
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
 import torch
-import torch._inductor.codecache  # noqa: F401 -- populate torch._inductor.codecache so torch.export.pt2_archive._package._load_aoti can read it on PPU torch (host torch auto-imports it; PPU's tzrec-test:1.1-ppu image does not).
+
+# Populate torch._inductor.codecache so torch.export.pt2_archive._package._load_aoti
+# can read it in runtime images where torch does not auto-import it.
+import torch._inductor.codecache  # noqa: F401
 from torch import nn
 
 from tzrec.acc.utils import (
+    canonical_contiguous,
+    get_aot_cpu_march,
     is_autotune_with_sample_inputs,
     is_input_tile,
+    is_portable_cpu_aot,
     is_unified_aot_predict,
 )
 from tzrec.features.feature import BaseFeature, get_hard_search_input_tile_features
@@ -48,7 +56,41 @@ def _aoti_compile_cfg() -> Dict[str, Any]:
     }
     if is_autotune_with_sample_inputs():
         cfg["triton.autotune_with_sample_inputs"] = True
+    march = get_aot_cpu_march()
+    simdlen_env = os.environ.get("AOTI_CPU_SIMDLEN")
+    if march is not None:
+        cfg["cpp.march"] = march
+        if simdlen_env is not None:
+            cfg["cpp.simdlen"] = int(simdlen_env)
+        elif march in ("x86-64", "x86-64-v2"):
+            cfg["cpp.simdlen"] = 0
+        elif march in ("core-avx2", "haswell", "skylake", "x86-64-v3"):
+            cfg["cpp.simdlen"] = 256
+    elif is_portable_cpu_aot():
+        if platform.machine() in ("x86_64", "AMD64"):
+            cfg["cpp.march"] = "core-avx2"
+            cfg["cpp.simdlen"] = 256
+        else:
+            cfg["cpp.march"] = ""
+            cfg["cpp.simdlen"] = 0
+        if simdlen_env is not None:
+            cfg["cpp.simdlen"] = int(simdlen_env)
     return cfg
+
+
+def _compile_and_package_aoti(
+    exported_pg: torch.export.ExportedProgram, save_dir: str
+) -> str:
+    """Compile and package an ExportedProgram into an AOTInductor .pt2 archive."""
+    with torch._inductor.config.patch(_aoti_compile_cfg()):
+        aoti_dir = os.path.join(save_dir, "aoti")
+        os.makedirs(aoti_dir, exist_ok=True)
+        package_path = os.path.join(aoti_dir, "aoti_model.pt2")
+        torch._inductor.aoti_compile_and_package(
+            exported_pg,
+            package_path=package_path,
+        )
+    return package_path
 
 
 def load_model_aot(
@@ -65,13 +107,16 @@ def load_model_aot(
     Return:
         AOTInductor model wrapper.
     """
+    if device.type != "cuda":
+        raise ValueError(f"load_model_aot requires a CUDA device, got {device!r}.")
+    device_index = -1 if device.index is None else device.index
     aoti_model_path = os.path.join(model_path, "aoti", "aoti_model.pt2")
 
     if is_unified_aot_predict(model_path):
         # Unified single-model path
         model = torch._inductor.aoti_load_package(
             aoti_model_path,
-            device_index=device.index,
+            device_index=device_index,
         )
         tile_keys: Optional[Tuple[str, str]] = None
         hsk_checks: Optional[List[Tuple[str, str]]] = None
@@ -100,7 +145,7 @@ def load_model_aot(
         dense_model: torch.export.pt2_archive._package.AOTICompiledModel = (
             torch._inductor.aoti_load_package(
                 aoti_model_path,
-                device_index=device.index,
+                device_index=device_index,
             )
         )
         return CombinedModelWrapper(sparse_model, dense_model)
@@ -129,6 +174,9 @@ def export_model_aot(
             it is only embedding lookups, which don't benefit from AMP and
             which would complicate torch.jit.script compilation.
     """
+    if not torch.cuda.is_available():
+        raise RuntimeError("AOTI export requires a CUDA device.")
+    os.makedirs(save_dir, exist_ok=True)
     # no_grad: outputs become leaf tensors so AOTI's
     # extract_autotune_inputs() can deepcopy them when sample-input
     # autotune is on (upstream pytorch issue: only leaves support deepcopy).
@@ -149,7 +197,7 @@ def export_model_aot(
 
     # Separate caches per axis: a SEQUENCE group and a JAGGED_SEQUENCE
     # group from the same parent SequenceFeature share a lengths source,
-    # but the Dims they need are different symbolic quantities — max
+    # but the Dims they need are different symbolic quantities -- max
     # seq_len (axis 1, padded) vs total nnz (axis 0, jagged).
     seq_len_dims: Dict[str, torch.export.Dim] = {}
     jagged_batch_dims: Dict[str, torch.export.Dim] = {}
@@ -159,7 +207,7 @@ def export_model_aot(
             share_key = seq_share_groups.get(key, key)
             if share_key not in seq_len_dims:
                 seq_len_dims[share_key] = torch.export.Dim(
-                    f"{share_key}__seq_len", min=1, max=999999993
+                    f"{share_key}__seq_len", min=0, max=999999993
                 )
             dynamic_shapes[key] = {0: batch, 1: seq_len_dims[share_key]}
         elif key in jagged_seq_tensor_names:
@@ -180,6 +228,7 @@ def export_model_aot(
     if mixed_precision:
         dense_to_export = CudaAutocastWrapper(dense_model, mixed_precision)
 
+    sparse_output = {k: canonical_contiguous(v) for k, v in sparse_output.items()}
     # pre_hook requires running arbitrary code at runtime
     with torch._inductor.config.patch(
         {"unsafe_ignore_unsupported_triton_autotune_args": True}
@@ -189,14 +238,7 @@ def export_model_aot(
             args=(sparse_output,),
             dynamic_shapes=(dynamic_shapes,),
         )
-    with torch._inductor.config.patch(_aoti_compile_cfg()):
-        aoti_dir = os.path.join(save_dir, "aoti")
-        os.makedirs(aoti_dir, exist_ok=True)
-
-        torch._inductor.aoti_compile_and_package(
-            exported_pg,
-            package_path=os.path.join(aoti_dir, "aoti_model.pt2"),
-        )
+    _compile_and_package_aoti(exported_pg, save_dir)
     return save_dir
 
 
@@ -374,6 +416,71 @@ def _pad_empty_sparse_values(
     return data
 
 
+def _collect_sequence_dim_groups(
+    features: List[BaseFeature],
+    feature_groups: List[model_pb2.FeatureGroupConfig],
+) -> Tuple[Dict[str, str], Set[str], Set[str], Set[str]]:
+    """Collect shared sequence Dim group mappings and JAGGED_SEQUENCE flags.
+
+    Args:
+        features: model feature definitions.
+        feature_groups: model feature group configs.
+
+    Returns:
+        Tuple of ``(feat_to_seq_dim_group, seq_feat_names,
+        jagged_seq_feat_names, jagged_seq_groups)``.
+    """
+    from tzrec.protos.model_pb2 import FeatureGroupType
+
+    # Features in the same SequenceFeature config share per-sample lengths,
+    # so their step tensors (.values or .key_lengths) share a Dim.
+    feat_to_seq_dim_group: Dict[str, str] = {}
+    seq_feat_names: Set[str] = set()
+    for feat in features:
+        if feat.is_sequence:
+            seq_feat_names.add(feat.name)
+            if getattr(feat, "_is_grouped_seq", False):
+                seq_name = getattr(feat, "sequence_name", None)
+                if seq_name:
+                    feat_to_seq_dim_group[feat.name] = f"seq_{seq_name}"
+
+    jagged_seq_feat_names: Set[str] = set()
+    jagged_seq_groups: Set[str] = set()
+    for fg in feature_groups:
+        if fg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
+            for name in fg.feature_names:
+                if name in seq_feat_names:
+                    jagged_seq_feat_names.add(name)
+                    if name not in feat_to_seq_dim_group:
+                        feat_to_seq_dim_group[name] = f"fg_{fg.group_name}"
+                    jagged_seq_groups.add(feat_to_seq_dim_group[name])
+        for sg in fg.sequence_groups:
+            for name in sg.feature_names:
+                if name in seq_feat_names and name not in feat_to_seq_dim_group:
+                    feat_to_seq_dim_group[name] = f"sg_{fg.group_name}_{sg.group_name}"
+
+    return (
+        feat_to_seq_dim_group,
+        seq_feat_names,
+        jagged_seq_feat_names,
+        jagged_seq_groups,
+    )
+
+
+def _can_prune_unused_input_keys(
+    gm: torch.fx.GraphModule, input_node: torch.fx.Node
+) -> bool:
+    """Return whether every user of ``input_node`` reads known named keys."""
+    del gm
+    for user in input_node.users:
+        if user.op == "call_function" and user.target == operator.getitem:
+            if len(user.args) == 2 and isinstance(user.args[1], str):
+                continue
+            return False
+        return False
+    return True
+
+
 def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
     features: Any,
@@ -403,42 +510,12 @@ def _build_dynamic_shapes(
     Returns:
         dynamic_shapes dict for torch.export.export().
     """
-    from tzrec.protos.model_pb2 import FeatureGroupType
-
-    # Step 1: Group grouped sequence features by their sequence_name.
-    # Features in the same SequenceFeature config share per-sample lengths,
-    # so their .values or .key_lengths tensors share a total sequence length Dim.
-    # This takes precedence over FeatureGroupConfig because it reflects the
-    # authoritative data structure (shared sequence), not model organization.
-    feat_to_seq_dim_group: Dict[str, str] = {}
-    seq_feat_names: set = set()
-    for feat in features:
-        if feat.is_sequence:
-            seq_feat_names.add(feat.name)
-            if getattr(feat, "_is_grouped_seq", False):
-                seq_name = getattr(feat, "sequence_name", None)
-                if seq_name:
-                    feat_to_seq_dim_group[feat.name] = f"seq_{seq_name}"
-
-    # Step 2: For standalone sequence features not yet grouped, fall back to
-    # feature_groups structure, and track JAGGED_SEQUENCE (min=1) members.
-    jagged_seq_feat_names: Set[str] = set()
-    jagged_seq_groups: Set[str] = set()
-    for fg in feature_groups:
-        if fg.group_type == FeatureGroupType.JAGGED_SEQUENCE:
-            for name in fg.feature_names:
-                if name in seq_feat_names:
-                    jagged_seq_feat_names.add(name)
-                    if name not in feat_to_seq_dim_group:
-                        feat_to_seq_dim_group[name] = f"fg_{fg.group_name}"
-                    jagged_seq_groups.add(feat_to_seq_dim_group[name])
-        # SEQUENCE (DIN-style) groups: standalone sequence features have
-        # independent lengths, so don't auto-share. Only grouped sequence
-        # features (from SequenceFeature config via sequence_groups) share nnz.
-        for sg in fg.sequence_groups:
-            for name in sg.feature_names:
-                if name in seq_feat_names and name not in feat_to_seq_dim_group:
-                    feat_to_seq_dim_group[name] = f"sg_{fg.group_name}_{sg.group_name}"
+    (
+        feat_to_seq_dim_group,
+        seq_feat_names,
+        jagged_seq_feat_names,
+        jagged_seq_groups,
+    ) = _collect_sequence_dim_groups(cast(List[BaseFeature], features), feature_groups)
 
     # Step 3: Collect prefixes with .lengths and .key_lengths siblings.
     lengths_prefixes = set()
@@ -459,11 +536,13 @@ def _build_dynamic_shapes(
         if input_tile
         else {}
     )
+    hsk_lengths_keys: Set[str] = (
+        {f"{name}.lengths" for name in hard_search_features} if input_tile else set()
+    )
 
     batch = torch.export.Dim("batch", min=1, max=499999999)
     user_batch: Optional[torch.export.Dim] = None
     hsk_batch_dims: Dict[str, torch.export.Dim] = {}
-    static_tile_keys: List[str] = []
     dynamic_shapes = {}
     group_to_dim: Dict[str, torch.export.Dim] = {}
     prefix_to_dim: Dict[str, torch.export.Dim] = {}
@@ -523,11 +602,14 @@ def _build_dynamic_shapes(
             dynamic_shapes[key] = {0: dim}
         elif is_key_lengths:
             dynamic_shapes[key] = {0: _get_total_sequence_length_dim(prefix)}
-        elif input_tile and prefix in hard_search_features:
+        elif (input_tile and prefix in hard_search_features) or key in hsk_lengths_keys:
             if tensor.size(0) < 2:
-                # torch.export specializes size < 2 and rejects a dynamic Dim.
+                logger.warning(
+                    "Dynamic shape for %r degraded to static {} (size(0)=%d < 2).",
+                    key,
+                    tensor.size(0),
+                )
                 dynamic_shapes[key] = {}
-                static_tile_keys.append(key)
             else:
                 seq_src = hard_search_features[prefix]
                 if seq_src not in hsk_batch_dims:
@@ -537,9 +619,12 @@ def _build_dynamic_shapes(
                 dynamic_shapes[key] = {0: hsk_batch_dims[seq_src]}
         elif input_tile and prefix in user_feat_names:
             if tensor.size(0) < 2:
-                # torch.export specializes size < 2 and rejects a dynamic Dim.
+                logger.warning(
+                    "Dynamic shape for %r degraded to static {} (size(0)=%d < 2).",
+                    key,
+                    tensor.size(0),
+                )
                 dynamic_shapes[key] = {}
-                static_tile_keys.append(key)
             else:
                 if user_batch is None:
                     user_batch = torch.export.Dim("user_batch", min=1, max=499999999)
@@ -547,12 +632,6 @@ def _build_dynamic_shapes(
         else:
             dynamic_shapes[key] = {0: batch}
 
-    if static_tile_keys:
-        logger.warning(
-            "Input-tile tensor(s) %s have <2 rows in the export sample; "
-            "freezing dim 0 as static in unified AOTI export.",
-            static_tile_keys,
-        )
     return dynamic_shapes
 
 
@@ -570,6 +649,8 @@ def export_unified_model_aot(
         save_dir (str): model save dir.
         mixed_precision (Optional[str]): "BF16", "FP16", or None.
     """
+    if not torch.cuda.is_available():
+        raise RuntimeError("AOTI export requires a CUDA device.")
     os.makedirs(save_dir, exist_ok=True)
 
     # AOTInductor export requires CUDA.
@@ -591,6 +672,12 @@ def export_unified_model_aot(
     features = cast(List[BaseFeature], model.features)
     # Normalize KeyedTensor column slices so AOTI compiles for contiguous inputs.
     data = {k: v.contiguous() for k, v in sorted(data.items())}
+    # Prune unconsumed keys (e.g. unused "batch_size") so in_spec stays minimal.
+    input_node = next(n for n in full_gm.graph.nodes if n.op == "placeholder")
+    if _can_prune_unused_input_keys(full_gm, input_node):
+        consumed_keys = _extract_distributed_dense_consumed_keys(full_gm, data)
+        if consumed_keys:
+            data = {k: v for k, v in data.items() if k in consumed_keys}
     # Pad <2-element sparse/sequence tensors so torch.export does not specialize
     # them as constants and reject dynamic Dim constraints.
     data = _pad_empty_sparse_values(data, features)
@@ -604,6 +691,7 @@ def export_unified_model_aot(
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
     # Export with torch.export (CPU inputs; graph handles its own H2D).
+    data = {k: canonical_contiguous(v) for k, v in data.items()}
     logger.info("exporting unified model with torch.export...")
     with torch._inductor.config.patch(
         {"unsafe_ignore_unsupported_triton_autotune_args": True}
@@ -616,30 +704,43 @@ def export_unified_model_aot(
 
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")
-    with torch._inductor.config.patch(_aoti_compile_cfg()):
-        aoti_dir = os.path.join(save_dir, "aoti")
-        os.makedirs(aoti_dir, exist_ok=True)
-
-        torch._inductor.aoti_compile_and_package(
-            exported_pg,
-            package_path=os.path.join(aoti_dir, "aoti_model.pt2"),
-        )
-        data_parser = getattr(model, "_data_parser", None)
-        aoti_meta: Dict[str, Any] = {}
-        if is_input_tile() and data_parser is not None:
-            if data_parser._tile_keys is not None:
-                aoti_meta["tile_keys"] = list(data_parser._tile_keys)
-            hsk_map = data_parser._hard_search_input_tile_features
-            hsk_checks = [
-                [f"{f.name}.lengths", f"{hsk_map[f.name]}__inverse_indices"]
-                for f in features
-                if not f.stub_type and f.is_sparse and f.name in hsk_map
-            ]
-            if hsk_checks:
-                aoti_meta["hsk_checks"] = hsk_checks
-        if aoti_meta:
-            with open(os.path.join(aoti_dir, "aoti_meta.json"), "w") as f:
-                json.dump(aoti_meta, f, indent=4)
+    _compile_and_package_aoti(exported_pg, save_dir)
+    data_parser = getattr(model, "_data_parser", None)
+    aoti_meta: Dict[str, Any] = {}
+    if is_input_tile() and data_parser is not None:
+        if data_parser._tile_keys is not None:
+            aoti_meta["tile_keys"] = list(data_parser._tile_keys)
+        hsk_map = data_parser._hard_search_input_tile_features
+        hsk_checks = [
+            [f"{f.name}.lengths", f"{hsk_map[f.name]}__inverse_indices"]
+            for f in features
+            if not f.stub_type and f.is_sparse and f.name in hsk_map
+        ]
+        if hsk_checks:
+            aoti_meta["hsk_checks"] = hsk_checks
+    if aoti_meta:
+        with open(os.path.join(save_dir, "aoti", "aoti_meta.json"), "w") as f:
+            json.dump(aoti_meta, f, indent=4)
 
     logger.info("unified AOTI model exported to %s", save_dir)
     return save_dir
+
+
+def _extract_distributed_dense_consumed_keys(
+    gm: torch.fx.GraphModule, data: Optional[Dict[str, torch.Tensor]] = None
+) -> Set[str]:
+    """Extract input dict keys consumed by the graph."""
+    del data
+    input_node = next(n for n in gm.graph.nodes if n.op == "placeholder")
+    consumed_keys: Set[str] = set()
+    for node in gm.graph.nodes:
+        if (
+            node.op == "call_function"
+            and node.target == operator.getitem
+            and len(node.args) == 2
+            and node.args[0] is input_node
+            and isinstance(node.args[1], str)
+            and len(node.users) > 0
+        ):
+            consumed_keys.add(node.args[1])
+    return consumed_keys
