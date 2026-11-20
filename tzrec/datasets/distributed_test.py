@@ -25,12 +25,14 @@ from parameterized import parameterized
 from pyarrow import parquet
 from torch import distributed as dist
 
+from tzrec.acc import utils as acc_utils
 from tzrec.datasets.csv_dataset import CsvReader
-from tzrec.datasets.dataset import BaseDataset
 from tzrec.datasets.kafka_dataset import KafkaReader
 from tzrec.datasets.odps_dataset import OdpsReader
-from tzrec.datasets.parquet_dataset import ParquetReader
+from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetReader
 from tzrec.datasets.sampler import _bootstrap
+from tzrec.features.feature import create_features
+from tzrec.protos import data_pb2, feature_pb2
 from tzrec.utils import dist_util
 from tzrec.utils.test_util import (
     ci_resources,
@@ -170,19 +172,38 @@ def _dataset_worker(rank, backend, timeout_seconds, test_dir):
                         case.assertIs(call.kwargs["group"], pg)
 
             if rank == 0:
-                with (
+                warmup_features = create_features(
+                    [
+                        feature_pb2.FeatureConfig(
+                            id_feature=feature_pb2.IdFeature(
+                                feature_name="x", num_buckets=8, embedding_dim=4
+                            )
+                        )
+                    ]
+                )
+                for warmup_ctx in (
                     mock.patch.dict(os.environ, {"WORLD_SIZE": "1"}),
-                    mock.patch.object(dist, "new_group") as new_group,
-                    mock.patch.object(dist, "broadcast_object_list") as broadcast,
-                    mock.patch.object(dist, "all_gather_object") as gather,
-                    mock.patch.object(dist, "all_reduce") as reduce,
+                    acc_utils.export_env_scope(world_size=1, rank=0),
                 ):
-                    case.assertIsNone(dist_util.get_dataset_process_group())
-                    _check_readers(test_dir, None)
-                    _bootstrap(1, 0, 0)
-                    case.assertEqual(BaseDataset.get_worker_info(None), (0, 1, 1))
-                    for collective in (new_group, broadcast, gather, reduce):
-                        collective.assert_not_called()
+                    with (
+                        warmup_ctx,
+                        mock.patch.object(dist, "new_group") as new_group,
+                        mock.patch.object(dist, "broadcast_object_list") as broadcast,
+                        mock.patch.object(dist, "all_gather_object") as gather,
+                        mock.patch.object(dist, "all_reduce") as reduce,
+                    ):
+                        case.assertIsNone(dist_util.get_dataset_process_group())
+                        _check_readers(test_dir, None)
+                        _bootstrap(1, 0, 0)
+                        warmup_ds = ParquetDataset(
+                            data_pb2.DataConfig(batch_size=1),
+                            warmup_features,
+                            os.path.join(test_dir, "*.parquet"),
+                        )
+                        case.assertEqual(warmup_ds.get_worker_info(), (0, 1, 1))
+                        for collective in (new_group, broadcast, gather, reduce):
+                            collective.assert_not_called()
+                    case.assertEqual(warmup_ds.get_worker_info(), (0, 1, 1))
 
             # Rank 1 waits here while rank 0 builds the local warm-up readers.
             value = torch.tensor([rank + 1], device=device)

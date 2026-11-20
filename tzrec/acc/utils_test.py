@@ -126,10 +126,35 @@ class AccUtilsTest(unittest.TestCase):
             self.assertEqual(utils.export_acc_config()["INPUT_TILE_3_ONLINE"], "0")
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertNotIn("INPUT_TILE_3_ONLINE", utils.export_acc_config())
-            with utils.export_env_scope(input_tile_3_online=True):
-                self.assertEqual(utils.export_acc_config()["INPUT_TILE_3_ONLINE"], "1")
+            with utils.export_env_scope(
+                use_distributed_embedding=True,
+                input_tile="3",
+                input_tile_3_online=True,
+            ):
+                acc_cfg = utils.export_acc_config()
+                self.assertEqual(acc_cfg["DISTRIBUTED_EMBEDDING"], "1")
+                self.assertEqual(acc_cfg["INPUT_TILE"], "3")
+                self.assertEqual(acc_cfg["INPUT_TILE_3_ONLINE"], "1")
             with utils.export_env_scope(input_tile_3_online=False):
                 self.assertEqual(utils.export_acc_config()["INPUT_TILE_3_ONLINE"], "0")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "USE_DISTRIBUTED_EMBEDDING": "1",
+                "INPUT_TILE": "3",
+                "INPUT_TILE_3_ONLINE": "1",
+            },
+            clear=True,
+        ):
+            with utils.export_env_scope(
+                use_distributed_embedding=False,
+                input_tile="0",
+                input_tile_3_online=False,
+            ):
+                acc_cfg = utils.export_acc_config()
+                self.assertNotIn("DISTRIBUTED_EMBEDDING", acc_cfg)
+                self.assertEqual(acc_cfg["INPUT_TILE"], "0")
+                self.assertEqual(acc_cfg["INPUT_TILE_3_ONLINE"], "0")
 
         test_dir = make_test_dir()
         try:

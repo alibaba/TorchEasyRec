@@ -455,9 +455,6 @@ def mixed_precision_for_export(pipeline_config: EasyRecConfig) -> str:
 def export_acc_config(
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     hard_search_input_tile_features: Optional[Dict[str, str]] = None,
-    use_distributed_embedding: Optional[bool] = None,
-    input_tile: Optional[str] = None,
-    input_tile_3_online: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Export acc config for model online inference.
 
@@ -466,27 +463,15 @@ def export_acc_config(
             into the acc config.
         hard_search_input_tile_features (dict, optional): hard-search feature to
             sequence mapping for HARD_SEARCH_INPUT_TILE.
-        use_distributed_embedding (bool, optional): explicit distributed
-            embedding flag overriding context/env.
-        input_tile (str, optional): explicit INPUT_TILE value overriding
-            context/env.
-        input_tile_3_online (bool, optional): explicit INPUT_TILE_3_ONLINE
-            value overriding env when specified.
     """
     ctx = _EXPORT_ENV_CTX.get() or {}
-    dist_emb = (
-        _is_distributed_embedding_enabled()
-        if use_distributed_embedding is None
-        else use_distributed_embedding
-    )
-    resolved_input_tile = get_input_tile() if input_tile is None else input_tile
+    dist_emb = _is_distributed_embedding_enabled()
+    resolved_input_tile = get_input_tile()
     # use int64 sparse id as input
     acc_config: Dict[str, Any] = {"SPARSE_INT64": "1"}
     if resolved_input_tile is not None:
         acc_config["INPUT_TILE"] = resolved_input_tile
-    if input_tile_3_online is not None:
-        acc_config["INPUT_TILE_3_ONLINE"] = "1" if input_tile_3_online else "0"
-    elif "input_tile_3_online" in ctx:
+    if "input_tile_3_online" in ctx:
         acc_config["INPUT_TILE_3_ONLINE"] = "1" if ctx["input_tile_3_online"] else "0"
     elif "INPUT_TILE_3_ONLINE" in os.environ:
         acc_config["INPUT_TILE_3_ONLINE"] = os.environ["INPUT_TILE_3_ONLINE"]
