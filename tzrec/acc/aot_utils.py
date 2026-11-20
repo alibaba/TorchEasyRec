@@ -194,8 +194,6 @@ def export_model_aot(
     seq_tensor_names = meta_info.get("seq_tensor_names", [])
     jagged_seq_tensor_names = meta_info.get("jagged_seq_tensor_names", [])
     seq_share_groups = meta_info.get("seq_share_groups", {})
-    dense_gm = dense_model if isinstance(dense_model, torch.fx.GraphModule) else None
-    jagged_min_len = 1 if (dense_gm is None or _has_hstu_op(dense_gm)) else 0
 
     # Separate caches per axis: a SEQUENCE group and a JAGGED_SEQUENCE
     # group from the same parent SequenceFeature share a lengths source,
@@ -216,7 +214,7 @@ def export_model_aot(
             share_key = seq_share_groups.get(key, key)
             if share_key not in jagged_batch_dims:
                 jagged_batch_dims[share_key] = torch.export.Dim(
-                    f"{share_key}__batch", min=jagged_min_len, max=999999993
+                    f"{share_key}__batch", min=1, max=999999993
                 )
             dynamic_shapes[key] = {0: jagged_batch_dims[share_key]}
         else:
@@ -469,18 +467,6 @@ def _collect_sequence_dim_groups(
     )
 
 
-def _has_hstu_op(gm: Optional[torch.fx.GraphModule]) -> bool:
-    """Return whether traced graph uses HSTU attention kernels."""
-    if gm is None:
-        return False
-    for node in gm.graph.nodes:
-        if node.op in ("call_function", "call_method"):
-            name = getattr(node.target, "__name__", str(node.target))
-            if "hstu" in name.lower():
-                return True
-    return any("hstu" in type(mod).__name__.lower() for mod in gm.modules())
-
-
 def _can_prune_unused_input_keys(
     gm: torch.fx.GraphModule, input_node: torch.fx.Node
 ) -> bool:
@@ -499,7 +485,6 @@ def _build_dynamic_shapes(
     data: Dict[str, torch.Tensor],
     features: Any,
     feature_groups: List[model_pb2.FeatureGroupConfig],
-    gm: Optional[torch.fx.GraphModule] = None,
 ) -> Dict[str, Dict[int, torch.export.Dim]]:
     """Build dynamic shapes for the full model input.
 
@@ -509,7 +494,7 @@ def _build_dynamic_shapes(
     - sequence value tensors (.values for single-value sparse or dense sequence
       features, .key_lengths for multi-value sparse sequence features) -> shared
       total sequence length Dim per SequenceFeature / JAGGED_SEQUENCE /
-      SeqGroupConfig (min=1 when HSTU ops use JAGGED_SEQUENCE, min=0 otherwise)
+      SeqGroupConfig (min=1 for JAGGED_SEQUENCE, min=0 otherwise)
     - .values without a .lengths sibling -> batch dim (dense feature)
     - .weights -> shares Dim with corresponding .values (same prefix)
     - .values for multi-value sparse sequence features (with .key_lengths) ->
@@ -521,12 +506,10 @@ def _build_dynamic_shapes(
         data: input tensor dict from Batch.to_dict().
         features: list of BaseFeature from model.features.
         feature_groups: list of FeatureGroupConfig from model.feature_groups.
-        gm: optional traced GraphModule used to detect HSTU ops.
 
     Returns:
         dynamic_shapes dict for torch.export.export().
     """
-    allow_empty_jagged = gm is not None and not _has_hstu_op(gm)
     (
         feat_to_seq_dim_group,
         seq_feat_names,
@@ -570,17 +553,13 @@ def _build_dynamic_shapes(
         if feat_prefix in feat_to_seq_dim_group:
             group = feat_to_seq_dim_group[feat_prefix]
             if group not in group_to_dim:
-                min_len = (
-                    0 if allow_empty_jagged or group not in jagged_seq_groups else 1
-                )
+                min_len = 1 if group in jagged_seq_groups else 0
                 group_to_dim[group] = torch.export.Dim(
                     f"g_{dim_counter}", min=min_len, max=999999993
                 )
                 dim_counter += 1
             return group_to_dim[group]
-        min_len = (
-            0 if allow_empty_jagged or feat_prefix not in jagged_seq_feat_names else 1
-        )
+        min_len = 1 if feat_prefix in jagged_seq_feat_names else 0
         total_sequence_length_dim = torch.export.Dim(
             f"g_{dim_counter}", min=min_len, max=999999993
         )
@@ -708,7 +687,6 @@ def export_unified_model_aot(
         data,
         features=features,
         feature_groups=model.feature_groups,
-        gm=full_gm,
     )
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
