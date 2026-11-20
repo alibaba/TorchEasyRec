@@ -221,7 +221,7 @@ export HOST_MEMORY_RESERVE_PERCENT=0.15
 
 默认仍使用 DP 规划。设置 `TZREC_PLANNER=milp` 可启用 MILP，同时选择每张表的分片候选和各 shard 的 rank，约束各 rank 的 HBM 用量及各 node 的 DDR、SSD 总用量，并优化最慢 rank 的预计耗时。
 
-启用 `train_config.rocksdb_config` 的 RocksDB 后端后，自动使用 MILP。
+启用 `train_config.rocksdb_config` 的 RocksDB 后端后，自动使用 MILP。对于开启淘汰的表，每次训练维护将该 rank 上的 RocksDB 记录数限制在 `max_capacity` 内。GPU 缓存中的行仍可用于训练，保存 checkpoint 时写回缓存可能使持久化行数暂时超过该上限。
 
 ```bash
 export TZREC_PLANNER=milp
