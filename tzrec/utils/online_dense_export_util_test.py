@@ -210,7 +210,8 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
 
         def fake_warmup(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             seen["world_size"] = os.environ.get("WORLD_SIZE")
-            seen["data_world_size"] = kwargs.get("world_size")
+            seen["data_world_size"] = acc_utils.get_world_size()
+            seen["data_rank"] = acc_utils.get_rank()
             return {}
 
         def fake_finalize(*args: Any, **kwargs: Any) -> None:
@@ -255,6 +256,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 self.assertEqual(seen["input_tile"], "3")
                 self.assertIsNone(seen["env_input_tile"])
                 self.assertEqual(seen["data_world_size"], 1)
+                self.assertEqual(seen["data_rank"], 0)
                 self.assertEqual(seen["world_size"], "4")
                 self.assertNotIn("INPUT_TILE", os.environ)
                 self.assertEqual(os.environ["WORLD_SIZE"], "4")

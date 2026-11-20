@@ -13,7 +13,7 @@ import contextlib
 import contextvars
 import json
 import os
-from typing import Any, Dict, Iterator, Optional, Union
+from typing import Any, Dict, Iterator, Optional, TypedDict, Union, cast
 
 import torch
 
@@ -23,14 +23,19 @@ from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils import env_util, quant_util
 from tzrec.utils.logging_util import logger
 
-_USE_DISTRIBUTED_EMBEDDING_CTX: contextvars.ContextVar[Optional[bool]] = (
-    contextvars.ContextVar("tzrec_use_distributed_embedding", default=None)
-)
-_INPUT_TILE_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "tzrec_input_tile", default=None
-)
-_INPUT_TILE_3_ONLINE_CTX: contextvars.ContextVar[Optional[bool]] = (
-    contextvars.ContextVar("tzrec_input_tile_3_online", default=None)
+
+class ExportEnvConfig(TypedDict, total=False):
+    """Scoped export environment overrides stored in ``_EXPORT_ENV_CTX``."""
+
+    use_distributed_embedding: bool
+    input_tile: str
+    input_tile_3_online: bool
+    world_size: int
+    rank: int
+
+
+_EXPORT_ENV_CTX: contextvars.ContextVar[Optional[ExportEnvConfig]] = (
+    contextvars.ContextVar("tzrec_export_env", default=None)
 )
 
 
@@ -39,34 +44,50 @@ def export_env_scope(
     use_distributed_embedding: Optional[bool] = None,
     input_tile: Optional[str] = None,
     input_tile_3_online: Optional[bool] = None,
+    world_size: Optional[int] = None,
+    rank: Optional[int] = None,
 ) -> Iterator[None]:
-    """Scope export acc flags in contextvars without mutating ``os.environ``."""
-    dist_tok = (
-        _USE_DISTRIBUTED_EMBEDDING_CTX.set(use_distributed_embedding)
-        if use_distributed_embedding is not None
-        else None
-    )
-    tile_tok = _INPUT_TILE_CTX.set(input_tile) if input_tile is not None else None
-    online_tok = (
-        _INPUT_TILE_3_ONLINE_CTX.set(input_tile_3_online)
-        if input_tile_3_online is not None
-        else None
-    )
+    """Scope export flags in a ContextVar without mutating ``os.environ``.
+
+    Each argument only overrides when not ``None``. Passing ``None`` leaves the
+    currently active value unchanged (enclosing ``export_env_scope``, then
+    ``os.environ``) and does not clear or unset an outer scope value.
+
+    Args:
+        use_distributed_embedding (bool, optional): override
+            ``USE_DISTRIBUTED_EMBEDDING`` within the scope; ``None`` leaves the
+            active outer/env value intact.
+        input_tile (str, optional): override ``INPUT_TILE`` within the scope;
+            ``None`` leaves the active outer/env value intact.
+        input_tile_3_online (bool, optional): override ``INPUT_TILE_3_ONLINE``
+            within the scope; ``None`` leaves the active outer/env value intact.
+        world_size (int, optional): override dataset ``WORLD_SIZE`` within the
+            scope; ``None`` leaves the active outer/env value intact.
+        rank (int, optional): override dataset ``RANK`` within the scope;
+            ``None`` leaves the active outer/env value intact.
+    """
+    next_ctx: Dict[str, Any] = dict(_EXPORT_ENV_CTX.get() or {})
+    if use_distributed_embedding is not None:
+        next_ctx["use_distributed_embedding"] = use_distributed_embedding
+    if input_tile is not None:
+        next_ctx["input_tile"] = input_tile
+    if input_tile_3_online is not None:
+        next_ctx["input_tile_3_online"] = input_tile_3_online
+    if world_size is not None:
+        next_ctx["world_size"] = world_size
+    if rank is not None:
+        next_ctx["rank"] = rank
+    token = _EXPORT_ENV_CTX.set(cast(ExportEnvConfig, next_ctx))
     try:
         yield
     finally:
-        if online_tok is not None:
-            _INPUT_TILE_3_ONLINE_CTX.reset(online_tok)
-        if tile_tok is not None:
-            _INPUT_TILE_CTX.reset(tile_tok)
-        if dist_tok is not None:
-            _USE_DISTRIBUTED_EMBEDDING_CTX.reset(dist_tok)
+        _EXPORT_ENV_CTX.reset(token)
 
 
 def _is_distributed_embedding_enabled() -> bool:
-    ctx = _USE_DISTRIBUTED_EMBEDDING_CTX.get()
-    if ctx is not None:
-        return ctx
+    ctx = _EXPORT_ENV_CTX.get() or {}
+    if "use_distributed_embedding" in ctx:
+        return ctx["use_distributed_embedding"]
     return os.environ.get("USE_DISTRIBUTED_EMBEDDING", "0") == "1"
 
 
@@ -77,10 +98,26 @@ def use_distributed_embedding() -> bool:
 
 def get_input_tile() -> Optional[str]:
     """Return active ``INPUT_TILE`` value from export scope or ``os.environ``."""
-    ctx = _INPUT_TILE_CTX.get()
-    if ctx is not None:
-        return ctx
+    ctx = _EXPORT_ENV_CTX.get() or {}
+    if "input_tile" in ctx:
+        return ctx["input_tile"]
     return os.environ.get("INPUT_TILE")
+
+
+def get_world_size() -> int:
+    """Return active ``WORLD_SIZE`` from export scope or ``os.environ``."""
+    ctx = _EXPORT_ENV_CTX.get() or {}
+    if "world_size" in ctx:
+        return ctx["world_size"]
+    return int(os.environ.get("WORLD_SIZE", 1))
+
+
+def get_rank() -> int:
+    """Return active ``RANK`` from export scope or ``os.environ``."""
+    ctx = _EXPORT_ENV_CTX.get() or {}
+    if "rank" in ctx:
+        return ctx["rank"]
+    return int(os.environ.get("RANK", 0))
 
 
 def is_distributed_embedding_predict(model_path: str) -> bool:
@@ -134,12 +171,13 @@ def is_input_tile_user_keyed_tensor(name: str) -> bool:
 def is_input_tile_3_online() -> bool:
     """Judge is the sequential tensor use jt.values() directly or not.
 
-    If INPUT_TILE_3_ONLINE=1, sequential tensor use jt.values() directly,
-    offline prediction for the model will not be supported.
+    If INPUT_TILE_3_ONLINE=1, sequential tensor uses jt.values() directly, and
+    offline prediction is only supported with batch_size=1 (``tzrec.predict``
+    rejects larger batch sizes).
     """
-    ctx = _INPUT_TILE_3_ONLINE_CTX.get()
-    if ctx is not None:
-        return ctx
+    ctx = _EXPORT_ENV_CTX.get() or {}
+    if "input_tile_3_online" in ctx:
+        return ctx["input_tile_3_online"]
     input_tile_3_online = os.environ.get("INPUT_TILE_3_ONLINE")
     if input_tile_3_online and input_tile_3_online[0] == "1":
         return True
@@ -435,6 +473,7 @@ def export_acc_config(
         input_tile_3_online (bool, optional): explicit INPUT_TILE_3_ONLINE
             value overriding env when specified.
     """
+    ctx = _EXPORT_ENV_CTX.get() or {}
     dist_emb = (
         _is_distributed_embedding_enabled()
         if use_distributed_embedding is None
@@ -447,6 +486,8 @@ def export_acc_config(
         acc_config["INPUT_TILE"] = resolved_input_tile
     if input_tile_3_online is not None:
         acc_config["INPUT_TILE_3_ONLINE"] = "1" if input_tile_3_online else "0"
+    elif "input_tile_3_online" in ctx:
+        acc_config["INPUT_TILE_3_ONLINE"] = "1" if ctx["input_tile_3_online"] else "0"
     elif "INPUT_TILE_3_ONLINE" in os.environ:
         acc_config["INPUT_TILE_3_ONLINE"] = os.environ["INPUT_TILE_3_ONLINE"]
     if "QUANT_EMB" in os.environ:

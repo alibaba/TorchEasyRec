@@ -279,8 +279,6 @@ class KafkaDataset(BaseDataset):
             input_fields=input_fields if input_fields else None,
             kafka_partition_round_robin=self._data_config.kafka_partition_round_robin,
             kafka_log_every_n_messages=self._data_config.kafka_log_every_n_messages,
-            world_size=self._world_size,
-            rank=self._rank,
         )
 
 
@@ -316,8 +314,6 @@ class KafkaReader(BaseReader):
         input_fields: Optional[List[pa.Field]] = None,
         kafka_partition_round_robin: bool = False,
         kafka_log_every_n_messages: int = 0,
-        world_size: Optional[int] = None,
-        rank: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -327,8 +323,6 @@ class KafkaReader(BaseReader):
             drop_remainder,
             shuffle,
             shuffle_buffer_size,
-            world_size=world_size,
-            rank=rank,
             **kwargs,
         )
 

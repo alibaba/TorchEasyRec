@@ -102,6 +102,8 @@ def export_online_dense_model(
     with acc_utils.export_env_scope(
         use_distributed_embedding=use_dist_emb,
         input_tile=resolved_input_tile,
+        world_size=1,
+        rank=0,
     ):
         model = _create_model(
             pipeline_config.model_config,
@@ -126,8 +128,6 @@ def export_online_dense_model(
                 model=scripted_model,
                 checkpoint_path=checkpoint_path,
                 save_dir=tmp_dir,
-                input_tile=resolved_input_tile,
-                use_distributed_embedding=use_dist_emb,
             )
 
             required_files = ["scripted_model.pt", "dense_meta.json"]

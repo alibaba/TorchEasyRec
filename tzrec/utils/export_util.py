@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import copy
 import glob
 import json
@@ -23,7 +22,7 @@ import traceback
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterable
 from queue import Queue
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import numpy as np
@@ -72,6 +71,7 @@ from tzrec.features.feature import (
     create_fg_json,
     get_hard_search_input_tile_features,
 )
+from tzrec.models.genrec_model import BaseGenRecModel, GenRecFrontEnd
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -145,23 +145,10 @@ def _is_genrec_export(
         )
         if has_prompt_config or is_genrec_model:
             return True
-    if model is not None:
-        inner = getattr(model, "model", model)
-        for mod in (model, inner):
-            if type(mod).__name__ in ("BaseGenRecModel", "GenRecFrontEnd"):
-                return True
-        if isinstance(model, nn.Module) and any(
-            type(sub).__name__
-            in (
-                "PromptAssembler",
-                "HoleKeyBuilder",
-                "GenRecFrontEnd",
-                "BaseGenRecModel",
-            )
-            for sub in model.modules()
-        ):
-            return True
-    return False
+    genrec_types = (BaseGenRecModel, GenRecFrontEnd)
+    return isinstance(model, genrec_types) or isinstance(
+        getattr(model, "model", None), genrec_types
+    )
 
 
 def _has_candidate_non_user_features(
@@ -193,36 +180,6 @@ def _should_disable_input_tile(
     return _has_candidate_non_user_features(features) is False
 
 
-@contextlib.contextmanager
-def _staged_export_dir(save_dir: str, use_staging: bool = True) -> Iterator[str]:
-    """Stage local exports in a sibling temp dir and rename atomically."""
-    if not use_staging:
-        os.makedirs(save_dir, exist_ok=True)
-        yield save_dir
-        return
-    clean_dir = os.path.abspath(save_dir)
-    if os.path.exists(clean_dir):
-        with os.scandir(clean_dir) as entries:
-            if any(entries):
-                raise RuntimeError(
-                    f"export directory {save_dir} already exists and is not empty."
-                )
-    parent_dir = os.path.dirname(clean_dir)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
-    stage_dir = f"{clean_dir}.tmp.{os.getpid()}"
-    if os.path.exists(stage_dir):
-        shutil.rmtree(stage_dir)
-    os.makedirs(stage_dir, exist_ok=True)
-    try:
-        yield stage_dir
-        os.replace(stage_dir, clean_dir)
-    except BaseException:
-        if os.path.exists(stage_dir):
-            shutil.rmtree(stage_dir, ignore_errors=True)
-        raise
-
-
 def ensure_input_tile_for_distributed_embedding(
     pipeline_config: Optional[EasyRecConfig] = None,
     model: Optional[nn.Module] = None,
@@ -252,6 +209,10 @@ def ensure_input_tile_for_distributed_embedding(
 
     Returns:
         Tuple of ``(resolved_use_distributed_embedding, resolved_input_tile)``.
+
+    Raises:
+        ValueError: If a GenRec export receives explicit ``INPUT_TILE=2`` or
+            ``"3"``.
     """
     use_rtp = env_util.use_rtp()
     if use_distributed_embedding is None:
@@ -420,6 +381,8 @@ def export_model(
         # scripted model and safetensors use io in cpp,
         # so that we can not use fsspec to patch cpp io operations.
         cache_root = os.environ.get("LOCAL_CACHE_DIR")
+        # NOTE: keep asset_dir at cache_root/local_path so predict() flat
+        # downloads into LOCAL_CACHE_DIR can locate feature assets.
         config_asset_dir = cache_root or local_path
         if cache_root:
             os.makedirs(cache_root, exist_ok=True)
@@ -428,7 +391,11 @@ def export_model(
                 cache_root or tempfile.gettempdir(), f"tzrec_rtp_export_{os.getppid()}"
             )
             if is_local_rank_zero:
+                # Clear stale shards from a prior failed run under the same ppid.
+                shutil.rmtree(local_path, ignore_errors=True)
                 os.makedirs(local_path, exist_ok=True)
+            if dist.is_initialized():
+                dist.barrier()
         else:
             local_path = tempfile.mkdtemp(
                 dir=cache_root or None, prefix="tzrec_export_"
@@ -449,24 +416,28 @@ def export_model(
                 use_local_cache_dir=use_local_cache_dir,
                 additional_export_config=additional_export_config,
                 data_input_path=data_input_path,
-                use_distributed_embedding=use_dist_embedding,
-                input_tile=resolved_input_tile,
                 config_asset_dir=config_asset_dir,
             )
             if use_local_cache_dir:
                 if use_rtp and dist.is_initialized():
                     dist.barrier()
+                upload_err: Optional[BaseException] = None
                 if is_local_rank_zero and (use_rtp or is_rank_zero):
-                    logger.info(f"uploading {local_path} to {save_dir}.")
-                    fs.upload(
-                        local_path,
-                        save_dir,
-                        recursive=True,
-                        file_thread_num=os.cpu_count(),
-                    )
-                    logger.info(f"finish upload {local_path} to {save_dir}.")
+                    try:
+                        logger.info(f"uploading {local_path} to {save_dir}.")
+                        fs.upload(
+                            local_path,
+                            save_dir,
+                            recursive=True,
+                            file_thread_num=os.cpu_count(),
+                        )
+                        logger.info(f"finish upload {local_path} to {save_dir}.")
+                    except BaseException as exc:
+                        upload_err = exc
                 if use_rtp and dist.is_initialized():
                     dist.barrier()
+                if upload_err is not None:
+                    raise upload_err
         finally:
             if use_local_cache_dir and (not use_rtp or is_local_rank_zero):
                 shutil.rmtree(local_path, ignore_errors=True)
@@ -508,176 +479,171 @@ def export_model_normal(
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
     use_local_cache_dir: bool = False,
-    use_distributed_embedding: Optional[bool] = None,
-    input_tile: Optional[str] = None,
-    rank: Optional[int] = None,
     config_asset_dir: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
-    """Export a EasyRec model on aliyun."""
-    del kwargs
-    resolved_rank = int(os.environ.get("RANK", 0)) if rank is None else rank
-    is_rank_zero = resolved_rank == 0
+    """Export an EasyRec model on a single rank.
+
+    Args:
+        pipeline_config: Full pipeline configuration.
+        model: Inference-wrapped model or module to export.
+        checkpoint_path: Checkpoint directory to restore from.
+        save_dir: Local directory (or remote cache staging directory) for
+            exported artifacts.
+        assets: Optional extra asset file paths to copy into ``save_dir``.
+        additional_export_config: Optional extra key/value pairs written into
+            ``model_acc.json``.
+        data_input_path: Optional warm-up dataloader input path override.
+        use_local_cache_dir: Unused for non-RTP local exports; accepted for
+            shared exporter dispatch signature compatibility.
+        config_asset_dir: Optional final asset directory written into exported
+            ``pipeline.config`` feature configs when ``save_dir`` is a temporary
+            remote-upload cache directory.
+        **kwargs: Ignored extra keyword arguments for dispatcher compatibility.
+    """
+    del use_local_cache_dir, kwargs
+    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     if not is_rank_zero:
         logger.warning("Only first rank will be used for export now.")
         return
 
-    resolved_dist_emb = (
-        acc_utils.use_distributed_embedding()
-        if use_distributed_embedding is None
-        else use_distributed_embedding
-    )
-    resolved_input_tile = (
-        acc_utils.get_input_tile() if input_tile is None else input_tile
-    )
-
     if not dist.is_initialized():
         dist.init_process_group("gloo", rank=0, world_size=1)
 
-    with acc_utils.export_env_scope(
-        use_distributed_embedding=resolved_dist_emb,
-        input_tile=resolved_input_tile,
-    ):
-        # make dataparser to get user feats before create model
-        data_config = copy.deepcopy(pipeline_config.data_config)
-        features = cast(List[BaseFeature], model.features)
-        if acc_utils.is_cuda_export():
-            # export batch_size too large may OOM in compile phase
-            max_batch_size = acc_utils.get_max_export_batch_size()
-            inference_batch_size = config_util.get_inference_batch_size(data_config)
-            inference_batch_size = min(inference_batch_size, max_batch_size)
-            config_util.set_inference_batch_size(data_config, inference_batch_size)
-            logger.info("using new batch_size: %s in export", inference_batch_size)
-        data_config.num_workers = 1
-        input_path = data_input_path or pipeline_config.train_input_path
+    # make dataparser to get user feats before create model
+    data_config = copy.deepcopy(pipeline_config.data_config)
+    features = cast(List[BaseFeature], model.features)
+    if acc_utils.is_cuda_export():
+        # export batch_size too large may OOM in compile phase
+        max_batch_size = acc_utils.get_max_export_batch_size()
+        inference_batch_size = config_util.get_inference_batch_size(data_config)
+        inference_batch_size = min(inference_batch_size, max_batch_size)
+        config_util.set_inference_batch_size(data_config, inference_batch_size)
+        logger.info("using new batch_size: %s in export", inference_batch_size)
+    data_config.num_workers = 1
+    input_path = data_input_path or pipeline_config.train_input_path
+    with acc_utils.export_env_scope(world_size=1, rank=0):
         dataloader = create_dataloader(
             data_config,
             features,
             input_path,
             mode=Mode.PREDICT,
-            world_size=1,
-            rank=0,
-            input_tile=resolved_input_tile,
-            use_distributed_embedding=resolved_dist_emb,
         )
 
-        if not checkpoint_path:
-            raise ValueError("checkpoint path should be specified.")
+    if not checkpoint_path:
+        raise ValueError("checkpoint path should be specified.")
 
-        with _staged_export_dir(
-            save_dir, use_staging=not use_local_cache_dir
-        ) as stage_dir:
-            init_parameters(model, torch.device("cpu"))
-            checkpoint_util.restore_model(
-                checkpoint_path,
-                model,
-                use_dense_ema=config_util.use_dense_ema(
-                    pipeline_config.export_config,
-                    pipeline_config.train_config,
-                ),
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    init_parameters(model, torch.device("cpu"))
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        model,
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
+    )
+    # for mc modules, fix output_segments_tensor is a meta tensor.
+    fix_mch_state(model)
+
+    batch = next(dataloader.get_iterator())  # pyre-ignore[16]
+
+    # Quantize on CPU before moving to CUDA. The fbgemm CUDA kernel
+    # for nbit quantization uses int32 pointer arithmetic which
+    # overflows for large embedding tables. The CPU kernel uses
+    # int64 and is safe for any table size.
+    if acc_utils.is_quant() or acc_utils.is_ec_quant():
+        logger.info("quantize embeddings...")
+        additional_qconfig_spec_keys = []
+        additional_mapping = {}
+        cache_order_types = [EmbeddingBagCollection]
+        if acc_utils.is_ec_quant():
+            additional_qconfig_spec_keys.append(EmbeddingCollection)
+            additional_mapping[EmbeddingCollection] = QuantEmbeddingCollection
+            cache_order_types.append(EmbeddingCollection)
+        # Cache the feature-permute order as an on-device buffer instead of
+        # rebuilding `torch.tensor(order, device=cuda)` (a blocking H2D copy)
+        # on every forward. Must run before quantize_embeddings so the quant
+        # modules pick it up via `from_float`.
+        quant_prep_enable_cache_features_order(model, cache_order_types)
+        quantize_embeddings(
+            model,
+            dtype=acc_utils.quant_dtype(),
+            inplace=True,
+            additional_qconfig_spec_keys=additional_qconfig_spec_keys,
+            additional_mapping=additional_mapping,
+        )
+        logger.info("finish quantize embeddings...")
+
+    if acc_utils.is_cuda_export():
+        _move_quantized_modules_to_device(model, torch.device("cuda:0"))
+        model = model.cuda()
+
+    model.eval()
+
+    data = batch.to_dict(sparse_dtype=torch.int64)
+    mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
+    autocast_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
+    if acc_utils.is_trt() or acc_utils.is_aot():
+        data = OrderedDict(sorted(data.items()))
+        # no_grad: avoid retaining activations that OOM AOTI autotune.
+        with (
+            torch.no_grad(),
+            torch.amp.autocast(
+                device_type="cuda",
+                dtype=autocast_dtype,
+                enabled=autocast_dtype is not None,
+            ),
+        ):
+            result = model(data, "cuda:0")
+        result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
+        logger.info(f"Model Outputs: {result_info}")
+        del result
+        torch.cuda.empty_cache()
+        if acc_utils.is_trt():
+            sparse, dense, meta_info = split_model(data, model, save_dir)
+            export_model_trt(
+                sparse,
+                dense,
+                data,
+                save_dir,
+                mixed_precision=mixed_precision,
             )
-            # for mc modules, fix output_segments_tensor is a meta tensor.
-            fix_mch_state(model)
-
-            batch = next(dataloader.get_iterator())  # pyre-ignore[16]
-
-            # Quantize on CPU before moving to CUDA. The fbgemm CUDA kernel
-            # for nbit quantization uses int32 pointer arithmetic which
-            # overflows for large embedding tables. The CPU kernel uses
-            # int64 and is safe for any table size.
-            if acc_utils.is_quant() or acc_utils.is_ec_quant():
-                logger.info("quantize embeddings...")
-                additional_qconfig_spec_keys = []
-                additional_mapping = {}
-                cache_order_types = [EmbeddingBagCollection]
-                if acc_utils.is_ec_quant():
-                    additional_qconfig_spec_keys.append(EmbeddingCollection)
-                    additional_mapping[EmbeddingCollection] = QuantEmbeddingCollection
-                    cache_order_types.append(EmbeddingCollection)
-                # Cache the feature-permute order as an on-device buffer instead of
-                # rebuilding `torch.tensor(order, device=cuda)` (a blocking H2D copy)
-                # on every forward. Must run before quantize_embeddings so the quant
-                # modules pick it up via `from_float`.
-                quant_prep_enable_cache_features_order(model, cache_order_types)
-                quantize_embeddings(
-                    model,
-                    dtype=acc_utils.quant_dtype(),
-                    inplace=True,
-                    additional_qconfig_spec_keys=additional_qconfig_spec_keys,
-                    additional_mapping=additional_mapping,
-                )
-                logger.info("finish quantize embeddings...")
-
-            if acc_utils.is_cuda_export():
-                _move_quantized_modules_to_device(model, torch.device("cuda:0"))
-                model = model.cuda()
-
-            model.eval()
-
-            data = batch.to_dict(sparse_dtype=torch.int64)
-            mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
-            autocast_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
-            if acc_utils.is_trt() or acc_utils.is_aot():
-                data = OrderedDict(sorted(data.items()))
-                # no_grad: avoid retaining activations that OOM AOTI autotune.
-                with (
-                    torch.no_grad(),
-                    torch.amp.autocast(
-                        device_type="cuda",
-                        dtype=autocast_dtype,
-                        enabled=autocast_dtype is not None,
-                    ),
-                ):
-                    result = model(data, "cuda:0")
-                result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-                logger.info(f"Model Outputs: {result_info}")
-                del result
-                torch.cuda.empty_cache()
-                if acc_utils.is_trt():
-                    sparse, dense, meta_info = split_model(data, model, stage_dir)
-                    export_model_trt(
-                        sparse,
-                        dense,
-                        data,
-                        stage_dir,
-                        mixed_precision=mixed_precision,
-                    )
-                elif acc_utils.is_unified_aot():
-                    export_unified_model_aot(
-                        model, data, stage_dir, mixed_precision=mixed_precision
-                    )
-                else:
-                    sparse, dense, meta_info = split_model(data, model, stage_dir)
-                    export_model_aot(
-                        sparse,
-                        dense,
-                        data,
-                        meta_info,
-                        stage_dir,
-                        mixed_precision=mixed_precision,
-                    )
-            else:
-                result = model(data)
-                result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-                logger.info(f"Model Outputs: {result_info}")
-
-                gm = symbolic_trace(model)
-                with open(os.path.join(stage_dir, "gm.code"), "w") as f:
-                    f.write(gm.code)
-
-                scripted_model = torch.jit.script(gm)
-                scripted_model.save(os.path.join(stage_dir, "scripted_model.pt"))
-
-            _write_export_metadata(
-                pipeline_config,
-                features,
-                stage_dir,
-                assets,
-                additional_export_config,
-                use_distributed_embedding=resolved_dist_emb,
-                input_tile=resolved_input_tile,
-                config_asset_dir=config_asset_dir or save_dir,
+        elif acc_utils.is_unified_aot():
+            export_unified_model_aot(
+                model, data, save_dir, mixed_precision=mixed_precision
             )
+        else:
+            sparse, dense, meta_info = split_model(data, model, save_dir)
+            export_model_aot(
+                sparse,
+                dense,
+                data,
+                meta_info,
+                save_dir,
+                mixed_precision=mixed_precision,
+            )
+    else:
+        result = model(data)
+        result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
+        logger.info(f"Model Outputs: {result_info}")
+
+        gm = symbolic_trace(model)
+        with open(os.path.join(save_dir, "gm.code"), "w") as f:
+            f.write(gm.code)
+
+        scripted_model = torch.jit.script(gm)
+        scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
+
+    _write_export_metadata(
+        pipeline_config,
+        features,
+        save_dir,
+        assets,
+        additional_export_config,
+        config_asset_dir=config_asset_dir,
+    )
 
 
 def _rewrite_feature_asset_dir(
@@ -706,9 +672,6 @@ def _write_export_metadata(
     save_dir: str,
     assets: Optional[List[str]],
     additional_export_config: Optional[Dict[str, Union[bool, str]]],
-    use_distributed_embedding: Optional[bool] = None,
-    input_tile: Optional[str] = None,
-    input_tile_3_online: Optional[bool] = None,
     config_asset_dir: Optional[str] = None,
 ) -> None:
     """Write serving metadata and assets without mutating the training config."""
@@ -727,15 +690,10 @@ def _write_export_metadata(
         if feature.name in hard_search_input_tile_features
         for node in feature.fg_json()
     }
-    with acc_utils.export_env_scope(
-        use_distributed_embedding=use_distributed_embedding,
-        input_tile=input_tile,
-        input_tile_3_online=input_tile_3_online,
-    ):
-        acc_config = acc_utils.export_acc_config(
-            additional_export_config=additional_export_config,
-            hard_search_input_tile_features=hard_search_input_tile_features,
-        )
+    acc_config = acc_utils.export_acc_config(
+        additional_export_config=additional_export_config,
+        hard_search_input_tile_features=hard_search_input_tile_features,
+    )
     with open(os.path.join(save_dir, "model_acc.json"), "w") as output:
         json.dump(acc_config, output, indent=4)
     has_fg_asset = False
@@ -748,12 +706,9 @@ def _write_export_metadata(
             json.dump(create_fg_json(features, asset_dir=save_dir), output, indent=4)
 
 
-def _prepare_single_rank_distributed_embedding_export(
-    rank: Optional[int] = None,
-) -> bool:
+def _prepare_single_rank_distributed_embedding_export() -> bool:
     """Return whether distributed-embedding export should run on this rank."""
-    resolved_rank = int(os.environ.get("RANK", 0)) if rank is None else rank
-    if resolved_rank != 0:
+    if int(os.environ.get("RANK", 0)) != 0:
         logger.warning(
             "Only first rank will be used for distributed embedding export now."
         )
@@ -1881,9 +1836,6 @@ def export_distributed_embedding(
     use_local_cache_dir: bool = False,
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
-    use_distributed_embedding: Optional[bool] = None,
-    input_tile: Optional[str] = None,
-    rank: Optional[int] = None,
     config_asset_dir: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
@@ -1893,199 +1845,182 @@ def export_distributed_embedding(
     and ZCH state are restored on CPU and exported before dense graph tracing
     shrinks their tables. Dynamic embedding settings only tune chunking and
     optional full upload; all models use this export path.
+
+    Args:
+        pipeline_config: Full pipeline configuration.
+        model: Inference-wrapped model or module to export.
+        checkpoint_path: Checkpoint directory to restore from.
+        save_dir: Local output or remote-upload staging directory.
+        assets: Optional extra asset file paths to copy into ``save_dir``.
+        use_local_cache_dir: Accepted for shared exporter dispatch compatibility.
+        additional_export_config: Optional extra key/value pairs written into
+            ``model_acc.json``.
+        data_input_path: Optional warm-up dataloader input path override.
+        config_asset_dir: Optional final asset directory written into exported
+            ``pipeline.config`` feature configs when ``save_dir`` is a temporary
+            remote-upload cache directory.
+        **kwargs: Ignored extra keyword arguments for dispatcher compatibility.
     """
-    del kwargs
-    if not _prepare_single_rank_distributed_embedding_export(rank=rank):
+    del use_local_cache_dir, kwargs
+    if not _prepare_single_rank_distributed_embedding_export():
         return
     if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 
-    resolved_dist_emb = (
-        True if use_distributed_embedding is None else use_distributed_embedding
-    )
-    resolved_input_tile = (
-        acc_utils.get_input_tile() if input_tile is None else input_tile
+    bag_infos, embedding_infos = _get_sparse_table_to_embedding_info(model)
+    settings = pipeline_config.export_config.dynamic_embedding
+    if settings.read_chunk_size_mb <= 0:
+        raise ValueError("dynamic_embedding.read_chunk_size_mb must be > 0")
+    if settings.upload_max_in_flight_batches <= 0:
+        raise ValueError("dynamic_embedding.upload_max_in_flight_batches must be > 0")
+    if settings.max_num_parts <= 0:
+        raise ValueError("dynamic_embedding.max_num_parts must be > 0")
+    infos = {**bag_infos, **embedding_infos}
+    dimensions = {
+        checkpoint_util.remap_input_tile_user_key(name): info.embedding_dim
+        for name, info in infos.items()
+    }
+    expected_dynamic = {
+        checkpoint_util.remap_input_tile_user_key(name)
+        for name, info in infos.items()
+        if getattr(info, "use_dynamicemb", False)
+    }
+    uploader = None
+    if settings.HasField("feature_store_config"):
+        uploader = FeatureStoreFullUploader(
+            settings.feature_store_config,
+            dimensions,
+            embedding_field_type="ARRAY<UINT8>"
+            if acc_utils.distributed_sparse_quant_format()
+            else "ARRAY<FLOAT>",
+            max_in_flight_batches=settings.upload_max_in_flight_batches,
+        )
+    read_chunk_bytes = int(settings.read_chunk_size_mb) * 1024 * 1024
+    quant_format = acc_utils.distributed_sparse_quant_format()
+    sharded_dynamic_arrays: Optional[List[Dict[str, npz_util.StreamingArray]]] = None
+    if uploader is not None:
+        dynamic_export = get_dynamic_embedding_export(
+            checkpoint_path,
+            dimensions,
+            read_chunk_bytes=read_chunk_bytes,
+            quant_format=quant_format,
+            on_values=uploader.write,
+        )
+    else:
+        part_arrays, dynamic_meta = get_sharded_dynamic_embedding_export(
+            checkpoint_path,
+            dimensions,
+            read_chunk_bytes=read_chunk_bytes,
+            quant_format=quant_format,
+            max_num_parts=int(settings.max_num_parts),
+        )
+        if len(part_arrays) > 1:
+            sharded_dynamic_arrays = part_arrays
+            dynamic_export = (part_arrays[0], dynamic_meta)
+        else:
+            dynamic_export = (
+                part_arrays[0] if part_arrays else {},
+                dynamic_meta,
+            )
+    missing_tables = expected_dynamic - dynamic_export[1].keys()
+    if missing_tables:
+        raise ValueError(
+            "dynamic embedding checkpoint is missing tables: "
+            + ", ".join(sorted(missing_tables))
+        )
+    total_records = sum(meta["shape"][0] for meta in dynamic_export[1].values())
+    logger.info(
+        "Distributed embedding export: dynamic_tables=%s rows=%s "
+        "read_chunk_size_mb=%s feature_store_upload=%s",
+        len(dynamic_export[1]),
+        total_records,
+        settings.read_chunk_size_mb,
+        uploader is not None,
     )
 
-    with acc_utils.export_env_scope(
-        use_distributed_embedding=resolved_dist_emb,
-        input_tile=resolved_input_tile,
-    ):
-        bag_infos, embedding_infos = _get_sparse_table_to_embedding_info(model)
-        settings = pipeline_config.export_config.dynamic_embedding
-        if settings.read_chunk_size_mb <= 0:
-            raise ValueError("dynamic_embedding.read_chunk_size_mb must be > 0")
-        if settings.upload_max_in_flight_batches <= 0:
-            raise ValueError(
-                "dynamic_embedding.upload_max_in_flight_batches must be > 0"
+    features = cast(List[BaseFeature], model.features)
+    try:
+        _restore_export_sparse_state(
+            model, checkpoint_path, set(dimensions), set(dynamic_export[1])
+        )
+        sparse_arrays, dynamic_arrays, embedding_meta, feature_meta = (
+            _get_sparse_embedding_tensor(
+                model,
+                checkpoint_path,
+                embedding_infos,
+                bag_infos,
+                features,
+                dynamic_export=dynamic_export,
+                rank=0,
             )
-        if settings.max_num_parts <= 0:
-            raise ValueError("dynamic_embedding.max_num_parts must be > 0")
-        infos = {**bag_infos, **embedding_infos}
-        dimensions = {
-            checkpoint_util.remap_input_tile_user_key(name): info.embedding_dim
-            for name, info in infos.items()
-        }
-        expected_dynamic = {
-            checkpoint_util.remap_input_tile_user_key(name)
-            for name, info in infos.items()
-            if getattr(info, "use_dynamicemb", False)
-        }
-        uploader = None
-        if settings.HasField("feature_store_config"):
-            uploader = FeatureStoreFullUploader(
-                settings.feature_store_config,
-                dimensions,
-                embedding_field_type="ARRAY<UINT8>"
-                if acc_utils.distributed_sparse_quant_format()
-                else "ARRAY<FLOAT>",
-                max_in_flight_batches=settings.upload_max_in_flight_batches,
-            )
-        read_chunk_bytes = int(settings.read_chunk_size_mb) * 1024 * 1024
-        quant_format = acc_utils.distributed_sparse_quant_format()
-        sharded_dynamic_arrays: Optional[List[Dict[str, npz_util.StreamingArray]]] = (
-            None
+        )
+        sparse_dir = os.path.join(save_dir, "sparse")
+        os.makedirs(sparse_dir, exist_ok=True)
+        npz_util.savez_streaming(
+            os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"), sparse_arrays
+        )
+        dense_device = torch.device("cpu")
+        if pipeline_config.model_config.kernel != model_pb2.PYTORCH:
+            if not torch.cuda.is_available():
+                raise RuntimeError("TRITON/CUTLASS dense export requires a CUDA device")
+            dense_device = torch.device("cuda:0")
+            torch.cuda.set_device(dense_device)
+        _export_dense_model_on_device(
+            pipeline_config,
+            model,
+            checkpoint_path,
+            save_dir,
+            dense_device,
+            data_input_path=data_input_path,
         )
         if uploader is not None:
-            dynamic_export = get_dynamic_embedding_export(
-                checkpoint_path,
-                dimensions,
-                read_chunk_bytes=read_chunk_bytes,
-                quant_format=quant_format,
-                on_values=uploader.write,
-            )
-        else:
-            part_arrays, dynamic_meta = get_sharded_dynamic_embedding_export(
-                checkpoint_path,
-                dimensions,
-                read_chunk_bytes=read_chunk_bytes,
-                quant_format=quant_format,
-                max_num_parts=int(settings.max_num_parts),
-            )
-            if len(part_arrays) > 1:
-                sharded_dynamic_arrays = part_arrays
-                dynamic_export = (part_arrays[0], dynamic_meta)
-            else:
-                dynamic_export = (
-                    part_arrays[0] if part_arrays else {},
-                    dynamic_meta,
+            zch_tables = {
+                name
+                for name, meta in embedding_meta.items()
+                if meta.get("is_dynamic") and name not in dynamic_export[1]
+            }
+            if zch_tables:
+                logger.warning(
+                    "FeatureStore full export uploads only native dynemb tables; "
+                    "ZCH tables remain NPZ-only: %s",
+                    ", ".join(sorted(zch_tables)),
                 )
-        missing_tables = expected_dynamic - dynamic_export[1].keys()
-        if missing_tables:
-            raise ValueError(
-                "dynamic embedding checkpoint is missing tables: "
-                + ", ".join(sorted(missing_tables))
+            uploader.start(total_records=total_records)
+        if sharded_dynamic_arrays is not None:
+            _save_sharded_dynamic_embedding_npz(
+                sparse_dir,
+                sharded_dynamic_arrays,
+                dynamic_arrays,
+                embedding_meta,
+                set(dynamic_export[1]),
             )
-        total_records = sum(meta["shape"][0] for meta in dynamic_export[1].values())
-        logger.info(
-            "Distributed embedding export: dynamic_tables=%s rows=%s "
-            "read_chunk_size_mb=%s feature_store_upload=%s",
-            len(dynamic_export[1]),
-            total_records,
-            settings.read_chunk_size_mb,
-            uploader is not None,
-        )
+        elif dynamic_arrays:
+            npz_util.savez_streaming(
+                os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz"),
+                dynamic_arrays,
+            )
+        if uploader is not None:
+            uploader.close()
+    except BaseException:
+        if uploader is not None:
+            uploader.close(raise_on_error=False)
+        raise
 
-        features = cast(List[BaseFeature], model.features)
-        try:
-            _restore_export_sparse_state(
-                model, checkpoint_path, set(dimensions), set(dynamic_export[1])
-            )
-            sparse_arrays, dynamic_arrays, embedding_meta, feature_meta = (
-                _get_sparse_embedding_tensor(
-                    model,
-                    checkpoint_path,
-                    embedding_infos,
-                    bag_infos,
-                    features,
-                    dynamic_export=dynamic_export,
-                    rank=0,
-                )
-            )
-            dense_device = torch.device("cpu")
-            if pipeline_config.model_config.kernel != model_pb2.PYTORCH:
-                if not torch.cuda.is_available():
-                    raise RuntimeError(
-                        "TRITON/CUTLASS dense export requires a CUDA device"
-                    )
-                dense_device = torch.device("cuda:0")
-                torch.cuda.set_device(dense_device)
+    for name in ("sparse_embeddings-00-of-01.json", "sparse_embedding.json"):
+        with open(os.path.join(sparse_dir, name), "w") as output:
+            json.dump(embedding_meta, output, indent=4)
+    with open(os.path.join(sparse_dir, "sparse_features.json"), "w") as output:
+        json.dump(feature_meta, output, indent=4)
 
-            with _staged_export_dir(
-                save_dir, use_staging=not use_local_cache_dir
-            ) as stage_dir:
-                sparse_dir = os.path.join(stage_dir, "sparse")
-                os.makedirs(sparse_dir, exist_ok=True)
-                npz_util.savez_streaming(
-                    os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"),
-                    sparse_arrays,
-                )
-                _export_dense_model_on_device(
-                    pipeline_config,
-                    model,
-                    checkpoint_path,
-                    stage_dir,
-                    dense_device,
-                    data_input_path=data_input_path,
-                    input_tile=resolved_input_tile,
-                    use_distributed_embedding=resolved_dist_emb,
-                )
-                if uploader is not None:
-                    zch_tables = {
-                        name
-                        for name, meta in embedding_meta.items()
-                        if meta.get("is_dynamic") and name not in dynamic_export[1]
-                    }
-                    if zch_tables:
-                        logger.warning(
-                            "FeatureStore full export uploads only native dynemb "
-                            "tables; ZCH tables remain NPZ-only: %s",
-                            ", ".join(sorted(zch_tables)),
-                        )
-                    uploader.start(total_records=total_records)
-                if sharded_dynamic_arrays is not None:
-                    _save_sharded_dynamic_embedding_npz(
-                        sparse_dir,
-                        sharded_dynamic_arrays,
-                        dynamic_arrays,
-                        embedding_meta,
-                        set(dynamic_export[1]),
-                    )
-                elif dynamic_arrays:
-                    npz_util.savez_streaming(
-                        os.path.join(
-                            sparse_dir, "sparse_dynamic_embedding-00-of-01.npz"
-                        ),
-                        dynamic_arrays,
-                    )
-                if uploader is not None:
-                    uploader.close()
-                for name in (
-                    "sparse_embeddings-00-of-01.json",
-                    "sparse_embedding.json",
-                ):
-                    with open(os.path.join(sparse_dir, name), "w") as output:
-                        json.dump(embedding_meta, output, indent=4)
-                with open(
-                    os.path.join(sparse_dir, "sparse_features.json"), "w"
-                ) as output:
-                    json.dump(feature_meta, output, indent=4)
-
-                _write_export_metadata(
-                    pipeline_config,
-                    cast(List[BaseFeature], model.features),
-                    stage_dir,
-                    assets,
-                    additional_export_config,
-                    use_distributed_embedding=resolved_dist_emb,
-                    input_tile=resolved_input_tile,
-                    config_asset_dir=config_asset_dir or save_dir,
-                )
-        except BaseException:
-            if uploader is not None:
-                uploader.close(raise_on_error=False)
-            raise
-        logger.info("Completed distributed embedding export to %s", save_dir)
+    _write_export_metadata(
+        pipeline_config,
+        cast(List[BaseFeature], model.features),
+        save_dir,
+        assets,
+        additional_export_config,
+        config_asset_dir=config_asset_dir,
+    )
+    logger.info("Completed distributed embedding export to %s", save_dir)
 
 
 def _write_dynamic_npz_worker(
@@ -2362,10 +2297,6 @@ def create_dense_export_warmup_data(
     model: BaseModule,
     device: torch.device,
     data_input_path: Optional[str] = None,
-    input_tile: Optional[str] = None,
-    input_tile_3_online: Optional[bool] = None,
-    use_distributed_embedding: Optional[bool] = None,
-    world_size: int = 1,
 ) -> Dict[str, Any]:
     """Build one warm-up batch for CPU dense export.
 
@@ -2384,11 +2315,6 @@ def create_dense_export_warmup_data(
         device: device the batch is moved to.
         data_input_path: optional warm-up input override; when unset the
             training input is used with an export-isolated Kafka group.
-        input_tile: optional explicit ``INPUT_TILE`` override.
-        input_tile_3_online: optional explicit ``INPUT_TILE_3_ONLINE`` override.
-        use_distributed_embedding: optional explicit distributed-embedding
-            override.
-        world_size: explicit world_size passed to the warm-up dataloader.
 
     Returns:
         The warm-up batch as a model-input dict.
@@ -2402,28 +2328,13 @@ def create_dense_export_warmup_data(
     data_config = copy.deepcopy(pipeline_config.data_config)
     data_config.num_workers = 1
     features = cast(List[BaseFeature], model.features)
-    resolved_tile = acc_utils.get_input_tile() if input_tile is None else input_tile
-    resolved_online = (
-        acc_utils.is_input_tile_3_online()
-        if input_tile_3_online is None
-        else input_tile_3_online
-    )
-    resolved_dist = (
-        acc_utils.use_distributed_embedding()
-        if use_distributed_embedding is None
-        else use_distributed_embedding
-    )
-    dataloader = create_dataloader(
-        data_config,
-        features,
-        input_path,
-        mode=Mode.PREDICT,
-        world_size=world_size,
-        rank=0,
-        input_tile=resolved_tile,
-        input_tile_3_online=resolved_online,
-        use_distributed_embedding=resolved_dist,
-    )
+    with acc_utils.export_env_scope(world_size=1, rank=0):
+        dataloader = create_dataloader(
+            data_config,
+            features,
+            input_path,
+            mode=Mode.PREDICT,
+        )
     batch = next(iter(dataloader))
     batch = batch.to(device)
     for kjt in batch.sparse_features.values():
@@ -2678,9 +2589,6 @@ def export_dense_model_cpu(
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
     data_input_path: Optional[str] = None,
-    input_tile: Optional[str] = None,
-    input_tile_3_online: Optional[bool] = None,
-    use_distributed_embedding: Optional[bool] = None,
     **kwargs: Any,
 ) -> None:
     """Export only the dense model on CPU without DMP or GPU usage.
@@ -2701,9 +2609,6 @@ def export_dense_model_cpu(
         save_dir,
         torch.device("cpu"),
         data_input_path,
-        input_tile=input_tile,
-        input_tile_3_online=input_tile_3_online,
-        use_distributed_embedding=use_distributed_embedding,
     )
 
 
@@ -2714,22 +2619,13 @@ def _export_dense_model_on_device(
     save_dir: str,
     device: torch.device,
     data_input_path: Optional[str] = None,
-    input_tile: Optional[str] = None,
-    input_tile_3_online: Optional[bool] = None,
-    use_distributed_embedding: Optional[bool] = None,
 ) -> None:
     """Build and restore a dense graph on the device its configured kernels need."""
-    resolved_input_tile = (
-        acc_utils.get_input_tile() if input_tile is None else input_tile
-    )
     data = create_dense_export_warmup_data(
         pipeline_config,
         model,
         device,
         data_input_path,
-        input_tile=resolved_input_tile,
-        input_tile_3_online=input_tile_3_online,
-        use_distributed_embedding=use_distributed_embedding,
     )
     gm, full_graph, dense_graph_config = build_dense_graph_module(model, data, device)
     checkpoint_util.restore_model(

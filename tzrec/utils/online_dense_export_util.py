@@ -415,11 +415,11 @@ class OnlineDenseExportManager:
     def _build_export_graph(self, model: nn.Module) -> List[Tuple[str, str]]:
         """Build the resident dense export graph once, before training starts.
 
-        Runs inside a thread-local ``export_env_scope(input_tile="3")`` with
-        ``world_size=1`` passed explicitly to the warm-up dataloader: the
-        export-side model has user-side twin modules the training process never
-        builds, and INPUT_TILE is read at model construction and batch-parse
-        time without mutating ``os.environ``.
+        Runs inside ``export_env_scope(use_distributed_embedding=True,
+        input_tile="3", world_size=1, rank=0)``: the export-side model has
+        user-side twin modules the training process never builds, and
+        ``INPUT_TILE`` / ``WORLD_SIZE`` are read at model construction and
+        warm-up dataloader initialization without mutating ``os.environ``.
 
         Fails fast (before training) on any trace/script error via a dry-run
         finalize, and on any dense-graph state key with no gatherable source
@@ -439,7 +439,12 @@ class OnlineDenseExportManager:
         from tzrec.models.tdm import TDM
 
         device = torch.device("cpu")
-        with acc_utils.export_env_scope(use_distributed_embedding=True, input_tile="3"):
+        with acc_utils.export_env_scope(
+            use_distributed_embedding=True,
+            input_tile="3",
+            world_size=1,
+            rank=0,
+        ):
             pipeline_config = config_util.load_pipeline_config(
                 self._pipeline_config_path
             )
@@ -467,9 +472,6 @@ class OnlineDenseExportManager:
                 pipeline_config,
                 twin_model,
                 device,
-                input_tile="3",
-                use_distributed_embedding=True,
-                world_size=1,
             )
             gm, full_graph, dense_graph_config = build_dense_graph_module(
                 twin_model, warmup_data, device

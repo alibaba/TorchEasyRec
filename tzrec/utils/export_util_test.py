@@ -3523,23 +3523,20 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
         real_empty_like = torch.empty_like
         real_dense_export = export_util._export_dense_model_on_device
 
-        staged_dir: Dict[str, str] = {}
-
         def guarded_dense_export(*args, **kwargs):
-            stage_dir = str(kwargs["save_dir"] if "save_dir" in kwargs else args[3])
-            staged_dir["path"] = stage_dir
             self.assertTrue(
                 os.path.exists(
-                    os.path.join(stage_dir, "sparse", "sparse_embeddings-00-of-01.npz")
+                    os.path.join(
+                        self.export_dir, "sparse", "sparse_embeddings-00-of-01.npz"
+                    )
                 )
             )
-            self.assertFalse(os.path.exists(os.path.join(self.export_dir, "sparse")))
             uploader.start.assert_not_called()
             real_dense_export(*args, **kwargs)
 
         def start_upload(*args, **kwargs):
             self.assertTrue(
-                os.path.exists(os.path.join(staged_dir["path"], "scripted_model.pt"))
+                os.path.exists(os.path.join(self.export_dir, "scripted_model.pt"))
             )
 
         uploader.start.side_effect = start_upload
@@ -3632,9 +3629,16 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
 
         sparse_dir = os.path.join(self.export_dir, "sparse")
         if failure:
-            self.assertFalse(os.path.exists(sparse_dir))
-            self.assertEqual(glob.glob(f"{self.export_dir}.tmp.*"), [])
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz")
+                )
+            )
+            self.assertFalse(
+                os.path.exists(os.path.join(sparse_dir, "sparse_embedding.json"))
+            )
             uploader.close.assert_called_with(raise_on_error=False)
+            self.assertFalse(any(".part." in name for name in os.listdir(sparse_dir)))
             return
         if upload:
             uploader.close.assert_called_once_with()
@@ -4032,13 +4036,22 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
 
     def test_dynamicemb_auto_enables_distributed_embedding_in_export_model(self):
         dyn_model = self._build_model()
+        seen_scope = {}
+
+        def _capture_dist_scope(*args, **kwargs):
+            del args, kwargs
+            seen_scope["dist"] = acc_utils.use_distributed_embedding()
+            seen_scope["tile"] = acc_utils.get_input_tile()
+
         with (
             mock.patch.dict(
                 os.environ,
                 {"USE_DISTRIBUTED_EMBEDDING": "0", "INPUT_TILE": "0", "USE_RTP": "0"},
             ),
             mock.patch.object(
-                export_util, "export_distributed_embedding"
+                export_util,
+                "export_distributed_embedding",
+                side_effect=_capture_dist_scope,
             ) as dist_export,
             mock.patch.object(export_util, "export_model_normal") as normal_export,
         ):
@@ -4051,10 +4064,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             self.assertEqual(os.environ["USE_DISTRIBUTED_EMBEDDING"], "0")
             self.assertEqual(os.environ["INPUT_TILE"], "0")
             dist_export.assert_called_once()
-            self.assertIs(
-                dist_export.call_args.kwargs["use_distributed_embedding"], True
-            )
-            self.assertEqual(dist_export.call_args.kwargs["input_tile"], "3")
+            self.assertEqual(seen_scope, {"dist": True, "tile": "3"})
             normal_export.assert_not_called()
 
         static_config = copy.deepcopy(self.pipeline_config)
@@ -4106,7 +4116,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             normal_export.assert_not_called()
 
 
-class ExportStagingTest(unittest.TestCase):
+class ExportScopeAndRemoteCacheTest(unittest.TestCase):
     def setUp(self):
         self.test_dir = make_test_dir()
         self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
@@ -4116,6 +4126,7 @@ class ExportStagingTest(unittest.TestCase):
     def test_genrec_export_forces_input_tile_zero_and_rejects_explicit_tile(
         self,
     ) -> None:
+        from tzrec.models.genrec_model import BaseGenRecModel, GenRecFrontEnd
         from tzrec.protos import prompt_pb2
         from tzrec.protos.models import genrec_model_pb2
 
@@ -4154,12 +4165,38 @@ class ExportStagingTest(unittest.TestCase):
                     ):
                         export_util.ensure_input_tile_for_distributed_embedding(cfg)
 
-        with mock.patch.object(
-            export_util.acc_utils,
-            "export_acc_config",
-            side_effect=lambda **kw: {
-                "INPUT_TILE": export_util.acc_utils.get_input_tile()
-            },
+        class _CustomGenRecModel(BaseGenRecModel):
+            def __init__(self) -> None:
+                torch.nn.Module.__init__(self)
+
+        sub_genrec = _CustomGenRecModel()
+        frontend = object.__new__(GenRecFrontEnd)
+        torch.nn.Module.__init__(frontend)
+        frontend._features = create_features(
+            [
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="uid",
+                        expression="user:uid",
+                        num_buckets=8,
+                        embedding_dim=4,
+                    )
+                )
+            ]
+        )
+        wrapped_frontend = ScriptWrapper(frontend)
+        for mod in (sub_genrec, frontend, wrapped_frontend):
+            self.assertTrue(export_util._is_genrec_export(model=mod))
+
+        with (
+            acc_utils.export_env_scope(use_distributed_embedding=True, input_tile="0"),
+            mock.patch.object(
+                export_util.acc_utils,
+                "export_acc_config",
+                side_effect=lambda **kw: {
+                    "INPUT_TILE": export_util.acc_utils.get_input_tile()
+                },
+            ),
         ):
             export_dir = os.path.join(self.test_dir, "genrec_meta")
             os.makedirs(export_dir, exist_ok=True)
@@ -4169,11 +4206,142 @@ class ExportStagingTest(unittest.TestCase):
                 export_dir,
                 assets=None,
                 additional_export_config=None,
-                use_distributed_embedding=True,
-                input_tile="0",
             )
             with open(os.path.join(export_dir, "model_acc.json")) as f:
                 self.assertEqual(json.load(f)["INPUT_TILE"], "0")
+
+    def test_user_only_tower_disables_input_tile_under_distributed_embedding(
+        self,
+    ) -> None:
+        user_only_cfg = EasyRecConfig(
+            feature_configs=[
+                feature_pb2.FeatureConfig(
+                    id_feature=feature_pb2.IdFeature(
+                        feature_name="u_id",
+                        expression="user:u_id",
+                        num_buckets=8,
+                        embedding_dim=4,
+                    )
+                )
+            ]
+        )
+        user_feats = create_features(list(user_only_cfg.feature_configs))
+        with (
+            mock.patch.dict(os.environ, {"USE_DISTRIBUTED_EMBEDDING": "1"}, clear=True),
+            mock.patch.object(export_util.logger, "warning") as warn_log,
+        ):
+            use_dist, tile = export_util.ensure_input_tile_for_distributed_embedding(
+                user_only_cfg, features=user_feats
+            )
+            self.assertTrue(use_dist)
+            self.assertEqual(tile, "0")
+            warn_log.assert_not_called()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"USE_DISTRIBUTED_EMBEDDING": "1", "INPUT_TILE": "3"},
+                clear=True,
+            ),
+            mock.patch.object(export_util.logger, "warning") as warn_log,
+        ):
+            use_dist, tile = export_util.ensure_input_tile_for_distributed_embedding(
+                user_only_cfg, features=user_feats
+            )
+            self.assertTrue(use_dist)
+            self.assertEqual(tile, "0")
+            warn_log.assert_called_once()
+
+    def test_dataset_and_parser_snapshot_export_env_scope(self) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from tzrec.datasets.csv_dataset import CsvDataset
+        from tzrec.datasets.data_parser import DataParser
+        from tzrec.datasets.parquet_dataset import ParquetDataset
+        from tzrec.utils import dist_util
+
+        feat_cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="u_id",
+                    expression="user:u_id",
+                    num_buckets=8,
+                    embedding_dim=4,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="i_id",
+                    expression="item:i_id",
+                    num_buckets=8,
+                    embedding_dim=4,
+                )
+            ),
+        ]
+        features = create_features(feat_cfgs)
+        table = pa.table({"u_id": [1, 2], "i_id": [3, 4]})
+        parquet_path = os.path.join(self.test_dir, "sample.parquet")
+        pq.write_table(table, parquet_path)
+        csv_path = os.path.join(self.test_dir, "sample.csv")
+        with open(csv_path, "w") as f:
+            f.write("1,3\n2,4\n")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"WORLD_SIZE": "4", "RANK": "2", "INPUT_TILE": "0"},
+                clear=True,
+            ),
+            mock.patch("tzrec.utils.dist_util.dist.is_initialized", return_value=True),
+            acc_utils.export_env_scope(
+                use_distributed_embedding=True,
+                input_tile="3",
+                input_tile_3_online=True,
+                world_size=1,
+                rank=0,
+            ),
+        ):
+            self.assertIsNone(dist_util.get_dataset_process_group())
+            parser = DataParser(features)
+            self.assertTrue(parser._is_input_tile_enabled)
+            self.assertTrue(parser._is_input_tile_emb_enabled)
+            self.assertTrue(parser._is_input_tile_3_online_enabled)
+            self.assertTrue(parser._use_distributed_embedding_enabled)
+
+            pq_ds = ParquetDataset(
+                data_config=data_pb2.DataConfig(
+                    batch_size=2,
+                    dataset_type=data_pb2.DatasetType.ParquetDataset,
+                ),
+                features=features,
+                input_path=parquet_path,
+            )
+            self.assertEqual(pq_ds._reader._world_size, 1)
+            self.assertEqual(pq_ds._reader._rank, 0)
+            self.assertIsNone(pq_ds._reader._pg)
+            self.assertEqual(pq_ds.get_worker_info(), (0, 1, 1))
+
+            csv_ds = CsvDataset(
+                data_config=data_pb2.DataConfig(
+                    batch_size=2,
+                    dataset_type=data_pb2.DatasetType.CsvDataset,
+                    with_header=False,
+                    input_fields=[
+                        data_pb2.Field(
+                            input_name="u_id", input_type=data_pb2.FieldType.INT64
+                        ),
+                        data_pb2.Field(
+                            input_name="i_id", input_type=data_pb2.FieldType.INT64
+                        ),
+                    ],
+                ),
+                features=features,
+                input_path=csv_path,
+            )
+            self.assertEqual(csv_ds._reader._world_size, 1)
+            self.assertEqual(csv_ds._reader._rank, 0)
+            self.assertEqual(csv_ds.get_worker_info(), (0, 1, 1))
 
     def test_remote_local_cache_dir_preserves_siblings_and_cleans_subdir(
         self,
@@ -4187,6 +4355,23 @@ class ExportStagingTest(unittest.TestCase):
         with open(keep_nested, "w") as f:
             f.write("nested")
 
+        vocab_path = os.path.join(self.test_dir, "vocab.txt")
+        with open(vocab_path, "w") as f:
+            f.write("a\nb\n")
+        meta_cfg = EasyRecConfig()
+        meta_cfg.feature_configs.append(
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="f_vocab",
+                    expression="user:f_vocab",
+                    vocab_file=vocab_path,
+                    default_bucketize_value=0,
+                    embedding_dim=4,
+                )
+            )
+        )
+        meta_feats = create_features(list(meta_cfg.feature_configs))
+
         seen_local_dirs = []
         fake_fs = mock.Mock()
 
@@ -4196,8 +4381,20 @@ class ExportStagingTest(unittest.TestCase):
             seen_local_dirs.append(save_dir)
             self.assertTrue(os.path.basename(save_dir).startswith("tzrec_export_"))
             self.assertTrue(os.path.samefile(os.path.dirname(save_dir), cache_root))
-            with open(os.path.join(save_dir, "artifact.txt"), "w") as f:
-                f.write("ok")
+            export_util._write_export_metadata(
+                meta_cfg,
+                meta_feats,
+                save_dir,
+                assets=[],
+                additional_export_config=None,
+                config_asset_dir=kwargs.get("config_asset_dir"),
+            )
+            loaded_meta = config_util.load_pipeline_config(
+                os.path.join(save_dir, "pipeline.config")
+            )
+            self.assertEqual(
+                loaded_meta.feature_configs[0].id_feature.asset_dir, cache_root
+            )
 
         with (
             mock.patch.dict(
@@ -4232,59 +4429,79 @@ class ExportStagingTest(unittest.TestCase):
             self.assertTrue(os.path.exists(keep_file))
             self.assertTrue(os.path.exists(keep_nested))
 
-    def test_local_atomic_staging_cleans_up_on_failure_and_allows_retry(
+    def test_remote_rtp_staging_precleans_and_preserves_barrier_on_upload_error(
         self,
     ) -> None:
-        target_dir = os.path.join(self.test_dir, "staged_export")
-        with self.assertRaisesRegex(RuntimeError, "mid_export_fail"):
-            with export_util._staged_export_dir(target_dir, use_staging=True) as stage:
-                with open(os.path.join(stage, "partial.txt"), "w") as f:
-                    f.write("incomplete")
-                raise RuntimeError("mid_export_fail")
+        cache_root = os.path.join(self.test_dir, "rtp_cache")
+        os.makedirs(cache_root, exist_ok=True)
+        rtp_stage_dir = os.path.join(cache_root, f"tzrec_rtp_export_{os.getppid()}")
+        os.makedirs(rtp_stage_dir, exist_ok=True)
+        stale_file = os.path.join(rtp_stage_dir, "stale.safetensors")
+        with open(stale_file, "w") as f:
+            f.write("stale")
 
-        self.assertFalse(os.path.exists(target_dir))
-        self.assertEqual(glob.glob(f"{target_dir}.tmp.*"), [])
+        fake_fs = mock.Mock()
+        fake_fs.upload.side_effect = RuntimeError("oss timeout")
 
-        with export_util._staged_export_dir(target_dir, use_staging=True) as stage:
-            with open(os.path.join(stage, "final.txt"), "w") as f:
-                f.write("complete")
-        self.assertTrue(os.path.exists(os.path.join(target_dir, "final.txt")))
-        with self.assertRaisesRegex(RuntimeError, "already exists and is not empty"):
-            with export_util._staged_export_dir(target_dir, use_staging=True):
-                pass
+        def _fake_rtp_export(pipeline_config, model, checkpoint_path, save_dir, **_kw):
+            self.assertFalse(os.path.exists(stale_file))
+            self.assertEqual(save_dir, rtp_stage_dir)
 
-        staged_meta_dir = os.path.join(self.test_dir, "staged_meta")
-        vocab_path = os.path.join(self.test_dir, "vocab.txt")
-        with open(vocab_path, "w") as f:
-            f.write("a\nb\n")
-        meta_cfg = EasyRecConfig()
-        meta_cfg.feature_configs.append(
-            feature_pb2.FeatureConfig(
-                id_feature=feature_pb2.IdFeature(
-                    feature_name="f_vocab",
-                    expression="user:f_vocab",
-                    vocab_file=vocab_path,
-                    default_bucketize_value=0,
-                    embedding_dim=4,
-                )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "LOCAL_CACHE_DIR": cache_root,
+                    "USE_RTP": "1",
+                    "RANK": "1",
+                    "LOCAL_RANK": "0",
+                },
+            ),
+            mock.patch.object(
+                export_util, "url_to_fs", return_value=(fake_fs, "bucket/rtp")
+            ),
+            mock.patch.object(
+                export_util, "export_rtp_model", side_effect=_fake_rtp_export
+            ),
+            mock.patch.object(export_util.dist, "is_initialized", return_value=True),
+            mock.patch.object(export_util.dist, "barrier") as barrier,
+            self.assertRaisesRegex(RuntimeError, "oss timeout"),
+        ):
+            export_util.export_model(
+                EasyRecConfig(), mock.Mock(), "ckpt", "oss://bucket/rtp"
             )
-        )
-        meta_feats = create_features(list(meta_cfg.feature_configs))
-        with export_util._staged_export_dir(staged_meta_dir, use_staging=True) as stage:
-            export_util._write_export_metadata(
-                meta_cfg,
-                meta_feats,
-                stage,
-                assets=[],
-                additional_export_config=None,
-                config_asset_dir=staged_meta_dir,
+        # Upload happened on LOCAL_RANK=0 even with RANK=1, and all three barriers ran.
+        fake_fs.upload.assert_called_once()
+        self.assertEqual(barrier.call_count, 3)
+        self.assertFalse(os.path.exists(rtp_stage_dir))
+
+        # Non-zero local rank neither uploads nor removes node-shared rtp_stage_dir.
+        os.makedirs(rtp_stage_dir, exist_ok=True)
+        fake_fs.reset_mock()
+        fake_fs.upload.side_effect = None
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "LOCAL_CACHE_DIR": cache_root,
+                    "USE_RTP": "1",
+                    "RANK": "1",
+                    "LOCAL_RANK": "1",
+                },
+            ),
+            mock.patch.object(
+                export_util, "url_to_fs", return_value=(fake_fs, "bucket/rtp")
+            ),
+            mock.patch.object(export_util, "export_rtp_model"),
+            mock.patch.object(export_util.dist, "is_initialized", return_value=True),
+            mock.patch.object(export_util.dist, "barrier") as barrier,
+        ):
+            export_util.export_model(
+                EasyRecConfig(), mock.Mock(), "ckpt", "oss://bucket/rtp"
             )
-        loaded_meta = config_util.load_pipeline_config(
-            os.path.join(staged_meta_dir, "pipeline.config")
-        )
-        self.assertEqual(
-            loaded_meta.feature_configs[0].id_feature.asset_dir, staged_meta_dir
-        )
+        fake_fs.upload.assert_not_called()
+        self.assertEqual(barrier.call_count, 3)
+        self.assertTrue(os.path.exists(rtp_stage_dir))
 
 
 if __name__ == "__main__":

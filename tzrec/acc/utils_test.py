@@ -75,6 +75,8 @@ class AccUtilsTest(unittest.TestCase):
                 "USE_DISTRIBUTED_EMBEDDING": "0",
                 "INPUT_TILE": "0",
                 "INPUT_TILE_3_ONLINE": "0",
+                "WORLD_SIZE": "4",
+                "RANK": "2",
             },
             clear=True,
         ):
@@ -83,19 +85,39 @@ class AccUtilsTest(unittest.TestCase):
                     use_distributed_embedding=True,
                     input_tile="3",
                     input_tile_3_online=True,
+                    world_size=1,
+                    rank=0,
                 ):
                     self.assertTrue(utils.use_distributed_embedding())
                     self.assertEqual(utils.get_input_tile(), "3")
                     self.assertTrue(utils.is_input_tile())
                     self.assertTrue(utils.is_input_tile_3_online())
+                    self.assertEqual(utils.get_world_size(), 1)
+                    self.assertEqual(utils.get_rank(), 0)
+                    # Nested scope with None inherits outer scope; explicit
+                    # False overrides outer True without touching os.environ.
+                    with utils.export_env_scope(
+                        use_distributed_embedding=False,
+                        input_tile=None,
+                    ):
+                        self.assertFalse(utils.use_distributed_embedding())
+                        self.assertEqual(utils.get_input_tile(), "3")
+                        self.assertTrue(utils.is_input_tile_3_online())
+                        self.assertEqual(utils.get_world_size(), 1)
+                        self.assertEqual(utils.get_rank(), 0)
+                    self.assertTrue(utils.use_distributed_embedding())
                     raise RuntimeError("boom")
 
             self.assertFalse(utils.use_distributed_embedding())
             self.assertEqual(utils.get_input_tile(), "0")
             self.assertFalse(utils.is_input_tile_3_online())
+            self.assertEqual(utils.get_world_size(), 4)
+            self.assertEqual(utils.get_rank(), 2)
             self.assertEqual(os.environ["USE_DISTRIBUTED_EMBEDDING"], "0")
             self.assertEqual(os.environ["INPUT_TILE"], "0")
             self.assertEqual(os.environ["INPUT_TILE_3_ONLINE"], "0")
+            self.assertEqual(os.environ["WORLD_SIZE"], "4")
+            self.assertEqual(os.environ["RANK"], "2")
 
     def test_export_acc_config_records_input_tile_3_online(self) -> None:
         with mock.patch.dict(os.environ, {"INPUT_TILE_3_ONLINE": "1"}, clear=True):
@@ -104,6 +126,10 @@ class AccUtilsTest(unittest.TestCase):
             self.assertEqual(utils.export_acc_config()["INPUT_TILE_3_ONLINE"], "0")
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertNotIn("INPUT_TILE_3_ONLINE", utils.export_acc_config())
+            with utils.export_env_scope(input_tile_3_online=True):
+                self.assertEqual(utils.export_acc_config()["INPUT_TILE_3_ONLINE"], "1")
+            with utils.export_env_scope(input_tile_3_online=False):
+                self.assertEqual(utils.export_acc_config()["INPUT_TILE_3_ONLINE"], "0")
 
         test_dir = make_test_dir()
         try:

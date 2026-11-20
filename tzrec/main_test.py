@@ -1505,6 +1505,56 @@ class OnlineLearningHandoverTest(unittest.TestCase):
                 batch_size=2,
             )
 
+    def test_predict_clears_stale_model_acc_json_before_remote_download(self) -> None:
+        import json
+
+        from google.protobuf import text_format
+
+        cache_dir = os.path.join(self.test_dir, "local_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        stale_acc = os.path.join(cache_dir, "model_acc.json")
+        with open(stale_acc, "w") as f:
+            json.dump({"INPUT_TILE_3_ONLINE": "1"}, f)
+
+        fake_fs = mock.Mock()
+
+        def _fake_download(src: str, dst: str, recursive: bool = True) -> None:
+            del src, recursive
+            self.assertFalse(os.path.exists(stale_acc))
+            cfg = EasyRecConfig()
+            cfg.data_config.batch_size = 4
+            with open(os.path.join(dst, "pipeline.config"), "w") as out:
+                out.write(text_format.MessageToString(cfg))
+            with open(os.path.join(dst, "model_acc.json"), "w") as out:
+                json.dump({"SPARSE_INT64": "1"}, out)
+
+        fake_fs.download.side_effect = _fake_download
+        with (
+            mock.patch.dict(
+                os.environ, {"LOCAL_CACHE_DIR": cache_dir, "LOCAL_RANK": "0"}
+            ),
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.url_to_fs", return_value=(fake_fs, "bucket/model")),
+            mock.patch("tzrec.main.dist.barrier"),
+            mock.patch("tzrec.main.acc_utils.allow_tf32_for_export"),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch(
+                "tzrec.main.create_dataloader",
+                side_effect=RuntimeError("stop_after_acc"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "stop_after_acc"),
+        ):
+            predict(
+                predict_input_path="unused",
+                predict_output_path="unused",
+                scripted_model_path="oss://bucket/model",
+                batch_size=4,
+            )
+        fake_fs.download.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1338,6 +1338,7 @@ def export(
         features = _create_features(list(pipeline_config.feature_configs), data_config)
         compiled_prompt = _compile_prompt(pipeline_config, features)
 
+    # Re-read raw env INPUT_TILE so auto-resolved tile does not trigger explicit checks.
     use_dist_emb, model_input_tile = ensure_input_tile_for_distributed_embedding(
         pipeline_config,
         features=features,
@@ -1345,6 +1346,7 @@ def export(
         input_tile=os.environ.get("INPUT_TILE"),
     )
     is_match_cfg = pipeline_config.model_config.WhichOneof("model") == "match_model"
+    # Build unexported MatchModel untiled; each wrapped tower resolves its own tile.
     create_input_tile = "0" if is_match_cfg else model_input_tile
 
     with acc_utils.export_env_scope(
@@ -1581,6 +1583,11 @@ def predict(
         # scripted model use io in cpp, so that we can not path to fsspec
         local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
         if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            # Clear stale cached model_acc.json before download so an older model's
+            # flags cannot poison the newly fetched export.
+            acc_json_cache = os.path.join(local_path, "model_acc.json")
+            if os.path.exists(acc_json_cache):
+                os.remove(acc_json_cache)
             logger.info(f"downloading {scripted_model_path} to {local_path}.")
             fs.download(
                 scripted_model_path.rstrip("/") + "/", local_path, recursive=True

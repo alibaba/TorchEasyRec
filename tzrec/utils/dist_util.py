@@ -51,6 +51,7 @@ from torchrec.distributed.types import (
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from tzrec.acc import utils as acc_utils
 from tzrec.utils.logging_util import logger
 
 _DATASET_PROCESS_GROUPS: Dict[Tuple[dist.ProcessGroup, int], dist.ProcessGroup] = {}
@@ -98,7 +99,7 @@ def get_dataset_process_group(
         A Gloo group, or None for local reading without collectives.
     """
     if world_size is None:
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        world_size = acc_utils.get_world_size()
     if world_size <= 1 or not dist.is_initialized():
         return None
     key = (cast(dist.ProcessGroup, dist.group.WORLD), world_size)

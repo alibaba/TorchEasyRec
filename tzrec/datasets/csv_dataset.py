@@ -99,8 +99,6 @@ class CsvDataset(BaseDataset):
             column_types=column_types,
             sample_cost_field=self._data_config.sample_cost_field,
             batch_cost_size=self._data_config.batch_cost_size,
-            world_size=self._world_size,
-            rank=self._rank,
         )
 
 
