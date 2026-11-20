@@ -958,7 +958,7 @@ def _rewrite_dense_serving_graph(
 
     graph.output(dict(zip(output_keys, output_values)))
     gm = torch.fx.GraphModule(root, graph)
-    _eliminate_dense_dead_code(gm.graph)
+    eliminate_dense_dead_code(gm.graph)
     gm = _prune_unused_param_and_buffer(gm)
 
     init_parameters(gm, device)
@@ -1028,9 +1028,6 @@ def _add_module_by_dotted_path(
             parent.add_module(p, nn.Module())  # create empty container
         parent = getattr(parent, p)
     parent.add_module(parts[-1], module)
-
-
-_eliminate_dense_dead_code = eliminate_dense_dead_code
 
 
 def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -1595,7 +1592,7 @@ def export_rtp_model(
                 raise RuntimeError(f"{node.target} op is not supported by rtp")
     graph.output(tuple(output_values))
     gm = torch.fx.GraphModule(unwrap_model, graph)
-    _eliminate_dense_dead_code(gm.graph)
+    eliminate_dense_dead_code(gm.graph)
     gm = _prune_unused_param_and_buffer(gm)
     init_parameters(gm, device)
     gm.to(device)
@@ -1798,7 +1795,7 @@ def split_model(
 
             node_t.replace_all_uses_with(get_node)
     dense_gm = torch.fx.GraphModule(model, graph)
-    _eliminate_dense_dead_code(dense_gm.graph)
+    eliminate_dense_dead_code(dense_gm.graph)
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
     seq_share_groups = _compute_seq_share_groups(

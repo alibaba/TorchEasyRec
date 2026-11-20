@@ -48,7 +48,7 @@ torchrun --master_addr=localhost --master_port=32555 \
   - **INPUT_TILE=3**：user侧fg和embedding计算仅一次，适用于user侧特征比较多的情况
 - HARD_SEARCH_INPUT_TILE：复用同一请求中候选 key 相同的 hard-search 历史，减少重复的 FG 和 embedding 计算，默认关闭。
   - **HARD_SEARCH_INPUT_TILE=0**：每个候选分别进行历史侧的 FG 和 embedding 计算。
-  - **HARD_SEARCH_INPUT_TILE=1**：相同候选 key 共享历史侧计算，attention 仍按各自候选计算。**当前仅支持 Python `tzrec.predict` 离线预测，`TorchRecProcessor` 在线推理启动时会直接拒绝加载开启 `HARD_SEARCH_INPUT_TILE=1` 的模型。**
+  - **HARD_SEARCH_INPUT_TILE=1**：相同候选 key 共享历史侧计算，attention 仍按各自候选计算。
   - 当前仅支持在 `INPUT_TILE=2/3` 下开启，具体用法和限制见 [hard-search](#hard-search)。
 - INPUT_TILE_3_ONLINE: 配合INPUT_TILE=3使用，对User侧序列特征使用在线推理模式，序列特征在线模型服务中推理性能更好，离线预测仅支持 `batch_size=1`（`tzrec.predict` 在 `batch_size > 1` 时会直接报错）
   - **INPUT_TILE_3_ONLINE=1**：启用序列特征的在线推理模式
@@ -64,7 +64,7 @@ torchrun --master_addr=localhost --master_port=32555 \
 - ENABLE_AOT: 使用AOT(Ahead Of Time)编译优化导出的模型，可显著提升推理性能。**AOT 编译产物与导出机器的 GPU 架构强绑定，在线服务的 GPU 类型必须与导出时使用的 GPU 类型完全一致**，详见下文 [在 PAI 上导出 AOT 模型](#export-aot-on-pai) 章节
   - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（sparse 部分用 JIT，dense 部分用 AOTI）
   - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]；支持 `INPUT_TILE`、`HARD_SEARCH_INPUT_TILE` 和空序列特征（`JAGGED_SEQUENCE` 特征组在预测时仍要求每个 batch 的序列总长度至少为 1）
-- TORCHINDUCTOR_CACHE_DIR: 指定 TorchInductor 与 Triton 编译缓存目录。开启 `ENABLE_AOT` 时，建议挂载容器本地持久化路径以复用已编译算子内核，显著缩短重编译耗时；导出流程会在该目录下通过跨进程文件锁串行化编译与 `.pt2` 打包，避免同构并发导出互相覆盖 `.so` 缓存
+- TORCHINDUCTOR_CACHE_DIR: 指定 TorchInductor 与 Triton 编译缓存目录。开启 `ENABLE_AOT` 时，建议挂载容器本地持久化路径以复用已编译算子内核，显著缩短重编译耗时
 - AOTI_PORTABLE_CPU / AOTI_CPU_MARCH: 可选配置。默认情况下 AOTI C++ 包装库使用 `-march=native` 编译，若导出机 CPU 具备高阶指令集（如 `AMX_TILE` / `AVX-512`）而线上推理节点 CPU 机型异构，可能引发 `SIGILL` 非法指令崩溃；跨机型部署时可设置 **AOTI_PORTABLE_CPU=1**（x86_64 默认采用 `core-avx2` 与 256-bit SIMD，避开 `AVX-512`/`AMX_TILE`），或通过 **AOTI_CPU_MARCH**（如 `core-avx2`、`x86-64`）及可选 **AOTI_CPU_SIMDLEN** 显式指定目标指令集
 
 (dynamic-embedding-full-export)=
@@ -313,6 +313,5 @@ export HARD_SEARCH_INPUT_TILE=1
 
 ### 使用限制
 
-- **适用范围：`HARD_SEARCH_INPUT_TILE=1` 当前仅支持 Python `tzrec.predict` 离线预测；`TorchRecProcessor` 暂不支持该特性，会在服务启动阶段直接报错拒绝。**
 - 当前支持 FX/TorchScript、统一 AOT（ENABLE_AOT=2）和 distributed embedding，不支持 ENABLE_AOT=1、TRT、RTP、HSTU。
 - 历史派生特征只能依赖同一份 hard-search 历史及共享用户输入或常量。若还依赖候选自身的 `item:` / `context:` 字段，或另一组历史，不能开启 `HARD_SEARCH_INPUT_TILE`。

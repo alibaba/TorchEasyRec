@@ -9,12 +9,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import shutil
 import unittest
+from typing import Dict, Tuple
 from unittest import mock
 
-import filelock
 import torch
 from parameterized import parameterized
 from torch import nn
@@ -24,7 +25,6 @@ from tzrec.acc import aot_utils
 from tzrec.acc.aot_utils import (
     _aoti_compile_cfg,
     _build_dynamic_shapes,
-    _compile_and_package_aoti,
     _pad_empty_sparse_values,
     export_model_aot,
     export_unified_model_aot,
@@ -822,7 +822,7 @@ class AotUtilsTest(unittest.TestCase):
                         fn(save_dir)
                     self.assertFalse(os.path.exists(save_dir))
 
-    def test_aoti_compile_cfg_portable_cpu_and_cache_lock(self) -> None:
+    def test_aoti_compile_cfg_portable_cpu(self) -> None:
         with mock.patch.dict(os.environ, {"AOTI_PORTABLE_CPU": "1"}, clear=True):
             cfg = _aoti_compile_cfg()
             self.assertIn("cpp.march", cfg)
@@ -836,49 +836,6 @@ class AotUtilsTest(unittest.TestCase):
             cfg = _aoti_compile_cfg()
             self.assertEqual(cfg["cpp.march"], "x86-64-v3")
             self.assertEqual(cfg["cpp.simdlen"], 128)
-
-        cache_dir = os.path.join(self.test_dir, "inductor_cache")
-        save_dir = os.path.join(self.test_dir, "lock_export")
-        events = []
-
-        class _RecordingLock:
-            def __init__(self, path: str) -> None:
-                self._path = path
-
-            def __enter__(self):
-                events.append(("enter", self._path))
-                return self
-
-            def __exit__(self, *args):
-                events.append(("exit", self._path))
-
-        def _fake_compile_and_package(exported_pg, *, package_path):
-            events.append(("compile", package_path))
-            return package_path
-
-        dummy_ep = mock.Mock()
-        dummy_ep.range_constraints = {}
-        with (
-            mock.patch.dict(os.environ, {"TORCHINDUCTOR_CACHE_DIR": cache_dir}),
-            mock.patch.object(filelock, "FileLock", side_effect=_RecordingLock),
-            mock.patch.object(
-                torch._inductor,
-                "aoti_compile_and_package",
-                side_effect=_fake_compile_and_package,
-            ),
-        ):
-            _compile_and_package_aoti(dummy_ep, save_dir)
-
-        expected_lock = os.path.join(cache_dir, ".tzrec_aoti_package.lock")
-        expected_pkg = os.path.join(save_dir, "aoti", "aoti_model.pt2")
-        self.assertEqual(
-            events,
-            [
-                ("enter", expected_lock),
-                ("compile", expected_pkg),
-                ("exit", expected_lock),
-            ],
-        )
 
     def test_build_dynamic_shapes_warns_static_and_tracks_non_seq_hsk(self) -> None:
         id_cfg = feature_pb2.FeatureConfig(
@@ -978,6 +935,46 @@ class AotUtilsTest(unittest.TestCase):
         }
         out = loaded(cold_in, torch.device("cuda:0"))
         self.assertEqual(float(out["out"].item()), 0.0)
+
+    @mark_ci_scope("gpu")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_export_model_aot_padded_sequence_empty_and_single_len(self) -> None:
+        class _PaddedSparseStage(nn.Module):
+            def forward(
+                self,
+                data: Dict[str, torch.Tensor],
+                device: torch.device,
+            ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+                out = {"seq": data["seq"].to(device)}
+                return out, out
+
+        class _PaddedDenseStage(nn.Module):
+            def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+                activation = (data["seq"] * 2 + 1).relu()
+                return {"activation": activation, "pooled": activation.sum(dim=1)}
+
+        sparse_model = _PaddedSparseStage()
+        dense_model = _PaddedDenseStage().cuda()
+        sample_data = {"seq": torch.randn(3, 5, 1)}
+        save_dir = os.path.join(self.test_dir, "padded_two_stage")
+        export_model_aot(
+            sparse_model,
+            dense_model,
+            sample_data,
+            {"seq_tensor_names": ["seq"]},
+            save_dir,
+        )
+        with open(os.path.join(save_dir, "model_acc.json"), "w") as f:
+            json.dump({"ENABLE_AOT": "1"}, f)
+
+        device = torch.device("cuda:0")
+        loaded = load_model_aot(save_dir, device)
+        for seq_len in (0, 1, 5):
+            test_in = {"seq": torch.randn(3, seq_len, 1, device=device)}
+            expected = dense_model(test_in)
+            actual = loaded(test_in, device)
+            for key in ("activation", "pooled"):
+                torch.testing.assert_close(actual[key], expected[key])
 
 
 if __name__ == "__main__":

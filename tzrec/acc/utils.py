@@ -267,31 +267,14 @@ def is_unified_aot_predict(model_path: str) -> bool:
 
 
 def is_aot_predict(model_path: str) -> bool:
-    """Judge whether the exported model uses AOTI in predict (ENABLE_AOT={1,2}).
-
-    Reads ``ENABLE_AOT`` (or legacy ``UNIFIED_AOT``) from model_acc.json,
-    falling back to file presence (``aoti/aoti_model.pt2`` without
-    ``scripted_model.pt``) when model_acc.json is missing or omits both keys.
-
-    Args:
-        model_path: exported model directory.
-
-    Returns:
-        True when prediction should load an AOTInductor package.
-    """
-    acc_json_path = os.path.join(model_path, "model_acc.json")
-    if os.path.exists(acc_json_path):
-        with open(acc_json_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-        enable_aot = data.get("ENABLE_AOT")
-        if enable_aot is not None:
-            return str(enable_aot)[:1] in ("1", "2")
-        legacy = data.get("UNIFIED_AOT")
-        if legacy is not None:
-            return str(legacy)[:1] == "1"
-    return os.path.exists(
-        os.path.join(model_path, "aoti", "aoti_model.pt2")
-    ) and not os.path.exists(os.path.join(model_path, "scripted_model.pt"))
+    """Judge is aot or not in predict (ENABLE_AOT={1,2})."""
+    with open(model_path + "/model_acc.json", "r", encoding="utf-8") as file:
+        data = json.load(file)
+    enable_aot = data.get("ENABLE_AOT")
+    if enable_aot and str(enable_aot)[:1] in ("1", "2"):
+        return True
+    legacy = data.get("UNIFIED_AOT")
+    return bool(legacy) and str(legacy)[:1] == "1"
 
 
 def is_trt() -> bool:

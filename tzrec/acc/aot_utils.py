@@ -10,14 +10,12 @@
 # limitations under the License.
 
 
-import contextlib
 import json
 import operator
 import os
 import platform
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
-import filelock
 import torch
 
 # Populate torch._inductor.codecache so torch.export.pt2_archive._package._load_aoti
@@ -80,49 +78,11 @@ def _aoti_compile_cfg() -> Dict[str, Any]:
     return cfg
 
 
-@contextlib.contextmanager
-def _aoti_cache_lock() -> Iterator[None]:
-    """Serialize AOTI compile and zip packaging sharing TORCHINDUCTOR_CACHE_DIR."""
-    cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
-    if not cache_dir:
-        yield
-        return
-    os.makedirs(cache_dir, exist_ok=True)
-    lock_path = os.path.join(cache_dir, ".tzrec_aoti_package.lock")
-    with filelock.FileLock(lock_path):
-        yield
-
-
-def _sync_range_constraints(exported_pg: torch.export.ExportedProgram) -> None:
-    """Copy ExportedProgram range constraints onto placeholder shape_env."""
-    constraints = exported_pg.range_constraints
-    if not constraints:
-        return
-    seen_envs: Set[int] = set()
-    for node in exported_pg.graph.nodes:
-        if node.op != "placeholder":
-            continue
-        val = node.meta.get("val")
-        fake_mode = getattr(val, "fake_mode", None)
-        shape_env = getattr(fake_mode, "shape_env", None)
-        if shape_env is None or id(shape_env) in seen_envs:
-            continue
-        seen_envs.add(id(shape_env))
-        shape_env.var_to_range.update(constraints)
-
-
 def _compile_and_package_aoti(
     exported_pg: torch.export.ExportedProgram, save_dir: str
 ) -> str:
-    """Sync tight range constraints and package an AOTInductor .pt2 archive."""
-    _sync_range_constraints(exported_pg)
-    # Keep backed_size_oblivious active during aot_export_module so PyTorch
-    # guards like is_contiguous(numel < 2) do not tighten [0/1, ...] bounds to >= 2.
-    with (
-        torch._inductor.config.patch(_aoti_compile_cfg()),
-        torch.fx.experimental._config.patch(backed_size_oblivious=True),
-        _aoti_cache_lock(),
-    ):
+    """Compile and package an ExportedProgram into an AOTInductor .pt2 archive."""
+    with torch._inductor.config.patch(_aoti_compile_cfg()):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
         package_path = os.path.join(aoti_dir, "aoti_model.pt2")
