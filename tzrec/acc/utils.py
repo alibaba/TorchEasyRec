@@ -201,10 +201,14 @@ def is_hard_search_input_tile() -> bool:
         return False
     if not is_input_tile():
         raise ValueError("HARD_SEARCH_INPUT_TILE=1 requires INPUT_TILE=2 or 3.")
-    if is_trt() or (is_aot() and not is_unified_aot()) or env_util.use_rtp():
+    if (
+        is_trt()
+        or (is_aot() and not (is_unified_aot() or use_distributed_embedding()))
+        or env_util.use_rtp()
+    ):
         raise ValueError(
-            "HARD_SEARCH_INPUT_TILE only supports FX/TorchScript or unified AOT "
-            "(ENABLE_AOT=2) export."
+            "HARD_SEARCH_INPUT_TILE only supports FX/TorchScript, unified AOT "
+            "(ENABLE_AOT=2), or distributed AOT export."
         )
     return True
 
@@ -212,8 +216,10 @@ def is_hard_search_input_tile() -> bool:
 def is_aot() -> bool:
     """Judge is inductor or not.
 
-    ENABLE_AOT=1: legacy two-stage export (sparse JIT + dense AOTI).
-    ENABLE_AOT=2: unified AOTI export (fused sparse+dense single .pt2).
+    ENABLE_AOT=1: legacy two-stage export (sparse JIT + dense AOTI); under
+    USE_DISTRIBUTED_EMBEDDING=1 it behaves as single-stage dense AOTI export.
+    ENABLE_AOT=2: unified AOTI export (fused sparse+dense single .pt2), or
+    single-stage dense AOTI export under USE_DISTRIBUTED_EMBEDDING=1.
     Legacy ``UNIFIED_AOT=1`` is honored as an alias of ``ENABLE_AOT=2``.
     """
     val = os.environ.get("ENABLE_AOT")
@@ -224,8 +230,11 @@ def is_aot() -> bool:
 
 
 def is_unified_aot() -> bool:
-    """Judge whether to use the unified AOTI export (ENABLE_AOT=2).
+    """Judge whether single-stage .pt2 AOTI export is requested (ENABLE_AOT=2).
 
+    Includes distributed embedding single-stage dense AOTI when
+    ``USE_DISTRIBUTED_EMBEDDING=1`` is set (callers dispatch distributed
+    exports via ``use_distributed_embedding()`` first).
     Legacy ``UNIFIED_AOT=1`` is honored as an alias of ``ENABLE_AOT=2``.
     """
     val = os.environ.get("ENABLE_AOT")
@@ -236,14 +245,16 @@ def is_unified_aot() -> bool:
 
 
 def is_unified_aot_predict(model_path: str) -> bool:
-    """Judge whether the exported model uses unified AOTI in predict.
+    """Judge whether the exported model uses single-stage .pt2 AOTI in predict.
 
-    Reads ``ENABLE_AOT`` from model_acc.json (=2 -> unified). Falls back
-    to the legacy ``UNIFIED_AOT`` key for pre-fold exports, then to
-    file presence (legacy two-stage exports produce
-    scripted_sparse_model.pt; unified exports do not) when neither
-    JSON key is present -- keeps unit tests that bypass the full export
-    pipeline working.
+    Reads ``ENABLE_AOT`` from model_acc.json (=2 -> single-stage ``.pt2``,
+    including both unified AOTI and distributed embedding dense AOTI, which
+    predict callers filter via ``is_distributed_embedding_predict()`` before
+    ``load_model_aot()``). Falls back to the legacy ``UNIFIED_AOT`` key for
+    pre-fold exports, then to file presence (legacy two-stage exports produce
+    scripted_sparse_model.pt; single-stage exports do not) when neither JSON
+    key is present -- keeps unit tests that bypass the full export pipeline
+    working.
     """
     acc_json_path = os.path.join(model_path, "model_acc.json")
     if os.path.exists(acc_json_path):
@@ -489,10 +500,9 @@ def export_acc_config(
         ]
     if "MAX_EXPORT_BATCH_SIZE" in os.environ:
         acc_config["MAX_EXPORT_BATCH_SIZE"] = os.environ["MAX_EXPORT_BATCH_SIZE"]
-    # Normalize ENABLE_AOT -- write "2" whenever the resolved mode is unified
-    # (whether via the new env or the legacy UNIFIED_AOT=1).
+    # Write "2" for single-stage .pt2 exports (unified or distributed dense).
     if is_aot():
-        acc_config["ENABLE_AOT"] = "2" if is_unified_aot() else "1"
+        acc_config["ENABLE_AOT"] = "2" if is_unified_aot() or dist_emb else "1"
     if additional_export_config:
         acc_config.update(additional_export_config)
     if dist_emb:

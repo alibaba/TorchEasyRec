@@ -18,6 +18,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyfg
 import torch
+from torch.fx._symbolic_trace import is_fx_symbolic_tracing
 from torchrec import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.modules.embedding_configs import PoolingType
 
@@ -92,11 +93,15 @@ def _infer_tile_size(item_t: torch.Tensor, user_t: torch.Tensor) -> int:
     """Infer the tile factor from candidate and user batch dimensions."""
     item_bs = item_t.size(0)
     user_bs = user_t.size(0)
-    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        tile_size = item_bs // user_bs
-        torch._check(tile_size >= 1)
-        torch._check(user_bs * tile_size == item_bs)
-        return tile_size
+    if not torch.jit.is_scripting():
+        if torch.compiler.is_compiling():
+            torch._check(user_bs >= 1)
+            tile_size = item_bs // user_bs
+            torch._check(tile_size >= 1)
+            torch._check(user_bs * tile_size == item_bs)
+            return tile_size
+        if is_fx_symbolic_tracing():
+            return item_bs // user_bs
     if user_bs <= 0 or item_bs < user_bs or item_bs % user_bs != 0:
         raise ValueError(
             f"Invalid input-tile batch dims: item_bs={item_bs}, user_bs={user_bs}."
@@ -112,7 +117,7 @@ def _pad_hard_search_input_tile_lengths(
     if not torch.jit.is_scripting():
         if torch.compiler.is_compiling():
             torch._check(indices.numel() >= lengths.numel())
-        elif indices.numel() < lengths.numel():
+        elif not is_fx_symbolic_tracing() and indices.numel() < lengths.numel():
             raise ValueError(
                 f"inverse_indices length ({indices.numel()}) must be >= "
                 f"compact feature lengths ({lengths.numel()})."
