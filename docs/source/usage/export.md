@@ -57,8 +57,8 @@ torchrun --master_addr=localhost --master_port=32555 \
   - 普通 sparse、ZCH 和原生 dynemb 模型使用统一导出流程；`dynamic_embedding` 仅调整 dynemb 读取和上传参数
   - 配置了 zch 的特征会自动转换为动态表导出，详见 [零冲突Hash Embedding](../feature/zch.md) 的分布式 Embedding 导出章节
   - 未开启 `ENABLE_AOT` 时，PYTORCH dense 图使用 CPU 导出 `scripted_model.pt`，TRITON/CUTLASS dense 图需要 CUDA；导出目录保留 full/dense graph 调试文件，不再生成 `graph/gm_sparse.graph`
-  - 搭配 **ENABLE_AOT=2**（或兼容写法 **ENABLE_AOT=1**）时，使用 CUDA 导出单阶段 AOTInductor dense 模型包 `aoti/aoti_model.pt2`（不再生成 `scripted_model.pt` 与 `scripted_sparse_model.pt`），并在 `model_acc.json` 中统一记录 `"ENABLE_AOT": "2"`、`"DISTRIBUTED_EMBEDDING": "1"`、`"INPUT_TILE": "3"`；可同时搭配 `DIST_QUANT=INT8` 及 `export_config.mixed_precision`（如 `"BF16"` / `"FP16"`），导出机器需设置 `CUDA_HOME`（含 `nvcc`）且 GPU SM 架构必须与推理服务完全一致
-  - 导出的模型可用 `tzrec.predict` 离线预测，详见 [离线预测](./predict.md#predict-distributed-embedding)
+  - 搭配 **ENABLE_AOT=2**（或兼容写法 **ENABLE_AOT=1**）时，使用 CUDA 导出单阶段 AOTInductor dense 模型包 `aoti/aoti_model.pt2`（不再生成 `scripted_model.pt` 与 `scripted_sparse_model.pt`），并在 `model_acc.json` 中记录 `"ENABLE_AOT": "2"`、`"DISTRIBUTED_EMBEDDING": "1"` 及解析后的 `"INPUT_TILE"`（通常为 `"3"`；GenRec 与纯 user 塔为 `"0"`，见上）；可同时搭配 `DIST_QUANT=INT8` 及 `export_config.mixed_precision`（如 `"BF16"` / `"FP16"`），导出机器需设置 `CUDA_HOME`（含 `nvcc`）且 GPU SM 架构必须与推理服务完全一致
+  - 未开启 `ENABLE_AOT` 时导出的模型可用 `tzrec.predict` 离线预测，详见 [离线预测](./predict.md#predict-distributed-embedding)；搭配 `ENABLE_AOT=2`/`1` 导出的 `aoti/aoti_model.pt2` 当前面向在线推理服务，离线预测支持将在后续版本补齐
 - DIST_QUANT: 分布式 embedding 导出模式下的 sparse embedding 参数量化开关，默认关闭；当前仅支持 INT8，与普通导出的 `QUANT_EMB` / `QUANT_EC_EMB` 不同
   - **USE_DISTRIBUTED_EMBEDDING=1 DIST_QUANT=INT8**：启用分布式 sparse embedding INT8 量化
   - 未设置 **DIST_QUANT** 时，不启用分布式 sparse embedding 量化

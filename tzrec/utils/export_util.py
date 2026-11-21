@@ -64,7 +64,6 @@ from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
 from tzrec.datasets.data_parser import (
     _infer_tile_size,
     _tile_size,
-    classify_raw_batch_dim_key,
 )
 from tzrec.datasets.dataset import (
     create_dataloader,
@@ -862,12 +861,7 @@ def _classify_serving_batch_node(
     feat_by_name: Dict[str, BaseFeature],
     hsk_feats: Set[str],
 ) -> Optional[str]:
-    """Classify a serving placeholder key as 'item', 'user', or None.
-
-    Handles rewritten distributed embedding keys directly and delegates raw
-    feature / ``__inverse_indices`` keys to ``classify_raw_batch_dim_key`` so
-    graph surgery and ``DataParser._resolve_tile_size`` share one contract.
-    """
+    """Classify a serving placeholder key as 'item', 'user', or None."""
     if key.endswith("__ebc") or key.endswith("__mc_ebc"):
         return "item"
     if acc_utils.is_input_tile_user_keyed_tensor(key):
@@ -880,9 +874,32 @@ def _classify_serving_batch_node(
         if feat is not None and feat.is_user_feat:
             return "user"
         return "item"
-    return classify_raw_batch_dim_key(
-        key, feat_by_name, hsk_feats, use_distributed_embedding=True
-    )
+    if key.endswith("__inverse_indices"):
+        seq_name = key[: -len("__inverse_indices")]
+        return "item" if seq_name else None
+    if key.endswith(".values"):
+        feat_name = key[: -len(".values")]
+        if feat_name in hsk_feats:
+            return None
+        feat = feat_by_name.get(feat_name)
+        if feat is not None and not feat.is_sparse and not feat.is_sequence:
+            return "user" if feat.is_user_feat else "item"
+        return None
+    if key.endswith(".lengths"):
+        feat_name = key[: -len(".lengths")]
+        if feat_name in hsk_feats:
+            return None
+        feat = feat_by_name.get(feat_name)
+        if feat is None:
+            return None
+        if not feat.is_sparse:
+            if feat.is_sequence:
+                return "user" if feat.is_user_feat else "item"
+            return None
+        if feat.is_sequence and feat.value_dim != 1:
+            return "user" if feat.is_user_feat else "item"
+        return None
+    return None
 
 
 def _rewrite_tile_size_nodes(
@@ -2812,9 +2829,6 @@ def finalize_dense_export(
     dense_graph_config: Dict[str, Any],
     dense_model_traced: Optional[torch.fx.GraphModule] = None,
     mixed_precision: Optional[str] = None,
-    input_tile: Optional[bool] = None,
-    input_tile_3_online: Optional[bool] = None,
-    hard_search_features: Optional[Dict[str, str]] = None,
 ) -> torch.fx.GraphModule:
     """Sanity-check and script or AOTI-compile a dense graph carrying final weights.
 
@@ -2843,11 +2857,6 @@ def finalize_dense_export(
         dense_graph_config: dense_meta config from build_dense_graph_module.
         dense_model_traced: pre-traced ``gm`` to export/script; traced here if None.
         mixed_precision: optional ``"BF16"``, ``"FP16"``, or None.
-        input_tile: optional captured ``is_input_tile()`` flag for AOTI dynamic
-            shapes when exporting off the build thread.
-        input_tile_3_online: optional captured ``is_input_tile_3_online()`` flag.
-        hard_search_features: optional pre-resolved hard-search feature map for
-            AOTI dynamic shapes when exporting off the build thread.
 
     Returns:
         The traced module, so a caller can reuse it across exports without
@@ -2857,9 +2866,16 @@ def finalize_dense_export(
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(graph_dir, exist_ok=True)
 
-    sparse_kts, seq_jts = _run_dense_graph_sanity_check(
-        model, full_graph, gm, data, device, mixed_precision=mixed_precision
-    )
+    is_aot = acc_utils.is_aot()
+    if is_aot:
+        sparse_kts, seq_jts = _run_dense_graph_sanity_check(
+            model, full_graph, gm, data, device, mixed_precision=mixed_precision
+        )
+    else:
+        _run_dense_graph_sanity_check(
+            model, full_graph, gm, data, device, mixed_precision=mixed_precision
+        )
+        sparse_kts, seq_jts = {}, {}
 
     with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
         f.write(str(full_graph))
@@ -2870,24 +2886,21 @@ def finalize_dense_export(
 
     if dense_model_traced is None:
         dense_model_traced = symbolic_trace(gm)
-    if isinstance(dense_model_traced, torch.fx.GraphModule):
-        eliminate_dense_dead_code(dense_model_traced.graph)
-        dense_model_traced.recompile()
+        if isinstance(dense_model_traced, torch.fx.GraphModule):
+            eliminate_dense_dead_code(dense_model_traced.graph)
+            dense_model_traced.recompile()
 
-    if acc_utils.is_aot():
+    if is_aot:
         aot_utils.export_distributed_dense_model_aot(
             model=model,
-            gm=gm,
+            dense_model_traced=dense_model_traced,
             data=data,
             sparse_kts=sparse_kts,
             seq_jts=seq_jts,
             dense_graph_config=dense_graph_config,
             save_dir=save_dir,
+            device=device,
             mixed_precision=mixed_precision,
-            dense_model_traced=dense_model_traced,
-            input_tile=input_tile,
-            input_tile_3_online=input_tile_3_online,
-            hard_search_features=hard_search_features,
         )
         return dense_model_traced
 

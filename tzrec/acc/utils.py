@@ -216,8 +216,10 @@ def is_hard_search_input_tile() -> bool:
 def is_aot() -> bool:
     """Judge is inductor or not.
 
-    ENABLE_AOT=1: legacy two-stage export (sparse JIT + dense AOTI).
-    ENABLE_AOT=2: unified AOTI export (fused sparse+dense single .pt2).
+    ENABLE_AOT=1: legacy two-stage export (sparse JIT + dense AOTI); under
+    USE_DISTRIBUTED_EMBEDDING=1 it behaves as single-stage dense AOTI export.
+    ENABLE_AOT=2: unified AOTI export (fused sparse+dense single .pt2), or
+    single-stage dense AOTI export under USE_DISTRIBUTED_EMBEDDING=1.
     Legacy ``UNIFIED_AOT=1`` is honored as an alias of ``ENABLE_AOT=2``.
     """
     val = os.environ.get("ENABLE_AOT")
@@ -228,8 +230,11 @@ def is_aot() -> bool:
 
 
 def is_unified_aot() -> bool:
-    """Judge whether to use the unified AOTI export (ENABLE_AOT=2).
+    """Judge whether single-stage .pt2 AOTI export is requested (ENABLE_AOT=2).
 
+    Includes distributed embedding single-stage dense AOTI when
+    ``USE_DISTRIBUTED_EMBEDDING=1`` is set (callers dispatch distributed
+    exports via ``use_distributed_embedding()`` first).
     Legacy ``UNIFIED_AOT=1`` is honored as an alias of ``ENABLE_AOT=2``.
     """
     val = os.environ.get("ENABLE_AOT")
@@ -240,14 +245,16 @@ def is_unified_aot() -> bool:
 
 
 def is_unified_aot_predict(model_path: str) -> bool:
-    """Judge whether the exported model uses unified AOTI in predict.
+    """Judge whether the exported model uses single-stage .pt2 AOTI in predict.
 
-    Reads ``ENABLE_AOT`` from model_acc.json (=2 -> unified). Falls back
-    to the legacy ``UNIFIED_AOT`` key for pre-fold exports, then to
-    file presence (legacy two-stage exports produce
-    scripted_sparse_model.pt; unified exports do not) when neither
-    JSON key is present -- keeps unit tests that bypass the full export
-    pipeline working.
+    Reads ``ENABLE_AOT`` from model_acc.json (=2 -> single-stage ``.pt2``,
+    including both unified AOTI and distributed embedding dense AOTI, which
+    predict callers filter via ``is_distributed_embedding_predict()`` before
+    ``load_model_aot()``). Falls back to the legacy ``UNIFIED_AOT`` key for
+    pre-fold exports, then to file presence (legacy two-stage exports produce
+    scripted_sparse_model.pt; single-stage exports do not) when neither JSON
+    key is present -- keeps unit tests that bypass the full export pipeline
+    working.
     """
     acc_json_path = os.path.join(model_path, "model_acc.json")
     if os.path.exists(acc_json_path):

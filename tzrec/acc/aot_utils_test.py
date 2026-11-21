@@ -45,9 +45,10 @@ from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, tower_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.export_util import (
-    _run_dense_graph_sanity_check,
     build_dense_graph_module,
+    finalize_dense_export,
 )
+from tzrec.utils.fx_util import eliminate_dense_dead_code
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
     gpu_unavailable,
@@ -829,7 +830,14 @@ class AotUtilsTest(unittest.TestCase):
                 (
                     "dist_dense",
                     lambda d: export_distributed_dense_model_aot(
-                        mock.Mock(), mock.Mock(), {}, {}, {}, {}, d
+                        mock.Mock(),
+                        mock.Mock(),
+                        {},
+                        {},
+                        {},
+                        {},
+                        d,
+                        torch.device("cuda:0"),
                     ),
                 ),
             ):
@@ -1288,7 +1296,6 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
 
             shapes = _build_distributed_dense_dynamic_shapes(
                 sample_data=sample_data,
-                gm=gm,
                 dense_graph_config=dense_graph_config,
                 features=features,
                 feature_groups=feature_groups,
@@ -1355,7 +1362,6 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
             self.assertEqual(sample_data2["deep__ebc_user"].shape[0], 2)
             shapes2 = _build_distributed_dense_dynamic_shapes(
                 sample_data=sample_data2,
-                gm=gm2,
                 dense_graph_config=dense_graph_config2,
                 features=features2,
                 feature_groups=feature_groups2,
@@ -1416,7 +1422,6 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
 
             shapes = _build_distributed_dense_dynamic_shapes(
                 sample_data=sample_data,
-                gm=gm,
                 dense_graph_config=dense_graph_config,
                 features=features,
                 feature_groups=feature_groups,
@@ -1523,7 +1528,6 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
 
             shapes = _build_distributed_dense_dynamic_shapes(
                 sample_data=sample_data,
-                gm=gm,
                 dense_graph_config=dense_graph_config,
                 features=features,
                 feature_groups=feature_groups,
@@ -1633,18 +1637,15 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
                 gm, full_graph, dense_cfg = build_dense_graph_module(
                     wrapped, export_data, device
                 )
-                skts, sjts = _run_dense_graph_sanity_check(
-                    wrapped, full_graph, gm, export_data, device
-                )
                 save_dir = os.path.join(self.test_dir, f"user_ebc_tile_{_name}")
-                export_distributed_dense_model_aot(
-                    model=wrapped,
-                    gm=gm,
-                    data=export_data,
-                    sparse_kts=skts,
-                    seq_jts=sjts,
-                    dense_graph_config=dense_cfg,
-                    save_dir=save_dir,
+                finalize_dense_export(
+                    wrapped,
+                    full_graph,
+                    gm,
+                    export_data,
+                    device,
+                    save_dir,
+                    dense_cfg,
                 )
                 aoti_model = torch._inductor.aoti_load_package(
                     os.path.join(save_dir, "aoti", "aoti_model.pt2")
@@ -1799,23 +1800,15 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
                 gm, full_graph, dense_graph_config = build_dense_graph_module(
                     wrapped, export_data, device, mixed_precision=mp or None
                 )
-                sparse_kts, seq_jts = _run_dense_graph_sanity_check(
+                save_dir = os.path.join(self.test_dir, f"dist_din_{_name}")
+                finalize_dense_export(
                     wrapped,
                     full_graph,
                     gm,
                     export_data,
                     device,
-                    mixed_precision=mp or None,
-                )
-                save_dir = os.path.join(self.test_dir, f"dist_din_{_name}")
-                export_distributed_dense_model_aot(
-                    model=wrapped,
-                    gm=gm,
-                    data=export_data,
-                    sparse_kts=sparse_kts,
-                    seq_jts=seq_jts,
-                    dense_graph_config=dense_graph_config,
-                    save_dir=save_dir,
+                    save_dir,
+                    dense_graph_config,
                     mixed_precision=mp or None,
                 )
 
@@ -2048,18 +2041,15 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
                 gm, full_graph, dense_graph_config = build_dense_graph_module(
                     wrapped, export_data, device
                 )
-                sparse_kts, seq_jts = _run_dense_graph_sanity_check(
-                    wrapped, full_graph, gm, export_data, device
-                )
                 save_dir = os.path.join(self.test_dir, "dist_hsk")
-                export_distributed_dense_model_aot(
-                    model=wrapped,
-                    gm=gm,
-                    data=export_data,
-                    sparse_kts=sparse_kts,
-                    seq_jts=seq_jts,
-                    dense_graph_config=dense_graph_config,
-                    save_dir=save_dir,
+                finalize_dense_export(
+                    wrapped,
+                    full_graph,
+                    gm,
+                    export_data,
+                    device,
+                    save_dir,
+                    dense_graph_config,
                 )
 
                 pt2_path = os.path.join(save_dir, "aoti", "aoti_model.pt2")
@@ -2156,19 +2146,15 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
         dead_gm.recompile()
         self.assertNotIn(
             "seq_mv__lengths",
-            aot_utils._extract_distributed_dense_consumed_keys(
-                dead_gm,
-                {
-                    "seq_mv": torch.randn(3, 4, device=device),
-                    "seq_mv__lengths": torch.tensor([2, 1], dtype=torch.int64),
-                },
-            ),
+            aot_utils._extract_distributed_dense_consumed_keys(dead_gm),
         )
+        eliminate_dense_dead_code(dead_gm.graph)
+        dead_gm.recompile()
         dead_save_dir = os.path.join(self.test_dir, "dead_mv_lengths")
-        with mock.patch.dict(os.environ, {"ENABLE_AOT": "2"}):
+        with mock.patch.dict(os.environ, {"ENABLE_AOT": "2", "INPUT_TILE": "0"}):
             export_distributed_dense_model_aot(
                 model=ScriptWrapper(dead_mod),
-                gm=dead_gm,
+                dense_model_traced=dead_gm,
                 data={
                     "seq_mv": torch.randn(3, 4, device=device),
                     "seq_mv__lengths": torch.tensor([2, 1], dtype=torch.int64),
@@ -2182,7 +2168,7 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
                 },
                 dense_graph_config={"sequence__ec": ["seq_mv__ec", "seq_mv__lengths"]},
                 save_dir=dead_save_dir,
-                input_tile=False,
+                device=device,
             )
         dead_aoti = torch._inductor.aoti_load_package(
             os.path.join(dead_save_dir, "aoti", "aoti_model.pt2")

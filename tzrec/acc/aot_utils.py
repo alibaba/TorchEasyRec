@@ -42,7 +42,7 @@ from tzrec.models.model import (
 )
 from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
 from tzrec.protos import model_pb2
-from tzrec.utils.fx_util import eliminate_dense_dead_code, symbolic_trace
+from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
 
 
@@ -678,7 +678,7 @@ def export_unified_model_aot(
     # Prune unconsumed keys (e.g. unused "batch_size") so in_spec stays minimal.
     input_node = next(n for n in full_gm.graph.nodes if n.op == "placeholder")
     if _can_prune_unused_input_keys(full_gm, input_node):
-        consumed_keys = _extract_distributed_dense_consumed_keys(full_gm, data)
+        consumed_keys = _extract_distributed_dense_consumed_keys(full_gm)
         if consumed_keys:
             data = {k: v for k, v in data.items() if k in consumed_keys}
     # Pad <2-element sparse/sequence tensors so torch.export does not specialize
@@ -730,10 +730,9 @@ def export_unified_model_aot(
 
 
 def _extract_distributed_dense_consumed_keys(
-    gm: torch.fx.GraphModule, data: Dict[str, torch.Tensor]
+    gm: torch.fx.GraphModule,
 ) -> Set[str]:
     """Extract input dict keys consumed by the rewritten dense graph."""
-    del data
     input_node = next(n for n in gm.graph.nodes if n.op == "placeholder")
     consumed_keys: Set[str] = set()
     for node in gm.graph.nodes:
@@ -801,7 +800,7 @@ def _pad_distributed_dense_sample_inputs(
     for name in seq_jts:
         raw_name_to_ec_keys[name.split("@", 1)[0]].append(name)
 
-    # Sequence groups sharing a step Dim (EC, SequenceDense, mulval key_lengths).
+    # 1. Sequence groups sharing a step Dim (EC, SequenceDense, mulval key_lengths).
     seq_groups: Dict[str, List[BaseFeature]] = defaultdict(list)
     for feat in features:
         if not feat.is_sequence:
@@ -865,7 +864,7 @@ def _pad_distributed_dense_sample_inputs(
                         _pad_rows_zeros(sample_data, values_key, pad_steps)
                         _increment_first_length(sample_data, lengths_key, pad_steps)
 
-        # 3. Multi-value sequence sub-token values may still be <2 even when
+        # 2. Multi-value sequence sub-token values may still be <2 even when
         # step count >= 2 (e.g. key_lengths=[0, 0]).
         for feat in group_feats:
             kl_key = f"{feat.name}.key_lengths"
@@ -896,7 +895,7 @@ def _pad_distributed_dense_sample_inputs(
             if pad_delta > 0:
                 _increment_first_length(sample_data, kl_key, pad_delta)
 
-    # 4. Non-sequence Query EC entries in sequence__ec.
+    # 3. Non-sequence Query EC entries in sequence__ec.
     for ec_key in seq_jts:
         raw_name = ec_key.split("@", 1)[0]
         feat = feat_by_name.get(raw_name)
@@ -952,7 +951,7 @@ def _prepare_distributed_dense_sample_inputs(
     hard_search_features: Optional[Dict[str, str]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Assemble and pad serving-style CUDA sample inputs for dense AOTI export."""
-    consumed_keys = _extract_distributed_dense_consumed_keys(gm, data)
+    consumed_keys = _extract_distributed_dense_consumed_keys(gm)
     online = (
         is_input_tile_3_online() if input_tile_3_online is None else input_tile_3_online
     )
@@ -1010,7 +1009,6 @@ def _prepare_distributed_dense_sample_inputs(
 
 def _build_distributed_dense_dynamic_shapes(
     sample_data: Dict[str, torch.Tensor],
-    gm: torch.fx.GraphModule,
     dense_graph_config: Dict[str, Any],
     features: List[BaseFeature],
     feature_groups: List[model_pb2.FeatureGroupConfig],
@@ -1018,7 +1016,6 @@ def _build_distributed_dense_dynamic_shapes(
     hard_search_features: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Dict[int, torch.export.Dim]]:
     """Build torch.export dynamic_shapes for a distributed dense serving graph."""
-    del gm
     (
         feat_to_seq_dim_group,
         seq_feat_names,
@@ -1082,7 +1079,7 @@ def _build_distributed_dense_dynamic_shapes(
         nonlocal user_batch
         if tensor.size(0) < 2:
             logger.warning(
-                "Dynamic shape for %r degraded to static {} (size(0)=%d < 2).",
+                "Dynamic shape for %r degraded to static (size(0)=%d < 2).",
                 key,
                 tensor.size(0),
             )
@@ -1096,7 +1093,7 @@ def _build_distributed_dense_dynamic_shapes(
     ) -> Dict[int, torch.export.Dim]:
         if tensor.size(0) < 2:
             logger.warning(
-                "Dynamic shape for %r degraded to static {} (size(0)=%d < 2).",
+                "Dynamic shape for %r degraded to static (size(0)=%d < 2).",
                 key,
                 tensor.size(0),
             )
@@ -1192,58 +1189,35 @@ def _build_distributed_dense_dynamic_shapes(
 
 def export_distributed_dense_model_aot(
     model: nn.Module,
-    gm: torch.fx.GraphModule,
+    dense_model_traced: torch.fx.GraphModule,
     data: Dict[str, torch.Tensor],
     sparse_kts: Dict[str, Any],
     seq_jts: Dict[str, Any],
     dense_graph_config: Dict[str, Any],
     save_dir: str,
+    device: torch.device,
     mixed_precision: Optional[str] = None,
-    dense_model_traced: Optional[torch.fx.GraphModule] = None,
-    input_tile: Optional[bool] = None,
-    input_tile_3_online: Optional[bool] = None,
-    hard_search_features: Optional[Dict[str, str]] = None,
 ) -> str:
     """Export a distributed-embedding dense serving graph to CUDA AOTInductor.
 
     Args:
         model: original wrapped model exposing ``features`` / ``feature_groups``.
-        gm: rewritten pure-dense serving ``GraphModule`` with restored weights.
+        dense_model_traced: traced and dead-code-cleaned pure-dense serving
+            ``GraphModule`` carrying restored weights on ``device``.
         data: warm-up input dict from ``create_dense_export_warmup_data``.
         sparse_kts: captured ``fx_mark_keyed_tensor`` outputs from sanity run.
         seq_jts: captured ``fx_mark_seq_ec_jt`` outputs from sanity run.
         dense_graph_config: ``dense_meta.json`` mapping.
         save_dir: export output directory receiving ``gm_dense.code`` and
             ``aoti/aoti_model.pt2``.
+        device: CUDA device ``dense_model_traced`` lives on.
         mixed_precision: optional ``"BF16"``, ``"FP16"``, or None/empty string.
-        dense_model_traced: optional pre-traced ``gm`` to reuse without
-            calling ``symbolic_trace`` on a background thread.
-        input_tile: optional captured ``is_input_tile()`` flag so background
-            exports do not depend on ``os.environ["INPUT_TILE"]``.
-        input_tile_3_online: optional captured ``is_input_tile_3_online()`` flag.
-        hard_search_features: optional pre-resolved hard-search feature map so
-            background exports do not re-read ``os.environ["INPUT_TILE"]``.
 
     Returns:
         ``save_dir``.
     """
     if not torch.cuda.is_available():
         raise RuntimeError("AOTI export requires a CUDA device.")
-    device: Optional[torch.device] = None
-    for p in gm.parameters():
-        device = p.device
-        break
-    if device is None:
-        for b in gm.buffers():
-            device = b.device
-            break
-    if device is None:
-        for v in data.values():
-            if isinstance(v, torch.Tensor):
-                device = v.device
-                break
-    if device is None:
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
     if device.type != "cuda":
         raise ValueError(
             "export_distributed_dense_model_aot requires a CUDA device, "
@@ -1253,12 +1227,12 @@ def export_distributed_dense_model_aot(
     os.makedirs(save_dir, exist_ok=True)
     features = cast(List[BaseFeature], getattr(model, "features", []) or [])
     feature_groups = list(getattr(model, "feature_groups", []) or [])
+    input_tile = is_input_tile()
+    input_tile_3_online = is_input_tile_3_online()
+    hard_search_features = (
+        get_hard_search_input_tile_features(features) if input_tile else {}
+    )
 
-    gm.eval()
-    if dense_model_traced is None:
-        dense_model_traced = symbolic_trace(gm)
-    eliminate_dense_dead_code(dense_model_traced.graph)
-    dense_model_traced.recompile()
     dense_model_traced.eval()
     with open(os.path.join(save_dir, "gm_dense.code"), "w") as f:
         f.write(dense_model_traced.code)
@@ -1277,7 +1251,6 @@ def export_distributed_dense_model_aot(
     )
     dynamic_shapes = _build_distributed_dense_dynamic_shapes(
         sample_data=dense_sample_data,
-        gm=dense_model_traced,
         dense_graph_config=dense_graph_config,
         features=features,
         feature_groups=feature_groups,
