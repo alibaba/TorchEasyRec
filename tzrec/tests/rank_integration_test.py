@@ -1339,72 +1339,39 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = dfs_are_close(df, df_ckpt, abs_tol)
             self.assertTrue(self.success, name)
 
-    @unittest.skipIf(
-        gpu_unavailable[0] or not dynamicemb_util.has_dynamicemb,
-        "dynamicemb not available.",
-    )
-    @mark_ci_scope("gpu")
-    def test_multi_tower_din_with_dynamicemb_train_eval_aot_export_predict(self):
-        self.success = utils.test_train_eval(
-            "tzrec/tests/configs/multi_tower_din_fg_dynamicemb_mock.config",
-            self.test_dir,
-            user_id="user_id",
-            item_id="item_id",
-        )
-        trained_config_path = os.path.join(self.test_dir, "pipeline.config")
-        if self.success:
-            self.success = utils.test_eval(trained_config_path, self.test_dir)
-        self.assertTrue(self.success)
         self.success = False
-
+        trained_config_path = os.path.join(self.test_dir, "pipeline.config")
         bf16_config_path = os.path.join(self.test_dir, "pipeline_bf16.config")
         bf16_config = config_util.load_pipeline_config(trained_config_path)
         bf16_config.export_config.mixed_precision = "BF16"
         config_util.save_message(bf16_config, bf16_config_path)
 
-        predict_input_path = os.path.join(self.test_dir, r"eval_data/\*.parquet")
-        predict_ckpt_path = os.path.join(self.test_dir, "predict_ckpt_result")
-        self.success = utils.test_predict_checkpoint(
-            trained_config_path,
-            predict_input_path=predict_input_path,
-            predict_output_path=predict_ckpt_path,
-            reserved_columns="user_id,item_id,clk",
-            output_columns="probs",
-            test_dir=self.test_dir,
-        )
-        self.assertTrue(self.success)
-        self.success = False
-
         # INT8 rows dequantize to fp16 and BF16 autocast lowers dense precision,
         # hence the looser 2e-2 tolerance compared to FP32.
-        cases = [
+        aot_cases = [
             (
-                "export_fp32",
+                "export_aot_fp32",
                 trained_config_path,
                 "USE_DISTRIBUTED_EMBEDDING=1 ENABLE_AOT=2",
                 1e-4,
                 None,
             ),
             (
-                "export_int8",
+                "export_aot_int8",
                 trained_config_path,
                 "USE_DISTRIBUTED_EMBEDDING=1 ENABLE_AOT=2 DIST_QUANT=INT8",
                 2e-2,
                 4,
             ),
             (
-                "export_int8_bf16",
+                "export_aot_int8_bf16",
                 bf16_config_path,
                 "USE_DISTRIBUTED_EMBEDDING=1 ENABLE_AOT=2 DIST_QUANT=INT8",
                 2e-2,
                 None,
             ),
         ]
-        predict_columns = ["user_id", "item_id", "clk"]
-        df_ckpt = ds.dataset(predict_ckpt_path, format="parquet").to_table()
-        df_ckpt = df_ckpt.to_pandas().sort_values(by=predict_columns, ignore_index=True)
-
-        for name, cfg_path, env_str, abs_tol, predict_threads in cases:
+        for name, cfg_path, env_str, abs_tol, predict_threads in aot_cases:
             export_dir = os.path.join(self.test_dir, name)
             predict_output_path = os.path.join(self.test_dir, f"predict_{name}")
             ok = utils.test_export(

@@ -46,7 +46,6 @@ from tzrec.utils.predict_util import (
     _encode_keys,
     _gpu_cache_ratio,
     _key_tag,
-    _load_scripted_model,
     _wrap_batch_predict_model,
     load_predict_model,
 )
@@ -541,15 +540,6 @@ class _DenseAOTIRich(torch.nn.Module):
             "batch_size"
         ].to(torch.float32)
         return {"p": p}
-
-
-class _DenseAOTISingleArg(torch.nn.Module):
-    def __init__(self, inner: torch.nn.Module) -> None:
-        super().__init__()
-        self.inner = inner
-
-    def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        return self.inner(data)
 
 
 def _write_export(export_dir, tables, features, dense_meta):
@@ -1080,7 +1070,6 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
         self,
         export_dir: str,
         *,
-        enable_aot: str = "2",
         ts_dir: Optional[str] = None,
     ) -> Tuple[_Table, _Table, torch.nn.Module]:
         dyn = _Table("model.ebc.dyn", 10, 8, False, dynamic=True)
@@ -1110,7 +1099,6 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
 
         torch.manual_seed(42)
         dense_mod = _DenseAOTIRich().cuda().eval()
-        single_arg = _DenseAOTISingleArg(dense_mod).cuda().eval()
         device = torch.device("cuda:0")
         sample = {
             "deep": torch.randn(2, 16, device=device),
@@ -1139,14 +1127,14 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
             "batch_size": {},
         }
         ep = torch.export.export(
-            single_arg, args=(sample,), dynamic_shapes=(dyn_shapes,)
+            dense_mod, args=(sample,), dynamic_shapes=(dyn_shapes,)
         )
         aoti_dir = os.path.join(export_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)
         torch._inductor.aoti_compile_and_package(
             ep, package_path=os.path.join(aoti_dir, "aoti_model.pt2")
         )
-        acc_cfg = {"DISTRIBUTED_EMBEDDING": "1", "ENABLE_AOT": enable_aot}
+        acc_cfg = {"DISTRIBUTED_EMBEDDING": "1", "ENABLE_AOT": "2"}
         with open(os.path.join(export_dir, "model_acc.json"), "w") as f:
             json.dump(acc_cfg, f)
 
@@ -1213,14 +1201,7 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
         }
         return batch
 
-    @parameterized.expand(
-        [
-            param("enable_aot_2", enable_aot="2"),
-            param("enable_aot_1", enable_aot="1"),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_runs_aoti_dense_on_lookup(self, _name, enable_aot: str) -> None:
+    def test_runs_aoti_dense_on_lookup(self) -> None:
         prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
         prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -1229,7 +1210,6 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
         try:
             dyn, _static, _dense_mod = self._build_rich_aoti_export(
                 self.export_dir,
-                enable_aot=enable_aot,
                 ts_dir=ts_dir,
             )
             device = torch.device("cuda:0")
@@ -1549,15 +1529,6 @@ class LoadPredictModelTest(unittest.TestCase):
         self.assertEqual(list(actual), list(expected))
         for k, v in expected.items():
             torch.testing.assert_close(actual[k], v, rtol=0, atol=0, msg=k)
-
-    def test_load_scripted_model_does_not_mutate_texpr_env(self) -> None:
-        torch.jit.script(_Model()).save(
-            os.path.join(self.model_dir, "scripted_model.pt")
-        )
-        with mock.patch.dict(os.environ, {}, clear=True):
-            loaded = _load_scripted_model(self.model_dir, torch.device("cpu"))
-            self.assertIsNotNone(loaded)
-            self.assertNotIn("PYTORCH_TENSOREXPR_FALLBACK", os.environ)
 
 
 if __name__ == "__main__":

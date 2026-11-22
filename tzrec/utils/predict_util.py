@@ -1103,6 +1103,51 @@ class DistributedEmbeddingLookup:
         return out
 
 
+def _prepare_dense_inputs(
+    embeddings: Dict[str, torch.Tensor],
+    dense_features: Dict[str, KeyedTensor],
+    sequence_mulval_lengths: Dict[str, KeyedJaggedTensor],
+    sequence_dense_features: Dict[str, JaggedTensor],
+    additional_infos: Dict[str, torch.Tensor],
+    batch_size: Optional[torch.Tensor],
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Move non-embedding batch tensors to ``device`` and merge into ``embeddings``.
+
+    Args:
+        embeddings (dict): DistributedEmbeddingLookup's outputs.
+        dense_features (dict): Batch.dense_features.
+        sequence_mulval_lengths (dict): Batch.sequence_mulval_lengths.
+        sequence_dense_features (dict): Batch.sequence_dense_features.
+        additional_infos (dict): Batch.additional_infos.
+        batch_size (Tensor, optional): batch_size input of tiled models.
+        device (torch.device): target CUDA device for execution.
+
+    Returns:
+        Dict[str, torch.Tensor]: ``embeddings`` updated in place with dense inputs.
+    """
+    inputs = batch_to_dict(
+        {k: v.to(device, non_blocking=True) for k, v in dense_features.items()},
+        torch.jit.annotate(Dict[str, KeyedJaggedTensor], {}),
+        {
+            k: v.to(device, non_blocking=True)
+            for k, v in sequence_mulval_lengths.items()
+        },
+        {
+            k: v.to(device, non_blocking=True)
+            for k, v in sequence_dense_features.items()
+        },
+        {k: v.to(device, non_blocking=True) for k, v in additional_infos.items()},
+        None
+        if batch_size is None
+        else batch_size.to(device=device, dtype=torch.int64, non_blocking=True),
+        torch.int64,
+    )
+    for k, v in inputs.items():
+        embeddings[k] = v
+    return embeddings
+
+
 class _DenseInputModel(torch.nn.Module):
     """Runs a distributed embedding export's dense model on a Batch.
 
@@ -1145,25 +1190,15 @@ class _DenseInputModel(torch.nn.Module):
         Return:
             predictions (dict): the dense model's predictions.
         """
-        inputs = batch_to_dict(
-            {k: v.to(device, non_blocking=True) for k, v in dense_features.items()},
-            torch.jit.annotate(Dict[str, KeyedJaggedTensor], {}),
-            {
-                k: v.to(device, non_blocking=True)
-                for k, v in sequence_mulval_lengths.items()
-            },
-            {
-                k: v.to(device, non_blocking=True)
-                for k, v in sequence_dense_features.items()
-            },
-            {k: v.to(device, non_blocking=True) for k, v in additional_infos.items()},
-            None
-            if batch_size is None
-            else batch_size.to(device=device, dtype=torch.int64, non_blocking=True),
-            torch.int64,
+        embeddings = _prepare_dense_inputs(
+            embeddings,
+            dense_features,
+            sequence_mulval_lengths,
+            sequence_dense_features,
+            additional_infos,
+            batch_size,
+            device,
         )
-        for k, v in inputs.items():
-            embeddings[k] = v
         return self.dense(embeddings, device)
 
 
@@ -1192,12 +1227,14 @@ class _DistributedDenseAOTIWrapper(nn.Module):
         object.__setattr__(self, "_lock", Lock())
         in_spec, out_spec = aoti_model.loader.get_call_spec()
         in_tree = pytree.treespec_loads(in_spec)
+        # Forward takes a single (data,) arg; read compiled key order from it.
         args_children = in_tree.children()[0].children() if in_tree.children() else []
         if len(args_children) != 1 or not isinstance(args_children[0].context, list):
             raise ValueError(
                 f"Expected a single dict input in AOTI call spec, got {in_spec}"
             )
         object.__setattr__(self, "_key_order", list(args_children[0].context))
+        # AOTICompiledModel.__call__ reparses the call spec on every call.
         object.__setattr__(self, "_out_spec", pytree.treespec_loads(out_spec))
 
     def forward(
@@ -1213,14 +1250,9 @@ class _DistributedDenseAOTIWrapper(nn.Module):
             Model prediction tensors on ``device``.
         """
         torch.cuda.set_device(device)
-        flat_inputs = []
-        for k in self._key_order:
-            # Sliced 1D/odd-dim tensors can be contiguous yet <16-byte aligned
-            # or have non-C strides on size-1 dims; normalize before alignment.
-            t = acc_utils.canonical_contiguous(inputs[k])
-            if t.numel() > 0 and t.data_ptr() % 16 != 0:
-                t = t.clone()
-            flat_inputs.append(t)
+        flat_inputs = [
+            acc_utils.canonical_contiguous(inputs[k]) for k in self._key_order
+        ]
         with cast(Any, self._lock):
             flat_outputs = cast(Any, self.model).loader.boxed_run(flat_inputs)
         return pytree.tree_unflatten(flat_outputs, self._out_spec)
@@ -1296,28 +1328,15 @@ class DistributedEmbeddingModel:
                 batch_size,
                 device,
             )
-        sparse_empty: Dict[str, KeyedJaggedTensor] = {}
-        dense_features = {
-            k: v.to(device, non_blocking=True) for k, v in batch.dense_features.items()
-        }
-        inputs = batch_to_dict(
-            dense_features,
-            sparse_empty,
+        embeddings = _prepare_dense_inputs(
+            embeddings,
+            batch.dense_features,
             sequence_mulval_lengths,
-            {
-                k: v.to(device, non_blocking=True)
-                for k, v in batch.sequence_dense_features.items()
-            },
-            {
-                k: v.to(device, non_blocking=True)
-                for k, v in batch.additional_infos.items()
-            },
-            None
-            if batch_size is None
-            else batch_size.to(device=device, dtype=torch.int64, non_blocking=True),
-            torch.int64,
+            batch.sequence_dense_features,
+            batch.additional_infos,
+            batch_size,
+            device,
         )
-        embeddings.update(inputs)
         return self._dense_aoti[device](embeddings, device)
 
 
