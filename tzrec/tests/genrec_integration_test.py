@@ -447,8 +447,11 @@ class GenRecIntegrationTest(unittest.TestCase):
             },
         )
 
-        # Also verify distributed AOTInductor export and predict from the same
-        # trained checkpoint without a second training run.
+    @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
+    def test_genrec_distributed_aoti_export_predict(self):
+        """Export a GenRec model with distributed AOTI and run predict."""
+        trained = self._train_eval_export()
         dist_aot_dir = os.path.join(self.test_dir, "export_dist_aot")
         self.success = False
         self.success = utils.test_export(
@@ -464,25 +467,6 @@ class GenRecIntegrationTest(unittest.TestCase):
             os.path.exists(os.path.join(dist_aot_dir, "aoti/aoti_model.pt2"))
         )
         self.assertTrue(os.path.exists(os.path.join(dist_aot_dir, "dense_meta.json")))
-        self.assertFalse(
-            os.path.exists(os.path.join(dist_aot_dir, "scripted_model.pt"))
-        )
-        self.assertFalse(
-            os.path.exists(os.path.join(dist_aot_dir, "scripted_sparse_model.pt"))
-        )
-        aot_graph_dir = os.path.join(dist_aot_dir, "graph")
-        self.assertTrue(os.path.exists(os.path.join(aot_graph_dir, "gm_dense.graph")))
-        self.assertFalse(os.path.exists(os.path.join(aot_graph_dir, "gm_sparse.graph")))
-
-        aot_sparse_dir = os.path.join(dist_aot_dir, "sparse")
-        for name in (
-            "sparse_embeddings-00-of-01.npz",
-            "sparse_embedding.json",
-            "sparse_features.json",
-        ):
-            self.assertTrue(os.path.exists(os.path.join(aot_sparse_dir, name)), name)
-        for name in ("config.json", "model.safetensors", "tokenizer.json"):
-            self.assertTrue(os.path.exists(os.path.join(dist_aot_dir, name)), name)
         with open(os.path.join(dist_aot_dir, "model_acc.json"), "r") as f:
             aot_acc_cfg = json.load(f)
         self.assertEqual(aot_acc_cfg.get("DISTRIBUTED_EMBEDDING"), "1")

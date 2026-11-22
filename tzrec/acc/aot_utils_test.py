@@ -43,11 +43,10 @@ from tzrec.models.model import ScriptWrapper
 from tzrec.models.multi_tower import MultiTower
 from tzrec.models.multi_tower_din import MultiTowerDIN
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.prompt.assembler import PromptAssembler
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, tower_pb2
 from tzrec.protos.models import rank_model_pb2
-from tzrec.protos.prompt_pb2 import PromptSlot
 from tzrec.utils.export_util import (
-    _run_dense_graph_sanity_check,
     build_dense_graph_module,
     finalize_dense_export,
 )
@@ -2253,247 +2252,6 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
             torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
             torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
 
-    @mark_ci_scope("gpu")
-    @unittest.skipIf(*gpu_unavailable)
-    def test_distributed_dense_aot_genrec_mixed_user_item(self):
-        device = torch.device("cuda:0")
-        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
-        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        try:
-            for include_item_seq in (True, False):
-                with (
-                    self.subTest(include_item_seq=include_item_seq),
-                    mock.patch.dict(
-                        os.environ,
-                        {
-                            "USE_DISTRIBUTED_EMBEDDING": "1",
-                            "INPUT_TILE": "3",
-                            "INPUT_TILE_3_ONLINE": "0",
-                            "ENABLE_AOT": "2",
-                        },
-                    ),
-                ):
-                    u_id = feature_pb2.FeatureConfig(
-                        id_feature=feature_pb2.IdFeature(
-                            feature_name="u_id",
-                            expression="user:u_id",
-                            num_buckets=16,
-                            embedding_dim=4,
-                        )
-                    )
-                    i_id = feature_pb2.FeatureConfig(
-                        id_feature=feature_pb2.IdFeature(
-                            feature_name="i_id",
-                            expression="item:i_id",
-                            num_buckets=16,
-                            embedding_dim=4,
-                        )
-                    )
-                    feat_cfgs = [u_id, i_id]
-                    prompt = "User : {{mix}} Predict :"
-                    export_data = {
-                        "batch_size": torch.tensor(1, dtype=torch.int64, device=device),
-                        "u_id.values": torch.zeros(2, dtype=torch.int64, device=device),
-                        "u_id.lengths": torch.ones(2, dtype=torch.int64, device=device),
-                        "i_id.values": torch.zeros(2, dtype=torch.int64, device=device),
-                        "i_id.lengths": torch.ones(2, dtype=torch.int64, device=device),
-                    }
-                    if include_item_seq:
-                        feat_cfgs.append(
-                            feature_pb2.FeatureConfig(
-                                sequence_id_feature=feature_pb2.IdFeature(
-                                    feature_name="i_seq",
-                                    expression="item:i_seq",
-                                    num_buckets=16,
-                                    embedding_dim=4,
-                                    sequence_length=2,
-                                )
-                            )
-                        )
-                        prompt = "User : {{mix}} Seq : {{i_seq}} Predict :"
-                        export_data["i_seq.values"] = torch.zeros(
-                            3, dtype=torch.int64, device=device
-                        )
-                        export_data["i_seq.lengths"] = torch.tensor(
-                            [2, 1], dtype=torch.int64, device=device
-                        )
-
-                    case_dir = os.path.join(
-                        self.test_dir, f"genrec_mixed_{int(include_item_seq)}"
-                    )
-                    model, _ = create_genrec_test_model(
-                        case_dir,
-                        feature_configs=feat_cfgs,
-                        prompt=prompt,
-                        slots=[PromptSlot(name="mix", feature_names=["u_id", "i_id"])],
-                    )
-                    init_parameters(model, device=device)
-                    wrapped = ScriptWrapper(GenRecFrontEnd(model)).to(device).eval()
-                    gm, full_graph, dense_graph_config = build_dense_graph_module(
-                        wrapped, export_data, device
-                    )
-                    sparse_kts, seq_jts = _run_dense_graph_sanity_check(
-                        wrapped, full_graph, gm, export_data, device
-                    )
-                    sample_data = _prepare_distributed_dense_sample_inputs(
-                        gm=gm,
-                        data=export_data,
-                        sparse_kts=sparse_kts,
-                        seq_jts=seq_jts,
-                        features=wrapped.features,
-                        feature_groups=wrapped.feature_groups,
-                        device=device,
-                    )
-                    dyn_shapes = _build_distributed_dense_dynamic_shapes(
-                        sample_data=sample_data,
-                        gm=gm,
-                        dense_graph_config=dense_graph_config,
-                        features=wrapped.features,
-                        feature_groups=wrapped.feature_groups,
-                    )
-                    batch_dim = dyn_shapes["i_id.lengths"][0]
-                    self.assertEqual(batch_dim.__name__, "batch")
-                    self.assertEqual(dyn_shapes["u_id.lengths"][0], batch_dim)
-                    self.assertEqual(dyn_shapes["mix__ebc"][0], batch_dim)
-                    self.assertEqual(dyn_shapes["mix__ebc_user"][0], batch_dim)
-                    if include_item_seq:
-                        self.assertEqual(dyn_shapes["i_seq.lengths"][0], batch_dim)
-                        self.assertEqual(dyn_shapes["i_seq__lengths"][0], batch_dim)
-
-                    save_dir = os.path.join(case_dir, "export")
-                    finalize_dense_export(
-                        wrapped,
-                        full_graph,
-                        gm,
-                        export_data,
-                        device,
-                        save_dir,
-                        dense_graph_config,
-                    )
-                    aoti_model = torch._inductor.aoti_load_package(
-                        os.path.join(save_dir, "aoti", "aoti_model.pt2")
-                    )
-                    in_spec = treespec_loads(aoti_model.loader.get_call_spec()[0])
-                    key_order = list(in_spec.child(0).child(0).context)
-                    gm_eval = gm.to(device).eval()
-
-                    for bs in (1, 3):
-                        case_inputs = {
-                            "mix__ebc": torch.randn(bs, 4, device=device),
-                            "mix__ebc_user": torch.randn(bs, 4, device=device),
-                            "u_id.values": torch.ones(
-                                bs, dtype=torch.int64, device=device
-                            ),
-                            "u_id.lengths": torch.ones(
-                                bs, dtype=torch.int64, device=device
-                            ),
-                            "i_id.values": torch.ones(
-                                bs, dtype=torch.int64, device=device
-                            ),
-                            "i_id.lengths": torch.ones(
-                                bs, dtype=torch.int64, device=device
-                            ),
-                        }
-                        if include_item_seq:
-                            case_inputs.update(
-                                {
-                                    "i_seq.values": torch.ones(
-                                        2 * bs, dtype=torch.int64, device=device
-                                    ),
-                                    "i_seq.lengths": torch.full(
-                                        (bs,), 2, dtype=torch.int64, device=device
-                                    ),
-                                    "i_seq": torch.randn(2 * bs, 4, device=device),
-                                    "i_seq__lengths": torch.full(
-                                        (bs,), 2, dtype=torch.int32, device=device
-                                    ),
-                                }
-                            )
-                        case_inputs = {k: case_inputs[k] for k in key_order}
-                        with torch.no_grad():
-                            expected = gm_eval(case_inputs, device)
-                            actual = aoti_model(case_inputs)
-                        for k, val in expected.items():
-                            torch.testing.assert_close(
-                                actual[k], val, atol=1e-5, rtol=1e-5
-                            )
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
-            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
-
-    @mark_ci_scope("gpu")
-    @unittest.skipIf(*gpu_unavailable)
-    def test_distributed_dense_aot_genrec_empty_anchor(self):
-        device = torch.device("cuda:0")
-        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
-        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        try:
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "USE_DISTRIBUTED_EMBEDDING": "1",
-                    "INPUT_TILE": "3",
-                    "INPUT_TILE_3_ONLINE": "0",
-                    "ENABLE_AOT": "2",
-                },
-            ):
-                u_id = feature_pb2.FeatureConfig(
-                    id_feature=feature_pb2.IdFeature(
-                        feature_name="u_id",
-                        expression="user:u_id",
-                        num_buckets=16,
-                        embedding_dim=4,
-                    )
-                )
-                model, _ = create_genrec_test_model(
-                    os.path.join(self.test_dir, "genrec_static"),
-                    feature_configs=[u_id],
-                    prompt="Predict :",
-                )
-                init_parameters(model, device=device)
-                wrapped = ScriptWrapper(GenRecFrontEnd(model)).to(device).eval()
-                export_data = {
-                    "batch_size": torch.tensor(1, dtype=torch.int64, device=device),
-                    "u_id.values": torch.zeros(2, dtype=torch.int64, device=device),
-                    "u_id.lengths": torch.ones(2, dtype=torch.int64, device=device),
-                }
-                gm, full_graph, dense_graph_config = build_dense_graph_module(
-                    wrapped, export_data, device
-                )
-                save_dir = os.path.join(self.test_dir, "dist_genrec_static")
-                finalize_dense_export(
-                    wrapped,
-                    full_graph,
-                    gm,
-                    export_data,
-                    device,
-                    save_dir,
-                    dense_graph_config,
-                )
-                aoti_model = torch._inductor.aoti_load_package(
-                    os.path.join(save_dir, "aoti", "aoti_model.pt2")
-                )
-                in_spec = treespec_loads(aoti_model.loader.get_call_spec()[0])
-                key_order = list(in_spec.child(0).child(0).context)
-                self.assertEqual(key_order, ["batch_size"])
-                gm_eval = gm.to(device).eval()
-                for bs in (1, 3):
-                    case_inputs = {
-                        "batch_size": torch.tensor(bs, dtype=torch.int64, device=device)
-                    }
-                    with torch.no_grad():
-                        expected = gm_eval(case_inputs, device)
-                        actual = aoti_model(case_inputs)
-                    for k, val in expected.items():
-                        torch.testing.assert_close(actual[k], val, atol=1e-5, rtol=1e-5)
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
-            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
-
     def test_jagged_sequence_min_bound_with_and_without_genrec_frontend(
         self,
     ) -> None:
@@ -2526,9 +2284,9 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
             def forward(self, data):
                 return data["j_seq__id"]
 
-        class PromptAssembler(nn.Module):
-            def forward(self, x):
-                return x
+        class _DummyPromptAssembler(PromptAssembler):
+            def __init__(self) -> None:
+                nn.Module.__init__(self)
 
         sample_data = {
             "j_seq__id": torch.randn(3, 4),
@@ -2549,7 +2307,7 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
         self.assertEqual(shapes_plain["j_seq__id"][0].min, 1)
 
         genrec_gm = fx.symbolic_trace(_PlainMod())
-        genrec_gm.assembler = PromptAssembler()
+        genrec_gm.assembler = _DummyPromptAssembler()
         shapes_genrec = _build_distributed_dense_dynamic_shapes(
             sample_data=sample_data,
             gm=genrec_gm,
@@ -2626,25 +2384,6 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
         )
         dead_spec = treespec_loads(dead_aoti.loader.get_call_spec()[0])
         self.assertEqual(list(dead_spec.child(0).child(0).context), ["seq_mv"])
-
-    def test_extract_consumed_keys_raises_for_empty_anchor_without_batch_size(
-        self,
-    ) -> None:
-        class PromptAssembler(nn.Module):
-            anchor = ""
-            member_names: list = []
-
-            def forward(self, x):
-                return x
-
-        class _StaticPromptMod(nn.Module):
-            def forward(self, data):
-                return data["deep"]
-
-        gm = fx.symbolic_trace(_StaticPromptMod())
-        gm.assembler = PromptAssembler()
-        with self.assertRaisesRegex(ValueError, "All-static GenRec prompt"):
-            aot_utils._extract_distributed_dense_consumed_keys(gm, data={})
 
 
 if __name__ == "__main__":

@@ -407,28 +407,6 @@ class PromptAssemblerTest(unittest.TestCase):
         for key, value in scripted(batch).items():
             self.assertTrue(torch.equal(eager[key], value), key)
 
-    def test_empty_anchor_exports_and_scripts(self) -> None:
-        """All-static prompts export without GuardOnDataDependentSymNode."""
-        module = PromptAssembler(_plan((Static((7, 8)),)), _sid_space())
-        self.assertEqual(module.anchor, "")
-        scripted = torch.jit.script(module)
-        zero_batch = {"batch_size": torch.tensor(0, dtype=torch.int64)}
-        for zero_out in (module(zero_batch), scripted(zero_batch)):
-            self.assertEqual(zero_out[INPUT_IDS].numel(), 0)
-            self.assertEqual(int(zero_out[MAX_SEQLEN]), 0)
-
-        exported = torch.export.export(
-            module,
-            args=({"batch_size": torch.tensor(1, dtype=torch.int64)},),
-            dynamic_shapes=({"batch_size": {}},),
-        )
-        for bs in (1, 3):
-            batch = {"batch_size": torch.tensor(bs, dtype=torch.int64)}
-            eager = module(batch)
-            for out in (scripted(batch), exported.module()(batch)):
-                for key, value in eager.items():
-                    self.assertTrue(torch.equal(out[key], value), key)
-
 
 if __name__ == "__main__":
     unittest.main()

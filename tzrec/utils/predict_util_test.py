@@ -1361,7 +1361,7 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
                 os.environ,
                 {
                     "USE_DISTRIBUTED_EMBEDDING": "1",
-                    "INPUT_TILE": "3",
+                    "INPUT_TILE": "0",
                     "ENABLE_AOT": "2",
                 },
             ):
@@ -1426,7 +1426,6 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
 
                 wrapped = ScriptWrapper(GenRecFrontEnd(genrec_model)).to(device).eval()
                 export_data = {
-                    "batch_size": torch.tensor(1, dtype=torch.int64, device=device),
                     "hist.values": torch.tensor(
                         GENREC_LONG_HIST_CODES * 2,
                         dtype=torch.float32,
@@ -1447,6 +1446,8 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
                 gm, full_graph, dense_meta = build_dense_graph_module(
                     wrapped, export_data, device
                 )
+                self.assertIn("user_slot__ebc", dense_meta)
+                self.assertNotIn("user_slot__ebc_user", dense_meta)
                 finalize_dense_export(
                     wrapped,
                     full_graph,
@@ -1459,15 +1460,13 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
 
                 emb_sd = ref_model.embedding_group.state_dict()
                 age_w = (
-                    emb_sd["emb_impls.__BASE__.ebc_user.embedding_bags.age_emb.weight"]
+                    next(v for k, v in emb_sd.items() if k.endswith(".age_emb.weight"))
                     .detach()
                     .cpu()
                     .numpy()
                 )
                 beh_w = (
-                    emb_sd[
-                        "seq_emb_impls.__BASE__.ec_dict_user.8.embeddings.beh_emb.weight"
-                    ]
+                    next(v for k, v in emb_sd.items() if k.endswith(".beh_emb.weight"))
                     .detach()
                     .cpu()
                     .numpy()
@@ -1520,7 +1519,7 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
                     json.dump(
                         {
                             "DISTRIBUTED_EMBEDDING": "1",
-                            "INPUT_TILE": "3",
+                            "INPUT_TILE": "0",
                             "ENABLE_AOT": "2",
                         },
                         f,
@@ -1559,19 +1558,13 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
                         )
                     },
                 )
-                tile_bs = torch.tensor(1, dtype=torch.int64)
-                with (
-                    torch.no_grad(),
-                    mock.patch.dict(os.environ, {"INPUT_TILE": "3"}),
-                ):
+                with torch.no_grad():
                     raw_inputs = {
                         k: v.to(device)
                         for k, v in batch.to_dict(sparse_dtype=torch.int64).items()
                     }
-                    raw_inputs["batch_size"] = tile_bs.to(device)
                     expected_frontend = ref_wrapped(raw_inputs, device)
-                with torch.no_grad():
-                    actual_frontend = predict_model._frontend(batch, tile_bs, device)
+                    actual_frontend = predict_model._frontend(batch, None, device)
                 for key in (
                     INPUT_IDS,
                     CU_SEQLENS,
@@ -1590,7 +1583,7 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
                     )
 
                 with torch.no_grad():
-                    actual = predict_model(batch, tile_bs, device)
+                    actual = predict_model(batch, None, device)
                     ref_lm = ref_model.lm.to(device)
                     embeds = ref_lm.get_input_embeddings()(expected_frontend[INPUT_IDS])
                     embeds.index_copy_(

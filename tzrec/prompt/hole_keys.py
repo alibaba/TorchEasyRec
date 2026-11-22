@@ -85,34 +85,23 @@ class HoleKeyBuilder(nn.Module):
     member_names: List[List[str]]
     is_sequences: List[bool]
     salts: List[int]
-    member_salts: List[List[int]]
 
     def __init__(self, prompt_plan: PromptPlan) -> None:
         super().__init__()
         self.member_names = []
         self.is_sequences = []
         self.salts = []
-        self.member_salts = []
         for seg in prompt_plan.projected_slots:
-            names = list(seg.feature_names)
-            self.member_names.append(names)
+            self.member_names.append(list(seg.feature_names))
             self.is_sequences.append(seg.group_type == FeatureGroupType.JAGGED_SEQUENCE)
             # 1-based: slot 0 must not salt to zero, or its empty hole
             # would fold to zero as an unsalted accumulator did
-            salt = _wrap64(self.C_SLOT * (int(seg.slot_id) + 1))
-            self.salts.append(salt)
-            self.member_salts.append(
-                [
-                    _wrap64(m_idx * self.MEMBER_STRIDE * self.C_INDEX + salt)
-                    for m_idx in range(len(names))
-                ]
-            )
+            self.salts.append(_wrap64(self.C_SLOT * (int(seg.slot_id) + 1)))
         self.num_slots = len(self.member_names)
 
     def _fold_slot(self, batch: Dict[str, torch.Tensor], index: int) -> torch.Tensor:
         """One projected occurrence's keys, one per hole, in sample order."""
         salt = self.salts[index]
-        m_salts = self.member_salts[index]
         members = self.member_names[index]
         is_sequence = self.is_sequences[index]
         # the assembler's hole count: one per item of a sequence slot, one per
@@ -198,19 +187,17 @@ class HoleKeyBuilder(nn.Module):
                     hole = torch.cumsum(torch.ones_like(values), dim=0) - 1
                     local = torch.zeros_like(hole)
 
-            # Break SymPy IndexPropagation across both local and the 64-bit
-            # constants below so Inductor cannot narrow them out of int64.
-            local = local ^ 0
+            # Break SymPy IndexPropagation before adding the 2**32 member
+            # offset so Inductor casts local to int64 instead of int32.
+            local = (local ^ 0) + member_index * self.MEMBER_STRIDE
             c_idx = torch.full(
                 (), self.C_INDEX, dtype=torch.int64, device=values.device
             )
             c_val = torch.full(
                 (), self.C_VALUE, dtype=torch.int64, device=values.device
             )
-            m_salt = torch.full(
-                (), m_salts[member_index], dtype=torch.int64, device=values.device
-            )
-            mixed = mix64(values * c_val + local * c_idx + m_salt)
+            slot_salt = torch.full((), salt, dtype=torch.int64, device=values.device)
+            mixed = mix64(values * c_val + local * c_idx + slot_salt)
             keys.index_add_(0, hole, mixed)
         return keys
 

@@ -41,6 +41,7 @@ from tzrec.models.model import (
     UnifiedAOTIModelWrapper,
 )
 from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
+from tzrec.prompt.assembler import PromptAssembler
 from tzrec.protos import model_pb2
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
@@ -470,17 +471,11 @@ def _collect_sequence_dim_groups(
     )
 
 
-_GENREC_PROMPT_LEAF_MODULES = ("PromptAssembler", "HoleKeyBuilder")
-
-
 def _has_genrec_frontend(gm: Optional[torch.fx.GraphModule]) -> bool:
-    """Return whether traced graph contains GenRec prompt assembly modules."""
+    """Return whether traced graph contains a GenRec prompt assembler."""
     if gm is None:
         return False
-    return any(
-        type(mod).__name__ in (*_GENREC_PROMPT_LEAF_MODULES, "GenRecFrontEnd")
-        for mod in gm.modules()
-    )
+    return any(isinstance(mod, PromptAssembler) for mod in gm.modules())
 
 
 def _can_prune_unused_input_keys(
@@ -760,28 +755,18 @@ def _extract_distributed_dense_consumed_keys(
         ):
             consumed_keys.add(node.args[1])
 
-    # ScriptWrapper.get_batch feeds the raw dict directly to PromptAssembler
-    # and HoleKeyBuilder leaf modules, which read slot member tensors.
+    if data is None:
+        return consumed_keys
+
+    # The prompt leaves read these inputs inside the FX leaf calls.
     for mod in gm.modules():
-        mod_type = type(mod).__name__
-        if mod_type not in _GENREC_PROMPT_LEAF_MODULES:
+        if not isinstance(mod, PromptAssembler):
             continue
-        if mod_type == "PromptAssembler" and getattr(mod, "anchor", None) == "":
-            if data is not None:
-                if "batch_size" not in data:
-                    raise ValueError(
-                        "All-static GenRec prompt (PromptAssembler.anchor == '') "
-                        "requires 'batch_size' in export inputs, which is absent "
-                        "under INPUT_TILE=0."
-                    )
-                consumed_keys.add("batch_size")
-        for members in getattr(mod, "member_names", []):
+        for members in mod.member_names:
             for member in members:
-                # Include .key_lengths (required in AOTI in_spec) and omit
-                # .weights (never read by prompt leaves), unlike predict_util.py.
                 for suffix in (".values", ".lengths", ".key_lengths"):
                     key = f"{member}{suffix}"
-                    if data and key in data:
+                    if key in data:
                         consumed_keys.add(key)
     return consumed_keys
 
@@ -1089,8 +1074,7 @@ def _build_distributed_dense_dynamic_shapes(
     gm: Optional[torch.fx.GraphModule] = None,
 ) -> Dict[str, Dict[int, torch.export.Dim]]:
     """Build torch.export dynamic_shapes for a distributed dense serving graph."""
-    has_genrec = _has_genrec_frontend(gm)
-    allow_empty_jagged = has_genrec
+    allow_empty_jagged = _has_genrec_frontend(gm)
     (
         feat_to_seq_dim_group,
         seq_feat_names,
@@ -1103,11 +1087,8 @@ def _build_distributed_dense_dynamic_shapes(
         f.name for f in features if f.is_sparse and f.is_sequence and f.value_dim != 1
     }
     resolved_input_tile = is_input_tile() if input_tile is None else input_tile
-    # GenRec PromptAssembler stacks all segments along one shared prompt batch.
     user_feat_names: Set[str] = (
-        {f.name for f in features if f.is_user_feat}
-        if resolved_input_tile and not has_genrec
-        else set()
+        {f.name for f in features if f.is_user_feat} if resolved_input_tile else set()
     )
     resolved_hsk: Dict[str, str] = (
         (
@@ -1208,9 +1189,7 @@ def _build_distributed_dense_dynamic_shapes(
         elif key in ebc_item_names or key.endswith("__ebc") or key.endswith("__mc_ebc"):
             dynamic_shapes[key] = {0: batch}
         elif key in ebc_user_names or is_input_tile_user_keyed_tensor(key):
-            dynamic_shapes[key] = (
-                {0: batch} if has_genrec else _user_batch_shape(key, tensor)
-            )
+            dynamic_shapes[key] = _user_batch_shape(key, tensor)
         elif key in seq_ec_lengths_names or key.endswith("__lengths"):
             raw_name = key[: -len("__lengths")].split("@", 1)[0]
             if resolved_input_tile and raw_name in resolved_hsk:

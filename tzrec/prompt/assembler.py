@@ -205,18 +205,10 @@ class PromptAssembler(nn.Module):
         """Row count, from the anchor member.
 
         A sequence or a multi-value member carries ``lengths``, one per row; a
-        dense member has one row per sample and no lengths. Compiled AOTI
-        exports assume ``batch_size >= 1`` via the export-time SymInt bound.
+        dense member has one row per sample and no lengths.
         """
         if self.anchor == "":
             if "batch_size" in batch:
-                if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-                    batch_size = batch["batch_size"].item()
-                    # Export-time SymInt bound (AOTI sets scalar_asserts=False)
-                    # so ``if batch_size > 0`` resolves statically at export.
-                    torch._check(batch_size >= 1)
-                    # pyre-ignore [7]
-                    return batch_size
                 return int(batch["batch_size"])
             return 0
         key = self.anchor + ".lengths"
@@ -342,8 +334,6 @@ class PromptAssembler(nn.Module):
                 response_lengths = response_lengths + seg_lens[i]
         flat_dests = torch.cat(dests, dim=0)
         flat_values = torch.cat(seg_values, dim=0)
-        if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-            torch._check(flat_dests.size(0) == flat_values.size(0))
         out = torch.zeros_like(flat_values)
         out.index_copy_(0, flat_dests, flat_values)
 
