@@ -1339,6 +1339,93 @@ class RankIntegrationTest(unittest.TestCase):
             self.success = dfs_are_close(df, df_ckpt, abs_tol)
             self.assertTrue(self.success, name)
 
+        self.success = False
+        trained_config_path = os.path.join(self.test_dir, "pipeline.config")
+        bf16_config_path = os.path.join(self.test_dir, "pipeline_bf16.config")
+        bf16_config = config_util.load_pipeline_config(trained_config_path)
+        bf16_config.export_config.mixed_precision = "BF16"
+        config_util.save_message(bf16_config, bf16_config_path)
+
+        # INT8 rows dequantize to fp16 and BF16 autocast lowers dense precision,
+        # hence the looser 2e-2 tolerance compared to FP32.
+        aot_cases = [
+            (
+                "export_aot_fp32",
+                trained_config_path,
+                "USE_DISTRIBUTED_EMBEDDING=1 ENABLE_AOT=2",
+                1e-4,
+                None,
+            ),
+            (
+                "export_aot_int8",
+                trained_config_path,
+                "USE_DISTRIBUTED_EMBEDDING=1 ENABLE_AOT=2 DIST_QUANT=INT8",
+                2e-2,
+                4,
+            ),
+            (
+                "export_aot_int8_bf16",
+                bf16_config_path,
+                "USE_DISTRIBUTED_EMBEDDING=1 ENABLE_AOT=2 DIST_QUANT=INT8",
+                2e-2,
+                None,
+            ),
+        ]
+        for name, cfg_path, env_str, abs_tol, predict_threads in aot_cases:
+            export_dir = os.path.join(self.test_dir, name)
+            predict_output_path = os.path.join(self.test_dir, f"predict_{name}")
+            ok = utils.test_export(
+                cfg_path,
+                self.test_dir,
+                export_dir=export_dir,
+                env_str=env_str,
+            )
+            self.assertTrue(ok, name)
+            self.assertTrue(
+                os.path.exists(os.path.join(export_dir, "aoti/aoti_model.pt2")), name
+            )
+            self.assertTrue(
+                os.path.exists(os.path.join(export_dir, "dense_meta.json")), name
+            )
+            with open(os.path.join(export_dir, "dense_meta.json")) as f:
+                dense_meta = json.load(f)
+            self.assertIn("sequence__ec", dense_meta, name)
+            with open(os.path.join(export_dir, "model_acc.json")) as f:
+                acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg.get("ENABLE_AOT"), "2", name)
+            self.assertEqual(acc_cfg.get("DISTRIBUTED_EMBEDDING"), "1", name)
+            self.assertEqual(acc_cfg.get("INPUT_TILE"), "3", name)
+            sparse_dir = os.path.join(export_dir, "sparse")
+            self.assertTrue(
+                os.path.exists(os.path.join(sparse_dir, "sparse_embedding.json")), name
+            )
+            self.assertTrue(
+                glob.glob(os.path.join(sparse_dir, "sparse_*embedding*.npz")), name
+            )
+            self.assertFalse(
+                os.path.exists(os.path.join(export_dir, "scripted_model.pt")), name
+            )
+            self.assertFalse(
+                os.path.exists(os.path.join(export_dir, "scripted_sparse_model.pt")),
+                name,
+            )
+
+            ok = utils.test_predict(
+                scripted_model_path=export_dir,
+                predict_input_path=predict_input_path,
+                predict_output_path=predict_output_path,
+                reserved_columns="user_id,item_id,clk",
+                output_columns="probs",
+                test_dir=self.test_dir,
+                predict_threads=predict_threads,
+            )
+            self.assertTrue(ok, name)
+            df = ds.dataset(predict_output_path, format="parquet").to_table()
+            df = df.to_pandas().sort_values(by=predict_columns, ignore_index=True)
+            self.assertTrue(dfs_are_close(df, df_ckpt, abs_tol), name)
+
+        self.success = True
+
     # id_1 is a regular embedding table, the rest are dynamicemb, so one run
     # covers FTRL on both the fused TBE kernel and the dynamicemb path.
     @unittest.skipIf(
