@@ -1442,7 +1442,7 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
                 shapes["u_seq__raw.lengths"][0],
             )
 
-    def test_pad_distributed_dense_step3_zero_mulval_subtokens(self):
+    def test_pad_distributed_dense_multivalue_sequence_with_zero_tokens(self):
         device = (
             torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         )
@@ -1457,8 +1457,9 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
             _,
         ) = self._build_distributed_dense_sample_fixture(user_bs=2, item_bs=4)
 
-        # Sequence has 2 steps on sample 1 ([0, 2]) so step-2 padding does not
-        # fire, while multi-value sub-token counts are all zero (key_lengths=[0, 0]).
+        # Sequence has 2 total elements on sample 1 ([0, 2]) so sequence-length
+        # padding does not fire, while multi-value token counts are all zero
+        # (key_lengths=[0, 0]).
         data["u_seq__mv.lengths"] = torch.tensor([0, 2], dtype=torch.int64)
         data["u_seq__mv.key_lengths"] = torch.tensor([0, 0], dtype=torch.int64)
         data["u_seq__mv.values"] = torch.empty(0, dtype=torch.int64)

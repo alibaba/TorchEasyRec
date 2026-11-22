@@ -56,15 +56,12 @@ torchrun --master_addr=localhost --master_port=32555 \
   - **USE_DISTRIBUTED_EMBEDDING=1**：启用分布式 embedding 导出；配置了 `dynamicemb` 的特征会在非 RTP 导出时自动开启该模式
   - 普通 sparse、ZCH 和原生 dynemb 模型使用统一导出流程；`dynamic_embedding` 仅调整 dynemb 读取和上传参数
   - 配置了 zch 的特征会自动转换为动态表导出，详见 [零冲突Hash Embedding](../feature/zch.md) 的分布式 Embedding 导出章节
-  - 未开启 `ENABLE_AOT` 时，PYTORCH dense 图使用 CPU 导出 `scripted_model.pt`，TRITON/CUTLASS dense 图需要 CUDA；导出目录保留 full/dense graph 调试文件，不再生成 `graph/gm_sparse.graph`
-  - 搭配 **ENABLE_AOT=2**（或兼容写法 **ENABLE_AOT=1**）时，使用 CUDA 导出单阶段 AOTInductor dense 模型包 `aoti/aoti_model.pt2`（不再生成 `scripted_model.pt` 与 `scripted_sparse_model.pt`），并在 `model_acc.json` 中记录 `"ENABLE_AOT": "2"`、`"DISTRIBUTED_EMBEDDING": "1"` 及解析后的 `"INPUT_TILE"`（通常为 `"3"`；GenRec 与纯 user 塔为 `"0"`，见上）；可同时搭配 `DIST_QUANT=INT8` 及 `export_config.mixed_precision`（如 `"BF16"` / `"FP16"`），导出机器需设置 `CUDA_HOME`（含 `nvcc`）且 GPU SM 架构必须与推理服务完全一致
-  - 未开启 `ENABLE_AOT` 时导出的模型可用 `tzrec.predict` 离线预测，详见 [离线预测](./predict.md#predict-distributed-embedding)；搭配 `ENABLE_AOT=2`/`1` 导出的 `aoti/aoti_model.pt2` 当前面向在线推理服务，离线预测支持将在后续版本补齐
 - DIST_QUANT: 分布式 embedding 导出模式下的 sparse embedding 参数量化开关，默认关闭；当前仅支持 INT8，与普通导出的 `QUANT_EMB` / `QUANT_EC_EMB` 不同
   - **USE_DISTRIBUTED_EMBEDDING=1 DIST_QUANT=INT8**：启用分布式 sparse embedding INT8 量化
   - 未设置 **DIST_QUANT** 时，不启用分布式 sparse embedding 量化
 - ENABLE_AOT: 使用AOT(Ahead Of Time)编译优化导出的模型，可显著提升推理性能。**AOT 编译产物与导出机器的 GPU 架构强绑定，在线服务的 GPU 类型必须与导出时使用的 GPU 类型完全一致**，详见下文 [在 PAI 上导出 AOT 模型](#export-aot-on-pai) 章节
-  - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（普通导出下 sparse 部分用 JIT，dense 部分用 AOTI；在 `USE_DISTRIBUTED_EMBEDDING=1` 下与 `ENABLE_AOT=2` 行为一致，仅导出单阶段 CUDA dense `aoti/aoti_model.pt2`）
-  - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化（普通导出下 sparse + dense 融合为单一 `.pt2`，支持 `INPUT_TILE`、`HARD_SEARCH_INPUT_TILE` 和空序列特征，其中 `JAGGED_SEQUENCE` 特征组在预测时仍要求每个 batch 的序列总长度至少为 1；在 `USE_DISTRIBUTED_EMBEDDING=1` 下导出单阶段 CUDA dense `aoti/aoti_model.pt2` 配合 `sparse/` 外置查表）
+  - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（普通导出下 sparse 部分用 JIT，dense 部分用 AOTI；在 `USE_DISTRIBUTED_EMBEDDING=1` 下与 `ENABLE_AOT=2` 行为一致）
+  - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化（普通导出下 sparse + dense 融合为单一 `.pt2`，支持 `INPUT_TILE`、`HARD_SEARCH_INPUT_TILE` 和空序列特征，其中 `JAGGED_SEQUENCE` 特征组在预测时仍要求每个 batch 的序列总长度至少为 1）
 - TORCHINDUCTOR_CACHE_DIR: 指定 TorchInductor 与 Triton 编译缓存目录。开启 `ENABLE_AOT` 时，建议挂载容器本地持久化路径以复用已编译算子内核，显著缩短重编译耗时
 - AOTI_PORTABLE_CPU / AOTI_CPU_MARCH: 可选配置。默认情况下 AOTI C++ 包装库使用 `-march=native` 编译，若导出机 CPU 具备高阶指令集（如 `AMX_TILE` / `AVX-512`）而线上推理节点 CPU 机型异构，可能引发 `SIGILL` 非法指令崩溃；跨机型部署时可设置 **AOTI_PORTABLE_CPU=1**（x86_64 默认采用 `core-avx2` 与 256-bit SIMD，避开 `AVX-512`/`AMX_TILE`），或通过 **AOTI_CPU_MARCH**（如 `core-avx2`、`x86-64`）及可选 **AOTI_CPU_SIMDLEN** 显式指定目标指令集
 

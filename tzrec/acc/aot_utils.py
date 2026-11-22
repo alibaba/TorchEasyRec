@@ -749,15 +749,15 @@ def _extract_distributed_dense_consumed_keys(
 
 
 def _increment_length_at(
-    sample_data: Dict[str, torch.Tensor], key: str, index: int, delta: int
+    sample_data: Dict[str, torch.Tensor], key: str, delta: int, index: int = 0
 ) -> None:
     """Increment one entry of a length tensor without mutating in place.
 
     Args:
         sample_data: sample tensor dictionary to update.
         key: length tensor key in ``sample_data``.
-        index: element index in ``sample_data[key]`` to increment.
         delta: positive length increment to add.
+        index: element index in ``sample_data[key]`` to increment.
     """
     if key not in sample_data:
         return
@@ -767,13 +767,6 @@ def _increment_length_at(
     updated = lengths.clone()
     updated[index] = updated[index] + delta
     sample_data[key] = updated
-
-
-def _increment_first_length(
-    sample_data: Dict[str, torch.Tensor], key: str, delta: int
-) -> None:
-    """Increment the first entry of a non-empty length tensor without mutating."""
-    _increment_length_at(sample_data, key, 0, delta)
 
 
 def _pad_rows_zeros(sample_data: Dict[str, torch.Tensor], key: str, pad_n: int) -> None:
@@ -800,7 +793,8 @@ def _pad_distributed_dense_sample_inputs(
     for name in seq_jts:
         raw_name_to_ec_keys[name.split("@", 1)[0]].append(name)
 
-    # 1. Sequence groups sharing a step Dim (EC, SequenceDense, mulval key_lengths).
+    # 1. Sequence groups sharing a total_sequence_length Dim
+    # (EC, SequenceDense, mulval key_lengths).
     seq_groups: Dict[str, List[BaseFeature]] = defaultdict(list)
     for feat in features:
         if not feat.is_sequence:
@@ -809,27 +803,27 @@ def _pad_distributed_dense_sample_inputs(
         seq_groups[group_key].append(feat)
 
     for group_feats in seq_groups.values():
-        step_size: Optional[int] = None
+        total_sequence_length: Optional[int] = None
         for feat in group_feats:
             kl_key = f"{feat.name}.key_lengths"
             if kl_key in sample_data:
-                step_size = int(sample_data[kl_key].size(0))
+                total_sequence_length = int(sample_data[kl_key].size(0))
                 break
             if not feat.is_sparse and f"{feat.name}.values" in sample_data:
-                step_size = int(sample_data[f"{feat.name}.values"].size(0))
+                total_sequence_length = int(sample_data[f"{feat.name}.values"].size(0))
                 break
             for ec_key in raw_name_to_ec_keys.get(feat.name, []):
                 if ec_key in sample_data:
-                    step_size = int(sample_data[ec_key].size(0))
+                    total_sequence_length = int(sample_data[ec_key].size(0))
                     break
-            if step_size is not None:
+            if total_sequence_length is not None:
                 break
             if feat.is_sparse and f"{feat.name}.values" in sample_data:
-                step_size = int(sample_data[f"{feat.name}.values"].size(0))
+                total_sequence_length = int(sample_data[f"{feat.name}.values"].size(0))
                 break
 
-        if step_size is not None and step_size < 2:
-            pad_steps = 2 - step_size
+        if total_sequence_length is not None and total_sequence_length < 2:
+            sequence_length_padding = 2 - total_sequence_length
             for feat in group_feats:
                 kl_key = f"{feat.name}.key_lengths"
                 lengths_key = f"{feat.name}.lengths"
@@ -837,35 +831,58 @@ def _pad_distributed_dense_sample_inputs(
                 if kl_key in sample_data:
                     kl = sample_data[kl_key]
                     sample_data[kl_key] = torch.cat(
-                        [kl, torch.ones(pad_steps, dtype=kl.dtype, device=kl.device)],
+                        [
+                            kl,
+                            torch.ones(
+                                sequence_length_padding,
+                                dtype=kl.dtype,
+                                device=kl.device,
+                            ),
+                        ],
                         dim=0,
                     )
-                    _increment_first_length(sample_data, lengths_key, pad_steps)
+                    _increment_length_at(
+                        sample_data, lengths_key, sequence_length_padding
+                    )
                     for ec_key in raw_name_to_ec_keys.get(feat.name, []):
                         if ec_key in sample_data:
-                            _pad_rows_zeros(sample_data, ec_key, pad_steps)
-                        _increment_first_length(
-                            sample_data, f"{ec_key}__lengths", pad_steps
+                            _pad_rows_zeros(
+                                sample_data, ec_key, sequence_length_padding
+                            )
+                        _increment_length_at(
+                            sample_data, f"{ec_key}__lengths", sequence_length_padding
                         )
                     if values_key in sample_data:
-                        _pad_rows_zeros(sample_data, values_key, pad_steps)
+                        _pad_rows_zeros(
+                            sample_data, values_key, sequence_length_padding
+                        )
                 elif not feat.is_sparse:
                     if values_key in sample_data:
-                        _pad_rows_zeros(sample_data, values_key, pad_steps)
-                        _increment_first_length(sample_data, lengths_key, pad_steps)
+                        _pad_rows_zeros(
+                            sample_data, values_key, sequence_length_padding
+                        )
+                        _increment_length_at(
+                            sample_data, lengths_key, sequence_length_padding
+                        )
                 else:
                     for ec_key in raw_name_to_ec_keys.get(feat.name, []):
                         if ec_key in sample_data:
-                            _pad_rows_zeros(sample_data, ec_key, pad_steps)
-                        _increment_first_length(
-                            sample_data, f"{ec_key}__lengths", pad_steps
+                            _pad_rows_zeros(
+                                sample_data, ec_key, sequence_length_padding
+                            )
+                        _increment_length_at(
+                            sample_data, f"{ec_key}__lengths", sequence_length_padding
                         )
                     if values_key in sample_data:
-                        _pad_rows_zeros(sample_data, values_key, pad_steps)
-                        _increment_first_length(sample_data, lengths_key, pad_steps)
+                        _pad_rows_zeros(
+                            sample_data, values_key, sequence_length_padding
+                        )
+                        _increment_length_at(
+                            sample_data, lengths_key, sequence_length_padding
+                        )
 
         # 2. Multi-value sequence sub-token values may still be <2 even when
-        # step count >= 2 (e.g. key_lengths=[0, 0]).
+        # total_sequence_length >= 2 (e.g. key_lengths=[0, 0]).
         for feat in group_feats:
             kl_key = f"{feat.name}.key_lengths"
             if kl_key not in sample_data or sample_data[kl_key].numel() == 0:
@@ -884,7 +901,7 @@ def _pad_distributed_dense_sample_inputs(
                     pad_vals = 2 - int(sample_data[ec_key].size(0))
                     _pad_rows_zeros(sample_data, ec_key, pad_vals)
                     _increment_length_at(
-                        sample_data, f"{ec_key}__lengths", owner_sample, pad_vals
+                        sample_data, f"{ec_key}__lengths", pad_vals, index=owner_sample
                     )
                     pad_delta = max(pad_delta, pad_vals)
             raw_vals_key = f"{feat.name}.values"
@@ -893,7 +910,7 @@ def _pad_distributed_dense_sample_inputs(
                 _pad_rows_zeros(sample_data, raw_vals_key, pad_vals)
                 pad_delta = max(pad_delta, pad_vals)
             if pad_delta > 0:
-                _increment_first_length(sample_data, kl_key, pad_delta)
+                _increment_length_at(sample_data, kl_key, pad_delta)
 
     # 3. Non-sequence Query EC entries in sequence__ec.
     for ec_key in seq_jts:
@@ -904,7 +921,7 @@ def _pad_distributed_dense_sample_inputs(
         if ec_key in sample_data and sample_data[ec_key].size(0) < 2:
             pad_n = 2 - int(sample_data[ec_key].size(0))
             _pad_rows_zeros(sample_data, ec_key, pad_n)
-            _increment_first_length(sample_data, f"{ec_key}__lengths", pad_n)
+            _increment_length_at(sample_data, f"{ec_key}__lengths", pad_n)
 
     return sample_data
 
@@ -1105,7 +1122,7 @@ def _build_distributed_dense_dynamic_shapes(
             )
         return {0: hsk_batch_dims[seq_src]}
 
-    def _get_seq_step_dim(feat_prefix: str) -> torch.export.Dim:
+    def _get_total_sequence_length_dim(feat_prefix: str) -> torch.export.Dim:
         if feat_prefix in feat_to_seq_dim_group:
             group = feat_to_seq_dim_group[feat_prefix]
             if group not in group_to_dim:
@@ -1141,7 +1158,7 @@ def _build_distributed_dense_dynamic_shapes(
                 # Sub-token rows vary independently of sequence step count.
                 dynamic_shapes[key] = {0: _next_dim(0)}
             elif raw_name in seq_feat_names:
-                dynamic_shapes[key] = {0: _get_seq_step_dim(raw_name)}
+                dynamic_shapes[key] = {0: _get_total_sequence_length_dim(raw_name)}
             else:
                 # Non-sequence Query EC entry inside a sequence group.
                 dynamic_shapes[key] = {0: _next_dim(0)}
@@ -1156,12 +1173,14 @@ def _build_distributed_dense_dynamic_shapes(
             feat = feat_by_name.get(prefix)
             if key.endswith(".values"):
                 if prefix in seq_feat_names and feat is not None and not feat.is_sparse:
-                    dynamic_shapes[key] = {0: _get_seq_step_dim(prefix)}
+                    dynamic_shapes[key] = {0: _get_total_sequence_length_dim(prefix)}
                 elif prefix in seq_feat_names and feat is not None and feat.is_sparse:
                     if prefix in mulval_seq_names:
                         dynamic_shapes[key] = {0: _get_or_create_prefix_dim(prefix)}
                     else:
-                        dynamic_shapes[key] = {0: _get_seq_step_dim(prefix)}
+                        dynamic_shapes[key] = {
+                            0: _get_total_sequence_length_dim(prefix)
+                        }
                 elif feat is not None and feat.is_sparse:
                     dynamic_shapes[key] = {0: _get_or_create_prefix_dim(prefix)}
                 elif resolved_input_tile and prefix in resolved_hsk:
@@ -1178,7 +1197,7 @@ def _build_distributed_dense_dynamic_shapes(
                 else:
                     dynamic_shapes[key] = {0: batch}
             elif key.endswith(".key_lengths"):
-                dynamic_shapes[key] = {0: _get_seq_step_dim(prefix)}
+                dynamic_shapes[key] = {0: _get_total_sequence_length_dim(prefix)}
             elif key.endswith(".weights"):
                 dynamic_shapes[key] = {0: _get_or_create_prefix_dim(prefix)}
             else:
