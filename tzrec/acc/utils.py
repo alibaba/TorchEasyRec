@@ -559,6 +559,9 @@ def allow_tf32_for_export(
 ) -> None:
     """Apply or validate TF32 flags for AOTI export.
 
+    Must run BEFORE ``torch.export.export()`` so AOTI captures the live
+    ``torch.backends`` globals into Triton ``ALLOW_TF32`` constexprs.
+
     Args:
         pipeline_config: pipeline config providing ``train_config`` and
             ``export_config`` TF32 preferences.

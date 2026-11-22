@@ -42,7 +42,7 @@ from tzrec.utils.online_dense_export_util import (
     validate_online_dense_export_pipeline_config,
 )
 
-_VALID_DENSE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+_VALID_DENSE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,239}$")
 
 
 def export_online_dense_model(
@@ -92,7 +92,7 @@ def export_online_dense_model(
     if not _VALID_DENSE_VERSION_RE.fullmatch(version):
         raise ValueError(
             f"Invalid dense export version {version!r}; must match "
-            r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$."
+            f"{_VALID_DENSE_VERSION_RE.pattern}."
         )
 
     pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
@@ -144,6 +144,7 @@ def export_online_dense_model(
             if is_aot:
                 device = torch.device("cuda:0")
                 torch.cuda.set_device(device)
+                # AOTI bakes allow_tf32 into Triton constexprs at export time.
                 acc_utils.allow_tf32_for_export(pipeline_config)
                 mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
                 _export_dense_model_on_device(

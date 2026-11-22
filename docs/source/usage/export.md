@@ -160,8 +160,8 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
   - **ONLINE_DENSE_EXPORT=1**：启用（要求同时设置 `USE_DISTRIBUTED_EMBEDDING=1`，并在 `train_config` 中配置带 `feature_store_config` 的 `delta_embedding_dump_config`；仅本地落盘的 dump 没有上传水位可供门控，缺少任一项训练启动即报错）
 - ONLINE_DENSE_EXPORT_DIR: 在线服务读取的根目录（必填）。导出产物发布在 `<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export` 下，必须为本地路径（发布依赖 `os.rename` 原子换版）；`model_dir` 可以是远端（如 OSS）
 - ONLINE_DENSE_EXPORT_KEEP_VERSIONS: 保留的历史版本数，默认 0（不删除任何已导出的版本）。大于 0 时保留最新 K 个版本，且 K 最小为 3（serving 需要当前版本 + 上一版本用于原子切换）。`current.json` 指向的版本永远不被清理
-- ONLINE_DENSE_EXPORT_TIMEOUT: 单次导出的预算秒数，默认 3600。超时不会中断导出线程，仅打印告警，并用于训练结束时 drain 的等待上限
-- ENABLE_AOT: 在 `ONLINE_DENSE_EXPORT=1` 下设置 `ENABLE_AOT=2`（兼容 `ENABLE_AOT=1`）时，版本目录交付 `versions/<yyyyMMddHHmmss>/aoti/aoti_model.pt2` 替代 `scripted_model.pt`。Rank 0 需具备 CUDA（`cuda:0`）及 `CUDA_HOME`（含 `nvcc`），后台线程在独立 CUDA Stream 中执行导出；**训练 Rank 0 节点的 GPU SM 架构必须与在线服务节点完全一致**（若训练与推理节点 CPU ISA 存在差异，如导出节点带 `AMX_TILE`，请同时配置 `AOTI_PORTABLE_CPU=1` 或 `AOTI_CPU_MARCH`），且同一服务进程运行期不可混用 `.pt` 与 `.pt2` 版本
+- ONLINE_DENSE_EXPORT_TIMEOUT: 单次导出的预算秒数，默认 3600。超时不会中断导出线程，仅打印告警，并用于训练结束时 drain 与启动阶段冷编译试运行（非 0 rank 在广播建图状态时需等待 `2 * timeout + 120` 秒，开启 `ENABLE_AOT` 时需保证该阈值覆盖冷编译耗时）
+- ENABLE_AOT: 在 `ONLINE_DENSE_EXPORT=1` 下设置 `ENABLE_AOT=2`（兼容 `ENABLE_AOT=1`）时，版本目录交付 `versions/<yyyyMMddHHmmss>/aoti/aoti_model.pt2` 替代 `scripted_model.pt`。各 rank 均需具备 CUDA，rank 0 在 `cuda:0` 上执行编译与导出并需具备 `CUDA_HOME`（含 `nvcc`），后台线程在独立 CUDA Stream 中执行导出；**训练 Rank 0 节点的 GPU SM 架构必须与在线服务节点完全一致**（若训练与推理节点 CPU ISA 存在差异，如导出节点带 `AMX_TILE`，请同时配置 `AOTI_PORTABLE_CPU=1` 或 `AOTI_CPU_MARCH`），且同一服务进程运行期不可混用 `.pt` 与 `.pt2` 版本。进程内热导出会保留训练期全局 TF32 状态（若 `export_config` 配置不一致仅告警；通过离线 bootstrap 预热的 `TORCHINDUCTOR_CACHE_DIR` 需保证双方 TF32 状态一致方可命中），同时 rank 0 `cuda:0` 需为常驻孪生图与编译工作区预留显存（进程内 AOTI 编译若发生不可恢复的 CUDA 设备故障会连带中止训练）
 - TORCHINDUCTOR_CACHE_DIR: 建议在 `ONLINE_DENSE_EXPORT=1` + `ENABLE_AOT=2` 下指向本地持久化缓存目录，利用启动试运行预热 Triton/C++ 编译缓存以加速后续各轮重打包
 
 ### 运行与排障说明
@@ -172,7 +172,7 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 - 两次导出间隔小于单次导出耗时时，排队中的旧任务被最新版本顶替（latest-wins），不产生积压；水位到达后也只发布最新的就绪版本，被顶替的未发布版本目录会被直接删除，不占用 `ONLINE_DENSE_EXPORT_KEEP_VERSIONS` 的保留配额。
 - 新鲜度预算：dump/发布间隔必须大于单次增量上传耗时的 p99（可通过监控上传耗时占发布间隔的比例确认），否则全局水位持续落后于配对步，`current.json` 长期不翻转。
 - 建议周期性做全量再基线（anti-entropy）：停训后用离线全量导出 + FeatureStore 全量导入，再用下述 bootstrap 命令发布配对的 dense 版本，以清理 crash 重启死时间线残留的旧值、僵尸 tombstone 等漂移。全量导入必须以重启式切换进行，不能在增量流写入的同时在线叠写。
-- MatchModel（向量召回）与 TDM 模型的完整导出按 user/item（或按模块）分目录，与单体 dense 热导出的布局不兼容，启用会直接报错，请使用完整的 `tzrec.export`。
+- MatchModel（向量召回）、TDM 与 BaseGenRecModel（`prompt_config`）模型的完整导出与单体 dense 热导出的产物布局不兼容，启用会直接报错，请使用完整的 `tzrec.export`。
 - 手动/离线从某个 checkpoint 导出一个版本（bootstrap，与训练内导出发布到同一目录结构）。该命令不经过水位门控、直接翻转 `current.json`，manifest 中 `sparse_step` 等于 `checkpoint_step`（`--checkpoint_step` 省略时从 `model.ckpt-<step>` 路径解析）、`sparse_probes` 为空（Processor 跳过探针验证），前提是 FeatureStore 中的全量 embedding 与该 checkpoint 同源：
 
 ```bash
@@ -185,7 +185,7 @@ python -m tzrec.tools.online_dense_export \
     --checkpoint_step 1200
 ```
 
-（不加 `ENABLE_AOT=2` 时导出 TorchScript `scripted_model.pt`。）
+（未设置 `ENABLE_AOT` 时导出 TorchScript `scripted_model.pt`。）
 
 (export-aot-on-pai)=
 

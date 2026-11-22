@@ -261,24 +261,35 @@ def validate_online_dense_export_pipeline_config(
         pipeline_config: Loaded or stubbed pipeline config to validate.
 
     Raises:
-        RuntimeError: When ``pipeline_config`` configures ``BaseGenRecModel``.
+        RuntimeError: When ``pipeline_config`` configures ``prompt_config`` or
+            a ``MatchModel``, ``TDM``, or ``BaseGenRecModel`` model class.
     """
-    model_cfg = getattr(pipeline_config, "model_config", None)
-    model_type = (
-        model_cfg.WhichOneof("model")
-        if model_cfg is not None and hasattr(model_cfg, "WhichOneof")
-        else None
-    )
     has_prompt = (
         pipeline_config.HasField("prompt_config")
         if hasattr(pipeline_config, "HasField")
         else bool(getattr(pipeline_config, "prompt_config", None))
     )
-    if has_prompt or model_type == "genrec_causal_lm_model":
+    if has_prompt:
         raise RuntimeError(
-            "ONLINE_DENSE_EXPORT does not support BaseGenRecModel models "
-            "(requires compiled_prompt and HF weights layout); use the full "
-            "export (export_model) instead."
+            "ONLINE_DENSE_EXPORT does not support prompt_config / "
+            "BaseGenRecModel models (requires compiled_prompt and HF weights "
+            "layout); use the full export (export_model) instead."
+        )
+    model_cfg = getattr(pipeline_config, "model_config", None)
+    from tzrec.protos.model_pb2 import ModelConfig
+
+    if not isinstance(model_cfg, ModelConfig) or not model_cfg.WhichOneof("model"):
+        return
+    from tzrec.main import _get_model_class
+    from tzrec.models.genrec_model import BaseGenRecModel
+    from tzrec.models.match_model import MatchModel
+    from tzrec.models.tdm import TDM
+
+    model_cls = _get_model_class(model_cfg)
+    if issubclass(model_cls, (MatchModel, TDM, BaseGenRecModel)):
+        raise RuntimeError(
+            f"ONLINE_DENSE_EXPORT does not support {model_cls.__name__} "
+            "models; use the full export (export_model) instead."
         )
 
 
@@ -314,6 +325,8 @@ class OnlineDenseExportManager:
     ) -> None:
         self._enabled = _online_dense_export_enabled()
         self._is_aot = acc_utils.is_aot()
+        self._device = torch.device("cuda:0") if self._is_aot else torch.device("cpu")
+        self._export_stream: Optional[torch.cuda.Stream] = None
         self._mixed_precision: Optional[str] = None
         self._input_tile_3_online: Optional[bool] = None
         self._rank = int(os.environ.get("RANK", 0))
@@ -391,10 +404,9 @@ class OnlineDenseExportManager:
                 )
         if dist.is_initialized() and dist.get_world_size() > 1:
             # collective; ONLINE_DENSE_EXPORT is job-uniform so all ranks enter.
-            # finalize_publish drains the export worker on rank zero (up to
-            # _close_timeout) before its gather while the other ranks already
-            # wait inside it, so the group timeout must cover that drain
-            # instead of the 30-minute gloo default.
+            # Covers both rank zero's startup dry-run compile (including cold
+            # AOTI compile under ENABLE_AOT) before broadcast_object_list and
+            # close() drain during finalize_publish while non-zero ranks wait.
             self._group = cast(
                 Optional[dist.ProcessGroup],
                 dist.new_group(
@@ -480,7 +492,7 @@ class OnlineDenseExportManager:
         from tzrec.models.model import ScriptWrapper
         from tzrec.models.tdm import TDM
 
-        device = torch.device("cuda:0") if self._is_aot else torch.device("cpu")
+        device = self._device
         with acc_utils.export_env_scope(
             use_distributed_embedding=True,
             input_tile="3",
@@ -513,6 +525,10 @@ class OnlineDenseExportManager:
             twin_model = ScriptWrapper(twin_model)
             if self._is_aot:
                 torch.cuda.set_device(device)
+                # Reuse one dedicated export stream across tasks so Inductor
+                # and AOTI allocator blocks are reused instead of stranded
+                # across PyTorch's 32-stream round-robin pool.
+                self._export_stream = torch.cuda.Stream(device=device)
                 acc_utils.allow_tf32_for_export(pipeline_config, mutate_globals=False)
                 self._mixed_precision = acc_utils.mixed_precision_for_export(
                     pipeline_config
@@ -546,6 +562,10 @@ class OnlineDenseExportManager:
                     dense_graph_config,
                     mixed_precision=self._mixed_precision,
                 )
+            if self._is_aot:
+                # Finish dry-run GPU work before handing the resident graph to
+                # the worker stream.
+                torch.cuda.synchronize(device)
 
         source_keys = model.state_dict()
         pairs: List[Tuple[str, str]] = []
@@ -889,7 +909,7 @@ class OnlineDenseExportManager:
         versions_root = os.path.join(self._export_root, VERSIONS_DIR)
         version_dir = os.path.join(versions_root, version)
         tmp_dir = f"{version_dir}.tmp.{os.getpid()}"
-        device = torch.device("cuda:0") if self._is_aot else torch.device("cpu")
+        device = self._device
         start_time = time.monotonic()
         logger.info(
             "start online dense export version %s (step %s)", version, task["step"]
@@ -906,12 +926,9 @@ class OnlineDenseExportManager:
             assert self._warmup_data is not None
             assert self._dense_graph_config is not None
             assert self._dense_model_traced is not None
-            export_stream: Optional[torch.cuda.Stream] = None
+            export_stream = self._export_stream
             if self._is_aot:
                 torch.cuda.set_device(device)
-                # Isolate H2D snapshot copies and AOTI export on a dedicated
-                # stream so the worker does not serialize on training work.
-                export_stream = torch.cuda.Stream(device=device)
             stream_ctx = (
                 torch.cuda.stream(export_stream)
                 if export_stream is not None
