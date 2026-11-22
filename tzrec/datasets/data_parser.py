@@ -93,6 +93,7 @@ def _infer_tile_size(item_t: torch.Tensor, user_t: torch.Tensor) -> int:
     item_bs = item_t.size(0)
     user_bs = user_t.size(0)
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        torch._check(user_bs >= 1)
         tile_size = item_bs // user_bs
         torch._check(tile_size >= 1)
         torch._check(user_bs * tile_size == item_bs)
