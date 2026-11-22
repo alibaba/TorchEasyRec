@@ -104,7 +104,7 @@ from tzrec.utils.export_util import (
     _shrink_sparse_embedding_tables,
     build_dense_graph_module,
     create_dense_export_warmup_data,
-    export_dense_model_cpu,
+    export_dense_model,
     export_distributed_embedding,
     finalize_dense_export,
 )
@@ -2585,7 +2585,7 @@ class ExportUtilTest(unittest.TestCase):
                     )
                 },
                 # First id is an out-of-range dynamicemb-style 64-bit FG hash
-                # to guard the warm-up zeroing in export_dense_model_cpu:
+                # to guard the warm-up zeroing in export_dense_model:
                 # without it F.embedding_bag's strict CPU range-check raises.
                 sparse_features={
                     BASE_DATA_GROUP: KeyedJaggedTensor.from_lengths_sync(
@@ -2618,11 +2618,12 @@ class ExportUtilTest(unittest.TestCase):
                 ):
                     checkpoint_util.save_model(ckpt_dir, _build_wrapped_model())
                     # pass meta embeddings to exercise in-function init_parameters
-                    export_dense_model_cpu(
+                    export_dense_model(
                         pipeline_config=pipeline_config,
                         model=ScriptWrapper(_build_model()),
                         checkpoint_path=ckpt_dir,
                         save_dir=export_dir,
+                        device=torch.device("cpu"),
                     )
             finally:
                 dist.destroy_process_group()
@@ -2757,11 +2758,12 @@ class ExportUtilTest(unittest.TestCase):
                     ),
                 ):
                     checkpoint_util.save_model(ckpt_dir, live_model)
-                    export_dense_model_cpu(
+                    export_dense_model(
                         pipeline_config=pipeline_config,
                         model=ScriptWrapper(_build_model()),
                         checkpoint_path=ckpt_dir,
                         save_dir=ckpt_export_dir,
+                        device=device,
                     )
                     # in-process path: gather the weights from the live
                     # model's own state_dict (single process => no sharding,
@@ -3259,11 +3261,12 @@ class ExportUtilTest(unittest.TestCase):
                     ),
                 ):
                     checkpoint_util.save_model(ckpt_dir, _build_wrapped_model())
-                    export_dense_model_cpu(
+                    export_dense_model(
                         pipeline_config=pipeline_config,
                         model=ScriptWrapper(_build_model()),
                         checkpoint_path=ckpt_dir,
                         save_dir=export_dir,
+                        device=torch.device("cpu"),
                     )
             finally:
                 dist.destroy_process_group()
@@ -3545,7 +3548,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
 
         real_init = export_util.init_parameters
         real_empty_like = torch.empty_like
-        real_dense_export = export_util._export_dense_model_on_device
+        real_dense_export = export_util.export_dense_model
 
         def guarded_dense_export(*args, **kwargs):
             self.assertTrue(
@@ -3590,7 +3593,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             mock.patch.object(export_util, "init_parameters", side_effect=guarded_init),
             mock.patch.object(
                 export_util,
-                "_export_dense_model_on_device",
+                "export_dense_model",
                 side_effect=guarded_dense_export,
             ),
             mock.patch.object(torch, "empty_like", new=guarded_empty_like),
@@ -3854,7 +3857,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
             mock.patch.object(torch.cuda, "set_device") as set_device,
             mock.patch.object(
                 export_util,
-                "_export_dense_model_on_device",
+                "export_dense_model",
                 side_effect=RuntimeError("dense device selected"),
             ) as dense_export,
             self.assertRaisesRegex(
@@ -3894,9 +3897,7 @@ class DistributedEmbeddingCheckpointExportTest(unittest.TestCase):
         if setting != "missing_tables":
             setattr(settings, setting, 0)
         with (
-            mock.patch.object(
-                export_util, "_export_dense_model_on_device"
-            ) as dense_export,
+            mock.patch.object(export_util, "export_dense_model") as dense_export,
             mock.patch.object(
                 export_util, "_restore_export_sparse_state"
             ) as sparse_restore,
@@ -4931,13 +4932,16 @@ class DistributedEmbeddingAOTExportTest(unittest.TestCase):
         cfg = EasyRecConfig()
         with (
             mock.patch.dict(os.environ, {"ENABLE_AOT": "2"}),
-            self.assertRaisesRegex(ValueError, "export_dense_model_cpu"),
+            self.assertRaisesRegex(
+                ValueError, "AOTI dense export requires a CUDA device"
+            ),
         ):
-            export_dense_model_cpu(
+            export_dense_model(
                 pipeline_config=cfg,
                 model=torch.nn.Identity(),
                 checkpoint_path=os.path.join(self.test_dir, "ckpt"),
                 save_dir=self.export_dir,
+                device=torch.device("cpu"),
             )
 
     @parameterized.expand(
