@@ -412,9 +412,10 @@ class PromptAssemblerTest(unittest.TestCase):
         module = PromptAssembler(_plan((Static((7, 8)),)), _sid_space())
         self.assertEqual(module.anchor, "")
         scripted = torch.jit.script(module)
-        zero_out = scripted({"batch_size": torch.tensor(0, dtype=torch.int64)})
-        self.assertEqual(zero_out[INPUT_IDS].numel(), 0)
-        self.assertEqual(int(zero_out[MAX_SEQLEN]), 0)
+        zero_batch = {"batch_size": torch.tensor(0, dtype=torch.int64)}
+        for zero_out in (module(zero_batch), scripted(zero_batch)):
+            self.assertEqual(zero_out[INPUT_IDS].numel(), 0)
+            self.assertEqual(int(zero_out[MAX_SEQLEN]), 0)
 
         exported = torch.export.export(
             module,

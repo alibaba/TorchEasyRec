@@ -1264,11 +1264,17 @@ class _DistributedDenseAOTIWrapper(nn.Module):
         return pytree.tree_unflatten(flat_outputs, self._out_spec)
 
 
-_RAW_SPARSE_SUFFIXES = (".values", ".lengths", ".weights")
+# Prompt leaves forward .values/.lengths from raw sparse KJTs; .key_lengths arrives
+# via sequence_mulval_lengths and .weights is never read (differs from aot_utils.py).
+_RAW_SPARSE_SUFFIXES = (".values", ".lengths")
 
 
 def _extract_script_required_keys(dense: torch.jit.ScriptModule) -> Set[str]:
-    """Collect raw sparse tensor keys referenced by a scripted dense model."""
+    """Collect raw sparse tensor keys referenced by a scripted dense model.
+
+    Leaf modules that dynamically index ``{member}.values``/``.lengths`` expose
+    them via ``member_names``.
+    """
     required: Set[str] = set()
     for mod in dense.modules():
         for members in getattr(mod, "member_names", []):
@@ -1284,6 +1290,30 @@ def _extract_script_required_keys(dense: torch.jit.ScriptModule) -> Set[str]:
                 if val.endswith(_RAW_SPARSE_SUFFIXES):
                     required.add(val)
     return required
+
+
+def _has_raw_sparse_required_keys(
+    required_keys: Set[str], lookup_sparse_names: Set[str]
+) -> bool:
+    """Return whether ``required_keys`` includes raw sparse tensor inputs.
+
+    Args:
+        required_keys: tensor keys referenced by the dense model contract.
+        lookup_sparse_names: raw sparse feature names served by lookup.
+
+    Returns:
+        True when any key comes from a raw sparse KJT rather than a dense
+        ``KeyedTensor`` (whose ``<feat>.values`` lacks ``.lengths`` and is
+        absent from ``lookup_sparse_names``).
+    """
+    for key in required_keys:
+        if key.endswith(".lengths"):
+            return True
+        if key.endswith(".values"):
+            prefix = key[: -len(".values")]
+            if prefix in lookup_sparse_names or f"{prefix}.lengths" in required_keys:
+                return True
+    return False
 
 
 class DistributedEmbeddingModel:
@@ -1333,8 +1363,11 @@ class DistributedEmbeddingModel:
             )
             if log_model:
                 logger.info(str(self._dense[devices[0]]))
-        self._has_raw_sparse_candidates = any(
-            k.endswith(_RAW_SPARSE_SUFFIXES) for k in self._required_keys
+        lookup_sparse_names = {
+            _input_name(f) for f in getattr(self._lookup, "_used_feats", ())
+        }
+        self._has_raw_sparse_candidates = _has_raw_sparse_required_keys(
+            self._required_keys, lookup_sparse_names
         )
 
     def _needed_sparse_kjt_names(self, batch: Batch) -> Tuple[str, ...]:
@@ -1358,7 +1391,6 @@ class DistributedEmbeddingModel:
                 for name, keys in layout[0]
                 if any(
                     f"{k}.values" in self._required_keys
-                    or f"{k}.weights" in self._required_keys
                     or (
                         f"{k}.lengths" in self._required_keys
                         and k not in mulval_or_seq_dense

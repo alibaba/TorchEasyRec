@@ -2128,7 +2128,7 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
                 os.environ,
                 {
                     "USE_DISTRIBUTED_EMBEDDING": "1",
-                    "INPUT_TILE": "3",
+                    "INPUT_TILE": "0",
                     "ENABLE_AOT": "2",
                 },
             ):
@@ -2155,7 +2155,6 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
                 wrapped = ScriptWrapper(GenRecFrontEnd(model)).to(device).eval()
 
                 export_data = {
-                    "batch_size": torch.tensor(1, dtype=torch.int64, device=device),
                     "hist.values": torch.tensor(
                         GENREC_LONG_HIST_CODES * 2, dtype=torch.float32, device=device
                     ).reshape(-1, 1),
@@ -2186,12 +2185,22 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
                 aoti_model = torch._inductor.aoti_load_package(pt2_path)
                 in_spec = treespec_loads(aoti_model.loader.get_call_spec()[0])
                 key_order = list(in_spec.child(0).child(0).context)
+                self.assertEqual(
+                    set(key_order),
+                    {
+                        "hist.values",
+                        "hist.lengths",
+                        "beh.values",
+                        "beh.lengths",
+                        "beh",
+                        "beh__lengths",
+                    },
+                )
 
                 gm_eval = gm.to(device).eval()
                 for bs in (1, 3):
                     beh_len = 2 * bs
                     case_inputs = {
-                        "batch_size": torch.tensor(1, dtype=torch.int64, device=device),
                         "hist.values": torch.tensor(
                             GENREC_LONG_HIST_CODES * bs,
                             dtype=torch.float32,
@@ -2617,6 +2626,25 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
         )
         dead_spec = treespec_loads(dead_aoti.loader.get_call_spec()[0])
         self.assertEqual(list(dead_spec.child(0).child(0).context), ["seq_mv"])
+
+    def test_extract_consumed_keys_raises_for_empty_anchor_without_batch_size(
+        self,
+    ) -> None:
+        class PromptAssembler(nn.Module):
+            anchor = ""
+            member_names: list = []
+
+            def forward(self, x):
+                return x
+
+        class _StaticPromptMod(nn.Module):
+            def forward(self, data):
+                return data["deep"]
+
+        gm = fx.symbolic_trace(_StaticPromptMod())
+        gm.assembler = PromptAssembler()
+        with self.assertRaisesRegex(ValueError, "All-static GenRec prompt"):
+            aot_utils._extract_distributed_dense_consumed_keys(gm, data={})
 
 
 if __name__ == "__main__":

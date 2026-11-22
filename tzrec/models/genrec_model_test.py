@@ -436,7 +436,7 @@ class GenRecFrontEndTest(unittest.TestCase):
             else:
                 self.assertTrue(torch.equal(out[key], value), key)
 
-    @parameterized.expand(["1", "2"])
+    @parameterized.expand(["1", "2"], name_func=parameterized_name_func)
     def test_front_end_rejects_non_distributed_aot(self, enable_aot: str) -> None:
         with mock.patch.dict(
             os.environ,

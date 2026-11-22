@@ -184,11 +184,13 @@ class HoleKeyBuilder(nn.Module):
                 key_length_key = member + ".key_lengths"
                 if not is_sequence:
                     lengths = batch[member + ".lengths"].to(torch.int64)
+                    # Relies on parser contract: sum(lengths) == values.numel().
                     output_size = values.numel()
                     hole = _row_ids(lengths, output_size=output_size)
                     local = _within_row_index(lengths, output_size=output_size)
                 elif key_length_key in batch:
                     key_lengths = batch[key_length_key].to(torch.int64).reshape(-1)
+                    # Relies on parser contract: sum(key_lengths) == values.numel().
                     output_size = values.numel()
                     hole = _row_ids(key_lengths, output_size=output_size)
                     local = _within_row_index(key_lengths, output_size=output_size)
@@ -196,7 +198,8 @@ class HoleKeyBuilder(nn.Module):
                     hole = torch.cumsum(torch.ones_like(values), dim=0) - 1
                     local = torch.zeros_like(hole)
 
-            # Break SymPy IndexPropagation so Inductor emits tl.full(..., tl.int64).
+            # Break SymPy IndexPropagation across both local and the 64-bit
+            # constants below so Inductor cannot narrow them out of int64.
             local = local ^ 0
             c_idx = torch.full(
                 (), self.C_INDEX, dtype=torch.int64, device=values.device

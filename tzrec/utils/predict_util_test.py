@@ -59,6 +59,7 @@ from tzrec.utils.predict_util import (
     GenRecExportModel,
     _encode_keys,
     _gpu_cache_ratio,
+    _has_raw_sparse_required_keys,
     _key_tag,
     _wrap_batch_predict_model,
     load_predict_model,
@@ -1907,7 +1908,7 @@ class DistributedScriptGenRecTest(unittest.TestCase):
                 return {
                     "user_slot__ebc": age_emb,
                     "beh": beh_w[beh_jt.values().to(target_device)].to(torch.float32),
-                    "beh__lengths": beh_jt.lengths().to(target_device, torch.int64),
+                    "beh__lengths": beh_jt.lengths().to(target_device, torch.int32),
                 }
 
         with mock.patch(
@@ -2027,6 +2028,19 @@ class DistributedScriptGenRecTest(unittest.TestCase):
         )
         self.assertEqual(model._needed_sparse_kjt_names(batch2), ("g2",))
         self.assertEqual(len(model._sparse_copy_keys_cache), 2)
+
+    def test_has_raw_sparse_required_keys(self) -> None:
+        self.assertFalse(
+            _has_raw_sparse_required_keys(
+                {"deep__ebc", "dense_x.values"}, {"age", "beh"}
+            )
+        )
+        self.assertTrue(
+            _has_raw_sparse_required_keys({"deep__ebc", "age.values"}, {"age"})
+        )
+        self.assertTrue(
+            _has_raw_sparse_required_keys({"title.values", "title.lengths"}, {"age"})
+        )
 
 
 if __name__ == "__main__":

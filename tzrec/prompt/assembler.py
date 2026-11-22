@@ -9,12 +9,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The prompt assembler: one scripted walk with two call sites.
+"""The prompt assembler: one walk shared by eager, TorchScript, and export.
 
 The collator runs it after parsing and the exported front-end runs the same
 module at serving. ``PromptPlan`` unrolls into constant lists at construction,
-leaving jagged integer arithmetic with no data-dependent control flow, which
-is what ``torch.jit.script`` can carry into a runtime without tzrec source.
+leaving jagged integer arithmetic with no data-dependent host scalars (such as
+``int(tensor.sum())``) or control flow, so both ``torch.jit.script`` and
+``torch.export`` / AOTInductor can capture it cleanly.
 The walk is prompt structure only; ``hole_keys.py`` folds the prefix-cache
 identity of each hole beside it.
 """
@@ -81,19 +82,24 @@ def batch_device(batch: Dict[str, torch.Tensor]) -> torch.device:
     return torch.device("cpu")
 
 
-def _destinations(seg_start: torch.Tensor, seg_len: torch.Tensor) -> torch.Tensor:
+def _destinations(
+    seg_start: torch.Tensor, seg_len: torch.Tensor, output_size: Optional[int] = None
+) -> torch.Tensor:
     """Absolute index of every value of one segment in the packed stream."""
     row_starts = _exclusive_cumsum(seg_len)
-    repeated_base = torch.repeat_interleave(seg_start - row_starts, seg_len)
+    repeated_base = torch.repeat_interleave(
+        seg_start - row_starts, seg_len, output_size=output_size
+    )
     return repeated_base + (torch.cumsum(torch.ones_like(repeated_base), dim=0) - 1)
 
 
 class PromptAssembler(nn.Module):
     """Walks a compiled plan to build one batch's packed token stream.
 
-    The collator calls it eagerly on the host; export scripts the same module
-    into the serving front-end. It trusts the parsed batch as every scripted
-    module does: the data contract belongs to the parser and to the request.
+    The collator calls it eagerly on the host; export compiles the same module
+    via TorchScript or ``torch.export`` / AOTInductor into the serving
+    front-end, avoiding data-dependent host scalars. It trusts the parsed
+    batch: the data contract belongs to the parser and to the request.
 
     Args:
         prompt_plan: the compiled walk order and its constants.
@@ -199,12 +205,15 @@ class PromptAssembler(nn.Module):
         """Row count, from the anchor member.
 
         A sequence or a multi-value member carries ``lengths``, one per row; a
-        dense member has one row per sample and no lengths.
+        dense member has one row per sample and no lengths. Compiled AOTI
+        exports assume ``batch_size >= 1`` via the export-time SymInt bound.
         """
         if self.anchor == "":
             if "batch_size" in batch:
                 if not torch.jit.is_scripting() and torch.compiler.is_compiling():
                     batch_size = batch["batch_size"].item()
+                    # Export-time SymInt bound (AOTI sets scalar_asserts=False)
+                    # so ``if batch_size > 0`` resolves statically at export.
                     torch._check(batch_size >= 1)
                     # pyre-ignore [7]
                     return batch_size
@@ -230,6 +239,7 @@ class PromptAssembler(nn.Module):
         if key in batch:
             key_lengths = batch[key].to(torch.int64).reshape(-1)
             counts = torch.zeros(batch_size, dtype=torch.int64, device=lengths.device)
+            # Relies on parser contract: sum(lengths) == key_lengths.numel().
             lengths = counts.index_add_(
                 0, _row_ids(lengths, output_size=key_lengths.numel()), key_lengths
             )
@@ -319,7 +329,11 @@ class PromptAssembler(nn.Module):
         response_lengths = torch.zeros(batch_size, dtype=torch.int64, device=device)
         dests: List[torch.Tensor] = []
         for i in range(self.num_segments):
-            dest = _destinations(row_start + seg_offsets[i], seg_lens[i])
+            dest = _destinations(
+                row_start + seg_offsets[i],
+                seg_lens[i],
+                output_size=seg_values[i].numel(),
+            )
             dests.append(dest)
             slot = self.hole_slots[i]
             if slot >= 0:

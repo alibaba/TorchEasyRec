@@ -61,7 +61,7 @@ torchrun --master_addr=localhost --master_port=32555 \
   - 未设置 **DIST_QUANT** 时，不启用分布式 sparse embedding 量化
 - ENABLE_AOT: 使用AOT(Ahead Of Time)编译优化导出的模型，可显著提升推理性能。**AOT 编译产物与导出机器的 GPU 架构强绑定，在线服务的 GPU 类型必须与导出时使用的 GPU 类型完全一致**，详见下文 [在 PAI 上导出 AOT 模型](#export-aot-on-pai) 章节
   - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（普通导出下 sparse 部分用 JIT，dense 部分用 AOTI；在 `USE_DISTRIBUTED_EMBEDDING=1` 下与 `ENABLE_AOT=2` 行为一致）
-  - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化（普通导出下 sparse + dense 融合为单一 `.pt2`，支持 `INPUT_TILE`、`HARD_SEARCH_INPUT_TILE` 和空序列特征，其中 `JAGGED_SEQUENCE` 特征组在预测时仍要求每个 batch 的序列总长度至少为 1）
+  - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化（普通导出下 sparse + dense 融合为单一 `.pt2`，支持 `INPUT_TILE`、`HARD_SEARCH_INPUT_TILE` 和空序列特征，其中非 GenRec 模型的 `JAGGED_SEQUENCE` 特征组在预测时仍要求每个 batch 的序列总长度至少为 1）
 - TORCHINDUCTOR_CACHE_DIR: 指定 TorchInductor 与 Triton 编译缓存目录。开启 `ENABLE_AOT` 时，建议挂载容器本地持久化路径以复用已编译算子内核，显著缩短重编译耗时
 - AOTI_PORTABLE_CPU / AOTI_CPU_MARCH: 可选配置。默认情况下 AOTI C++ 包装库使用 `-march=native` 编译，若导出机 CPU 具备高阶指令集（如 `AMX_TILE` / `AVX-512`）而线上推理节点 CPU 机型异构，可能引发 `SIGILL` 非法指令崩溃；跨机型部署时可设置 **AOTI_PORTABLE_CPU=1**（x86_64 默认采用 `core-avx2` 与 256-bit SIMD，避开 `AVX-512`/`AMX_TILE`），或通过 **AOTI_CPU_MARCH**（如 `core-avx2`、`x86-64`）及可选 **AOTI_CPU_SIMDLEN** 显式指定目标指令集
 

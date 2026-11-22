@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import shutil
 import unittest
@@ -71,21 +72,26 @@ def _tensors(raw):
     return {key: torch.as_tensor(np.asarray(value)) for key, value in raw.items()}
 
 
+def _wrap64_ref(value: int) -> int:
+    masked = value & ((1 << 64) - 1)
+    return masked - (1 << 64) if masked >= (1 << 63) else masked
+
+
+def _mix64_ref(value: int) -> int:
+    mask = (1 << 64) - 1
+    z = (value * 0x9E3779B97F4A7C15) & mask
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
+    z = z ^ (z >> 31)
+    return _wrap64_ref(z)
+
+
 class MixTest(unittest.TestCase):
     def test_mix64_matches_a_host_reference(self) -> None:
         """The mixer's masked shifts must reproduce SplitMix64 on negatives."""
-
-        def reference(value: int) -> int:
-            mask = (1 << 64) - 1
-            z = (value * 0x9E3779B97F4A7C15) & mask
-            z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & mask
-            z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
-            z = z ^ (z >> 31)
-            return z - (1 << 64) if z >= 1 << 63 else z
-
         values = [0, 1, -1, 2**31, -(2**31), 123456789, -987654321]
         got = mix64(torch.tensor(values, dtype=torch.int64)).tolist()
-        self.assertEqual(got, [reference(v) for v in values])
+        self.assertEqual(got, [_mix64_ref(v) for v in values])
 
 
 class HoleKeyBuilderTest(unittest.TestCase):
@@ -270,15 +276,62 @@ class HoleKeyBuilderTest(unittest.TestCase):
                 "hist_mv.key_lengths": np.array([2, 1], dtype=np.int64),
             }
         )
-        self.assertEqual(
-            HoleKeyBuilder(plan)(batch).tolist(),
-            [
-                5725696216062345785,
-                -7885223075814977969,
-                426601094493070354,
-                -556887799052857370,
+
+        # Independent host oracle of the pre-refactor formula.
+        def _encode_f32(val: float) -> int:
+            if not math.isfinite(val):
+                return (
+                    (1 << 40)
+                    + (1 if math.isnan(val) else 0)
+                    + (2 if math.isinf(val) and val < 0 else 0)
+                )
+            mantissa, exponent = math.frexp(val)
+            return exponent * (1 << 25) + int(mantissa * (1 << 24))
+
+        def _oracle_fold(slot_id: int, num_holes: int, member_items: list) -> list[int]:
+            salt = _wrap64_ref(HoleKeyBuilder.C_SLOT * (slot_id + 1))
+            out = [salt] * num_holes
+            for m_idx, items in enumerate(member_items):
+                for hole_idx, local, val in items:
+                    combined = local + m_idx * HoleKeyBuilder.MEMBER_STRIDE
+                    mixed = _mix64_ref(
+                        val * HoleKeyBuilder.C_VALUE
+                        + combined * HoleKeyBuilder.C_INDEX
+                        + salt
+                    )
+                    out[hole_idx] = _wrap64_ref(out[hole_idx] + mixed)
+            return out
+
+        ctx_expected = _oracle_fold(
+            slot_id=0,
+            num_holes=2,
+            member_items=[
+                [(0, 0, 7), (0, 1, 11)],
+                [
+                    (0, 0, _encode_f32(0.5)),
+                    (0, 1, _encode_f32(float("-inf"))),
+                    (1, 0, _encode_f32(float("nan"))),
+                    (1, 1, _encode_f32(-1.25)),
+                ],
             ],
         )
+        hist_expected = _oracle_fold(
+            slot_id=1,
+            num_holes=2,
+            member_items=[
+                [(0, 0, 100), (1, 0, 200)],
+                [(0, 0, 3), (0, 1, 4), (1, 0, 5)],
+            ],
+        )
+        expected_ref = ctx_expected + hist_expected
+        pinned = [
+            5725696216062345785,
+            -7885223075814977969,
+            426601094493070354,
+            -556887799052857370,
+        ]
+        self.assertEqual(expected_ref, pinned)
+        self.assertEqual(HoleKeyBuilder(plan)(batch).tolist(), expected_ref)
 
     def test_scripting_preserves_the_keys(self) -> None:
         """The exported front-end folds exactly what the eager module does."""

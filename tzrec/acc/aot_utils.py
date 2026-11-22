@@ -470,12 +470,15 @@ def _collect_sequence_dim_groups(
     )
 
 
+_GENREC_PROMPT_LEAF_MODULES = ("PromptAssembler", "HoleKeyBuilder")
+
+
 def _has_genrec_frontend(gm: Optional[torch.fx.GraphModule]) -> bool:
     """Return whether traced graph contains GenRec prompt assembly modules."""
     if gm is None:
         return False
     return any(
-        type(mod).__name__ in ("PromptAssembler", "HoleKeyBuilder", "GenRecFrontEnd")
+        type(mod).__name__ in (*_GENREC_PROMPT_LEAF_MODULES, "GenRecFrontEnd")
         for mod in gm.modules()
     )
 
@@ -757,17 +760,25 @@ def _extract_distributed_dense_consumed_keys(
         ):
             consumed_keys.add(node.args[1])
 
-    # GenRecFrontEnd forwards the raw dict directly to PromptAssembler and
-    # HoleKeyBuilder leaf modules, which read slot member tensors.
+    # ScriptWrapper.get_batch feeds the raw dict directly to PromptAssembler
+    # and HoleKeyBuilder leaf modules, which read slot member tensors.
     for mod in gm.modules():
         mod_type = type(mod).__name__
-        if mod_type not in ("PromptAssembler", "HoleKeyBuilder"):
+        if mod_type not in _GENREC_PROMPT_LEAF_MODULES:
             continue
         if mod_type == "PromptAssembler" and getattr(mod, "anchor", None) == "":
-            if data and "batch_size" in data:
+            if data is not None:
+                if "batch_size" not in data:
+                    raise ValueError(
+                        "All-static GenRec prompt (PromptAssembler.anchor == '') "
+                        "requires 'batch_size' in export inputs, which is absent "
+                        "under INPUT_TILE=0."
+                    )
                 consumed_keys.add("batch_size")
         for members in getattr(mod, "member_names", []):
             for member in members:
+                # Include .key_lengths (required in AOTI in_spec) and omit
+                # .weights (never read by prompt leaves), unlike predict_util.py.
                 for suffix in (".values", ".lengths", ".key_lengths"):
                     key = f"{member}{suffix}"
                     if data and key in data:
@@ -820,7 +831,7 @@ def _pad_distributed_dense_sample_inputs(
     for name in seq_jts:
         raw_name_to_ec_keys[name.split("@", 1)[0]].append(name)
 
-    # 1. Non-sequence raw sparse inputs (only present for GenRecFrontEnd).
+    # 1. Non-sequence raw sparse inputs (only present for GenRec prompt leaves).
     for key in list(sample_data.keys()):
         if not key.endswith(".lengths"):
             continue
@@ -836,16 +847,6 @@ def _pad_distributed_dense_sample_inputs(
             pad_n = 2 - values.numel()
             _pad_rows_zeros(sample_data, values_key, pad_n)
             _increment_length_at(sample_data, key, pad_n)
-            weights_key = f"{prefix}.weights"
-            if weights_key in sample_data:
-                weights = sample_data[weights_key]
-                sample_data[weights_key] = torch.cat(
-                    [
-                        weights,
-                        torch.ones(pad_n, dtype=weights.dtype, device=weights.device),
-                    ],
-                    dim=0,
-                )
 
     # 2. Sequence groups sharing a total_sequence_length Dim
     # (EC, SequenceDense, mulval key_lengths, and any GenRec raw sparse sequences).
