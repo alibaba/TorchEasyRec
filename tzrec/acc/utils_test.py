@@ -18,9 +18,6 @@ from unittest import mock
 import torch
 
 from tzrec.acc import utils
-from tzrec.protos.export_pb2 import ExportConfig
-from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from tzrec.protos.train_pb2 import TrainConfig
 from tzrec.utils.test_util import make_test_dir
 
 
@@ -175,63 +172,6 @@ class AccUtilsTest(unittest.TestCase):
                 )
         finally:
             shutil.rmtree(test_dir)
-
-    def test_allow_tf32_for_export_non_mutating_warns(self) -> None:
-        prev_cudnn = torch.backends.cudnn.allow_tf32
-        prev_matmul = torch.backends.cuda.matmul.allow_tf32
-        try:
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            cfg = EasyRecConfig(
-                train_config=TrainConfig(
-                    cudnn_allow_tf32=True, cuda_matmul_allow_tf32=True
-                ),
-                export_config=ExportConfig(
-                    cudnn_allow_tf32=False, cuda_matmul_allow_tf32=False
-                ),
-            )
-            with mock.patch.object(utils.logger, "warning") as warn_log:
-                utils.allow_tf32_for_export(cfg, mutate_globals=False)
-            self.assertTrue(torch.backends.cudnn.allow_tf32)
-            self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
-            self.assertEqual(warn_log.call_count, 2)
-        finally:
-            torch.backends.cudnn.allow_tf32 = prev_cudnn
-            torch.backends.cuda.matmul.allow_tf32 = prev_matmul
-
-    def test_allow_tf32_for_export_mutating_and_train_fallback(self) -> None:
-        prev_cudnn = torch.backends.cudnn.allow_tf32
-        prev_matmul = torch.backends.cuda.matmul.allow_tf32
-        try:
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            cfg = EasyRecConfig(
-                train_config=TrainConfig(
-                    cudnn_allow_tf32=False, cuda_matmul_allow_tf32=True
-                ),
-                export_config=ExportConfig(cuda_matmul_allow_tf32=False),
-            )
-            with mock.patch.object(utils.logger, "warning") as warn_log:
-                utils.allow_tf32_for_export(cfg)
-            self.assertFalse(torch.backends.cudnn.allow_tf32)
-            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
-            self.assertEqual(warn_log.call_count, 1)
-
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            train_only_cfg = EasyRecConfig(
-                train_config=TrainConfig(
-                    cudnn_allow_tf32=False, cuda_matmul_allow_tf32=False
-                ),
-            )
-            with mock.patch.object(utils.logger, "warning") as warn_log:
-                utils.allow_tf32_for_export(train_only_cfg, mutate_globals=False)
-            self.assertTrue(torch.backends.cudnn.allow_tf32)
-            self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
-            self.assertEqual(warn_log.call_count, 2)
-        finally:
-            torch.backends.cudnn.allow_tf32 = prev_cudnn
-            torch.backends.cuda.matmul.allow_tf32 = prev_matmul
 
     def test_portable_cpu_aot_env_helpers(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):

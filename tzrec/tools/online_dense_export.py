@@ -19,16 +19,12 @@ import torch
 
 from tzrec.acc import utils as acc_utils
 from tzrec.main import _create_features, _create_model
-from tzrec.models.genrec_model import BaseGenRecModel
-from tzrec.models.match_model import MatchModel
 from tzrec.models.model import ScriptWrapper
-from tzrec.models.tdm import TDM
 from tzrec.utils import config_util
 from tzrec.utils.checkpoint_util import _get_checkpoint_step
 from tzrec.utils.export_util import (
-    _export_dense_model_on_device,
     ensure_input_tile_for_distributed_embedding,
-    export_dense_model_cpu,
+    export_dense_model,
 )
 from tzrec.utils.logging_util import logger
 from tzrec.utils.online_dense_export_util import (
@@ -130,43 +126,30 @@ def export_online_dense_model(
             sampler_type=None,
         )
         model.set_is_inference(True)
-        if isinstance(model, (MatchModel, TDM, BaseGenRecModel)):
-            # The full export emits per-tower (MatchModel) or per-module
-            # (TDM) artifacts, or HF assets (BaseGenRecModel); a single
-            # monolithic dense export cannot mirror that layout.
-            raise RuntimeError(
-                f"ONLINE_DENSE_EXPORT does not support {type(model).__name__} "
-                "models; use the full export (export_model) instead."
-            )
         scripted_model = ScriptWrapper(model)
 
         try:
+            device = torch.device("cuda:0" if is_aot else "cpu")
+            mixed_precision = None
+            model_file = "scripted_model.pt"
+
             if is_aot:
-                device = torch.device("cuda:0")
                 torch.cuda.set_device(device)
                 # AOTI bakes allow_tf32 into Triton constexprs at export time.
                 acc_utils.allow_tf32_for_export(pipeline_config)
                 mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
-                _export_dense_model_on_device(
-                    pipeline_config=pipeline_config,
-                    model=scripted_model,
-                    checkpoint_path=checkpoint_path,
-                    save_dir=tmp_dir,
-                    device=device,
-                    mixed_precision=mixed_precision,
-                )
-                required_files = [
-                    os.path.join("aoti", "aoti_model.pt2"),
-                    "dense_meta.json",
-                ]
-            else:
-                export_dense_model_cpu(
-                    pipeline_config=pipeline_config,
-                    model=scripted_model,
-                    checkpoint_path=checkpoint_path,
-                    save_dir=tmp_dir,
-                )
-                required_files = ["scripted_model.pt", "dense_meta.json"]
+                model_file = os.path.join("aoti", "aoti_model.pt2")
+
+            export_dense_model(
+                pipeline_config=pipeline_config,
+                model=scripted_model,
+                checkpoint_path=checkpoint_path,
+                save_dir=tmp_dir,
+                device=device,
+                mixed_precision=mixed_precision,
+            )
+
+            required_files = (model_file, "dense_meta.json")
 
             for file_name in required_files:
                 file_path = os.path.join(tmp_dir, file_name)

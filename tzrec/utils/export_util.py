@@ -2155,7 +2155,7 @@ def export_distributed_embedding(
         npz_util.savez_streaming(
             os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"), sparse_arrays
         )
-        _export_dense_model_on_device(
+        export_dense_model(
             pipeline_config,
             model,
             checkpoint_path,
@@ -2911,52 +2911,31 @@ def finalize_dense_export(
     return dense_model_traced
 
 
-def export_dense_model_cpu(
+def export_dense_model(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
     checkpoint_path: Optional[str],
-    save_dir: str,
-    assets: Optional[List[str]] = None,
-    use_local_cache_dir: bool = False,
-    data_input_path: Optional[str] = None,
-    **kwargs: Any,
-) -> None:
-    """Export only the dense model on CPU without DMP or GPU usage.
-
-    One batch from ``data_input_path`` (or ``pipeline_config.train_input_path``)
-    warms up lazy modules before tracing and sanity-runs the rewritten graph
-    before scripting; restore fails on any checkpoint-missing state so the
-    exported model can never carry uninitialized weights.
-    """
-    del assets, use_local_cache_dir, kwargs
-    if acc_utils.is_aot():
-        raise ValueError(
-            "export_dense_model_cpu does not support ENABLE_AOT; AOTI dense "
-            "export requires a CUDA device."
-        )
-    if not checkpoint_path:
-        raise ValueError("checkpoint path should be specified.")
-
-    _export_dense_model_on_device(
-        pipeline_config,
-        model,
-        checkpoint_path,
-        save_dir,
-        torch.device("cpu"),
-        data_input_path,
-    )
-
-
-def _export_dense_model_on_device(
-    pipeline_config: EasyRecConfig,
-    model: BaseModule,
-    checkpoint_path: str,
     save_dir: str,
     device: torch.device,
     data_input_path: Optional[str] = None,
     mixed_precision: Optional[str] = None,
 ) -> None:
-    """Build and restore a dense graph on the device its configured kernels need."""
+    """Export only the dense model from a checkpoint on ``device``.
+
+    Args:
+        pipeline_config: Pipeline configuration for input and export settings.
+        model: Model instance to trace into a dense serving graph.
+        checkpoint_path: Path to the checkpoint storing dense weights.
+        save_dir: Destination directory for the exported dense artifacts.
+        device: Target device for graph building, restoration, and export.
+        data_input_path: Optional override path for warm-up batch reading.
+        mixed_precision: Optional mixed precision mode for dense AOTI export.
+    """
+    if not checkpoint_path:
+        raise ValueError("checkpoint path should be specified.")
+    if acc_utils.is_aot() and device.type != "cuda":
+        raise ValueError("AOTI dense export requires a CUDA device.")
+
     data = create_dense_export_warmup_data(
         pipeline_config,
         model,

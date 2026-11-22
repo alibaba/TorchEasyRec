@@ -18,7 +18,6 @@ import threading
 import time
 import unittest
 from contextlib import contextmanager
-from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from unittest import mock
 
@@ -62,6 +61,7 @@ from tzrec.utils.online_dense_export_util import (
     _atomic_write_json,
     _make_monotonic_version,
     _read_current_version,
+    _warn_if_export_tf32_differs,
     make_version,
     resolve_dense_export_root,
 )
@@ -139,12 +139,8 @@ class _TinyModel(nn.Module):
 _BUILD_PATCHES = "tzrec.utils.online_dense_export_util.{}"
 
 
-def _dummy_pipeline_config() -> SimpleNamespace:
-    return SimpleNamespace(
-        feature_configs=[],
-        data_config=SimpleNamespace(label_fields=[]),
-        model_config=SimpleNamespace(),
-    )
+def _dummy_pipeline_config() -> EasyRecConfig:
+    return EasyRecConfig()
 
 
 class OnlineDenseExportUtilTest(unittest.TestCase):
@@ -1337,7 +1333,7 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 with (
                     mock.patch.dict(os.environ, env, clear=True),
                     mock.patch("torch.cuda.is_available", return_value=True),
-                    mock.patch("torch.cuda.set_device") as set_device,
+                    mock.patch("torch.cuda.set_device"),
                     mock.patch("torch.cuda.synchronize") as mock_cuda_sync,
                     mock.patch(
                         "torch.cuda.Stream", return_value=fake_stream
@@ -1409,7 +1405,44 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                 mock_stream_cls.assert_called_once_with(device=torch.device("cuda:0"))
                 mock_cuda_sync.assert_called_once_with(torch.device("cuda:0"))
                 self.assertEqual(fake_stream.synchronize.call_count, 2)
-                self.assertGreaterEqual(set_device.call_count, 3)
+        finally:
+            torch.backends.cudnn.allow_tf32 = prev_cudnn
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul
+
+    def test_warn_if_export_tf32_differs(self) -> None:
+        prev_cudnn = torch.backends.cudnn.allow_tf32
+        prev_matmul = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            cfg = EasyRecConfig(
+                train_config=train_pb2.TrainConfig(
+                    cudnn_allow_tf32=True, cuda_matmul_allow_tf32=True
+                ),
+                export_config=export_pb2.ExportConfig(cudnn_allow_tf32=False),
+            )
+            with mock.patch(_BUILD_PATCHES.format("logger.warning")) as warn:
+                _warn_if_export_tf32_differs(cfg)
+            self.assertEqual(warn.call_count, 2)
+            self.assertEqual(
+                warn.call_args_list[0].args[1:], ("cudnn_allow_tf32", True, False)
+            )
+            self.assertEqual(
+                warn.call_args_list[1].args[1:],
+                ("cuda_matmul_allow_tf32", False, True),
+            )
+            self.assertTrue(torch.backends.cudnn.allow_tf32)
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+
+            matching_cfg = EasyRecConfig(
+                train_config=train_pb2.TrainConfig(
+                    cudnn_allow_tf32=False, cuda_matmul_allow_tf32=False
+                ),
+                export_config=export_pb2.ExportConfig(cudnn_allow_tf32=True),
+            )
+            with mock.patch(_BUILD_PATCHES.format("logger.warning")) as warn:
+                _warn_if_export_tf32_differs(matching_cfg)
+            warn.assert_not_called()
         finally:
             torch.backends.cudnn.allow_tf32 = prev_cudnn
             torch.backends.cuda.matmul.allow_tf32 = prev_matmul
@@ -1577,8 +1610,6 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                         self.assertTrue(mgr.enabled)
                         self.assertTrue(mgr._is_aot)
                         self.assertIsNotNone(mgr._dense_model_traced)
-                        self.assertTrue(torch.backends.cudnn.allow_tf32)
-                        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
 
                         versions_root = _versions_root(tmp_dir)
                         current_path = _current_path(tmp_dir)
@@ -1617,8 +1648,6 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                         serving_inputs = self._build_serving_inputs(
                             v1_dir, pt2_v1, device
                         )
-                        self.assertTrue(torch.backends.cudnn.allow_tf32)
-                        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
                         with torch.no_grad():
                             eager_v1 = mgr._gm(serving_inputs, device)
                             out_v1 = pt2_v1(serving_inputs)
@@ -1658,8 +1687,6 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                         self.assertEqual(payload_v2["sparse_step"], 10)
 
                         pt2_v2 = torch._inductor.aoti_load_package(v2_pt2)
-                        self.assertTrue(torch.backends.cudnn.allow_tf32)
-                        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
                         with torch.no_grad():
                             eager_v2 = mgr._gm(serving_inputs, device)
                             out_v2 = pt2_v2(serving_inputs)

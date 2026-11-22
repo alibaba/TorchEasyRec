@@ -80,6 +80,7 @@ from torch.distributed._tensor import DTensor
 
 from tzrec.acc import utils as acc_utils
 from tzrec.optim.ema import DenseEMA
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import config_util
 from tzrec.utils.checkpoint_util import remap_input_tile_user_key
 from tzrec.utils.export_util import (
@@ -253,32 +254,25 @@ def _is_remote_path(path: str) -> bool:
 
 
 def validate_online_dense_export_pipeline_config(
-    pipeline_config: Any,
+    pipeline_config: EasyRecConfig,
 ) -> None:
     """Reject pipeline configs whose model layout is unsupported online.
 
     Args:
-        pipeline_config: Loaded or stubbed pipeline config to validate.
+        pipeline_config: Loaded pipeline config to validate.
 
     Raises:
         RuntimeError: When ``pipeline_config`` configures ``prompt_config`` or
             a ``MatchModel``, ``TDM``, or ``BaseGenRecModel`` model class.
     """
-    has_prompt = (
-        pipeline_config.HasField("prompt_config")
-        if hasattr(pipeline_config, "HasField")
-        else bool(getattr(pipeline_config, "prompt_config", None))
-    )
-    if has_prompt:
+    if pipeline_config.HasField("prompt_config"):
         raise RuntimeError(
             "ONLINE_DENSE_EXPORT does not support prompt_config / "
             "BaseGenRecModel models (requires compiled_prompt and HF weights "
             "layout); use the full export (export_model) instead."
         )
-    model_cfg = getattr(pipeline_config, "model_config", None)
-    from tzrec.protos.model_pb2 import ModelConfig
-
-    if not isinstance(model_cfg, ModelConfig) or not model_cfg.WhichOneof("model"):
+    model_cfg = pipeline_config.model_config
+    if not model_cfg.WhichOneof("model"):
         return
     from tzrec.main import _get_model_class
     from tzrec.models.genrec_model import BaseGenRecModel
@@ -291,6 +285,25 @@ def validate_online_dense_export_pipeline_config(
             f"ONLINE_DENSE_EXPORT does not support {model_cls.__name__} "
             "models; use the full export (export_model) instead."
         )
+
+
+def _warn_if_export_tf32_differs(pipeline_config: EasyRecConfig) -> None:
+    """Warn when hot export uses TF32 flags that differ from the config."""
+    train_config = pipeline_config.train_config
+    export_config = pipeline_config.export_config
+    live_flags = (
+        ("cudnn_allow_tf32", torch.backends.cudnn.allow_tf32),
+        ("cuda_matmul_allow_tf32", torch.backends.cuda.matmul.allow_tf32),
+    )
+    for field, live in live_flags:
+        config = export_config if export_config.HasField(field) else train_config
+        if config.HasField(field) and getattr(config, field) != live:
+            logger.warning(
+                "Online dense export uses live TF32 %s=%s (configured=%s).",
+                field,
+                live,
+                getattr(config, field),
+            )
 
 
 class OnlineDenseExportManager:
@@ -487,10 +500,7 @@ class OnlineDenseExportManager:
         """
         # lazy import: tzrec.main imports this module
         from tzrec.main import _create_features, _create_model
-        from tzrec.models.genrec_model import BaseGenRecModel
-        from tzrec.models.match_model import MatchModel
         from tzrec.models.model import ScriptWrapper
-        from tzrec.models.tdm import TDM
 
         device = self._device
         with acc_utils.export_env_scope(
@@ -513,15 +523,6 @@ class OnlineDenseExportManager:
                 list(pipeline_config.data_config.label_fields),
                 sampler_type=None,
             )
-            if isinstance(twin_model, (MatchModel, TDM, BaseGenRecModel)):
-                # The full export emits per-tower (MatchModel) or per-module
-                # (TDM) artifacts, or HF assets (BaseGenRecModel); a single
-                # monolithic dense export cannot mirror that layout.
-                raise RuntimeError(
-                    f"ONLINE_DENSE_EXPORT does not support "
-                    f"{type(twin_model).__name__} models; use the full export "
-                    "(export_model) instead."
-                )
             twin_model = ScriptWrapper(twin_model)
             if self._is_aot:
                 torch.cuda.set_device(device)
@@ -529,7 +530,7 @@ class OnlineDenseExportManager:
                 # and AOTI allocator blocks are reused instead of stranded
                 # across PyTorch's 32-stream round-robin pool.
                 self._export_stream = torch.cuda.Stream(device=device)
-                acc_utils.allow_tf32_for_export(pipeline_config, mutate_globals=False)
+                _warn_if_export_tf32_differs(pipeline_config)
                 self._mixed_precision = acc_utils.mixed_precision_for_export(
                     pipeline_config
                 )
@@ -927,8 +928,6 @@ class OnlineDenseExportManager:
             assert self._dense_graph_config is not None
             assert self._dense_model_traced is not None
             export_stream = self._export_stream
-            if self._is_aot:
-                torch.cuda.set_device(device)
             stream_ctx = (
                 torch.cuda.stream(export_stream)
                 if export_stream is not None
