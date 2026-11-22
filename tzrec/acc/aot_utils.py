@@ -41,6 +41,7 @@ from tzrec.models.model import (
     UnifiedAOTIModelWrapper,
 )
 from tzrec.ops._cuda import cutlass_hstu_attention  # noqa: F401
+from tzrec.prompt.assembler import PromptAssembler
 from tzrec.protos import model_pb2
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
@@ -470,6 +471,13 @@ def _collect_sequence_dim_groups(
     )
 
 
+def _has_genrec_frontend(gm: Optional[torch.fx.GraphModule]) -> bool:
+    """Return whether traced graph contains a GenRec prompt assembler."""
+    if gm is None:
+        return False
+    return any(isinstance(mod, PromptAssembler) for mod in gm.modules())
+
+
 def _can_prune_unused_input_keys(
     gm: torch.fx.GraphModule, input_node: torch.fx.Node
 ) -> bool:
@@ -731,6 +739,7 @@ def export_unified_model_aot(
 
 def _extract_distributed_dense_consumed_keys(
     gm: torch.fx.GraphModule,
+    data: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Set[str]:
     """Extract input dict keys consumed by the rewritten dense graph."""
     input_node = next(n for n in gm.graph.nodes if n.op == "placeholder")
@@ -745,6 +754,20 @@ def _extract_distributed_dense_consumed_keys(
             and len(node.users) > 0
         ):
             consumed_keys.add(node.args[1])
+
+    if data is None:
+        return consumed_keys
+
+    # The prompt leaves read these inputs inside the FX leaf calls.
+    for mod in gm.modules():
+        if not isinstance(mod, PromptAssembler):
+            continue
+        for members in mod.member_names:
+            for member in members:
+                for suffix in (".values", ".lengths", ".key_lengths"):
+                    key = f"{member}{suffix}"
+                    if key in data:
+                        consumed_keys.add(key)
     return consumed_keys
 
 
@@ -793,8 +816,25 @@ def _pad_distributed_dense_sample_inputs(
     for name in seq_jts:
         raw_name_to_ec_keys[name.split("@", 1)[0]].append(name)
 
-    # 1. Sequence groups sharing a total_sequence_length Dim
-    # (EC, SequenceDense, mulval key_lengths).
+    # 1. Non-sequence raw sparse inputs (only present for GenRec prompt leaves).
+    for key in list(sample_data.keys()):
+        if not key.endswith(".lengths"):
+            continue
+        prefix = key[: -len(".lengths")]
+        if prefix in seq_feat_names:
+            continue
+        values_key = f"{prefix}.values"
+        if values_key not in sample_data:
+            continue
+        values = sample_data[values_key]
+        lengths = sample_data[key]
+        if values.numel() < 2 and lengths.numel() > 0:
+            pad_n = 2 - values.numel()
+            _pad_rows_zeros(sample_data, values_key, pad_n)
+            _increment_length_at(sample_data, key, pad_n)
+
+    # 2. Sequence groups sharing a total_sequence_length Dim
+    # (EC, SequenceDense, mulval key_lengths, and any GenRec raw sparse sequences).
     seq_groups: Dict[str, List[BaseFeature]] = defaultdict(list)
     for feat in features:
         if not feat.is_sequence:
@@ -881,7 +921,7 @@ def _pad_distributed_dense_sample_inputs(
                             sample_data, lengths_key, sequence_length_padding
                         )
 
-        # 2. Multi-value sequence sub-token values may still be <2 even when
+        # 3. Multi-value sequence sub-token values may still be <2 even when
         # total_sequence_length >= 2 (e.g. key_lengths=[0, 0]).
         for feat in group_feats:
             kl_key = f"{feat.name}.key_lengths"
@@ -912,7 +952,7 @@ def _pad_distributed_dense_sample_inputs(
             if pad_delta > 0:
                 _increment_length_at(sample_data, kl_key, pad_delta)
 
-    # 3. Non-sequence Query EC entries in sequence__ec.
+    # 4. Non-sequence Query EC entries in sequence__ec.
     for ec_key in seq_jts:
         raw_name = ec_key.split("@", 1)[0]
         feat = feat_by_name.get(raw_name)
@@ -968,7 +1008,7 @@ def _prepare_distributed_dense_sample_inputs(
     hard_search_features: Optional[Dict[str, str]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Assemble and pad serving-style CUDA sample inputs for dense AOTI export."""
-    consumed_keys = _extract_distributed_dense_consumed_keys(gm)
+    consumed_keys = _extract_distributed_dense_consumed_keys(gm, data)
     online = (
         is_input_tile_3_online() if input_tile_3_online is None else input_tile_3_online
     )
@@ -1031,8 +1071,10 @@ def _build_distributed_dense_dynamic_shapes(
     feature_groups: List[model_pb2.FeatureGroupConfig],
     input_tile: Optional[bool] = None,
     hard_search_features: Optional[Dict[str, str]] = None,
+    gm: Optional[torch.fx.GraphModule] = None,
 ) -> Dict[str, Dict[int, torch.export.Dim]]:
     """Build torch.export dynamic_shapes for a distributed dense serving graph."""
+    allow_empty_jagged = _has_genrec_frontend(gm)
     (
         feat_to_seq_dim_group,
         seq_feat_names,
@@ -1126,10 +1168,14 @@ def _build_distributed_dense_dynamic_shapes(
         if feat_prefix in feat_to_seq_dim_group:
             group = feat_to_seq_dim_group[feat_prefix]
             if group not in group_to_dim:
-                min_len = 1 if group in jagged_seq_groups else 0
+                min_len = (
+                    0 if allow_empty_jagged or group not in jagged_seq_groups else 1
+                )
                 group_to_dim[group] = _next_dim(min_len)
             return group_to_dim[group]
-        min_len = 1 if feat_prefix in jagged_seq_feat_names else 0
+        min_len = (
+            0 if allow_empty_jagged or feat_prefix not in jagged_seq_feat_names else 1
+        )
         return _next_dim(min_len)
 
     def _get_or_create_prefix_dim(feat_prefix: str) -> torch.export.Dim:
@@ -1275,6 +1321,7 @@ def export_distributed_dense_model_aot(
         feature_groups=feature_groups,
         input_tile=input_tile,
         hard_search_features=hard_search_features,
+        gm=dense_model_traced,
     )
     logger.info("distributed dense dynamic shapes=%s", dynamic_shapes)
 

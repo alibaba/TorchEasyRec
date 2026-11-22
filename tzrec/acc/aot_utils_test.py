@@ -38,10 +38,12 @@ from tzrec.acc.aot_utils import (
 )
 from tzrec.datasets.data_parser import DataParser, _infer_tile_size
 from tzrec.features.feature import FgMode, create_features
+from tzrec.models.genrec_model import GenRecFrontEnd
 from tzrec.models.model import ScriptWrapper
 from tzrec.models.multi_tower import MultiTower
 from tzrec.models.multi_tower_din import MultiTowerDIN
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.prompt.assembler import PromptAssembler
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2, module_pb2, tower_pb2
 from tzrec.protos.models import rank_model_pb2
 from tzrec.utils.export_util import (
@@ -51,6 +53,8 @@ from tzrec.utils.export_util import (
 from tzrec.utils.fx_util import eliminate_dense_dead_code
 from tzrec.utils.state_dict_util import init_parameters
 from tzrec.utils.test_util import (
+    GENREC_LONG_HIST_CODES,
+    create_genrec_test_model,
     gpu_unavailable,
     make_test_dir,
     mark_ci_scope,
@@ -2109,6 +2113,210 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
         finally:
             torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
             torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
+    @mark_ci_scope("gpu")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_distributed_dense_aot_genrec_frontend(self):
+        device = torch.device("cuda:0")
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "USE_DISTRIBUTED_EMBEDDING": "1",
+                    "INPUT_TILE": "0",
+                    "ENABLE_AOT": "2",
+                },
+            ):
+                hist_cfg = feature_pb2.FeatureConfig(
+                    sequence_raw_feature=feature_pb2.RawFeature(
+                        feature_name="hist", expression="user:hist"
+                    )
+                )
+                beh_cfg = feature_pb2.FeatureConfig(
+                    sequence_id_feature=feature_pb2.IdFeature(
+                        feature_name="beh",
+                        expression="user:beh",
+                        num_buckets=32,
+                        embedding_dim=8,
+                        sequence_length=2,
+                    )
+                )
+                model, _ = create_genrec_test_model(
+                    os.path.join(self.test_dir, "genrec"),
+                    feature_configs=[hist_cfg, beh_cfg],
+                    prompt="History : {{hist}} . {{beh}} Predict :",
+                )
+                init_parameters(model, device=device)
+                wrapped = ScriptWrapper(GenRecFrontEnd(model)).to(device).eval()
+
+                export_data = {
+                    "hist.values": torch.tensor(
+                        GENREC_LONG_HIST_CODES * 2, dtype=torch.float32, device=device
+                    ).reshape(-1, 1),
+                    "hist.lengths": torch.tensor(
+                        [6, 6], dtype=torch.int64, device=device
+                    ),
+                    "beh.values": torch.zeros(4, dtype=torch.int64, device=device),
+                    "beh.lengths": torch.tensor(
+                        [2, 2], dtype=torch.int64, device=device
+                    ),
+                }
+                gm, full_graph, dense_graph_config = build_dense_graph_module(
+                    wrapped, export_data, device
+                )
+                save_dir = os.path.join(self.test_dir, "dist_genrec")
+                finalize_dense_export(
+                    wrapped,
+                    full_graph,
+                    gm,
+                    export_data,
+                    device,
+                    save_dir,
+                    dense_graph_config,
+                )
+
+                pt2_path = os.path.join(save_dir, "aoti", "aoti_model.pt2")
+                self.assertTrue(os.path.exists(pt2_path))
+                aoti_model = torch._inductor.aoti_load_package(pt2_path)
+                in_spec = treespec_loads(aoti_model.loader.get_call_spec()[0])
+                key_order = list(in_spec.child(0).child(0).context)
+                self.assertEqual(
+                    set(key_order),
+                    {
+                        "hist.values",
+                        "hist.lengths",
+                        "beh.values",
+                        "beh.lengths",
+                        "beh",
+                        "beh__lengths",
+                    },
+                )
+
+                gm_eval = gm.to(device).eval()
+                for bs in (1, 3):
+                    beh_len = 2 * bs
+                    case_inputs = {
+                        "hist.values": torch.tensor(
+                            GENREC_LONG_HIST_CODES * bs,
+                            dtype=torch.float32,
+                            device=device,
+                        ).reshape(-1, 1),
+                        "hist.lengths": torch.full(
+                            (bs,), 6, dtype=torch.int64, device=device
+                        ),
+                        "beh.values": torch.arange(
+                            1, beh_len + 1, dtype=torch.int64, device=device
+                        ),
+                        "beh.lengths": torch.full(
+                            (bs,), 2, dtype=torch.int64, device=device
+                        ),
+                        "beh": torch.randn(beh_len, 8, device=device),
+                        "beh__lengths": torch.full(
+                            (bs,), 2, dtype=torch.int32, device=device
+                        ),
+                    }
+                    case_inputs = {k: case_inputs[k] for k in key_order}
+                    with torch.no_grad():
+                        expected = gm_eval(case_inputs, device)
+                        actual = aoti_model(case_inputs)
+                    for k, val in expected.items():
+                        torch.testing.assert_close(actual[k], val, atol=1e-5, rtol=1e-5)
+                for bs in (1, 3):
+                    cold_case = {
+                        "beh": torch.empty((0, 8), dtype=torch.float32, device=device),
+                        "beh.values": torch.empty(0, dtype=torch.int64, device=device),
+                        "beh.lengths": torch.zeros(
+                            bs, dtype=torch.int64, device=device
+                        ),
+                        "beh__lengths": torch.zeros(
+                            bs, dtype=torch.int32, device=device
+                        ),
+                        "hist.values": torch.empty(
+                            (0, 1), dtype=torch.float32, device=device
+                        ),
+                        "hist.lengths": torch.zeros(
+                            bs, dtype=torch.int64, device=device
+                        ),
+                    }
+                    aot_inputs = {k: cold_case[k] for k in key_order}
+                    with torch.no_grad():
+                        expected = gm_eval(cold_case, device)
+                        actual = aoti_model(aot_inputs)
+                    for k, val in expected.items():
+                        torch.testing.assert_close(actual[k], val, atol=1e-5, rtol=1e-5)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
+    def test_jagged_sequence_min_bound_with_and_without_genrec_frontend(
+        self,
+    ) -> None:
+        j_seq = feature_pb2.FeatureConfig(
+            sequence_feature=feature_pb2.SequenceFeature(
+                sequence_name="j_seq",
+                sequence_length=4,
+                features=[
+                    feature_pb2.SeqFeatureConfig(
+                        id_feature=feature_pb2.IdFeature(
+                            feature_name="id",
+                            expression="user:j_seq",
+                            num_buckets=16,
+                            embedding_dim=4,
+                        )
+                    )
+                ],
+            )
+        )
+        feats = create_features([j_seq])
+        groups = [
+            model_pb2.FeatureGroupConfig(
+                group_name="jagged_seq",
+                feature_names=["j_seq__id"],
+                group_type=model_pb2.JAGGED_SEQUENCE,
+            )
+        ]
+
+        class _PlainMod(nn.Module):
+            def forward(self, data):
+                return data["j_seq__id"]
+
+        class _DummyPromptAssembler(PromptAssembler):
+            def __init__(self) -> None:
+                nn.Module.__init__(self)
+
+        sample_data = {
+            "j_seq__id": torch.randn(3, 4),
+            "j_seq__id.values": torch.tensor([1, 2, 3], dtype=torch.int64),
+            "j_seq__id.lengths": torch.tensor([2, 1], dtype=torch.int64),
+        }
+        dense_meta = {"sequence__ec": ["j_seq__id__ec", "j_seq__id__lengths"]}
+
+        plain_gm = fx.symbolic_trace(_PlainMod())
+        shapes_plain = _build_distributed_dense_dynamic_shapes(
+            sample_data=sample_data,
+            gm=plain_gm,
+            dense_graph_config=dense_meta,
+            features=feats,
+            feature_groups=groups,
+            input_tile=False,
+        )
+        self.assertEqual(shapes_plain["j_seq__id"][0].min, 1)
+
+        genrec_gm = fx.symbolic_trace(_PlainMod())
+        genrec_gm.assembler = _DummyPromptAssembler()
+        shapes_genrec = _build_distributed_dense_dynamic_shapes(
+            sample_data=sample_data,
+            gm=genrec_gm,
+            dense_graph_config=dense_meta,
+            features=feats,
+            feature_groups=groups,
+            input_tile=False,
+        )
+        self.assertEqual(shapes_genrec["j_seq__id"][0].min, 0)
 
     @mark_ci_scope("gpu")
     @unittest.skipIf(*gpu_unavailable)

@@ -9,6 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+import os
+import shutil
 import unittest
 
 import numpy as np
@@ -28,7 +31,7 @@ from tzrec.prompt.types import (
 )
 from tzrec.protos.model_pb2 import FeatureGroupType
 from tzrec.utils.fx_util import symbolic_trace
-from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
+from tzrec.utils.test_util import gpu_unavailable, make_test_dir, mark_ci_scope
 
 
 def _slot(
@@ -69,21 +72,26 @@ def _tensors(raw):
     return {key: torch.as_tensor(np.asarray(value)) for key, value in raw.items()}
 
 
+def _wrap64_ref(value: int) -> int:
+    masked = value & ((1 << 64) - 1)
+    return masked - (1 << 64) if masked >= (1 << 63) else masked
+
+
+def _mix64_ref(value: int) -> int:
+    mask = (1 << 64) - 1
+    z = (value * 0x9E3779B97F4A7C15) & mask
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
+    z = z ^ (z >> 31)
+    return _wrap64_ref(z)
+
+
 class MixTest(unittest.TestCase):
     def test_mix64_matches_a_host_reference(self) -> None:
         """The mixer's masked shifts must reproduce SplitMix64 on negatives."""
-
-        def reference(value: int) -> int:
-            mask = (1 << 64) - 1
-            z = (value * 0x9E3779B97F4A7C15) & mask
-            z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & mask
-            z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
-            z = z ^ (z >> 31)
-            return z - (1 << 64) if z >= 1 << 63 else z
-
         values = [0, 1, -1, 2**31, -(2**31), 123456789, -987654321]
         got = mix64(torch.tensor(values, dtype=torch.int64)).tolist()
-        self.assertEqual(got, [reference(v) for v in values])
+        self.assertEqual(got, [_mix64_ref(v) for v in values])
 
 
 class HoleKeyBuilderTest(unittest.TestCase):
@@ -236,6 +244,95 @@ class HoleKeyBuilderTest(unittest.TestCase):
         self.assertEqual(keys.numel(), 0)
         self.assertEqual(keys.dtype, torch.int64)
 
+    def test_golden_hole_key_values(self) -> None:
+        """Exact int64 keys match the pre-refactor formula across builds."""
+        plan = _plan(
+            (
+                _slot(
+                    "ctx",
+                    feature_names=("ctx_id", "ctx_vec"),
+                    group_type=FeatureGroupType.DEEP,
+                    slot_id=0,
+                ),
+                _slot(
+                    "hist",
+                    feature_names=("hist_id", "hist_mv"),
+                    group_type=FeatureGroupType.JAGGED_SEQUENCE,
+                    slot_id=1,
+                ),
+            )
+        )
+        batch = _tensors(
+            {
+                "ctx_id.values": np.array([7, 11], dtype=np.int64),
+                "ctx_id.lengths": np.array([2, 0], dtype=np.int64),
+                "ctx_vec.values": np.array(
+                    [[0.5, float("-inf")], [float("nan"), -1.25]], dtype=np.float32
+                ),
+                "hist_id.values": np.array([100, 200], dtype=np.int64),
+                "hist_id.lengths": np.array([2, 0], dtype=np.int64),
+                "hist_mv.values": np.array([3, 4, 5], dtype=np.int64),
+                "hist_mv.lengths": np.array([2, 0], dtype=np.int64),
+                "hist_mv.key_lengths": np.array([2, 1], dtype=np.int64),
+            }
+        )
+
+        # Independent host oracle of the pre-refactor formula.
+        def _encode_f32(val: float) -> int:
+            if not math.isfinite(val):
+                return (
+                    (1 << 40)
+                    + (1 if math.isnan(val) else 0)
+                    + (2 if math.isinf(val) and val < 0 else 0)
+                )
+            mantissa, exponent = math.frexp(val)
+            return exponent * (1 << 25) + int(mantissa * (1 << 24))
+
+        def _oracle_fold(slot_id: int, num_holes: int, member_items: list) -> list[int]:
+            salt = _wrap64_ref(HoleKeyBuilder.C_SLOT * (slot_id + 1))
+            out = [salt] * num_holes
+            for m_idx, items in enumerate(member_items):
+                for hole_idx, local, val in items:
+                    combined = local + m_idx * HoleKeyBuilder.MEMBER_STRIDE
+                    mixed = _mix64_ref(
+                        val * HoleKeyBuilder.C_VALUE
+                        + combined * HoleKeyBuilder.C_INDEX
+                        + salt
+                    )
+                    out[hole_idx] = _wrap64_ref(out[hole_idx] + mixed)
+            return out
+
+        ctx_expected = _oracle_fold(
+            slot_id=0,
+            num_holes=2,
+            member_items=[
+                [(0, 0, 7), (0, 1, 11)],
+                [
+                    (0, 0, _encode_f32(0.5)),
+                    (0, 1, _encode_f32(float("-inf"))),
+                    (1, 0, _encode_f32(float("nan"))),
+                    (1, 1, _encode_f32(-1.25)),
+                ],
+            ],
+        )
+        hist_expected = _oracle_fold(
+            slot_id=1,
+            num_holes=2,
+            member_items=[
+                [(0, 0, 100), (1, 0, 200)],
+                [(0, 0, 3), (0, 1, 4), (1, 0, 5)],
+            ],
+        )
+        expected_ref = ctx_expected + hist_expected
+        pinned = [
+            5725696216062345785,
+            -7885223075814977969,
+            426601094493070354,
+            -556887799052857370,
+        ]
+        self.assertEqual(expected_ref, pinned)
+        self.assertEqual(HoleKeyBuilder(plan)(batch).tolist(), expected_ref)
+
     def test_scripting_preserves_the_keys(self) -> None:
         """The exported front-end folds exactly what the eager module does."""
         module = HoleKeyBuilder(
@@ -315,6 +412,151 @@ class HoleKeyBuilderTest(unittest.TestCase):
         on_cpu = module(batch)
         on_gpu = module({k: v.cuda() for k, v in batch.items()})
         self.assertTrue(torch.equal(on_cpu, on_gpu.cpu()))
+
+    @mark_ci_scope("gpu")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_aoti_matches_eager_and_script_on_gpu(self) -> None:
+        """Eager, TorchScript, and AOTI must fold bit-identically on GPU."""
+        device = torch.device("cuda:0")
+        module = (
+            HoleKeyBuilder(
+                _plan(
+                    (
+                        _slot(
+                            "ctx",
+                            feature_names=("ctx_id", "ctx_vec"),
+                            group_type=FeatureGroupType.DEEP,
+                            slot_id=0,
+                        ),
+                        _slot(
+                            "hist",
+                            feature_names=("hist_id", "hist_mv", "hist_vec"),
+                            group_type=FeatureGroupType.JAGGED_SEQUENCE,
+                            slot_id=1,
+                        ),
+                    )
+                )
+            )
+            .to(device)
+            .eval()
+        )
+        self.assertEqual(module.state_dict(), {})
+
+        inf, nan = float("inf"), float("nan")
+        multi_batch = {
+            "ctx_id.values": torch.tensor(
+                [11, 22, 33, 44], dtype=torch.int64, device=device
+            ),
+            "ctx_id.lengths": torch.tensor([2, 0, 2], dtype=torch.int64, device=device),
+            "ctx_vec.values": torch.tensor(
+                [
+                    [0.5, -1.0, nan, -inf],
+                    [1.0 + 2**-23, 0.0, inf, -0.0],
+                    [3e10, -1e-10, 2.5, nan],
+                ],
+                dtype=torch.float32,
+                device=device,
+            ),
+            "hist_id.values": torch.tensor(
+                [101, 102, 103, 104], dtype=torch.int64, device=device
+            ),
+            "hist_id.lengths": torch.tensor(
+                [2, 1, 1], dtype=torch.int64, device=device
+            ),
+            "hist_mv.values": torch.tensor(
+                [201, 202, 203, 204, 205], dtype=torch.int64, device=device
+            ),
+            "hist_mv.lengths": torch.tensor(
+                [2, 1, 1], dtype=torch.int64, device=device
+            ),
+            "hist_mv.key_lengths": torch.tensor(
+                [2, 0, 1, 2], dtype=torch.int64, device=device
+            ),
+            "hist_vec.values": torch.tensor(
+                [
+                    [0.25, -2.0, nan, -inf],
+                    [1.5, 0.0, inf, 4.0],
+                    [-0.5, 3.0, -inf, nan],
+                    [8.0, -1.25, 0.0, 1.0],
+                ],
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        one_row_batch = {
+            "ctx_id.values": torch.tensor([99], dtype=torch.int64, device=device),
+            "ctx_id.lengths": torch.tensor([1], dtype=torch.int64, device=device),
+            "ctx_vec.values": torch.tensor(
+                [[0.25, nan, -inf, -3.5]], dtype=torch.float32, device=device
+            ),
+            "hist_id.values": torch.tensor(
+                [301, 302], dtype=torch.int64, device=device
+            ),
+            "hist_id.lengths": torch.tensor([2], dtype=torch.int64, device=device),
+            "hist_mv.values": torch.tensor(
+                [401, 402], dtype=torch.int64, device=device
+            ),
+            "hist_mv.lengths": torch.tensor([2], dtype=torch.int64, device=device),
+            "hist_mv.key_lengths": torch.tensor(
+                [0, 2], dtype=torch.int64, device=device
+            ),
+            "hist_vec.values": torch.tensor(
+                [[-1.0, nan, 2.0, -inf], [0.0, 0.5, inf, -0.25]],
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        one_row_empty_mv_batch = {
+            "ctx_id.values": torch.empty(0, dtype=torch.int64, device=device),
+            "ctx_id.lengths": torch.tensor([0], dtype=torch.int64, device=device),
+            "ctx_vec.values": torch.tensor(
+                [[nan, -inf, 0.0, 1.0]], dtype=torch.float32, device=device
+            ),
+            "hist_id.values": torch.tensor([501], dtype=torch.int64, device=device),
+            "hist_id.lengths": torch.tensor([1], dtype=torch.int64, device=device),
+            "hist_mv.values": torch.empty(0, dtype=torch.int64, device=device),
+            "hist_mv.lengths": torch.tensor([1], dtype=torch.int64, device=device),
+            "hist_mv.key_lengths": torch.tensor([0], dtype=torch.int64, device=device),
+            "hist_vec.values": torch.tensor(
+                [[1.25, -0.75, nan, -inf]], dtype=torch.float32, device=device
+            ),
+        }
+
+        batch_dim = torch.export.Dim("batch", min=1, max=1000)
+        seq_step_dim = torch.export.Dim("seq_step", min=1, max=1000)
+        ctx_vals_dim = torch.export.Dim("ctx_vals", min=0, max=1000)
+        mv_vals_dim = torch.export.Dim("mv_vals", min=0, max=1000)
+        dynamic_shapes = {
+            "ctx_id.values": {0: ctx_vals_dim},
+            "ctx_id.lengths": {0: batch_dim},
+            "ctx_vec.values": {0: batch_dim},
+            "hist_id.values": {0: seq_step_dim},
+            "hist_id.lengths": {0: batch_dim},
+            "hist_mv.values": {0: mv_vals_dim},
+            "hist_mv.lengths": {0: batch_dim},
+            "hist_mv.key_lengths": {0: seq_step_dim},
+            "hist_vec.values": {0: seq_step_dim},
+        }
+
+        scripted = torch.jit.script(module)
+        exported_pg = torch.export.export(
+            module, args=(multi_batch,), dynamic_shapes=(dynamic_shapes,)
+        )
+        test_dir = make_test_dir()
+        try:
+            pt2_path = os.path.join(test_dir, "hole_keys.pt2")
+            torch._inductor.aoti_compile_and_package(exported_pg, package_path=pt2_path)
+            aoti_module = torch._inductor.aoti_load_package(pt2_path)
+
+            for batch in (multi_batch, one_row_batch, one_row_empty_mv_batch):
+                eager_out = module(batch)
+                script_out = scripted(batch)
+                aoti_out = aoti_module(batch)
+                self.assertTrue(torch.equal(eager_out, script_out))
+                self.assertTrue(torch.equal(eager_out, aoti_out))
+        finally:
+            if os.path.exists(test_dir):
+                shutil.rmtree(test_dir)
 
 
 _SID_SPACE = ResolvedSidSpace(

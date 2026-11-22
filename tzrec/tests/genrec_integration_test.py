@@ -447,6 +447,51 @@ class GenRecIntegrationTest(unittest.TestCase):
             },
         )
 
+    @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
+    def test_genrec_distributed_aoti_export_predict(self):
+        """Export a GenRec model with distributed AOTI and run predict."""
+        trained = self._train_eval_export()
+        dist_aot_dir = os.path.join(self.test_dir, "export_dist_aot")
+        self.success = False
+        self.success = utils.test_export(
+            trained,
+            self.test_dir,
+            export_dir=dist_aot_dir,
+            env_str="USE_DISTRIBUTED_EMBEDDING=1 ENABLE_AOT=2 QUANT_EMB=0",
+        )
+        self.assertTrue(self.success)
+        self.success = False
+
+        self.assertTrue(
+            os.path.exists(os.path.join(dist_aot_dir, "aoti/aoti_model.pt2"))
+        )
+        self.assertTrue(os.path.exists(os.path.join(dist_aot_dir, "dense_meta.json")))
+        with open(os.path.join(dist_aot_dir, "model_acc.json"), "r") as f:
+            aot_acc_cfg = json.load(f)
+        self.assertEqual(aot_acc_cfg.get("DISTRIBUTED_EMBEDDING"), "1")
+        self.assertEqual(aot_acc_cfg.get("INPUT_TILE"), "0")
+        self.assertEqual(aot_acc_cfg.get("ENABLE_AOT"), "2")
+
+        predict_dir = os.path.join(self.test_dir, "predict_dist_aot")
+        self.success = utils.test_predict(
+            dist_aot_dir,
+            self.data_glob,
+            predict_dir,
+            "answer",
+            "generated_sids",
+            self.test_dir,
+        )
+        self.assertTrue(self.success)
+        predicted = pq.read_table(predict_dir)
+        self.assertIn("answer", predicted.column_names)
+        sids = predicted.column("generated_sids").to_pylist()
+        self.assertEqual(len(sids), 8)
+        for row in sids:
+            self.assertEqual([len(beam) for beam in row], [3, 3])
+            for beam in row:
+                self.assertTrue(all(0 <= c < n for c, n in zip(beam, _CODEBOOK)), beam)
+
 
 if __name__ == "__main__":
     unittest.main()
