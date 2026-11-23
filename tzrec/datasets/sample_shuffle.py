@@ -46,15 +46,12 @@ _INPUT_QUEUE_BATCHES_PER_READER = 2
 # Allow one pending GET and one CANCEL per consumer.
 _REQUEST_QUEUE_PER_CONSUMER = 2
 _LOOP_TICK_SECS = 0.1
-# An idle input read must not hold a newly queued GET; the request wait
-# returns as soon as a GET arrives, so only the input tick needs to be short.
 _INPUT_TICK_SECS = 0.01
 _WATCHDOG_TICK_SECS = 5.0
 # Keep the handle's stop timeout above the combined reader deadlines.
 _READER_GRACEFUL_STOP_SECS = 6.0
 _READER_FORCED_STOP_SECS = 2.0
 _STATS_LOG_INTERVAL_SECS = 60.0
-# Freeze-time merge target in training batches per merged chunk.
 _MERGE_BATCHES_PER_CHUNK = 2
 
 _DATA = "DATA"
@@ -177,11 +174,7 @@ def _conform_batch(batch: pa.RecordBatch, schema: pa.Schema) -> pa.RecordBatch:
 
 
 def _concat_batches(batches: List[pa.RecordBatch]) -> pa.RecordBatch:
-    """Concatenate same-schema record batches into one batch.
-
-    The pyarrow in use has no ``concat_batches``; this is the table
-    round-trip the gather path already relies on.
-    """
+    """Concatenate same-schema record batches into one batch."""
     table = pa.Table.from_batches(batches).combine_chunks()
     return table.to_batches(max_chunksize=table.num_rows)[0]
 
@@ -189,14 +182,10 @@ def _concat_batches(batches: List[pa.RecordBatch]) -> pa.RecordBatch:
 class SamplePool:
     """Chunked raw-sample pool with sample-level shuffle.
 
-    Rows stay in the chunk they arrived in; a numpy arena of (chunk, row)
-    pairs is the sampling domain. SAMPLE_WINDOW freezes the pool content
-    into a shuffled window once it reaches capacity and emits requested
-    batches from it before refilling; SAMPLE_ROLLING extracts a random
-    sample once the pool is refilled to capacity. With ``batch_size`` set,
-    a window freeze first repacks the live rows into chunks of about
-    ``_MERGE_BATCHES_PER_CHUNK * batch_size`` rows, so batch gathers read a
-    few big chunks instead of every reader-sized chunk.
+    A NumPy arena of (chunk, row) pairs identifies the live samples.
+    SAMPLE_WINDOW emits a frozen window in shuffled order while new rows
+    accumulate for the next window. SAMPLE_ROLLING samples from the live
+    pool each time it refills to capacity.
 
     ``emit`` normally waits until the pool reaches its capacity. With
     ``drain=True`` it only requires enough rows for the request, which lets
@@ -211,9 +200,8 @@ class SamplePool:
         capacity_rows: pool capacity in samples.
         mode: "SAMPLE_WINDOW" or "SAMPLE_ROLLING".
         rng: random source, injectable for tests.
-        batch_size: training batch size; when set, a window freeze merges
-            small chunks to about ``_MERGE_BATCHES_PER_CHUNK * batch_size``
-            rows. Without it chunks stay exactly as the readers sent them.
+        batch_size: optional training batch size. When set, a window freeze
+            merges small chunks to about twice this many rows.
     """
 
     def __init__(
@@ -407,15 +395,9 @@ class SamplePool:
         self.num_compactions += 1
 
     def _merge_chunks(self, merge_rows: int) -> None:
-        """Repack live rows into merge-sized chunks before a window freezes.
+        """Merge live rows into chunks of about ``merge_rows`` rows.
 
-        Reader-sized chunks would make every later batch gather take rows
-        from most of them; consecutive live chunks are concatenated up to
-        ``merge_rows`` rows each, so a gather reads a handful of big chunks
-        instead. The repack keeps every arena position's row identity, so
-        a window's shuffled output does not depend on how the input was
-        chunked. Rows of already-emitted samples drop out with the replaced
-        chunk references.
+        Each arena position must still identify the same sample after merging.
         """
         order = np.argsort(self._arena_chunk, kind="stable")
         sorted_c = self._arena_chunk[order]
@@ -440,8 +422,7 @@ class SamplePool:
         for u, st, c in zip(uniq, starts, counts):
             chunk = self._chunks[int(u)]
             if c == chunk.num_rows and c >= merge_rows:
-                # An intact chunk at or above the merge size is reused as
-                # is; its rows keep their in-chunk addresses.
+                # Reusing the chunk preserves its row offsets.
                 if parts:
                     _flush_parts(st)
                 sorted_c[st : st + c] = len(new_chunks)
@@ -450,7 +431,6 @@ class SamplePool:
                 continue
             rows = sorted_r[st : st + c]
             if c == chunk.num_rows and np.array_equal(rows, np.arange(c)):
-                # A fresh intact chunk's rows already sit in arena order.
                 parts.append(chunk)
             else:
                 parts.append(chunk.take(pa.array(rows.astype(np.int64))))
@@ -695,13 +675,10 @@ class Coordinator:
         """Take one reader message and add its rows to the pool.
 
         Args:
-            timeout: seconds to wait for a message; 0 takes only a message
-                that already arrived (``get_nowait`` is required for that:
-                ``get(timeout=0)`` never polls the pipe of an mp.Queue).
+            timeout: seconds to wait for input. Use 0 for a non-blocking read.
 
         Returns:
-            rows the message added to the pool; 0 for a control message or
-            when no message was available.
+            Number of rows added to the pool (0 if none).
         """
         # NOTE: Reading a dead reader's truncated frame can block forever.
         self._check_readers()
@@ -735,13 +712,9 @@ class Coordinator:
         return 0
 
     def _refill_pool(self, target_rows: int) -> None:
-        """Refill pool capacity freed by one emitted batch without blocking.
+        """Refill the pool from ready reader messages without waiting.
 
-        Pulls reader messages that already arrived until roughly the freed
-        capacity is back in the pool, the pool is full or no message is
-        ready, so the next window accumulates while the old one drains
-        instead of only after it is exhausted. Whole reader chunks may
-        overshoot the row target.
+        Whole chunks may exceed ``target_rows``.
         """
         rows = 0
         while rows < target_rows and self._error is None and self._pool_has_room():
@@ -755,9 +728,7 @@ class Coordinator:
 
         One response queue per consumer and at most one outstanding GET
         mean every response goes into a queue its consumer has already
-        drained, so the put cannot block. In SAMPLE_WINDOW mode every
-        emitted batch is followed by a non-blocking refill of the capacity
-        it freed, so the next window fills up while the old one drains.
+        drained, so the put cannot block.
         """
         if self._error is not None:
             while self._request_order:
