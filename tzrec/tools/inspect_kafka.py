@@ -74,7 +74,7 @@ def _fetch_messages(
     Returns:
         list: fetched confluent_kafka messages.
     """
-    topic, config, _ = _parse_kafka_uri(input_path)
+    topic, config, _, _ = _parse_kafka_uri(input_path)
     # never commit, the group.id may be shared with a training job
     config["enable.auto.commit"] = "false"
     consumer = Consumer(config)

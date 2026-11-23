@@ -118,6 +118,17 @@ data_config {
       - `TZREC_KAFKA_OFFSETS_FOR_TIMES_TIMEOUT`: 每次`offsets_for_times`请求的超时时间（秒），默认`30.0`
       - `TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES`: 每批请求失败后的重试次数，默认`2`
 
+  - 支持`end.timestamp.ms`参数，把作业定义为**有限回放**：可单独使用，也可与`start.timestamp.ms`组合成时间窗口（同时配置时要求起点不晚于终点，相等时窗口为空、直接结束）。启动时由rank 0一次性确定每个分区的排他结束offset并广播给所有rank和worker——先记录启动时的高位水印`H`，再用`offsets_for_times`查询终点对应的`E`：
+
+    - `E`查询成功时结束offset为`min(E, H)`，查询期间即使有新写入，本次范围也已固定；`E`查不到（该分区没有任何时间戳达到终点的消息，空分区同样适用）时结束offset为`H`，即读完启动时已有的数据即可结束；查询请求失败会重试，重试耗尽后报错退出，不会把失败当作`E`不存在
+    - 因此即使终点时间在未来，本次作业也只回放启动时已存在的数据，不会持续追流；运行过程中不刷新终点。故障恢复沿用checkpoint位点，重启后重新确定本次的结束offset（上次因`E`查不到而用`H`结束的分区，重启后终点可能前移）
+    - 读取时在Arrow解码前按`msg.offset() < end_offset`筛选，越界消息不会进入shuffle或训练checkpoint。分区在下一消费位置达到结束offset时即完成，无需等待边界消息；分区内offset有空洞时由分区EOF事件兜底（配置终点后`enable.partition.eof`自动开启，可用URI参数覆盖）。空`poll`沿用原有等待逻辑
+    - 起点仍以`checkpoint + 1`优先；无checkpoint时`start.timestamp.ms`查不到的分区在本次快照中是空窗口，直接跳过（不再回退`auto.offset.reset`，避免把窗口之前的数据读进来）；只配置终点、未配置起点的分区按`auto.offset.reset`确定起点（`earliest`读启动时的低位水印，`latest`等其余取值意味着本次快照为空）
+    - 配置终点后，作业不再通过`subscribe()`加入消费组共享分区，而是按全局worker固定切分分区（与`kafka_partition_round_robin`的分区归属一致），每个worker用一个consumer批量读取分给它的分区，分给自己的分区可以是0个，因此不要求分片数不少于worker数。先读完的worker直接退出，不会触发rebalance、把已读完的分区交给其他worker重读。因此带终点的作业自行切分整个topic，如需多个独立作业共享同一consumer group分摊分区，请不要配置终点
+    - 配置终点时读取是有限的：普通batch按训练、评估各自的`drop_remainder`和`min_batch_size`处理最后的尾批；样本级shuffle的ReadPlan标记为有限，收到EOF后排空缓冲区。多rank训练时，任一rank的数据先耗尽，所有rank会一同停止，其他rank剩余的batch可能不参与训练
+    - 示例:
+      - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest&start.timestamp.ms=1711929600000&end.timestamp.ms=1712016000000`
+
   - 如需按分区轮询读取，可设置`data_config.kafka_partition_round_robin: true`，默认为false
 
   - 如需观察各worker的读取量，可设置`data_config.kafka_log_every_n_messages`，默认为0

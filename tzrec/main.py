@@ -48,6 +48,7 @@ from tzrec.datasets.dataset import (
     create_dataloader,
     create_writer,
 )
+from tzrec.datasets.kafka_dataset import is_finite_kafka_input
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
     BaseFeature,
@@ -1125,8 +1126,13 @@ def train_and_evaluate(
         try:
             if delta_embedding_dumper is not None:
                 delta_embedding_dumper.start()
-            # when slice batch by sample cost, data on all workers may not be balanced
-            check_all_workers_data_status = data_config.HasField("batch_cost_size")
+            # when slice batch by sample cost, data on all workers may not be
+            # balanced; a kafka input bounded by end.timestamp.ms is finite
+            # too, and the rank that runs out of data first ends the pass for
+            # every rank, its remaining batches may not train
+            check_all_workers_data_status = data_config.HasField(
+                "batch_cost_size"
+            ) or is_finite_kafka_input(pipeline_config.train_input_path)
             _train_and_evaluate(
                 model,
                 optimizer,
@@ -1249,8 +1255,12 @@ def evaluate(
         else:
             raise ValueError("Eval checkpoint path should be specified.")
 
-        # when slice batch by sample cost, data on all workers may not be balanced
-        check_all_workers_data_status = data_config.HasField("batch_cost_size")
+        # when slice batch by sample cost, data on all workers may not be
+        # balanced; a kafka input bounded by end.timestamp.ms is finite too,
+        # and the rank that runs out of data first ends the pass for everyone
+        check_all_workers_data_status = data_config.HasField(
+            "batch_cost_size"
+        ) or is_finite_kafka_input(eval_input_path or pipeline_config.eval_input_path)
         with (
             SummaryWriter(os.path.join(pipeline_config.model_dir, "eval"))
             if is_rank_zero
