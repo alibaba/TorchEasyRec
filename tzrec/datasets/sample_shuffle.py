@@ -421,34 +421,31 @@ class SamplePool:
             sorted_c, return_index=True, return_counts=True
         )
         new_chunks: List[pa.RecordBatch] = []
-        new_c = np.empty_like(sorted_c)
-        new_r = np.empty_like(sorted_r)
         parts: List[pa.RecordBatch] = []
         part_start = 0
         part_rows = 0
 
-        def _flush(end: int, chunk: pa.RecordBatch, rids: np.ndarray) -> None:
+        def _flush_parts(end: int) -> None:
             nonlocal part_start, part_rows
-            new_c[part_start:end] = len(new_chunks)
-            new_r[part_start:end] = rids
-            new_chunks.append(chunk)
+            sorted_c[part_start:end] = len(new_chunks)
+            sorted_r[part_start:end] = np.arange(end - part_start, dtype=np.int32)
+            new_chunks.append(_concat_batches(parts))
             part_start = end
             part_rows = 0
             parts.clear()
 
         for u, st, c in zip(uniq, starts, counts):
             chunk = self._chunks[int(u)]
-            rows = sorted_r[st : st + c]
             if c == chunk.num_rows and c >= merge_rows:
-                # An intact chunk at or above the merge size is reused as is.
+                # An intact chunk at or above the merge size is reused as
+                # is; its rows keep their in-chunk addresses.
                 if parts:
-                    _flush(
-                        st,
-                        _concat_batches(parts),
-                        np.arange(st - part_start, dtype=np.int32),
-                    )
-                _flush(st + c, chunk, rows)
+                    _flush_parts(st)
+                sorted_c[st : st + c] = len(new_chunks)
+                new_chunks.append(chunk)
+                part_start = st + c
                 continue
+            rows = sorted_r[st : st + c]
             if c == chunk.num_rows and np.array_equal(rows, np.arange(c)):
                 # A fresh intact chunk's rows already sit in arena order.
                 parts.append(chunk)
@@ -456,20 +453,12 @@ class SamplePool:
                 parts.append(chunk.take(pa.array(rows.astype(np.int64))))
             part_rows += c
             if part_rows >= merge_rows:
-                _flush(
-                    st + c,
-                    _concat_batches(parts),
-                    np.arange(st + c - part_start, dtype=np.int32),
-                )
+                _flush_parts(st + c)
         if parts:
-            _flush(
-                len(sorted_c),
-                _concat_batches(parts),
-                np.arange(len(sorted_c) - part_start, dtype=np.int32),
-            )
+            _flush_parts(len(sorted_c))
         self._chunks = new_chunks
-        self._arena_chunk[order] = new_c
-        self._arena_row[order] = new_r
+        self._arena_chunk[order] = sorted_c
+        self._arena_row[order] = sorted_r
         self._dead_rows = 0
         self.num_compactions += 1
 
@@ -591,7 +580,6 @@ class Coordinator:
         self._response_queues = response_queues
         self._stop_event = stop_event
         self._cancel_event = cancel_event
-        self._mode = mode
         self._batch_size = batch_size
         self._min_batch_size = min_batch_size
         self._num_consumers = num_consumers
@@ -712,6 +700,10 @@ class Coordinator:
             rows the message added to the pool; 0 for a control message or
             when no message was available.
         """
+        # NOTE: Reading a dead reader's truncated frame can block forever.
+        self._check_readers()
+        if self._error is not None:
+            return 0
         try:
             if timeout > 0:
                 msg = self._input_q.get(timeout=timeout)
@@ -750,10 +742,6 @@ class Coordinator:
         """
         rows = 0
         while rows < target_rows and self._error is None and self._pool_has_room():
-            # NOTE: Reading a dead reader's truncated frame can block forever.
-            self._check_readers()
-            if self._error is not None:
-                return
             added = self._service_input(0.0)
             if added <= 0:
                 return
@@ -818,7 +806,7 @@ class Coordinator:
                 (_BATCH, batch.serialize().to_pybytes())
             )
             self._request_order.popleft()
-            if self._mode == "SAMPLE_WINDOW":
+            if self._pool.mode == "SAMPLE_WINDOW":
                 self._refill_pool(batch.num_rows)
                 if self._error is not None:
                     return
@@ -875,10 +863,7 @@ class Coordinator:
                 if self._error is not None:
                     break
                 if self._pool_has_room():
-                    # NOTE: Reading a dead reader's truncated frame can block forever.
-                    self._check_readers()
-                    if self._error is None:
-                        self._service_input(_LOOP_TICK_SECS)
+                    self._service_input(_LOOP_TICK_SECS)
                 elif not self._request_order:
                     self._service_requests(_LOOP_TICK_SECS)
                 else:
