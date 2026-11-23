@@ -120,8 +120,10 @@ def _feed_eof(coord, reader_id=0):
 
 
 class SamplePoolTest(unittest.TestCase):
-    def _pool(self, capacity, mode, seed=0):
-        return SamplePool(capacity, mode, rng=np.random.default_rng(seed))
+    def _pool(self, capacity, mode, seed=0, batch_size=None):
+        return SamplePool(
+            capacity, mode, rng=np.random.default_rng(seed), batch_size=batch_size
+        )
 
     @parameterized.expand(
         [param("window", mode=_WINDOW), param("rolling", mode=_ROLLING)],
@@ -146,15 +148,20 @@ class SamplePoolTest(unittest.TestCase):
         self.assertEqual(one.emit(8).num_rows, 8)
 
     def test_window_sequence(self):
-        pool = self._pool(64, _WINDOW, seed=3)
-        source = make_batch(64)
-        pool.add(source)
+        pool = self._pool(64, _WINDOW, seed=3, batch_size=16)
+        source = make_batch(80)
+        for start in range(0, 40, 8):
+            pool.add(source.slice(start, 8))
+        large = source.slice(40)
+        pool.add(large)
         order = []
-        for _ in range(4):
+        for _ in range(5):
             out = pool.emit(16)
             check_batch(self, out, [source])
             order.extend(out.column("id").to_pylist())
-        self.assertEqual(order, np.random.default_rng(3).permutation(64).tolist())
+        self.assertEqual([c.num_rows for c in pool._chunks], [32, 8, 40])
+        self.assertIs(pool._chunks[-1], large)
+        self.assertEqual(order, np.random.default_rng(3).permutation(80).tolist())
         # New arrivals must not enter the frozen window.
         pool.add(make_batch(32, start_id=1000))
         pool.add(make_batch(32, start_id=2000))
@@ -168,21 +175,31 @@ class SamplePoolTest(unittest.TestCase):
             frozen.update(b.column("id").to_pylist())
         self.assertEqual(frozen, set(range(1000, 1032)) | set(range(2000, 2032)))
         self.assertEqual(pool.total_rows, 16)
-        tail = self._pool(16, _WINDOW)
+        tail = self._pool(16, _WINDOW, batch_size=8)
         tail_source = make_batch(12)
         tail.add(tail_source)
-        check_batch(self, tail.emit(8, drain=True), [tail_source])
-        tail.add(make_batch(5, start_id=100))
-        ids = set(tail.emit(8, drain=True).column("id").to_pylist())
-        self.assertTrue(any(i < 12 for i in ids) and any(i >= 100 for i in ids))
+        first = tail.emit(8, drain=True)
+        new_rows = make_batch(5, start_id=100)
+        tail.add(new_rows)
+        second = tail.emit(8, drain=True)
+        self.assertEqual([c.num_rows for c in tail._chunks], [9])
         self.assertEqual(tail.total_rows, 1)
-        self.assertEqual(tail.emit(1, drain=True).num_rows, 1)
+        batches = [first, second, tail.emit(1, drain=True)]
+        self.assertEqual([batch.num_rows for batch in batches], [8, 8, 1])
+        ids = []
+        for batch in batches:
+            check_batch(self, batch, [tail_source, new_rows])
+            ids.extend(batch.column("id").to_pylist())
+        self.assertEqual(sorted(ids), list(range(12)) + list(range(100, 105)))
+        self.assertEqual(tail.total_rows, 0)
 
     def test_rolling_sequence(self):
-        pool = self._pool(32, _ROLLING, seed=7)
+        pool = self._pool(32, _ROLLING, seed=7, batch_size=16)
         source = make_batch(32)
-        pool.add(source)
+        for start in range(0, 32, 8):
+            pool.add(source.slice(start, 8))
         first = pool.emit(16)
+        self.assertEqual([c.num_rows for c in pool._chunks], [8] * 4)
         check_batch(self, first, [source])
         first_ids = set(first.column("id").to_pylist())
         self.assertEqual(len(first_ids), 16)
@@ -225,79 +242,6 @@ class SamplePoolTest(unittest.TestCase):
         self.assertEqual(len(ids), len(produced) * 8)
         self.assertEqual(len(set(ids)), len(ids))
 
-    def test_window_merge_determinism_and_chunk_sizes(self):
-        """Merged chunks reach the 2x-batch target without changing output."""
-        seed = 11
-
-        def emitted(chunk_rows):
-            pool = SamplePool(
-                8192, _WINDOW, rng=np.random.default_rng(seed), batch_size=1024
-            )
-            for start in range(0, 8192, chunk_rows):
-                pool.add(_plan_batch(chunk_rows, start))
-            outs = []
-            while (out := pool.emit(1024)) is not None:
-                outs.append(out)
-            return pool, outs
-
-        small_pool, small_outs = emitted(256)
-        big_pool, big_outs = emitted(4096)
-        self.assertEqual([c.num_rows for c in small_pool._chunks], [2048] * 4)
-        self.assertEqual([c.num_rows for c in big_pool._chunks], [4096, 4096])
-        self.assertEqual(len(small_outs), 8)
-        for small, big in zip(small_outs, big_outs):
-            self.assertTrue(small.equals(big))
-        perm = np.random.default_rng(seed).permutation(8192).tolist()
-        ids = [i for b in small_outs for i in b.column("id").to_pylist()]
-        self.assertEqual(ids, perm)
-
-    def test_window_merge_with_leftovers(self):
-        """Merging keeps leftover rows valid and releases replaced chunks."""
-        pool = SamplePool(32, _WINDOW, rng=np.random.default_rng(5), batch_size=8)
-        sources = []
-        next_id = 0
-
-        def feed(chunks):
-            nonlocal next_id
-            for _ in range(chunks):
-                source = make_batch(8, start_id=next_id)
-                sources.append(source)
-                pool.add(source)
-                next_id += 8
-
-        feed(4)
-        first = pool.emit(12)
-        self.assertIsNotNone(first)
-        self.assertEqual([c.num_rows for c in pool._chunks], [16, 16])
-        second = pool.emit(12)
-        self.assertIsNotNone(second)
-        # The third emit fails and carries 8 unemitted rows over.
-        self.assertIsNone(pool.emit(12))
-        feed(3)
-        third = pool.emit(12)
-        self.assertIsNotNone(third)
-        self.assertEqual([c.num_rows for c in pool._chunks], [16, 16])
-        fourth = pool.emit(12)
-        self.assertIsNotNone(fourth)
-        self.assertIsNone(pool.emit(12))
-        tail = pool.emit(8, drain=True)
-        self.assertIsNotNone(tail)
-        produced = [first, second, third, fourth, tail]
-        for batch in produced:
-            check_batch(self, batch, sources)
-        ids = [i for b in produced for i in b.column("id").to_pylist()]
-        self.assertEqual(len(ids), len(set(ids)))
-        self.assertEqual(len(ids), 56)
-        self.assertEqual(pool.total_rows, 0)
-
-    def test_rolling_ignores_merge_target(self):
-        """SAMPLE_ROLLING never freezes, so reader chunks are never merged."""
-        pool = SamplePool(32, _ROLLING, rng=np.random.default_rng(0), batch_size=8)
-        for start in range(0, 32, 8):
-            pool.add(make_batch(8, start))
-        self.assertIsNotNone(pool.emit(8))
-        self.assertEqual([c.num_rows for c in pool._chunks], [8] * 4)
-
 
 class CoordinatorTest(unittest.TestCase):
     """In-process coordinator tests over the request/response protocol."""
@@ -333,37 +277,14 @@ class CoordinatorTest(unittest.TestCase):
         return coord
 
     def _coordinator(
-        self,
-        planned_rows,
-        is_finite=True,
-        min_batch_size=0,
-        num_readers=1,
-        mode=_ROLLING,
-        num_consumers=1,
+        self, planned_rows, is_finite=True, min_batch_size=0, num_readers=1
     ):
         plan = _plan(planned_rows, is_finite=is_finite, num_readers=num_readers)
-        coord = self._make_coordinator(
-            plan,
-            plan,
-            min_batch_size=min_batch_size,
-            mode=mode,
-            num_consumers=num_consumers,
-        )
+        coord = self._make_coordinator(plan, plan, min_batch_size=min_batch_size)
         coord._start_pass(coord._first_plan)
         for task_q in coord._task_queues:
             task_q.get(timeout=1.0)
         return coord
-
-    def _sync_queues(self, coord, num_consumers):
-        """Swap the protocol queues for synchronous in-process ones.
-
-        mp.Queue puts flush through a feeder thread, so a message is not
-        readable the instant ``put`` returns; plain queues make every
-        serve/refill ordering below fully deterministic.
-        """
-        coord._input_q = queue.Queue()
-        coord._request_q = queue.Queue()
-        coord._response_queues = [queue.Queue() for _ in range(num_consumers)]
 
     def _request(self, coord):
         coord._request_q.put((sample_shuffle._GET, 0))
@@ -480,66 +401,45 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self._next_response(coord)[0], sample_shuffle._END)
 
     @parameterized.expand(
-        [
-            ("ready_input", True),
-            ("idle_input", False),
-        ],
+        [("ready_input", True), ("idle_input", False)],
         name_func=parameterized_name_func,
     )
     def test_window_refill_between_batches(self, _name, has_data):
-        """Serving one window batch refills freed capacity without blocking.
-
-        The refill after the first batch must cover it with queued reader
-        chunks before the second batch is served, and an idle reader queue
-        must never add a blocking read between the two.
-        """
-        coord = self._coordinator(
-            planned_rows=None, is_finite=False, mode=_WINDOW, num_consumers=2
-        )
-        self._sync_queues(coord, 2)
-        for start in range(0, 16, 4):
-            _feed_batch(coord, 4, start)
-        for _ in range(4):
-            coord._service_input(0.05)
-        timeouts = []
-        service_input = coord._service_input
-
-        def record_input(timeout):
-            timeouts.append(timeout)
-            return service_input(timeout)
-
-        coord._service_input = record_input
+        plan = _plan(None, is_finite=False)
+        coord = self._make_coordinator(plan, plan, mode=_WINDOW, num_consumers=2)
+        coord._start_pass(plan)
+        # NOTE: Synchronous queues make the order of responses and reads observable.
+        coord._input_q = queue.Queue()
+        coord._response_queues = [queue.Queue(), queue.Queue()]
+        coord._pool.add(_plan_batch(16))
         if has_data:
             _feed_batch(coord, 4, start_id=16)
             _feed_batch(coord, 4, start_id=20)
+        coord._request_order.extend([0, 1])
 
-        coord._request_q.put((sample_shuffle._GET, 0))
-        coord._service_requests()
-        coord._serve_waiting()
-        kind, payload = coord._response_queues[0].get_nowait()
-        self.assertEqual(kind, sample_shuffle._BATCH)
-        rb = pa.ipc.read_record_batch(payload, _PLAN_SCHEMA)
-        self.assertEqual(rb.num_rows, 8)
-        self.assertTrue(all(0 <= i < 16 for i in rb.column("id").to_pylist()))
-        self.assertEqual(coord._pool.total_rows, 16 if has_data else 8)
-        self.assertEqual(timeouts, [0.0] * (2 if has_data else 1))
+        replies_at_read = []
+        service_input = coord._service_input
 
-        coord._request_q.put((sample_shuffle._GET, 1))
-        coord._service_requests()
-        coord._serve_waiting()
-        kind, payload = coord._response_queues[1].get_nowait()
-        self.assertEqual(kind, sample_shuffle._BATCH)
-        rb = pa.ipc.read_record_batch(payload, _PLAN_SCHEMA)
-        self.assertTrue(all(0 <= i < 16 for i in rb.column("id").to_pylist()))
+        def read_ready(timeout):
+            self.assertEqual(timeout, 0.0)
+            replies_at_read.append(sum(q.qsize() for q in coord._response_queues))
+            return service_input(timeout)
+
+        with mock.patch.object(coord, "_service_input", side_effect=read_ready):
+            coord._serve_waiting()
+        self.assertEqual(replies_at_read, [1, 1, 2] if has_data else [1, 2])
+        ids = []
+        for response in coord._response_queues:
+            kind, payload = response.get_nowait()
+            self.assertEqual(kind, sample_shuffle._BATCH)
+            batch = pa.ipc.read_record_batch(payload, _PLAN_SCHEMA)
+            self.assertEqual(batch.num_rows, 8)
+            ids.extend(batch.column("id").to_pylist())
+        self.assertEqual(sorted(ids), list(range(16)))
         self.assertEqual(coord._pool.total_rows, 8 if has_data else 0)
-        self.assertEqual(timeouts, [0.0] * (3 if has_data else 2))
 
     def test_nonblocking_input_read_sees_flushed_message(self):
-        """A flushed reader message must be visible to the 0-timeout read.
-
-        ``get(timeout=0)`` on an mp.Queue skips the pipe poll entirely, so
-        this only passes with the real non-blocking ``get_nowait``.
-        """
+        """Read a real queue without blocking once its feeder has flushed the data."""
         coord = self._coordinator(planned_rows=None, is_finite=False)
         _feed_batch(coord, 4)
         deadline = time.monotonic() + 5.0
