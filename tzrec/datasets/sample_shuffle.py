@@ -46,6 +46,9 @@ _INPUT_QUEUE_BATCHES_PER_READER = 2
 # Allow one pending GET and one CANCEL per consumer.
 _REQUEST_QUEUE_PER_CONSUMER = 2
 _LOOP_TICK_SECS = 0.1
+# An idle input read must not hold a newly queued GET; the request wait
+# returns as soon as a GET arrives, so only the input tick needs to be short.
+_INPUT_TICK_SECS = 0.01
 _WATCHDOG_TICK_SECS = 5.0
 # Keep the handle's stop timeout above the combined reader deadlines.
 _READER_GRACEFUL_STOP_SECS = 6.0
@@ -863,7 +866,7 @@ class Coordinator:
                 if self._error is not None:
                     break
                 if self._pool_has_room():
-                    self._service_input(_LOOP_TICK_SECS)
+                    self._service_input(_INPUT_TICK_SECS)
                 elif not self._request_order:
                     self._service_requests(_LOOP_TICK_SECS)
                 else:
