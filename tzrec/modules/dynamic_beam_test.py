@@ -111,13 +111,15 @@ class DynamicBeamSearchTest(unittest.TestCase):
         ids = torch.tensor([[5, 6, 7, 8]])
         ref = _bruteforce_scores(lm, ids, torch.ones_like(ids), pairs)
         expected = sorted(ref, key=ref.__getitem__, reverse=True)[: beam_widths[-1]]
-        out = _decode(
+        out, scores = _decode(
             lm,
             ids,
             pairs,
             beam_widths=beam_widths,
         )
         self.assertEqual([tuple(row) for row in out.tolist()], expected)
+        self.assertEqual(scores.dtype, torch.float32)
+        torch.testing.assert_close(scores, torch.tensor([ref[row] for row in expected]))
 
     @parameterized.expand(
         [
@@ -135,12 +137,14 @@ class DynamicBeamSearchTest(unittest.TestCase):
     def test_width_schedule(self, beam_widths, pairs, expected_widths) -> None:
         spy = _RowSpy(create_tiny_causal_lm(vocab_size=48))
         ids = torch.tensor([[5, 6, 7, 8]])
-        out = _decode(spy, ids, pairs, beam_widths=beam_widths)
+        out, scores = _decode(spy, ids, pairs, beam_widths=beam_widths)
         # calls: [prompt (1 row)] + one per level>0, each carrying widths[j-1] rows
         widths = spy.rows[1:] + [out.shape[0]]
         self.assertEqual(spy.rows[0], 1)
         self.assertEqual(widths, expected_widths)
         self.assertEqual(tuple(out.shape), (expected_widths[-1], len(pairs)))
+        self.assertEqual(tuple(scores.shape), (expected_widths[-1],))
+        self.assertTrue(bool(torch.all(scores[:-1] >= scores[1:])))
 
     def test_ragged_batch_rows_match_solo_runs(self) -> None:
         # every row of a ragged batch must decode exactly as if run alone.
@@ -148,12 +152,13 @@ class DynamicBeamSearchTest(unittest.TestCase):
         lm = create_tiny_causal_lm(vocab_size=30)
         ids = torch.tensor([[5, 6, 7, 8], [0, 9, 10, 11]])
         am = torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]])
-        out = _decode(lm, ids, pairs, attention_mask=am)
+        out, scores = _decode(lm, ids, pairs, attention_mask=am)
         width = out.shape[0] // 2
         solos = [torch.tensor([[5, 6, 7, 8]]), torch.tensor([[9, 10, 11]])]
         for i, solo_ids in enumerate(solos):
-            solo = _decode(lm, solo_ids, pairs)
+            solo, solo_scores = _decode(lm, solo_ids, pairs)
             self.assertTrue(torch.equal(out[i * width : (i + 1) * width], solo))
+            torch.testing.assert_close(scores[i * width : (i + 1) * width], solo_scores)
 
 
 @mark_ci_scope("gpu")
@@ -190,8 +195,8 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
             beam_widths=beam_widths,
             attention_mask=attention_mask,
         )
-        ordinary = _decode(lm, ids, pairs, **options)
-        shared = _decode(
+        ordinary, ordinary_scores = _decode(lm, ids, pairs, **options)
+        shared, shared_scores = _decode(
             lm,
             ids,
             pairs,
@@ -199,6 +204,8 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
             **options,
         )
         self.assertTrue(torch.equal(shared, ordinary))
+        torch.testing.assert_close(shared_scores, ordinary_scores)
+        self.assertEqual(shared_scores.dtype, torch.float32)
         self.assertEqual(tuple(shared.shape), (2 * 200, 3))
 
     @parameterized.expand(
@@ -225,9 +232,9 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
             device=device,
         )
 
-        out = _decode(lm, ids, pairs, attention_mask=attention_mask)
+        out, scores = _decode(lm, ids, pairs, attention_mask=attention_mask)
         with torch.no_grad():
-            codes = generate_codes(
+            codes, code_scores = generate_codes(
                 lm,
                 lm.get_input_embeddings()(ids)[attention_mask.bool()],
                 torch.tensor([0, 4, 7], device=device),
@@ -237,14 +244,18 @@ class DynamicBeamSearchFlashAttentionTest(unittest.TestCase):
             )
         expected = out.reshape(2, -1, 3) - ids.new_tensor([lo for lo, _ in pairs])
         self.assertTrue(torch.equal(codes, expected))
+        torch.testing.assert_close(code_scores, scores.reshape(2, -1) / len(pairs))
         width = out.shape[0] // 2
         solos = [
             torch.tensor([[5, 6, 7, 8]], device=device),
             torch.tensor([[9, 10, 11]], device=device),
         ]
         for index, solo_ids in enumerate(solos):
-            solo = _decode(lm, solo_ids, pairs)
+            solo, solo_scores = _decode(lm, solo_ids, pairs)
             torch.testing.assert_close(out[index * width : (index + 1) * width], solo)
+            torch.testing.assert_close(
+                scores[index * width : (index + 1) * width], solo_scores
+            )
 
 
 if __name__ == "__main__":

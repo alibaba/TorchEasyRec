@@ -228,13 +228,14 @@ class GenerateCodesTest(unittest.TestCase):
         bands = [(100, 103), (104, 107), (108, 111)]
         local_codes = torch.tensor([[0, 1, 3], [3, 0, 2], [1, 3, 0], [2, 2, 1]])
         tokens = local_codes + torch.tensor([lo for lo, _ in bands])
+        cumulative_log_probs = torch.tensor([-3.0, -6.0, -4.5, -7.5])
         lm = nn.Identity()
         lm.config = SimpleNamespace(_attn_implementation="sdpa")
         with mock.patch(
             "tzrec.models.genrec_causal_lm_model.dynamic_beam_search",
-            return_value=tokens,
+            return_value=(tokens, cumulative_log_probs),
         ) as beam_search:
-            codes = generate_codes(
+            codes, scores = generate_codes(
                 lm,
                 torch.zeros(5, 4),
                 torch.tensor([0, 2, 5]),
@@ -246,6 +247,8 @@ class GenerateCodesTest(unittest.TestCase):
             codes.tolist(),
             local_codes.reshape(2, 2, -1).tolist(),
         )
+        torch.testing.assert_close(scores, torch.tensor([[-1.0, -2.0], [-1.5, -2.5]]))
+        self.assertEqual(scores.dtype, torch.float32)
         searched_lm, padded, mask, widths, searched_bands = beam_search.call_args.args
         self.assertIs(searched_lm, lm)
         self.assertEqual(padded.shape, (2, 3, 4))

@@ -183,6 +183,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         )
         common = self._model_config.common
         self._generated_sids_key = common.generated_sids_key
+        self._generated_scores_key = common.generated_scores_key
         self._read_beam_config(common)
         response = self._prompt.prompt_plan.response_segments
         self._sid_only_response = len(response) == 1 and isinstance(
@@ -207,12 +208,16 @@ class GenRecCausalLMModel(BaseGenRecModel):
 
         Returns:
             The response-window logits and labels when training, the decoded
-            SIDs otherwise.
+            SIDs and their length-normalized log-probabilities otherwise.
         """
         # outside the leaf on both paths, so the pipeline can prefetch it
         embeds = self.build_input(batch)
         if self.is_inference:
-            return {self._generated_sids_key: _fx_wrapped_generate(self, embeds, batch)}
+            codes, scores = _fx_wrapped_generate(self, embeds, batch)
+            return {
+                self._generated_sids_key: codes,
+                self._generated_scores_key: scores,
+            }
         predictions = _fx_wrapped_forward(self, embeds, batch)
         keys = ("logits", "labels")
         if self._sid_only_response:
@@ -496,7 +501,9 @@ class GenRecCausalLMModel(BaseGenRecModel):
         )
         return outputs.logits
 
-    def _generate(self, embeds: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def _generate(
+        self, embeds: torch.Tensor, batch: Batch
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Beam-search the SID answer.
 
         Args:
@@ -504,7 +511,8 @@ class GenRecCausalLMModel(BaseGenRecModel):
             batch: carries the packed prompt and the padded width.
 
         Returns:
-            ``(B, self._capped_widths[-1], num_levels)`` local codes, best first.
+            ``(B, self._capped_widths[-1], num_levels)`` local codes and their
+            ``(B, self._capped_widths[-1])`` scores, best first.
         """
         infos = batch.additional_infos
         return generate_codes(
@@ -579,7 +587,7 @@ def generate_codes(
     max_seqlen: int,
     capped_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Beam-search the SID answer of packed prompts.
 
     Args:
@@ -591,10 +599,11 @@ def generate_codes(
         bands: inclusive ``(lo, hi)`` token-id edge per SID level.
 
     Returns:
-        ``(rows, capped_widths[-1], num_levels)`` local codes, best first.
+        ``(rows, capped_widths[-1], num_levels)`` local codes and their FP32
+        mean token log-probabilities ``(rows, capped_widths[-1])``, best first.
     """
     padded, mask = _left_pad(embeds, cu_seqlens, max_seqlen)
-    tokens = dynamic_beam_search(
+    tokens, cumulative_log_probs = dynamic_beam_search(
         lm,
         padded,
         mask,
@@ -605,7 +614,8 @@ def generate_codes(
     # a band starts at base_vocab_size + level_offset, so this undoes both shifts
     codes = tokens - tokens.new_tensor([lo for lo, _ in bands])
     codes = codes.view(padded.shape[0], -1, len(bands))
-    return codes
+    scores = cumulative_log_probs.view(padded.shape[0], -1) / len(bands)
+    return codes, scores
 
 
 @torch.fx.wrap
@@ -654,7 +664,7 @@ def _fx_wrapped_forward(
 @torch.fx.wrap
 def _fx_wrapped_generate(
     model: "GenRecCausalLMModel", embeds: torch.Tensor, batch: Batch
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Hide the decode loop from FX.
 
     ``PredictPipelineSparseDist`` FX-traces the model, and beam decode reads
@@ -667,6 +677,6 @@ def _fx_wrapped_generate(
         batch: the batch to decode.
 
     Returns:
-        The decoded local codes.
+        The decoded local codes and their length-normalized log-probabilities.
     """
     return model._generate(embeds, batch)

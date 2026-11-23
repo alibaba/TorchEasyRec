@@ -24,6 +24,9 @@ message GenRecModelConfig {
     optional ParamDtype lm_parameter_dtype = 4 [default = FP32];
 
     optional string attn_kernel = 5 [default = "sdpa"];
+
+    // Mean SID token log-probabilities, aligned with generated_sids_key.
+    optional string generated_scores_key = 6 [default = "generated_scores"];
 }
 
 message GenRecCausalLMModel {

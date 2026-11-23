@@ -292,7 +292,7 @@ class GenRecIntegrationTest(unittest.TestCase):
             self.data_glob,
             predict_dir,
             "answer",
-            "generated_sids",
+            "generated_sids,generated_scores",
             self.test_dir,
         )
         self.assertTrue(self.success)
@@ -304,7 +304,7 @@ class GenRecIntegrationTest(unittest.TestCase):
             self.data_glob,
             export_predict_dir,
             "answer",
-            "generated_sids",
+            "generated_sids,generated_scores",
             self.test_dir,
         )
         self.assertTrue(self.success)
@@ -312,9 +312,14 @@ class GenRecIntegrationTest(unittest.TestCase):
             predicted = pq.read_table(output_dir)
             self.assertIn("answer", predicted.column_names)
             sids = predicted.column("generated_sids").to_pylist()
+            scores = predicted.column("generated_scores").to_pylist()
             self.assertEqual(len(sids), 8)
-            for row in sids:
+            self.assertEqual(len(scores), len(sids))
+            for row, row_scores in zip(sids, scores):
                 self.assertEqual([len(beam) for beam in row], [3, 3])
+                self.assertEqual(len(row_scores), len(row))
+                self.assertTrue(bool(torch.isfinite(torch.tensor(row_scores)).all()))
+                self.assertEqual(row_scores, sorted(row_scores, reverse=True))
                 for beam in row:
                     self.assertTrue(
                         all(0 <= c < n for c, n in zip(beam, _CODEBOOK)), beam
@@ -479,16 +484,21 @@ class GenRecIntegrationTest(unittest.TestCase):
             self.data_glob,
             predict_dir,
             "answer",
-            "generated_sids",
+            "generated_sids,generated_scores",
             self.test_dir,
         )
         self.assertTrue(self.success)
         predicted = pq.read_table(predict_dir)
         self.assertIn("answer", predicted.column_names)
         sids = predicted.column("generated_sids").to_pylist()
+        scores = predicted.column("generated_scores").to_pylist()
         self.assertEqual(len(sids), 8)
-        for row in sids:
+        self.assertEqual(len(scores), len(sids))
+        for row, row_scores in zip(sids, scores):
             self.assertEqual([len(beam) for beam in row], [3, 3])
+            self.assertEqual(len(row_scores), len(row))
+            self.assertTrue(bool(torch.isfinite(torch.tensor(row_scores)).all()))
+            self.assertEqual(row_scores, sorted(row_scores, reverse=True))
             for beam in row:
                 self.assertTrue(all(0 <= c < n for c, n in zip(beam, _CODEBOOK)), beam)
 
