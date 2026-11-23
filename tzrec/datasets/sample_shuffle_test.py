@@ -225,6 +225,79 @@ class SamplePoolTest(unittest.TestCase):
         self.assertEqual(len(ids), len(produced) * 8)
         self.assertEqual(len(set(ids)), len(ids))
 
+    def test_window_merge_determinism_and_chunk_sizes(self):
+        """Merged chunks reach the 2x-batch target without changing output."""
+        seed = 11
+
+        def emitted(chunk_rows):
+            pool = SamplePool(
+                8192, _WINDOW, rng=np.random.default_rng(seed), batch_size=1024
+            )
+            for start in range(0, 8192, chunk_rows):
+                pool.add(_plan_batch(chunk_rows, start))
+            outs = []
+            while (out := pool.emit(1024)) is not None:
+                outs.append(out)
+            return pool, outs
+
+        small_pool, small_outs = emitted(256)
+        big_pool, big_outs = emitted(4096)
+        self.assertEqual([c.num_rows for c in small_pool._chunks], [2048] * 4)
+        self.assertEqual([c.num_rows for c in big_pool._chunks], [4096, 4096])
+        self.assertEqual(len(small_outs), 8)
+        for small, big in zip(small_outs, big_outs):
+            self.assertTrue(small.equals(big))
+        perm = np.random.default_rng(seed).permutation(8192).tolist()
+        ids = [i for b in small_outs for i in b.column("id").to_pylist()]
+        self.assertEqual(ids, perm)
+
+    def test_window_merge_with_leftovers(self):
+        """Merging keeps leftover rows valid and releases replaced chunks."""
+        pool = SamplePool(32, _WINDOW, rng=np.random.default_rng(5), batch_size=8)
+        sources = []
+        next_id = 0
+
+        def feed(chunks):
+            nonlocal next_id
+            for _ in range(chunks):
+                source = make_batch(8, start_id=next_id)
+                sources.append(source)
+                pool.add(source)
+                next_id += 8
+
+        feed(4)
+        first = pool.emit(12)
+        self.assertIsNotNone(first)
+        self.assertEqual([c.num_rows for c in pool._chunks], [16, 16])
+        second = pool.emit(12)
+        self.assertIsNotNone(second)
+        # The third emit fails and carries 8 unemitted rows over.
+        self.assertIsNone(pool.emit(12))
+        feed(3)
+        third = pool.emit(12)
+        self.assertIsNotNone(third)
+        self.assertEqual([c.num_rows for c in pool._chunks], [16, 16])
+        fourth = pool.emit(12)
+        self.assertIsNotNone(fourth)
+        self.assertIsNone(pool.emit(12))
+        tail = pool.emit(8, drain=True)
+        self.assertIsNotNone(tail)
+        produced = [first, second, third, fourth, tail]
+        for batch in produced:
+            check_batch(self, batch, sources)
+        ids = [i for b in produced for i in b.column("id").to_pylist()]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(len(ids), 56)
+        self.assertEqual(pool.total_rows, 0)
+
+    def test_rolling_ignores_merge_target(self):
+        """SAMPLE_ROLLING never freezes, so reader chunks are never merged."""
+        pool = SamplePool(32, _ROLLING, rng=np.random.default_rng(0), batch_size=8)
+        for start in range(0, 32, 8):
+            pool.add(make_batch(8, start))
+        self.assertIsNotNone(pool.emit(8))
+        self.assertEqual([c.num_rows for c in pool._chunks], [8] * 4)
+
 
 class CoordinatorTest(unittest.TestCase):
     """In-process coordinator tests over the request/response protocol."""

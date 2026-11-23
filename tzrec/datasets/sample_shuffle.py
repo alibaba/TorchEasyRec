@@ -51,6 +51,8 @@ _WATCHDOG_TICK_SECS = 5.0
 _READER_GRACEFUL_STOP_SECS = 6.0
 _READER_FORCED_STOP_SECS = 2.0
 _STATS_LOG_INTERVAL_SECS = 60.0
+# Freeze-time merge target in training batches per merged chunk.
+_MERGE_BATCHES_PER_CHUNK = 2
 
 _DATA = "DATA"
 _EOF = "EOF"
@@ -171,6 +173,16 @@ def _conform_batch(batch: pa.RecordBatch, schema: pa.Schema) -> pa.RecordBatch:
     return batch
 
 
+def _concat_batches(batches: List[pa.RecordBatch]) -> pa.RecordBatch:
+    """Concatenate same-schema record batches into one batch.
+
+    The pyarrow in use has no ``concat_batches``; this is the table
+    round-trip the gather path already relies on.
+    """
+    table = pa.Table.from_batches(batches).combine_chunks()
+    return table.to_batches(max_chunksize=table.num_rows)[0]
+
+
 class SamplePool:
     """Chunked raw-sample pool with sample-level shuffle.
 
@@ -178,7 +190,10 @@ class SamplePool:
     pairs is the sampling domain. SAMPLE_WINDOW freezes the pool content
     into a shuffled window once it reaches capacity and emits requested
     batches from it before refilling; SAMPLE_ROLLING extracts a random
-    sample once the pool is refilled to capacity.
+    sample once the pool is refilled to capacity. With ``batch_size`` set,
+    a window freeze first repacks the live rows into chunks of about
+    ``_MERGE_BATCHES_PER_CHUNK * batch_size`` rows, so batch gathers read a
+    few big chunks instead of every reader-sized chunk.
 
     ``emit`` normally waits until the pool reaches its capacity. With
     ``drain=True`` it only requires enough rows for the request, which lets
@@ -193,6 +208,9 @@ class SamplePool:
         capacity_rows: pool capacity in samples.
         mode: "SAMPLE_WINDOW" or "SAMPLE_ROLLING".
         rng: random source, injectable for tests.
+        batch_size: training batch size; when set, a window freeze merges
+            small chunks to about ``_MERGE_BATCHES_PER_CHUNK * batch_size``
+            rows. Without it chunks stay exactly as the readers sent them.
     """
 
     def __init__(
@@ -200,10 +218,14 @@ class SamplePool:
         capacity_rows: int,
         mode: str,
         rng: Optional[np.random.Generator] = None,
+        batch_size: Optional[int] = None,
     ) -> None:
         self.capacity_rows = capacity_rows
         self.mode = mode
         self.rng = rng if rng is not None else np.random.default_rng()
+        self._merge_rows = (
+            _MERGE_BATCHES_PER_CHUNK * batch_size if batch_size is not None else None
+        )
         self._chunks: List[pa.RecordBatch] = []
         self._arena_chunk = np.empty(0, dtype=np.int32)
         self._arena_row = np.empty(0, dtype=np.int32)
@@ -291,6 +313,9 @@ class SamplePool:
                     return None
             elif self.total_rows < self.capacity_rows:
                 return None
+            merge_rows = self._merge_rows
+            if merge_rows is not None:
+                self._merge_chunks(merge_rows)
             n_freeze = self.total_rows
             perm = self.rng.permutation(n_freeze)
             self._frozen_chunk = self._arena_chunk[perm]
@@ -375,6 +400,76 @@ class SamplePool:
         self._chunks = new_chunks
         self._arena_chunk = arena_c
         self._arena_row = arena_r
+        self._dead_rows = 0
+        self.num_compactions += 1
+
+    def _merge_chunks(self, merge_rows: int) -> None:
+        """Repack live rows into merge-sized chunks before a window freezes.
+
+        Reader-sized chunks would make every later batch gather take rows
+        from most of them; consecutive live chunks are concatenated up to
+        ``merge_rows`` rows each, so a gather reads a handful of big chunks
+        instead. The repack keeps every arena position's row identity, so
+        a window's shuffled output does not depend on how the input was
+        chunked. Rows of already-emitted samples drop out with the replaced
+        chunk references.
+        """
+        order = np.argsort(self._arena_chunk, kind="stable")
+        sorted_c = self._arena_chunk[order]
+        sorted_r = self._arena_row[order]
+        uniq, starts, counts = np.unique(
+            sorted_c, return_index=True, return_counts=True
+        )
+        new_chunks: List[pa.RecordBatch] = []
+        new_c = np.empty_like(sorted_c)
+        new_r = np.empty_like(sorted_r)
+        parts: List[pa.RecordBatch] = []
+        part_start = 0
+        part_rows = 0
+
+        def _flush(end: int, chunk: pa.RecordBatch, rids: np.ndarray) -> None:
+            nonlocal part_start, part_rows
+            new_c[part_start:end] = len(new_chunks)
+            new_r[part_start:end] = rids
+            new_chunks.append(chunk)
+            part_start = end
+            part_rows = 0
+            parts.clear()
+
+        for u, st, c in zip(uniq, starts, counts):
+            chunk = self._chunks[int(u)]
+            rows = sorted_r[st : st + c]
+            if c == chunk.num_rows and c >= merge_rows:
+                # An intact chunk at or above the merge size is reused as is.
+                if parts:
+                    _flush(
+                        st,
+                        _concat_batches(parts),
+                        np.arange(st - part_start, dtype=np.int32),
+                    )
+                _flush(st + c, chunk, rows)
+                continue
+            if c == chunk.num_rows and np.array_equal(rows, np.arange(c)):
+                # A fresh intact chunk's rows already sit in arena order.
+                parts.append(chunk)
+            else:
+                parts.append(chunk.take(pa.array(rows.astype(np.int64))))
+            part_rows += c
+            if part_rows >= merge_rows:
+                _flush(
+                    st + c,
+                    _concat_batches(parts),
+                    np.arange(st + c - part_start, dtype=np.int32),
+                )
+        if parts:
+            _flush(
+                len(sorted_c),
+                _concat_batches(parts),
+                np.arange(len(sorted_c) - part_start, dtype=np.int32),
+            )
+        self._chunks = new_chunks
+        self._arena_chunk[order] = new_c
+        self._arena_row[order] = new_r
         self._dead_rows = 0
         self.num_compactions += 1
 
@@ -502,7 +597,7 @@ class Coordinator:
         self._num_consumers = num_consumers
         self._trainer_pid = trainer_pid
         self._capacity_rows = capacity_rows
-        self._pool = SamplePool(capacity_rows, mode)
+        self._pool = SamplePool(capacity_rows, mode, batch_size=batch_size)
         self._plan = first_plan
         self._remaining: Optional[int] = None
         self._rows_read = 0
