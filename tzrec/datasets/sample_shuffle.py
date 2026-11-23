@@ -496,6 +496,7 @@ class Coordinator:
         self._response_queues = response_queues
         self._stop_event = stop_event
         self._cancel_event = cancel_event
+        self._mode = mode
         self._batch_size = batch_size
         self._min_batch_size = min_batch_size
         self._num_consumers = num_consumers
@@ -604,12 +605,25 @@ class Coordinator:
             return
         self._verified = True
 
-    def _service_input(self, timeout: float) -> bool:
-        """Take one reader message and update the pool; return whether it took one."""
+    def _service_input(self, timeout: float) -> int:
+        """Take one reader message and add its rows to the pool.
+
+        Args:
+            timeout: seconds to wait for a message; 0 takes only a message
+                that already arrived (``get_nowait`` is required for that:
+                ``get(timeout=0)`` never polls the pipe of an mp.Queue).
+
+        Returns:
+            rows the message added to the pool; 0 for a control message or
+            when no message was available.
+        """
         try:
-            msg = self._input_q.get(timeout=timeout)
+            if timeout > 0:
+                msg = self._input_q.get(timeout=timeout)
+            else:
+                msg = self._input_q.get_nowait()
         except queue.Empty:
-            return False
+            return 0
         kind = msg[0]
         if kind == _DATA:
             rb = pa.ipc.read_record_batch(msg[2], self._plan.schema)
@@ -620,21 +634,44 @@ class Coordinator:
                     f"read more than the planned {expected} rows; "
                     "the input changed during the run"
                 )
-                return True
+                return 0
             self._pool.add(rb)
+            return rb.num_rows
         elif kind == _EOF:
             self._eof_readers.add(msg[1])
             self._check_eof()
         elif kind == _ERROR:
             self._fail(f"reader {msg[1]} failed: {msg[2]}")
-        return True
+        return 0
+
+    def _refill_pool(self, target_rows: int) -> None:
+        """Refill pool capacity freed by one emitted batch without blocking.
+
+        Pulls reader messages that already arrived until roughly the freed
+        capacity is back in the pool, the pool is full or no message is
+        ready, so the next window accumulates while the old one drains
+        instead of only after it is exhausted. Whole reader chunks may
+        overshoot the row target.
+        """
+        rows = 0
+        while rows < target_rows and self._error is None and self._pool_has_room():
+            # NOTE: Reading a dead reader's truncated frame can block forever.
+            self._check_readers()
+            if self._error is not None:
+                return
+            added = self._service_input(0.0)
+            if added <= 0:
+                return
+            rows += added
 
     def _serve_waiting(self) -> None:
         """Answer outstanding GETs in arrival order.
 
         One response queue per consumer and at most one outstanding GET
         mean every response goes into a queue its consumer has already
-        drained, so the put cannot block.
+        drained, so the put cannot block. In SAMPLE_WINDOW mode every
+        emitted batch is followed by a non-blocking refill of the capacity
+        it freed, so the next window fills up while the old one drains.
         """
         if self._error is not None:
             while self._request_order:
@@ -686,6 +723,10 @@ class Coordinator:
                 (_BATCH, batch.serialize().to_pybytes())
             )
             self._request_order.popleft()
+            if self._mode == "SAMPLE_WINDOW":
+                self._refill_pool(batch.num_rows)
+                if self._error is not None:
+                    return
 
     @property
     def _input_done(self) -> bool:

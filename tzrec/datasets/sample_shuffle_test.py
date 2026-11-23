@@ -260,14 +260,37 @@ class CoordinatorTest(unittest.TestCase):
         return coord
 
     def _coordinator(
-        self, planned_rows, is_finite=True, min_batch_size=0, num_readers=1
+        self,
+        planned_rows,
+        is_finite=True,
+        min_batch_size=0,
+        num_readers=1,
+        mode=_ROLLING,
+        num_consumers=1,
     ):
         plan = _plan(planned_rows, is_finite=is_finite, num_readers=num_readers)
-        coord = self._make_coordinator(plan, plan, min_batch_size=min_batch_size)
+        coord = self._make_coordinator(
+            plan,
+            plan,
+            min_batch_size=min_batch_size,
+            mode=mode,
+            num_consumers=num_consumers,
+        )
         coord._start_pass(coord._first_plan)
         for task_q in coord._task_queues:
             task_q.get(timeout=1.0)
         return coord
+
+    def _sync_queues(self, coord, num_consumers):
+        """Swap the protocol queues for synchronous in-process ones.
+
+        mp.Queue puts flush through a feeder thread, so a message is not
+        readable the instant ``put`` returns; plain queues make every
+        serve/refill ordering below fully deterministic.
+        """
+        coord._input_q = queue.Queue()
+        coord._request_q = queue.Queue()
+        coord._response_queues = [queue.Queue() for _ in range(num_consumers)]
 
     def _request(self, coord):
         coord._request_q.put((sample_shuffle._GET, 0))
@@ -382,6 +405,114 @@ class CoordinatorTest(unittest.TestCase):
         _feed_eof(coord)
         self._settle_input(coord)
         self.assertEqual(self._next_response(coord)[0], sample_shuffle._END)
+
+    def test_window_refill_between_batches(self):
+        """A served window batch triggers an immediate non-blocking refill.
+
+        With several queued reader chunks, the refill must pull enough of
+        them to cover one batch, and it must run after the first response
+        was sent and before the second one is served.
+        """
+        coord = self._coordinator(
+            planned_rows=None, is_finite=False, mode=_WINDOW, num_consumers=2
+        )
+        self._sync_queues(coord, 2)
+        for start in range(0, 16, 4):
+            _feed_batch(coord, 4, start)
+        for _ in range(4):
+            coord._service_input(0.05)
+        self.assertEqual(coord._pool.total_rows, 16)
+        _feed_batch(coord, 4, start_id=16)
+        _feed_batch(coord, 4, start_id=20)
+        events = []
+        pool_add, pool_emit = coord._pool.add, coord._pool.emit
+
+        def record_add(batch):
+            events.append("add")
+            pool_add(batch)
+
+        def record_emit(num_rows, drain=False):
+            events.append("emit")
+            return pool_emit(num_rows, drain)
+
+        coord._pool.add = record_add
+        coord._pool.emit = record_emit
+        for consumer_id in (0, 1):
+            coord._request_q.put((sample_shuffle._GET, consumer_id))
+        coord._service_requests()
+        coord._serve_waiting()
+        self.assertEqual(events, ["emit", "add", "add", "emit"])
+        for consumer_id in (0, 1):
+            kind, payload = coord._response_queues[consumer_id].get_nowait()
+            self.assertEqual(kind, sample_shuffle._BATCH)
+            rb = pa.ipc.read_record_batch(payload, _PLAN_SCHEMA)
+            self.assertEqual(rb.num_rows, 8)
+            ids = rb.column("id").to_pylist()
+            self.assertTrue(all(0 <= i < 16 for i in ids))
+        self.assertEqual(coord._pool.total_rows, 8)
+
+    def test_window_serves_batches_while_input_idle(self):
+        """An empty reader queue never blocks serving the frozen window."""
+        coord = self._coordinator(
+            planned_rows=None, is_finite=False, mode=_WINDOW, num_consumers=2
+        )
+        self._sync_queues(coord, 2)
+        for start in range(0, 16, 4):
+            _feed_batch(coord, 4, start)
+        for _ in range(4):
+            coord._service_input(0.05)
+        timeouts = []
+        service_input = coord._service_input
+
+        def record_input(timeout):
+            timeouts.append(timeout)
+            return service_input(timeout)
+
+        coord._service_input = record_input
+        for consumer_id in (0, 1):
+            coord._request_q.put((sample_shuffle._GET, consumer_id))
+        coord._service_requests()
+        coord._serve_waiting()
+        self.assertEqual(timeouts, [0.0, 0.0])
+        for consumer_id in (0, 1):
+            kind, payload = coord._response_queues[consumer_id].get_nowait()
+            self.assertEqual(kind, sample_shuffle._BATCH)
+            rb = pa.ipc.read_record_batch(payload, _PLAN_SCHEMA)
+            self.assertTrue(all(0 <= i < 16 for i in rb.column("id").to_pylist()))
+        self.assertEqual(coord._pool.total_rows, 0)
+
+    def test_nonblocking_input_read_sees_flushed_message(self):
+        """A flushed reader message must be visible to the 0-timeout read.
+
+        ``get(timeout=0)`` on an mp.Queue skips the pipe poll entirely, so
+        this only passes with the real non-blocking ``get_nowait``.
+        """
+        coord = self._coordinator(planned_rows=None, is_finite=False)
+        _feed_batch(coord, 4)
+        deadline = time.monotonic() + 5.0
+        added = 0
+        while time.monotonic() < deadline:
+            added = coord._service_input(0.0)
+            if added > 0:
+                break
+            time.sleep(0.005)
+        self.assertEqual(added, 4)
+        self.assertEqual(coord._pool.total_rows, 4)
+
+    def test_window_refill_drains_flooded_input_queue(self):
+        """Window serving keeps draining a reader that outruns the pool."""
+        task = ReadTask(fn=_yield_rows, kwargs=dict(n=40, chunk=10))
+        plan = _plan(40, tasks=[task])
+        with mock.patch.object(sample_shuffle, "_INPUT_QUEUE_BATCHES_PER_READER", 1):
+            coord = self._make_coordinator(plan, plan, mode=_WINDOW)
+        runner, errors = self._run_with_readers(coord)
+        batches, msg = self._collect_batches(coord, timeout=5.0)
+        self.assertEqual(msg[0], sample_shuffle._END)
+        self.assertEqual([b.num_rows for b in batches], [8] * 5)
+        ids = [i for b in batches for i in b.column("id").to_pylist()]
+        self.assertEqual(sorted(ids), list(range(40)))
+        self.assertEqual(len(ids), len(set(ids)))
+        self._stop_runner(coord, runner, errors)
 
     @parameterized.expand(
         [
