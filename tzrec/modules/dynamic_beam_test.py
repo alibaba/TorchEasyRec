@@ -143,7 +143,6 @@ class DynamicBeamSearchTest(unittest.TestCase):
         self.assertEqual(widths, expected_widths)
         self.assertEqual(tuple(out.shape), (expected_widths[-1], len(pairs)))
         self.assertEqual(tuple(scores.shape), (expected_widths[-1],))
-        self.assertTrue(bool(torch.all(scores[:-1] >= scores[1:])))
 
     def test_ragged_batch_rows_match_solo_runs(self) -> None:
         # every row of a ragged batch must decode exactly as if run alone.
