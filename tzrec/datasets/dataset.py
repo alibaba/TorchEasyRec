@@ -620,6 +620,11 @@ class BaseReader(metaclass=_reader_meta_cls):
         """Table schema."""
         raise NotImplementedError
 
+    @property
+    def is_finite_replay(self) -> bool:
+        """Whether this reader replays a window bounded at job start."""
+        return False
+
     def _worker_intervals(
         self,
         sources: List[Tuple[str, int]],

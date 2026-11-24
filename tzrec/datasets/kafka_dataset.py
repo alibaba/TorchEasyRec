@@ -140,21 +140,6 @@ def _parse_kafka_uri(
     return topic, params, start_timestamp_ms, end_timestamp_ms
 
 
-def is_finite_kafka_input(input_path: str) -> bool:
-    """Whether a kafka URI bounds its read window with end.timestamp.ms.
-
-    Args:
-        input_path: data input path from the config.
-
-    Returns:
-        True only for kafka URIs carrying ``end.timestamp.ms``.  A malformed
-        value still reports True and fails when the reader parses the URI.
-    """
-    if not input_path.startswith("kafka://"):
-        return False
-    return "end.timestamp.ms" in dict(parse_qsl(urlparse(input_path).query))
-
-
 def _build_projection(
     src_schema: pa.Schema, dst_schema: pa.Schema
 ) -> Optional[List[int]]:
@@ -429,6 +414,16 @@ class KafkaReader(BaseReader):
     def schema(self) -> pa.Schema:
         """Table schema."""
         return self._schema
+
+    @property
+    def is_finite_replay(self) -> bool:
+        """Whether end.timestamp.ms bounds this reader to a finite replay.
+
+        The startup snapshot resolved the exclusive end offset of every
+        partition, so this answers the finiteness question for the plans
+        and the training entries without re-parsing the URI.
+        """
+        return self._end_offsets is not None
 
     def _peek_schema_from_kafka(self) -> pa.Schema:
         """Peek at newest Kafka message to extract schema.
@@ -1308,10 +1303,11 @@ class KafkaReader(BaseReader):
         on each assignment, like the BATCH path.
 
         An end-timestamp plan is finite without a planned row count, so the
-        coordinator drains the pool after EOF.  Its tasks carry a reader
-        snapshot whose checkpoint state is private, so the handle clearing
-        the original reader's resume position for later full passes cannot
-        erase this plan's first-pass start.
+        coordinator drains the pool after EOF.  Its tasks carry a shallow
+        reader snapshot: the checkpoint dict is safe to share because
+        load_state_dict rebinds it instead of mutating, so the handle
+        clearing the original reader's resume position for later full
+        passes cannot erase this plan's first-pass start.
 
         Args:
             rank: this process's rank.
@@ -1319,16 +1315,13 @@ class KafkaReader(BaseReader):
             num_readers: number of reader processes on this rank.
 
         Returns:
-            a read plan with one task per reader; finite iff ``end.timestamp.ms``
-            is configured, then without a planned row count.
+            a read plan with one task per reader; finite iff the reader
+            resolved end offsets at startup, then without a planned row
+            count.
         """
-        _, _, _, end_timestamp_ms = _parse_kafka_uri(self._input_path)
         reader = self
-        if end_timestamp_ms is not None:
+        if self.is_finite_replay:
             reader = copy.copy(self)
-            reader._checkpoint_state = (
-                dict(self._checkpoint_state) if self._checkpoint_state else None
-            )
         global_num_readers = world_size * num_readers
         tasks = [
             ReadTask(
@@ -1347,7 +1340,7 @@ class KafkaReader(BaseReader):
             tasks=tasks,
             # kafka batches carry the event-time column
             schema=make_sample_table_schema(self._schema, with_timestamp=True),
-            is_finite=end_timestamp_ms is not None,
+            is_finite=self.is_finite_replay,
             planned_rows=None,
             num_readers=num_readers,
         )

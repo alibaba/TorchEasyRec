@@ -39,7 +39,6 @@ from tzrec.datasets.kafka_dataset import (
     _build_projection,
     _offsets_for_times_batched,
     _parse_kafka_uri,
-    is_finite_kafka_input,
 )
 from tzrec.datasets.utils import CKPT_ROW_IDX, DATA_TIMESTAMP
 from tzrec.features.feature import FgMode, create_features
@@ -144,22 +143,6 @@ class ParseKafkaUriTest(unittest.TestCase):
         uri = "kafka://broker:9092/topic?group.id=g1&end.timestamp.ms=soon"
         with self.assertRaises(ValueError):
             _parse_kafka_uri(uri)
-
-    def test_is_finite_kafka_input(self):
-        self.assertTrue(
-            is_finite_kafka_input("kafka://b:9092/t?group.id=g&end.timestamp.ms=1")
-        )
-        self.assertTrue(
-            is_finite_kafka_input(
-                "kafka://b:9092/t?group.id=g&start.timestamp.ms=1&end.timestamp.ms=x"
-            )
-        )
-        self.assertFalse(is_finite_kafka_input("kafka://b:9092/t?group.id=g"))
-        self.assertFalse(
-            is_finite_kafka_input("kafka://b:9092/t?group.id=g&start.timestamp.ms=1")
-        )
-        self.assertFalse(is_finite_kafka_input("odps://project/table"))
-        self.assertFalse(is_finite_kafka_input("/data/part-*.parquet"))
 
 
 def _resolved(partition, offset, topic="t"):
@@ -636,6 +619,32 @@ class KafkaReaderEndOffsetsTest(unittest.TestCase):
             **kwargs,
         )
 
+    def test_is_finite_replay_follows_the_reader_state(self):
+        # the reader's startup snapshot answers the finiteness question, so
+        # the plans and the training entries cannot diverge from it, e.g.
+        # on an uppercase scheme the URI parser still accepts
+        reader = self._make_reader(
+            [mock.Mock()],
+            uri="kafka://broker:9092/topic?group.id=g1",
+        )
+        self.assertFalse(reader.is_finite_replay)
+        self.assertTrue(
+            self._make_reader(
+                [mock.Mock()], highs={0: 5, 1: 5}, ends={0: 3, 1: 4}
+            ).is_finite_replay
+        )
+        self.assertTrue(
+            self._make_reader(
+                [mock.Mock()],
+                highs={0: 5, 1: 5},
+                ends={0: 3, 1: 4},
+                uri=(
+                    "KAFKA://broker:9092/topic?group.id=g1"
+                    "&auto.offset.reset=earliest&end.timestamp.ms=120000"
+                ),
+            ).is_finite_replay
+        )
+
     def test_minimal_example_exact_offsets_and_termination(self):
         # P0 resolves E=3, so its boundary message at offset 3 is never
         # fetched; P1 finds no message past the timestamp and ends at its
@@ -673,12 +682,13 @@ class KafkaReaderEndOffsetsTest(unittest.TestCase):
 
     def test_boundary_in_one_fetch_across_partitions(self):
         # one consume() straddles P0's boundary and P1's last legal message:
-        # P0:100 is dropped, P0:99 and P1:40 are delivered, and both
-        # partitions complete without a further fetch
+        # 99 is never fetched, P0:100 crosses the end offset and is dropped
+        # by the offset filter itself, P0:98 and P1:40 are delivered, and
+        # both partitions complete without a further fetch
         consumer = mock.Mock()
         consumer.get_watermark_offsets.side_effect = [(0, 101), (0, 41)]
         consumer.consume.side_effect = [
-            [_msg(0, 99, 1), _msg(0, 100, 2), _msg(1, 40, 3)],
+            [_msg(0, 98, 1), _msg(0, 100, 2), _msg(1, 40, 3)],
         ]
         reader = self._make_reader(
             [consumer], highs={0: 101, 1: 41}, ends={0: 100, 1: 41}
@@ -689,7 +699,7 @@ class KafkaReaderEndOffsetsTest(unittest.TestCase):
             (batch.column("x").to_pylist(), batch.column(CKPT_ROW_IDX).to_pylist())
             for batch in gen
         ]
-        self.assertEqual(observed, [([1, 3], [99, 40])])
+        self.assertEqual(observed, [([1, 3], [98, 40])])
         self.assertEqual(consumer.consume.call_count, 1)
 
     def test_partition_starting_at_end_is_skipped(self):
@@ -1312,6 +1322,25 @@ class KafkaDatasetConfigTest(unittest.TestCase):
                 round_robin=True,
                 log_every_n_messages=1000,
             ),
+            param(
+                "train_drop_remainder",
+                mode=Mode.TRAIN,
+                expected_shuffle=True,
+                drop_remainder=True,
+            ),
+            param(
+                "train_min_batch_size",
+                mode=Mode.TRAIN,
+                expected_shuffle=True,
+                min_batch_size=2,
+            ),
+            param(
+                "eval_keeps_every_row",
+                mode=Mode.EVAL,
+                expected_shuffle=False,
+                drop_remainder=True,
+                min_batch_size=3,
+            ),
         ],
         name_func=parameterized_name_func,
     )
@@ -1322,6 +1351,8 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         expected_shuffle,
         round_robin=None,
         log_every_n_messages=None,
+        drop_remainder=False,
+        min_batch_size=0,
     ):
         data_config = data_pb2.DataConfig(
             batch_size=4,
@@ -1335,6 +1366,8 @@ class KafkaDatasetConfigTest(unittest.TestCase):
                 data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
             ],
         )
+        data_config.drop_remainder = drop_remainder
+        data_config.min_batch_size = min_batch_size
         if round_robin is not None:
             data_config.kafka_partition_round_robin = round_robin
         if log_every_n_messages is not None:
@@ -1363,51 +1396,15 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         self.assertEqual(
             dataset._reader._log_every_n_messages, log_every_n_messages or 0
         )
-
-    @parameterized.expand(
-        [
-            param("train_drop_remainder", Mode.TRAIN, True, 0, True, 4),
-            param("train_min_batch_size", Mode.TRAIN, False, 2, False, 2),
-            param("train_keep_all", Mode.TRAIN, False, 0, False, 0),
-            param("eval_keeps_every_row", Mode.EVAL, True, 3, False, 0),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_tail_batch_config_reaches_reader(
-        self, _name, mode, drop_remainder, min_batch_size, expected_drop, expected_min
-    ):
-        data_config = data_pb2.DataConfig(
-            batch_size=4,
-            dataset_type=data_pb2.DatasetType.KafkaDataset,
-            fg_mode=data_pb2.FgMode.FG_NONE,
-            label_fields=["label"],
-            shuffle=True,
-            shuffle_buffer_size=64,
-            input_fields=[
-                data_pb2.Field(input_name="id_a", input_type=data_pb2.STRING),
-                data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
-            ],
+        # training drops tail batches by its own config, eval and predict
+        # keep every row of a bounded window
+        self.assertEqual(
+            dataset._reader._drop_remainder, drop_remainder and mode == Mode.TRAIN
         )
-        data_config.drop_remainder = drop_remainder
-        data_config.min_batch_size = min_batch_size
-        features = create_features(
-            [
-                feature_pb2.FeatureConfig(
-                    id_feature=feature_pb2.IdFeature(feature_name="id_a")
-                )
-            ]
+        self.assertEqual(
+            dataset._reader._min_batch_size,
+            (4 if drop_remainder else min_batch_size) if mode == Mode.TRAIN else 0,
         )
-        with mock.patch.object(
-            KafkaReader, "_get_partition_layout", return_value=([0, 1], None)
-        ):
-            dataset = KafkaDataset(
-                data_config=data_config,
-                features=features,
-                input_path="kafka://broker:9092/topic?group.id=tzrec_test_group",
-                mode=mode,
-            )
-        self.assertEqual(dataset._reader._drop_remainder, expected_drop)
-        self.assertEqual(dataset._reader._min_batch_size, expected_min)
 
 
 class KafkaDatasetTest(unittest.TestCase):
@@ -1952,25 +1949,21 @@ class KafkaDatasetTest(unittest.TestCase):
         iterator = None
         try:
             iterator = dataloader.get_iterator()
-            sizes = []
-            seen = set()
-            for batch in iterator:
-                values = [int(v) for v in batch.to_dict()["raw_c.values"]]
-                sizes.append(len(values))
-                self.assertEqual(len(set(values)), len(values))
-                seen.update(values)
-                for value in values:
-                    partition, offset = metadata[value]
-                    # resumed from checkpoint_offset + 1 in every partition
-                    self.assertGreater(
-                        offset, checkpoint[f"{self.test_topic}:{partition}"]
-                    )
-                    # every served message stays inside the startup snapshot
-                    self.assertLess(offset, 5 if partition < 3 else 8)
-            self.assertEqual(sizes, expected_sizes)
-            self.assertEqual(len(seen), sum(expected_sizes))
+            sizes, values, _ = utils.drain_sample(iterator)
         finally:
             utils.stop_sample(dataloader, iterator)
+        seen = set(values)
+        # every legal row of the window is served exactly once, ending with
+        # the configured tail batch
+        self.assertEqual(sizes, expected_sizes)
+        self.assertEqual(len(seen), len(values))
+        self.assertEqual(len(seen), sum(expected_sizes))
+        for value in values:
+            partition, offset = metadata[value]
+            # resumed from checkpoint_offset + 1 in every partition
+            self.assertGreater(offset, checkpoint[f"{self.test_topic}:{partition}"])
+            # every served message stays inside the startup snapshot
+            self.assertLess(offset, 5 if partition < 3 else 8)
 
     @unittest.skipIf(
         os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
