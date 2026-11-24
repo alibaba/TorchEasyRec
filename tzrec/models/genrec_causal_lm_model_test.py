@@ -248,7 +248,6 @@ class GenerateCodesTest(unittest.TestCase):
             local_codes.reshape(2, 2, -1).tolist(),
         )
         torch.testing.assert_close(scores, torch.tensor([[-1.0, -2.0], [-1.5, -2.5]]))
-        self.assertEqual(scores.dtype, torch.float32)
         searched_lm, padded, mask, widths, searched_bands = beam_search.call_args.args
         self.assertIs(searched_lm, lm)
         self.assertEqual(padded.shape, (2, 3, 4))

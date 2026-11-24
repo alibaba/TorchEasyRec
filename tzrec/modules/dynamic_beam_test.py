@@ -118,7 +118,6 @@ class DynamicBeamSearchTest(unittest.TestCase):
             beam_widths=beam_widths,
         )
         self.assertEqual([tuple(row) for row in out.tolist()], expected)
-        self.assertEqual(scores.dtype, torch.float32)
         torch.testing.assert_close(scores, torch.tensor([ref[row] for row in expected]))
 
     @parameterized.expand(
