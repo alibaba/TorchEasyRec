@@ -190,7 +190,7 @@ answer = [1, 8194, 16387, 4, 8197, 16390]
 
 默认输出列 `generated_sids` 的每行形状为 `(实际返回数量, 码本层数)`，实际返回数量不超过末层配置宽度和候选池容量，各 SID 按预测得分从高到低排列。例如 `[[3, 5, 7], [8, 4, 12], ...]`。**输出是每层从 0 开始的编码**，应与最终 SID 映射表的 `codebook` 列对齐；若使用 `offset_codebook` 做关联，需先加回层偏移。
 
-`generated_scores` 与 SID 一一对应，表示各层编码的平均对数概率，分数越大越优。预测默认输出两列；显式选择时使用 `--output_columns generated_sids,generated_scores`。
+`generated_scores` 与 SID 一一对应，表示各层编码的平均对数概率，概率按完整词表归一化，分数越大越优。预测默认输出两列；仅需 SID 时使用 `--output_columns generated_sids`。
 
 生成 SID 的层数与码本层数一致。召回时需查询 SID 到物品的映射表，过滤没有对应物品的 SID，并展开同一 SID 对应的物品列表。
 

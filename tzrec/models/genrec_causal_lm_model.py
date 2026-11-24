@@ -184,6 +184,10 @@ class GenRecCausalLMModel(BaseGenRecModel):
         common = self._model_config.common
         self._generated_sids_key = common.generated_sids_key
         self._generated_scores_key = common.generated_scores_key
+        if self._generated_sids_key == self._generated_scores_key:
+            raise ValueError(
+                "generated_sids_key and generated_scores_key must be different."
+            )
         self._read_beam_config(common)
         response = self._prompt.prompt_plan.response_segments
         self._sid_only_response = len(response) == 1 and isinstance(

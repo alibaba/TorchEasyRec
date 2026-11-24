@@ -1667,6 +1667,10 @@ class GenRecExportModel:
         self._capped_widths = resolve_beam_config(common, sid_space["codebook"])
         self._generated_sids_key = common.generated_sids_key
         self._generated_scores_key = common.generated_scores_key
+        if self._generated_sids_key == self._generated_scores_key:
+            raise ValueError(
+                "generated_sids_key and generated_scores_key must be different."
+            )
         self._mixed_dtype = acc_utils.mixed_precision_to_dtype(
             acc_utils.mixed_precision_for_export(pipeline_config)
         )
@@ -1838,9 +1842,9 @@ def load_predict_model(
             genrec, decodes with its beam settings, read from the export's own
             pipeline.config when not given.
 
-    Return:
+    Returns:
         a callable of (batch, batch_size input of tiled models, device) returning
-        the predictions, the decoded SIDs for a GenRec export.
+        the predictions, including decoded SIDs and their scores for a GenRec export.
     """
     hf_config_path = os.path.join(model_path, "config.json")
     is_genrec = False
