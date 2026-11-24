@@ -1147,10 +1147,20 @@ class OffsetsForTimesBatchedTest(unittest.TestCase):
         self.assertEqual(consumer.offsets_for_times.call_count, 2)
         self.assertEqual(sleep_fn.call_count, 1)
 
-    def test_retry_exhausted_raises(self):
+    @parameterized.expand(
+        [
+            ("request", KafkaException("persistent timeout")),
+            (
+                "partition",
+                [mock.Mock(offset=-1, error=KafkaError(KafkaError._TIMED_OUT))],
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_retry_exhausted_raises(self, _name, response):
         sleep_fn = mock.MagicMock()
         consumer = mock.MagicMock()
-        consumer.offsets_for_times.side_effect = KafkaException("persistent timeout")
+        consumer.offsets_for_times.side_effect = [response] * 4
         parts = [TopicPartition("t", 0)]
         with self.assertRaises(KafkaException):
             _offsets_for_times_batched(

@@ -252,6 +252,9 @@ def _offsets_for_times_batched(
         while True:
             try:
                 resolved = consumer.offsets_for_times(chunk, timeout=timeout)
+                for partition in resolved:
+                    if partition.error is not None:
+                        raise KafkaException(partition.error)
             except KafkaException as e:
                 if retry_cnt >= max_retries:
                     logger.error(
