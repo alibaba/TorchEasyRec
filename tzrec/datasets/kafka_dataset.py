@@ -16,7 +16,8 @@ import multiprocessing as mp
 import os
 import threading
 import time
-from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Set, Tuple
+from collections import deque
+from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlparse
 
 import pyarrow as pa
@@ -79,8 +80,10 @@ def _parse_kafka_uri(
             specified.
 
     Raises:
-        ValueError: on a malformed URI, a non-integer or negative timestamp,
-            or a start timestamp greater than the end timestamp.
+        ValueError: on a malformed URI, an explicitly empty, non-integer or
+            negative timestamp, a start timestamp greater than the end
+            timestamp, or disabling partition EOF together with an end
+            timestamp.
     """
     parsed = urlparse(uri)
     if parsed.scheme != "kafka":
@@ -94,9 +97,16 @@ def _parse_kafka_uri(
     if not topic:
         raise ValueError("Kafka topic not specified in URI")
 
-    params = dict(parse_qsl(parsed.query))
-    if "group.id" not in params:
+    # one parse with kept blank values: an explicitly empty window endpoint
+    # raises instead of silently consuming as an unbounded stream, other
+    # blank values drop out of the consumer config like parse_qsl's default
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if not params.get("group.id"):
         raise ValueError("Consumer group not specified in URI (use ?group.id=xxx)")
+    for param_name in ("start.timestamp.ms", "end.timestamp.ms"):
+        if params.get(param_name) == "":
+            raise ValueError(f"{param_name} must not be empty")
+    params = {key: value for key, value in params.items() if value != ""}
 
     # Extract custom timestamp parameters (not confluent_kafka config keys)
     start_timestamp_ms: Optional[int] = None
@@ -131,10 +141,18 @@ def _parse_kafka_uri(
         params["debug"] = "assignor,conf"
     if "enable.auto.commit" not in params:
         params["enable.auto.commit"] = "false"
-    if end_timestamp_ms is not None and "enable.partition.eof" not in params:
+    if end_timestamp_ms is not None:
         # partition EOF events let a bounded reader finish a partition whose
-        # remaining offsets are holes instead of waiting for a boundary message
-        params["enable.partition.eof"] = "true"
+        # remaining offsets are holes instead of waiting for a boundary
+        # message; disabling them would stall the reader on those holes
+        eof = params.get("enable.partition.eof", "true").lower()
+        if eof in ("false", "0"):
+            raise ValueError(
+                "enable.partition.eof cannot be disabled together with "
+                "end.timestamp.ms: partitions whose last offsets are holes "
+                "would never complete"
+            )
+        params.setdefault("enable.partition.eof", "true")
     params["bootstrap.servers"] = broker
 
     return topic, params, start_timestamp_ms, end_timestamp_ms
@@ -678,22 +696,24 @@ class KafkaReader(BaseReader):
     def _filter_end_offsets(
         self,
         messages: List[Message],
-        end_offsets: Dict[int, int],
-        completed: Set[int],
+        remaining: Dict[int, int],
     ) -> List[Message]:
-        """Keep only the messages before each partition's end offset.
+        """Keep only the messages of partitions that still read their window.
 
-        A message at or past its partition's end offset is the boundary: it
-        and every later message of that partition is dropped.  A partition
-        also completes once its next consume position reaches the end
-        offset, without waiting for the boundary message; and a partition
-        EOF event completes it even when offsets have holes.  Other error
-        messages carry no rows and pass through for _decode_messages to log.
+        ``remaining`` holds this worker's unfinished partitions with their
+        exclusive end offsets.  A message at or past its partition's end
+        offset is the boundary: it and every later message of that partition
+        is dropped and the partition leaves the table.  A partition also
+        leaves once its next consume position reaches the end offset right
+        after its last legal message, and a partition EOF event covers
+        offset holes.  An empty table means the worker read every assigned
+        window.  Other error messages carry no rows and pass through for
+        _decode_messages to log.
 
         Args:
             messages (list): kafka messages fetched from the broker.
-            end_offsets (dict): partition id to exclusive end offset.
-            completed (set): partition ids already finished, updated in place.
+            remaining (dict): unfinished partition id to exclusive end
+                offset, partitions are removed in place.
 
         Returns:
             list: the messages to decode, in their original order.
@@ -707,7 +727,7 @@ class KafkaReader(BaseReader):
                     msg_error.code() == KafkaError._PARTITION_EOF
                     and partition is not None
                 ):
-                    completed.add(partition)
+                    remaining.pop(partition, None)
                 else:
                     retained.append(msg)
                 continue
@@ -715,15 +735,16 @@ class KafkaReader(BaseReader):
                 # a message without a partition has no window to check
                 retained.append(msg)
                 continue
-            if partition in completed:
+            end = remaining.get(partition)
+            if end is None:
                 continue
             offset = msg.offset()
-            if offset >= end_offsets[partition]:
-                completed.add(partition)
+            if offset >= end:
+                remaining.pop(partition)
                 continue
             retained.append(msg)
-            if offset + 1 >= end_offsets[partition]:
-                completed.add(partition)
+            if offset + 1 >= end:
+                remaining.pop(partition)
         return retained
 
     def _decode_messages(
@@ -846,19 +867,23 @@ class KafkaReader(BaseReader):
 
         When partition round-robin is enabled the partitions owned by this
         worker are read in round-robin order by :meth:`_round_robin_reader`.
-        When ``end.timestamp.ms`` is configured (and partition round-robin is
-        not), the worker's fixed share of partitions is read up to their
-        end offsets by :meth:`_finite_reader`; partitions whose window is
-        empty, e.g. when the start equals the end timestamp, finish without
-        yielding anything.
-        Otherwise a background heartbeat thread monitors idle time (time since
-        the last ``consume()`` call).  When the generator is blocked at
-        ``yield`` for longer than 80% of ``max.poll.interval.ms``, the
-        heartbeat thread pauses all partitions and calls ``consumer.poll(0)``
-        periodically to reset the application poll timer and keep the consumer
-        in its group.  This prevents ``MAX_POLL_EXCEEDED`` errors during long
-        downstream pauses (checkpoint saves, evaluation, compilation warmup,
-        etc.).
+        Otherwise one consumer serves this worker in either mode below,
+        sharing the fetch-size estimate and the decode and yield loop.
+        Unbounded consumption joins the shared consumer group through
+        ``subscribe()``: a background heartbeat thread monitors idle time
+        (time since the last ``consume()`` call) and, when the generator is
+        blocked at ``yield`` for longer than 80% of ``max.poll.interval.ms``,
+        pauses all partitions and calls ``consumer.poll(0)`` periodically to
+        reset the application poll timer and keep the consumer in its group,
+        preventing ``MAX_POLL_EXCEEDED`` errors during long downstream
+        pauses (checkpoint saves, evaluation, compilation warmup, etc.).
+        With ``end.timestamp.ms`` the worker instead fixedly assigns its
+        share of partitions, without group coordination so a finished
+        worker exits without a rebalance handing its partitions around;
+        messages at or past each partition's end offset are dropped before
+        decode and the generator ends once every assigned window is read.
+        Partitions whose window is empty, e.g. when the start equals the
+        end timestamp, finish without yielding anything.
 
         Args:
             worker_id: Worker ID
@@ -884,78 +909,111 @@ class KafkaReader(BaseReader):
                 num_workers,
             )
             return
-        if end_timestamp_ms is not None:
-            yield from self._finite_reader(
-                topic,
-                config,
-                start_timestamp_ms,
-                worker_id,
-                num_workers,
-            )
-            return
 
-        max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
         consumer = Consumer(config)
+        parent = mp.parent_process()
+        projections: Dict[pa.Schema, Optional[List[int]]] = {}
+        batch_size_per_msg: Optional[float] = None
+        # the end offset of every assigned partition this worker still has
+        # to read; the table empties when the last window finished
+        remaining: Dict[int, int] = {}
 
         stop_event = threading.Event()
         consumer_lock = threading.RLock()
         is_paused = [False]
         last_consume_time = [time.monotonic()]
-        idle_threshold = max_poll_interval_ms / 1000.0 * 0.8
         stolen_msgs: List = []
+        # only the unbounded subscribe mode runs the heartbeat thread
+        heartbeat_thread: Optional[threading.Thread] = None
 
-        # Define on_assign callback to seek to checkpointed offsets
-        def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
-            self._set_start_offsets(consumer, partitions, start_timestamp_ms)
-            with consumer_lock:
-                consumer.assign(partitions)
-                if is_paused[0]:
-                    consumer.pause(consumer.assignment())
-            logger.info(f"{log_prefix} assignment: {consumer.assignment()}")
+        try:
+            if end_timestamp_ms is None:
+                # unbounded consumption joins the shared consumer group
+                max_poll_interval_ms = int(config.get("max.poll.interval.ms", "300000"))
+                idle_threshold = max_poll_interval_ms / 1000.0 * 0.8
 
-        def _heartbeat() -> None:
-            """Keep consumer alive when generator is blocked at yield."""
-            while not stop_event.is_set():
-                try:
-                    elapsed = time.monotonic() - last_consume_time[0]
-                    if elapsed > idle_threshold:
-                        with consumer_lock:
-                            # Re-check elapsed inside lock to avoid racing
-                            # with the main thread that updates
-                            # last_consume_time under the same lock.
+                # Define on_assign callback to seek to checkpointed offsets
+                def on_assign(
+                    consumer: Consumer, partitions: List[TopicPartition]
+                ) -> None:
+                    self._set_start_offsets(consumer, partitions, start_timestamp_ms)
+                    with consumer_lock:
+                        consumer.assign(partitions)
+                        if is_paused[0]:
+                            consumer.pause(consumer.assignment())
+                    logger.info(f"{log_prefix} assignment: {consumer.assignment()}")
+
+                def _heartbeat() -> None:
+                    """Keep consumer alive when generator is blocked at yield."""
+                    while not stop_event.is_set():
+                        try:
                             elapsed = time.monotonic() - last_consume_time[0]
                             if elapsed > idle_threshold:
-                                if not is_paused[0]:
-                                    assignment = consumer.assignment()
-                                    if assignment:
-                                        consumer.pause(assignment)
-                                    is_paused[0] = True
-                                    logger.debug(
-                                        f"{log_prefix} heartbeat: paused "
-                                        f"{len(assignment)} partitions after "
-                                        f"{elapsed:.1f}s idle"
-                                    )
-                                msg = consumer.poll(0)
-                                if msg is not None and not msg.error():
-                                    stolen_msgs.append(msg)
-                except Exception:
-                    logger.warning(f"{log_prefix} heartbeat error", exc_info=True)
-                stop_event.wait(1.0)
+                                with consumer_lock:
+                                    # Re-check elapsed inside lock to avoid
+                                    # racing with the main thread that updates
+                                    # last_consume_time under the same lock.
+                                    elapsed = time.monotonic() - last_consume_time[0]
+                                    if elapsed > idle_threshold:
+                                        if not is_paused[0]:
+                                            assignment = consumer.assignment()
+                                            if assignment:
+                                                consumer.pause(assignment)
+                                            is_paused[0] = True
+                                            logger.debug(
+                                                f"{log_prefix} heartbeat: paused "
+                                                f"{len(assignment)} partitions "
+                                                f"after {elapsed:.1f}s idle"
+                                            )
+                                        msg = consumer.poll(0)
+                                        if msg is not None and not msg.error():
+                                            stolen_msgs.append(msg)
+                        except Exception:
+                            logger.warning(
+                                f"{log_prefix} heartbeat error", exc_info=True
+                            )
+                        stop_event.wait(1.0)
 
-        heartbeat_thread = threading.Thread(
-            target=_heartbeat,
-            name=f"{log_prefix}-hb",
-            daemon=True,
-        )
-        batch_size_per_msg = None
-        # name-based projection per seen message schema, so an upstream schema
-        # change costs one recompute rather than one per message.
-        projections: Dict[pa.Schema, Optional[List[int]]] = {}
-        parent = mp.parent_process()
-        heartbeat_thread.start()
-        try:
-            consumer.subscribe([topic], on_assign=on_assign)
-            while True:
+                heartbeat_thread = threading.Thread(
+                    target=_heartbeat,
+                    name=f"{log_prefix}-hb",
+                    daemon=True,
+                )
+                heartbeat_thread.start()
+                consumer.subscribe([topic], on_assign=on_assign)
+            else:
+                # finite replay fixedly assigns this worker's share: without
+                # group coordination a finished worker exits without a
+                # rebalance handing its partitions around
+                end_offsets = self._end_offsets
+                assert end_offsets is not None
+                owned_partitions = [
+                    TopicPartition(topic, partition)
+                    for partition in sorted(
+                        self._round_robin_partition_order[worker_id::num_workers]
+                    )
+                ]
+                if not owned_partitions:
+                    logger.info(f"{log_prefix} no partitions assigned, nothing to read")
+                    return
+                self._set_start_offsets(
+                    consumer,
+                    owned_partitions,
+                    start_timestamp_ms,
+                    end_offsets=end_offsets,
+                    auto_offset_reset=config.get("auto.offset.reset", "largest"),
+                )
+                consumer.assign(owned_partitions)
+                remaining = {
+                    tp.partition: end_offsets[tp.partition]
+                    for tp in owned_partitions
+                    if tp.offset < end_offsets[tp.partition]
+                }
+                logger.info(
+                    f"{log_prefix} assignment: {owned_partitions}, "
+                    f"remaining windows: {remaining}"
+                )
+            while end_timestamp_ms is None or remaining:
                 if parent is not None and os.getppid() != parent.pid:
                     logger.error(f"{log_prefix}: owner process gone, exiting")
                     return
@@ -981,137 +1039,44 @@ class KafkaReader(BaseReader):
                     messages = pending
                     messages.extend(consumer.consume(num_messages, timeout=1.0))
 
-                t, num_decoded = self._decode_messages(messages, topic, projections)
-                if t is None:
-                    continue
-
-                # estimate batch_size per message
-                if batch_size_per_msg is None:
-                    batch_size_per_msg = len(t) / num_decoded
-                else:
-                    batch_size_per_msg = (
-                        0.9 * batch_size_per_msg + 0.1 * len(t) / num_decoded
-                    )
-
-                for batch in t.to_batches():
-                    yield batch
-        except Exception as e:
-            logger.error(f"{log_prefix} exception: {e}")
-            raise
-        finally:
-            stop_event.set()
-            heartbeat_thread.join(timeout=5.0)
-            if heartbeat_thread.is_alive():
-                logger.warning(
-                    "Heartbeat thread did not exit within timeout; "
-                    "skipping consumer.close() to avoid race."
-                )
-            else:
-                try:
-                    consumer.close()
-                except Exception as e:
-                    logger.warning(f"consumer.close() failed: {e}")
-
-    def _finite_reader(
-        self,
-        topic: str,
-        config: Dict[str, Any],
-        start_timestamp_ms: Optional[int],
-        worker_id: int,
-        num_workers: int,
-    ) -> Generator[pa.RecordBatch, None, None]:
-        """Read this worker's fixed share of partitions up to their end offsets.
-
-        The partitions are assigned in the same order as the round-robin
-        reader but read with a single consumer: an end-timestamp job splits
-        the topic itself instead of joining the shared consumer group, so a
-        worker whose partitions are all done exits without a rebalance
-        handing finished partitions to other workers.  A partition whose
-        start position is already at or past its end offset finishes without
-        consuming; when the last partition completes, the retained messages
-        of the final fetch are delivered before the generator ends.
-
-        Args:
-            topic (str): kafka topic name.
-            config (dict): kafka consumer configuration.
-            start_timestamp_ms (int, optional): start timestamp in milliseconds.
-            worker_id (int): global worker ID.
-            num_workers (int): total number of global workers.
-
-        Yields:
-            PyArrow RecordBatch
-        """
-        end_offsets = self._end_offsets
-        assert end_offsets is not None
-        log_prefix = f"KafkaReader[rank-{os.environ.get('RANK', 0)}|worker-{worker_id}]"
-        owned_partitions = [
-            TopicPartition(topic, partition)
-            for partition in sorted(
-                self._round_robin_partition_order[worker_id::num_workers]
-            )
-        ]
-        if not owned_partitions:
-            logger.info(f"{log_prefix} no partitions assigned, nothing to read")
-            return
-        consumer = Consumer(config)
-        parent = mp.parent_process()
-        projections: Dict[pa.Schema, Optional[List[int]]] = {}
-        completed: Set[int] = set()
-        batch_size_per_msg: Optional[float] = None
-        try:
-            self._set_start_offsets(
-                consumer,
-                owned_partitions,
-                start_timestamp_ms,
-                end_offsets=end_offsets,
-                auto_offset_reset=config.get("auto.offset.reset", "largest"),
-            )
-            consumer.assign(owned_partitions)
-            completed = {
-                tp.partition
-                for tp in owned_partitions
-                if tp.offset >= end_offsets[tp.partition]
-            }
-            owned_ends = {
-                tp.partition: end_offsets[tp.partition] for tp in owned_partitions
-            }
-            logger.info(
-                f"{log_prefix} assignment: {owned_partitions}, "
-                f"end_offsets: {owned_ends}"
-            )
-            while len(completed) < len(owned_partitions):
-                if parent is not None and os.getppid() != parent.pid:
-                    logger.error(f"{log_prefix}: owner process gone, exiting")
-                    return
-                num_messages = (
-                    int(math.ceil(self._batch_size / batch_size_per_msg))
-                    if batch_size_per_msg
-                    else 2
-                )
-                messages = self._filter_end_offsets(
-                    consumer.consume(num_messages, timeout=1.0),
-                    end_offsets,
-                    completed,
-                )
+                if end_timestamp_ms is not None:
+                    messages = self._filter_end_offsets(messages, remaining)
                 t, num_decoded = self._decode_messages(messages, topic, projections)
                 if t is not None:
+                    # estimate batch_size per message
                     if batch_size_per_msg is None:
                         batch_size_per_msg = len(t) / num_decoded
                     else:
                         batch_size_per_msg = (
                             0.9 * batch_size_per_msg + 0.1 * len(t) / num_decoded
                         )
+
                     for batch in t.to_batches():
                         yield batch
-            logger.info(f"{log_prefix} every partition reached its end offset")
+            if end_timestamp_ms is not None:
+                logger.info(f"{log_prefix} every assigned partition read its window")
         except Exception as e:
             logger.error(f"{log_prefix} exception: {e}")
             raise
         finally:
-            try:
-                consumer.close()
-            except Exception as e:
-                logger.warning(f"consumer.close() failed: {e}")
+            if heartbeat_thread is None:
+                try:
+                    consumer.close()
+                except Exception as e:
+                    logger.warning(f"consumer.close() failed: {e}")
+            else:
+                stop_event.set()
+                heartbeat_thread.join(timeout=5.0)
+                if heartbeat_thread.is_alive():
+                    logger.warning(
+                        "Heartbeat thread did not exit within timeout; "
+                        "skipping consumer.close() to avoid race."
+                    )
+                else:
+                    try:
+                        consumer.close()
+                    except Exception as e:
+                        logger.warning(f"consumer.close() failed: {e}")
 
     def _round_robin_reader(
         self,
@@ -1195,22 +1160,22 @@ class KafkaReader(BaseReader):
                 return got
 
             end_offsets = self._end_offsets
-            completed: Set[int] = (
+            remaining: Dict[int, int] = (
                 {
-                    tp.partition
+                    tp.partition: end_offsets[tp.partition]
                     for tp in owned_partitions
-                    if tp.offset >= end_offsets[tp.partition]
+                    if tp.offset < end_offsets[tp.partition]
                 }
                 if end_offsets is not None
-                else set()
+                else {}
             )
-            # partitions already at their end offset never join the rotation
-            rotation = [
+            # partitions already at their end offset never join the rotation;
+            # the queue head is the partition of the current turn
+            rotation = deque(
                 idx
                 for idx, tp in enumerate(owned_partitions)
-                if tp.partition not in completed
-            ]
-            rot_pos = 0
+                if end_offsets is None or tp.partition in remaining
+            )
             while rotation:
                 if parent is not None and os.getppid() != parent.pid:
                     logger.error(f"{log_prefix}: owner process gone, exiting")
@@ -1223,7 +1188,7 @@ class KafkaReader(BaseReader):
                     if rows_per_msg
                     else 1
                 )
-                idx = rotation[rot_pos]
+                idx = rotation[0]
                 consumer = consumers[idx]
                 messages = consumer.consume(msg_per_turn, timeout=0)
                 got = _record_offsets(messages, idx)
@@ -1244,9 +1209,7 @@ class KafkaReader(BaseReader):
                         _record_offsets(more, idx)
                         messages.extend(more)
                 if end_offsets is not None:
-                    messages = self._filter_end_offsets(
-                        messages, end_offsets, completed
-                    )
+                    messages = self._filter_end_offsets(messages, remaining)
                 t, num_decoded = self._decode_messages(messages, topic, projections)
                 if t is not None:
                     idle_turns = 0
@@ -1259,28 +1222,24 @@ class KafkaReader(BaseReader):
                         yield batch
                 if (
                     end_offsets is not None
-                    and owned_partitions[idx].partition in completed
+                    and owned_partitions[idx].partition not in remaining
                 ):
                     logger.info(
                         f"{log_prefix} partition "
                         f"{owned_partitions[idx].partition} reached its end "
                         f"offset {end_offsets[owned_partitions[idx].partition]}"
                     )
-                    rotation.pop(rot_pos)
-                    if not rotation:
-                        return
-                    if rot_pos >= len(rotation):
-                        rot_pos = 0
+                    rotation.popleft()
                     continue
                 if t is None:
                     if caught_up:
-                        rot_pos = (rot_pos + 1) % len(rotation)
+                        rotation.rotate(-1)
                         idle_turns += 1
                         if idle_turns >= len(rotation):
                             time.sleep(0.01)
                             idle_turns = 0
                     continue
-                rot_pos = (rot_pos + 1) % len(rotation)
+                rotation.rotate(-1)
         except Exception as e:
             logger.error(f"{log_prefix} exception: {e}")
             raise

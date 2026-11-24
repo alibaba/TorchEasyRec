@@ -228,8 +228,15 @@ def _evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.eval()
+    # the eval pipeline follows its own loader: a kafka input bounded by
+    # end.timestamp.ms ends the pass for every rank together
+    # pyre-ignore [16]
+    eval_reader = eval_dataloader.dataset._reader
     pipeline = create_train_pipeline(
-        model, check_all_workers_data_status=check_all_workers_data_status
+        model,
+        check_all_workers_data_status=(
+            check_all_workers_data_status or eval_reader.is_finite_replay
+        ),
     )
 
     use_step = eval_config.num_steps and eval_config.num_steps > 0
@@ -439,7 +446,6 @@ def _train_and_evaluate(
     ckpt_path: Optional[str] = None,
     eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
     check_all_workers_data_status: bool = False,
-    check_eval_workers_data_status: bool = False,
     ignore_restore_optimizer: bool = False,
     restore_from_model_dir: bool = False,
     dataloader_state: Optional[Dict[str, Any]] = None,
@@ -464,6 +470,8 @@ def _train_and_evaluate(
     kafka_baseline_offsets: Dict[str, int] = {}
     # pyre-ignore [16]
     dataset_config = train_dataloader.dataset._data_config
+    # pyre-ignore [16]
+    train_reader = train_dataloader.dataset._reader
     kafka_log_enabled = (
         dataset_config.dataset_type == DatasetType.KafkaDataset
         and dataset_config.kafka_log_every_n_messages > 0
@@ -586,7 +594,7 @@ def _train_and_evaluate(
                     global_step=step,
                     eval_summary_writer=eval_summary_writer,
                     global_epoch=epoch,
-                    check_all_workers_data_status=check_eval_workers_data_status,
+                    check_all_workers_data_status=check_all_workers_data_status,
                 )
             model.train()
 
@@ -627,10 +635,13 @@ def _train_and_evaluate(
     data_timestamp = -1.0
     try:
         for i_epoch in epoch_iter:
+            # the training pipeline follows its own loader's reader state
             pipeline = create_train_pipeline(
                 model,
                 optimizer,
-                check_all_workers_data_status=check_all_workers_data_status,
+                check_all_workers_data_status=(
+                    check_all_workers_data_status or train_reader.is_finite_replay
+                ),
             )
             if plogger is not None:
                 plogger.set_description(f"Training Epoch {i_epoch}")
@@ -1129,19 +1140,10 @@ def train_and_evaluate(
             # when slice batch by sample cost, data on all workers may not be
             # balanced; a kafka input bounded by end.timestamp.ms is finite
             # too, and the rank that runs out of data first ends the pass for
-            # every rank, its remaining batches may not train.  The loaders'
-            # own readers answer the finiteness question, so the judgment
-            # cannot diverge from the reader (e.g. on an uppercase scheme)
-            # and the eval pass follows the eval input, not the train input.
-            cost_batching = data_config.HasField("batch_cost_size")
-            check_all_workers_data_status = (
-                cost_batching
-                or train_dataloader.dataset._reader.is_finite_replay  # pyre-ignore[16]
-            )
-            check_eval_workers_data_status = cost_batching or (
-                eval_dataloader is not None
-                and eval_dataloader.dataset._reader.is_finite_replay  # pyre-ignore[16]
-            )
+            # every rank, its remaining batches may not train.  The pipelines
+            # OR in their own loader's reader state, so train, in-training
+            # eval and standalone eval each follow their own input.
+            check_all_workers_data_status = data_config.HasField("batch_cost_size")
             _train_and_evaluate(
                 model,
                 optimizer,
@@ -1155,7 +1157,6 @@ def train_and_evaluate(
                 skip_steps=skip_steps,
                 ckpt_path=ckpt_path,
                 check_all_workers_data_status=check_all_workers_data_status,
-                check_eval_workers_data_status=check_eval_workers_data_status,
                 ignore_restore_optimizer=ignore_restore_optimizer,
                 ignore_restore_lr_scheduler=ignore_restore_lr_scheduler,
                 restore_from_model_dir=restore_from_model_dir,
@@ -1266,15 +1267,8 @@ def evaluate(
             raise ValueError("Eval checkpoint path should be specified.")
 
         # when slice batch by sample cost, data on all workers may not be
-        # balanced; a kafka input bounded by end.timestamp.ms is finite too,
-        # and the rank that runs out of data first ends the pass for everyone.
-        # The eval loader's own reader answers the finiteness question, so
-        # the judgment cannot diverge from the reader (e.g. on an uppercase
-        # scheme).
-        check_all_workers_data_status = (
-            data_config.HasField("batch_cost_size")
-            or eval_dataloader.dataset._reader.is_finite_replay
-        )  # pyre-ignore[16]
+        # balanced; the eval pipeline ORs in its own loader's reader state
+        check_all_workers_data_status = data_config.HasField("batch_cost_size")
         with (
             SummaryWriter(os.path.join(pipeline_config.model_dir, "eval"))
             if is_rank_zero

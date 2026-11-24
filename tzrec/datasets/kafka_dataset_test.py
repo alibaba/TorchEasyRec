@@ -100,13 +100,39 @@ class ParseKafkaUriTest(unittest.TestCase):
         self.assertNotIn("end.timestamp.ms", params)
         self.assertEqual(params["enable.partition.eof"], "true")
 
-    def test_parse_end_timestamp_eof_override(self):
-        uri = (
-            "kafka://broker:9092/topic?group.id=g1"
-            "&end.timestamp.ms=1&enable.partition.eof=false"
-        )
-        _, params, _, _ = _parse_kafka_uri(uri)
-        self.assertEqual(params["enable.partition.eof"], "false")
+    @parameterized.expand(
+        [
+            # parse_qsl drops blank values, so an explicitly empty endpoint
+            # would otherwise silently consume as an unbounded stream
+            param(
+                "empty_end",
+                "kafka://broker:9092/topic?group.id=g1&end.timestamp.ms=",
+                "must not be empty",
+            ),
+            param(
+                "empty_start_with_end",
+                (
+                    "kafka://broker:9092/topic?group.id=g1"
+                    "&start.timestamp.ms=&end.timestamp.ms=1"
+                ),
+                "must not be empty",
+            ),
+            # partition EOF events finish partitions whose last offsets are
+            # holes; disabling them would stall the reader on those holes
+            param(
+                "eof_disabled_with_end",
+                (
+                    "kafka://broker:9092/topic?group.id=g1"
+                    "&end.timestamp.ms=1&enable.partition.eof=false"
+                ),
+                "enable.partition.eof cannot be disabled",
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_invalid_end_timestamp_params_raise(self, _name, uri, pattern):
+        with self.assertRaisesRegex(ValueError, pattern):
+            _parse_kafka_uri(uri)
 
     def test_parse_with_start_and_end_timestamp(self):
         uri = (
@@ -646,18 +672,20 @@ class KafkaReaderEndOffsetsTest(unittest.TestCase):
         )
 
     def test_minimal_example_exact_offsets_and_termination(self):
-        # P0 resolves E=3, so its boundary message at offset 3 is never
-        # fetched; P1 finds no message past the timestamp and ends at its
-        # high watermark 4. Both partitions finish on their last legal
-        # message, without waiting for anything new.
+        # P0 resumes from checkpoint offset 1 and resolves E=3, so its
+        # boundary message at offset 3 is never fetched; P1 finds no message
+        # past the timestamp and ends at its high watermark 4. Both
+        # partitions finish on their last legal message, without waiting
+        # for anything new.
         consumer = mock.Mock()
-        consumer.get_watermark_offsets.side_effect = [(0, 5), (0, 4)]
+        consumer.get_watermark_offsets.side_effect = [(0, 4)]
         consumer.consume.side_effect = [
             [_msg(0, 0, 1), _msg(0, 1, 2), _msg(0, 2, 3)],
             [_msg(1, 0, 11), _msg(1, 1, 12), _msg(1, 2, 13)],
             [_msg(1, 3, 14)],
         ]
         reader = self._make_reader([consumer], highs={0: 5, 1: 4}, ends={0: 3})
+        reader.load_state_dict({"topic:0": 1})
         self.assertEqual(reader._end_offsets, {0: 3, 1: 4})
         gen = reader._reader(0, 1)
         self.addCleanup(gen.close)
@@ -677,7 +705,8 @@ class KafkaReaderEndOffsetsTest(unittest.TestCase):
         consumer.subscribe.assert_not_called()
         assigned = consumer.assign.call_args.args[0]
         self.assertEqual([tp.partition for tp in assigned], [0, 1])
-        self.assertEqual([tp.offset for tp in assigned], [0, 0])
+        # P0 resumes from checkpoint + 1, P1 starts at its low watermark
+        self.assertEqual([tp.offset for tp in assigned], [2, 0])
         consumer.close.assert_called_once()
 
     def test_boundary_in_one_fetch_across_partitions(self):
@@ -789,23 +818,6 @@ class KafkaReaderEndOffsetsTest(unittest.TestCase):
         consumer.consume.assert_not_called()
         assigned = consumer.assign.call_args.args[0]
         self.assertEqual((assigned[0].partition, assigned[0].offset), (0, 3))
-
-    def test_checkpoint_resume_between_offsets(self):
-        consumer = mock.Mock()
-        consumer.consume.side_effect = [[_msg(0, 2, 1), _msg(0, 3, 2)]]
-        reader = self._make_reader(
-            [consumer], partitions=(0,), highs={0: 5}, ends={0: 4}
-        )
-        reader.load_state_dict({"topic:0": 1})
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        observed = [
-            (batch.column("x").to_pylist(), batch.column(CKPT_ROW_IDX).to_pylist())
-            for batch in gen
-        ]
-        # resume from checkpoint + 1; the boundary message never arrives
-        self.assertEqual(observed, [([1, 2], [2, 3])])
-        consumer.consume.assert_called_once_with(2, timeout=1.0)
 
     def test_checkpoint_past_end_completes_immediately(self):
         consumer = mock.Mock()
@@ -1736,32 +1748,35 @@ class KafkaDatasetTest(unittest.TestCase):
                 # (equal if we consumed the next message after checkpoint)
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
-    @parameterized.expand(
-        [
-            ("rolling", "SAMPLE_ROLLING", 2, False),
-            ("window", "SAMPLE_WINDOW", 2, False),
-            ("round_robin_no_workers", "SAMPLE_ROLLING", 0, True),
-        ],
-        name_func=parameterized_name_func,
-    )
-    @unittest.skipIf(
-        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
-    )
-    def test_sample_shuffle_checkpoint_resume(
-        self, _name, mode, num_workers, round_robin
+    def _produce_sample_batches(
+        self,
+        rows_per_message,
+        messages_per_partition,
+        timestamp_ms,
+        partition_timestamps,
     ):
+        """Produce 4 partitions of raw_c/label batches; map rows to offsets.
+
+        Args:
+            rows_per_message: rows carried by each produced message.
+            messages_per_partition: messages produced per partition.
+            timestamp_ms: base event time in milliseconds.
+            partition_timestamps: maps (partition, offset) to the event
+                time of the produced message.
+
+        Returns:
+            dict: row value to (partition, offset, event time in seconds)
+            as reported by the delivery callbacks.
+        """
         self._create_test_topic()
         producer = Producer({"bootstrap.servers": self.brokers})
-        rows_per_message = 24
-        messages_per_partition = 16
         metadata = {}
-        timestamp_ms = int(time.time() * 1000)
 
         def on_delivery(row_start, event_time, error, message):
             self.assertIsNone(error)
             for row in range(row_start, row_start + rows_per_message):
                 metadata[row] = (
-                    f"{self.test_topic}:{message.partition()}",
+                    message.partition(),
                     message.offset(),
                     event_time / 1000.0,
                 )
@@ -1777,15 +1792,50 @@ class KafkaDatasetTest(unittest.TestCase):
                         "label": [0] * rows_per_message,
                     }
                 )
+                event_time = partition_timestamps(partition, offset)
                 producer.produce(
                     topic=self.test_topic,
                     partition=partition,
                     value=record_batch.serialize(),
-                    timestamp=timestamp_ms + offset,
-                    on_delivery=partial(on_delivery, row_start, timestamp_ms + offset),
+                    timestamp=event_time,
+                    on_delivery=partial(on_delivery, row_start, event_time),
                 )
         self.assertEqual(producer.flush(30), 0)
         self.assertEqual(len(metadata), 4 * messages_per_partition * rows_per_message)
+        return metadata
+
+    def _arm_sample_timeout(self):
+        """Fail a stuck sample-shuffle pass after 120 seconds."""
+
+        def alarm(signum, frame):
+            raise TimeoutError("timed out waiting for sample-shuffle batches")
+
+        old_handler = signal.signal(signal.SIGALRM, alarm)
+        self.addCleanup(signal.signal, signal.SIGALRM, old_handler)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        signal.setitimer(signal.ITIMER_REAL, 120)
+
+    @parameterized.expand(
+        [
+            ("rolling", "SAMPLE_ROLLING", 2, False),
+            ("window", "SAMPLE_WINDOW", 2, False),
+            ("round_robin_no_workers", "SAMPLE_ROLLING", 0, True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipIf(
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
+    )
+    def test_sample_shuffle_checkpoint_resume(
+        self, _name, mode, num_workers, round_robin
+    ):
+        timestamp_ms = int(time.time() * 1000)
+        metadata = self._produce_sample_batches(
+            rows_per_message=24,
+            messages_per_partition=16,
+            timestamp_ms=timestamp_ms,
+            partition_timestamps=lambda partition, offset: timestamp_ms + offset,
+        )
         cfg = utils.sample_data_config(
             data_pb2.DatasetType.KafkaDataset,
             mode,
@@ -1803,13 +1853,7 @@ class KafkaDatasetTest(unittest.TestCase):
             "?group.id=tzrec_sample_shuffle&auto.offset.reset=earliest"
         )
 
-        def alarm(signum, frame):
-            raise TimeoutError("timed out waiting for sample-shuffle batches")
-
-        old_handler = signal.signal(signal.SIGALRM, alarm)
-        self.addCleanup(signal.signal, signal.SIGALRM, old_handler)
-        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
-        signal.setitimer(signal.ITIMER_REAL, 120)
+        self._arm_sample_timeout()
         state = {}
         seen = set()
         for resume in (False, True):
@@ -1835,7 +1879,8 @@ class KafkaDatasetTest(unittest.TestCase):
                     timestamps = []
                     messages = set()
                     for value in values:
-                        source, offset, event_time = metadata[value]
+                        partition, offset, event_time = metadata[value]
+                        source = f"{self.test_topic}:{partition}"
                         if resume:
                             self.assertGreater(offset, checkpoint[source])
                         expected[source] = max(expected.get(source, -1), offset)
@@ -1869,46 +1914,22 @@ class KafkaDatasetTest(unittest.TestCase):
         self, _name, mode, min_batch_size, expected_sizes
     ):
         """Finite replay: the resumed window drains to END with a tail batch."""
-        self._create_test_topic()
-        producer = Producer({"bootstrap.servers": self.brokers})
-        rows_per_message = 3
-        messages_per_partition = 8
         # partitions 0..2 carry timestamps crossing the end at offset 5;
         # partition 3 predates the window entirely, so its end offset falls
         # back to the startup high watermark and replays everything
         timestamp_ms = int(time.time() * 1000)
-        metadata = {}
-
-        def on_delivery(row_start, error, message):
-            self.assertIsNone(error)
-            for row in range(row_start, row_start + rows_per_message):
-                metadata[row] = (message.partition(), message.offset())
-
-        for partition in range(4):
-            for offset in range(messages_per_partition):
-                row_start = (
-                    partition * messages_per_partition + offset
-                ) * rows_per_message
-                record_batch = pa.record_batch(
-                    {
-                        "raw_c": list(range(row_start, row_start + rows_per_message)),
-                        "label": [0] * rows_per_message,
-                    }
-                )
-                message_ts = (
+        metadata = self._produce_sample_batches(
+            rows_per_message=3,
+            messages_per_partition=8,
+            timestamp_ms=timestamp_ms,
+            partition_timestamps=(
+                lambda partition, offset: (
                     timestamp_ms + offset
                     if partition < 3
                     else timestamp_ms - 100_000 + offset
                 )
-                producer.produce(
-                    topic=self.test_topic,
-                    partition=partition,
-                    value=record_batch.serialize(),
-                    timestamp=message_ts,
-                    on_delivery=partial(on_delivery, row_start),
-                )
-        self.assertEqual(producer.flush(30), 0)
-        self.assertEqual(len(metadata), 4 * messages_per_partition * rows_per_message)
+            ),
+        )
         end_ms = timestamp_ms + 5
         cfg = utils.sample_data_config(
             data_pb2.DatasetType.KafkaDataset,
@@ -1928,13 +1949,7 @@ class KafkaDatasetTest(unittest.TestCase):
             f"&auto.offset.reset=earliest&end.timestamp.ms={end_ms}"
         )
 
-        def alarm(signum, frame):
-            raise TimeoutError("timed out waiting for sample-shuffle batches")
-
-        old_handler = signal.signal(signal.SIGALRM, alarm)
-        self.addCleanup(signal.signal, signal.SIGALRM, old_handler)
-        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
-        signal.setitimer(signal.ITIMER_REAL, 120)
+        self._arm_sample_timeout()
         # resume from checkpoint offset 1: partitions 0..2 replay offsets
         # 2..4 (9 rows each), partition 3 replays offsets 2..7 (18 rows),
         # 45 rows in total: five batches of 8 plus a tail of 5
@@ -1959,7 +1974,7 @@ class KafkaDatasetTest(unittest.TestCase):
         self.assertEqual(len(seen), len(values))
         self.assertEqual(len(seen), sum(expected_sizes))
         for value in values:
-            partition, offset = metadata[value]
+            partition, offset, _ = metadata[value]
             # resumed from checkpoint_offset + 1 in every partition
             self.assertGreater(offset, checkpoint[f"{self.test_topic}:{partition}"])
             # every served message stays inside the startup snapshot
