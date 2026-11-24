@@ -120,8 +120,10 @@ def _feed_eof(coord, reader_id=0):
 
 
 class SamplePoolTest(unittest.TestCase):
-    def _pool(self, capacity, mode, seed=0):
-        return SamplePool(capacity, mode, rng=np.random.default_rng(seed))
+    def _pool(self, capacity, mode, seed=0, batch_size=None):
+        return SamplePool(
+            capacity, mode, rng=np.random.default_rng(seed), batch_size=batch_size
+        )
 
     @parameterized.expand(
         [param("window", mode=_WINDOW), param("rolling", mode=_ROLLING)],
@@ -146,15 +148,20 @@ class SamplePoolTest(unittest.TestCase):
         self.assertEqual(one.emit(8).num_rows, 8)
 
     def test_window_sequence(self):
-        pool = self._pool(64, _WINDOW, seed=3)
-        source = make_batch(64)
-        pool.add(source)
+        pool = self._pool(64, _WINDOW, seed=3, batch_size=16)
+        source = make_batch(80)
+        for start in range(0, 40, 8):
+            pool.add(source.slice(start, 8))
+        large = source.slice(40)
+        pool.add(large)
         order = []
-        for _ in range(4):
+        for _ in range(5):
             out = pool.emit(16)
             check_batch(self, out, [source])
             order.extend(out.column("id").to_pylist())
-        self.assertEqual(order, np.random.default_rng(3).permutation(64).tolist())
+        self.assertEqual([c.num_rows for c in pool._chunks], [32, 8, 40])
+        self.assertIs(pool._chunks[-1], large)
+        self.assertEqual(order, np.random.default_rng(3).permutation(80).tolist())
         # New arrivals must not enter the frozen window.
         pool.add(make_batch(32, start_id=1000))
         pool.add(make_batch(32, start_id=2000))
@@ -168,21 +175,25 @@ class SamplePoolTest(unittest.TestCase):
             frozen.update(b.column("id").to_pylist())
         self.assertEqual(frozen, set(range(1000, 1032)) | set(range(2000, 2032)))
         self.assertEqual(pool.total_rows, 16)
-        tail = self._pool(16, _WINDOW)
+        tail = self._pool(16, _WINDOW, batch_size=8)
         tail_source = make_batch(12)
         tail.add(tail_source)
         check_batch(self, tail.emit(8, drain=True), [tail_source])
         tail.add(make_batch(5, start_id=100))
-        ids = set(tail.emit(8, drain=True).column("id").to_pylist())
+        second = tail.emit(8, drain=True)
+        self.assertEqual([c.num_rows for c in tail._chunks], [9])
+        ids = set(second.column("id").to_pylist())
         self.assertTrue(any(i < 12 for i in ids) and any(i >= 100 for i in ids))
         self.assertEqual(tail.total_rows, 1)
         self.assertEqual(tail.emit(1, drain=True).num_rows, 1)
 
     def test_rolling_sequence(self):
-        pool = self._pool(32, _ROLLING, seed=7)
+        pool = self._pool(32, _ROLLING, seed=7, batch_size=16)
         source = make_batch(32)
-        pool.add(source)
+        for start in range(0, 32, 8):
+            pool.add(source.slice(start, 8))
         first = pool.emit(16)
+        self.assertEqual([c.num_rows for c in pool._chunks], [8] * 4)
         check_batch(self, first, [source])
         first_ids = set(first.column("id").to_pylist())
         self.assertEqual(len(first_ids), 16)
@@ -383,6 +394,39 @@ class CoordinatorTest(unittest.TestCase):
         self._settle_input(coord)
         self.assertEqual(self._next_response(coord)[0], sample_shuffle._END)
 
+    def test_window_refill_between_batches(self):
+        """Refills between two batches only use reads that cannot block."""
+        plan = _plan(None, is_finite=False)
+        coord = self._make_coordinator(plan, plan, mode=_WINDOW, num_consumers=2)
+        # NOTE: Synchronous queues make the order of responses and reads observable.
+        coord._input_q = queue.Queue()
+        coord._response_queues = [queue.Queue(), queue.Queue()]
+        coord._pool.add(_plan_batch(16))
+        _feed_batch(coord, 4, start_id=16)
+        _feed_batch(coord, 4, start_id=20)
+        coord._request_order.extend([0, 1])
+        reads = []
+        service_input = coord._service_input
+
+        def record_read(timeout):
+            reads.append((timeout, sum(q.qsize() for q in coord._response_queues)))
+            return service_input(timeout)
+
+        with mock.patch.object(coord, "_service_input", side_effect=record_read):
+            coord._serve_waiting()
+        self.assertEqual(reads, [(0.0, 1), (0.0, 1), (0.0, 2)])
+        self.assertEqual(coord._pool.rows_out, 16)
+        self.assertEqual(coord._pool.total_rows, 8)
+
+    def test_nonblocking_input_read_sees_flushed_message(self):
+        """A flushed message needs get_nowait; get(timeout=0) never polls."""
+        coord = self._coordinator(planned_rows=None, is_finite=False)
+        _feed_batch(coord, 4)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and coord._service_input(0.0) <= 0:
+            time.sleep(0.005)
+        self.assertEqual(coord._pool.total_rows, 4)
+
     @parameterized.expand(
         [
             ("more_rows", 12, False, None, "more than the planned"),
@@ -555,18 +599,22 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(coord._pool.total_rows, 20)
         self.assertTrue(coord._input_q.full())
 
-    def _backpressure_coord(self):
+    def _backpressure_coord(self, mode=_ROLLING):
         """Coordinator whose single reader outgrows a capacity-1 input queue."""
         task = ReadTask(fn=_yield_rows, kwargs=dict(n=30, chunk=5))
         plan = _plan(30, tasks=[task])
         with mock.patch.object(sample_shuffle, "_INPUT_QUEUE_BATCHES_PER_READER", 1):
-            coord = self._make_coordinator(plan, plan)
+            coord = self._make_coordinator(plan, plan, mode=mode)
         runner, errors = self._run_with_readers(coord)
         return coord, runner, errors
 
-    def test_input_queue_backpressure_resumes(self):
+    @parameterized.expand(
+        [("window", _WINDOW), ("rolling", _ROLLING)],
+        name_func=parameterized_name_func,
+    )
+    def test_input_queue_backpressure_resumes(self, _name, mode):
         """Consumption after the reader waited on the input queue loses nothing."""
-        coord, runner, errors = self._backpressure_coord()
+        coord, runner, errors = self._backpressure_coord(mode)
         self._wait_input_backpressure(coord)
         batches, msg = self._collect_batches(coord, timeout=5.0)
         self.assertEqual(msg[0], sample_shuffle._END)

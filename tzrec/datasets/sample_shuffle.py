@@ -46,11 +46,13 @@ _INPUT_QUEUE_BATCHES_PER_READER = 2
 # Allow one pending GET and one CANCEL per consumer.
 _REQUEST_QUEUE_PER_CONSUMER = 2
 _LOOP_TICK_SECS = 0.1
+_INPUT_TICK_SECS = 0.01
 _WATCHDOG_TICK_SECS = 5.0
 # Keep the handle's stop timeout above the combined reader deadlines.
 _READER_GRACEFUL_STOP_SECS = 6.0
 _READER_FORCED_STOP_SECS = 2.0
 _STATS_LOG_INTERVAL_SECS = 60.0
+_MERGE_BATCHES_PER_CHUNK = 2
 
 _DATA = "DATA"
 _EOF = "EOF"
@@ -171,14 +173,19 @@ def _conform_batch(batch: pa.RecordBatch, schema: pa.Schema) -> pa.RecordBatch:
     return batch
 
 
+def _concat_batches(batches: List[pa.RecordBatch]) -> pa.RecordBatch:
+    """Concatenate same-schema record batches into one batch."""
+    table = pa.Table.from_batches(batches).combine_chunks()
+    return table.to_batches(max_chunksize=table.num_rows)[0]
+
+
 class SamplePool:
     """Chunked raw-sample pool with sample-level shuffle.
 
-    Rows stay in the chunk they arrived in; a numpy arena of (chunk, row)
-    pairs is the sampling domain. SAMPLE_WINDOW freezes the pool content
-    into a shuffled window once it reaches capacity and emits requested
-    batches from it before refilling; SAMPLE_ROLLING extracts a random
-    sample once the pool is refilled to capacity.
+    A NumPy arena of (chunk, row) pairs identifies the live samples.
+    SAMPLE_WINDOW emits a frozen window in shuffled order while new rows
+    accumulate for the next window. SAMPLE_ROLLING samples from the live
+    pool each time it refills to capacity.
 
     ``emit`` normally waits until the pool reaches its capacity. With
     ``drain=True`` it only requires enough rows for the request, which lets
@@ -193,6 +200,8 @@ class SamplePool:
         capacity_rows: pool capacity in samples.
         mode: "SAMPLE_WINDOW" or "SAMPLE_ROLLING".
         rng: random source, injectable for tests.
+        batch_size: optional training batch size. When set, a window freeze
+            merges small chunks to about twice this many rows.
     """
 
     def __init__(
@@ -200,10 +209,14 @@ class SamplePool:
         capacity_rows: int,
         mode: str,
         rng: Optional[np.random.Generator] = None,
+        batch_size: Optional[int] = None,
     ) -> None:
         self.capacity_rows = capacity_rows
         self.mode = mode
         self.rng = rng if rng is not None else np.random.default_rng()
+        self._merge_rows = (
+            _MERGE_BATCHES_PER_CHUNK * batch_size if batch_size is not None else None
+        )
         self._chunks: List[pa.RecordBatch] = []
         self._arena_chunk = np.empty(0, dtype=np.int32)
         self._arena_row = np.empty(0, dtype=np.int32)
@@ -291,6 +304,9 @@ class SamplePool:
                     return None
             elif self.total_rows < self.capacity_rows:
                 return None
+            merge_rows = self._merge_rows
+            if merge_rows is not None:
+                self._merge_chunks(merge_rows)
             n_freeze = self.total_rows
             perm = self.rng.permutation(n_freeze)
             self._frozen_chunk = self._arena_chunk[perm]
@@ -375,6 +391,57 @@ class SamplePool:
         self._chunks = new_chunks
         self._arena_chunk = arena_c
         self._arena_row = arena_r
+        self._dead_rows = 0
+        self.num_compactions += 1
+
+    def _merge_chunks(self, merge_rows: int) -> None:
+        """Merge live rows into chunks of about ``merge_rows`` rows.
+
+        Each arena position must still identify the same sample after merging.
+        """
+        order = np.argsort(self._arena_chunk, kind="stable")
+        sorted_c = self._arena_chunk[order]
+        sorted_r = self._arena_row[order]
+        uniq, starts, counts = np.unique(
+            sorted_c, return_index=True, return_counts=True
+        )
+        new_chunks: List[pa.RecordBatch] = []
+        parts: List[pa.RecordBatch] = []
+        part_start = 0
+        part_rows = 0
+
+        def _flush_parts(end: int) -> None:
+            nonlocal part_start, part_rows
+            sorted_c[part_start:end] = len(new_chunks)
+            sorted_r[part_start:end] = np.arange(end - part_start, dtype=np.int32)
+            new_chunks.append(_concat_batches(parts))
+            part_start = end
+            part_rows = 0
+            parts.clear()
+
+        for u, st, c in zip(uniq, starts, counts):
+            chunk = self._chunks[int(u)]
+            if c == chunk.num_rows and c >= merge_rows:
+                # Reusing the chunk preserves its row offsets.
+                if parts:
+                    _flush_parts(st)
+                sorted_c[st : st + c] = len(new_chunks)
+                new_chunks.append(chunk)
+                part_start = st + c
+                continue
+            rows = sorted_r[st : st + c]
+            if c == chunk.num_rows and np.array_equal(rows, np.arange(c)):
+                parts.append(chunk)
+            else:
+                parts.append(chunk.take(pa.array(rows.astype(np.int64))))
+            part_rows += c
+            if part_rows >= merge_rows:
+                _flush_parts(st + c)
+        if parts:
+            _flush_parts(len(sorted_c))
+        self._chunks = new_chunks
+        self._arena_chunk[order] = sorted_c
+        self._arena_row[order] = sorted_r
         self._dead_rows = 0
         self.num_compactions += 1
 
@@ -501,7 +568,7 @@ class Coordinator:
         self._num_consumers = num_consumers
         self._trainer_pid = trainer_pid
         self._capacity_rows = capacity_rows
-        self._pool = SamplePool(capacity_rows, mode)
+        self._pool = SamplePool(capacity_rows, mode, batch_size=batch_size)
         self._plan = first_plan
         self._remaining: Optional[int] = None
         self._rows_read = 0
@@ -604,12 +671,26 @@ class Coordinator:
             return
         self._verified = True
 
-    def _service_input(self, timeout: float) -> bool:
-        """Take one reader message and update the pool; return whether it took one."""
+    def _service_input(self, timeout: float) -> int:
+        """Take one reader message and add its rows to the pool.
+
+        Args:
+            timeout: seconds to wait for input. Use 0 for a non-blocking read.
+
+        Returns:
+            Number of rows added to the pool (0 if none).
+        """
+        # NOTE: Reading a dead reader's truncated frame can block forever.
+        self._check_readers()
+        if self._error is not None:
+            return 0
         try:
-            msg = self._input_q.get(timeout=timeout)
+            if timeout > 0:
+                msg = self._input_q.get(timeout=timeout)
+            else:
+                msg = self._input_q.get_nowait()
         except queue.Empty:
-            return False
+            return 0
         kind = msg[0]
         if kind == _DATA:
             rb = pa.ipc.read_record_batch(msg[2], self._plan.schema)
@@ -620,14 +701,27 @@ class Coordinator:
                     f"read more than the planned {expected} rows; "
                     "the input changed during the run"
                 )
-                return True
+                return 0
             self._pool.add(rb)
+            return rb.num_rows
         elif kind == _EOF:
             self._eof_readers.add(msg[1])
             self._check_eof()
         elif kind == _ERROR:
             self._fail(f"reader {msg[1]} failed: {msg[2]}")
-        return True
+        return 0
+
+    def _refill_pool(self, target_rows: int) -> None:
+        """Refill the pool from ready reader messages without waiting.
+
+        Whole chunks may exceed ``target_rows``.
+        """
+        rows = 0
+        while rows < target_rows and self._error is None and self._pool_has_room():
+            added = self._service_input(0.0)
+            if added <= 0:
+                return
+            rows += added
 
     def _serve_waiting(self) -> None:
         """Answer outstanding GETs in arrival order.
@@ -686,6 +780,10 @@ class Coordinator:
                 (_BATCH, batch.serialize().to_pybytes())
             )
             self._request_order.popleft()
+            if self._pool.mode == "SAMPLE_WINDOW":
+                self._refill_pool(batch.num_rows)
+                if self._error is not None:
+                    return
 
     @property
     def _input_done(self) -> bool:
@@ -739,10 +837,7 @@ class Coordinator:
                 if self._error is not None:
                     break
                 if self._pool_has_room():
-                    # NOTE: Reading a dead reader's truncated frame can block forever.
-                    self._check_readers()
-                    if self._error is None:
-                        self._service_input(_LOOP_TICK_SECS)
+                    self._service_input(_INPUT_TICK_SECS)
                 elif not self._request_order:
                     self._service_requests(_LOOP_TICK_SECS)
                 else:
