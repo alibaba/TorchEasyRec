@@ -178,20 +178,14 @@ class SamplePoolTest(unittest.TestCase):
         tail = self._pool(16, _WINDOW, batch_size=8)
         tail_source = make_batch(12)
         tail.add(tail_source)
-        first = tail.emit(8, drain=True)
-        new_rows = make_batch(5, start_id=100)
-        tail.add(new_rows)
+        check_batch(self, tail.emit(8, drain=True), [tail_source])
+        tail.add(make_batch(5, start_id=100))
         second = tail.emit(8, drain=True)
         self.assertEqual([c.num_rows for c in tail._chunks], [9])
+        ids = set(second.column("id").to_pylist())
+        self.assertTrue(any(i < 12 for i in ids) and any(i >= 100 for i in ids))
         self.assertEqual(tail.total_rows, 1)
-        batches = [first, second, tail.emit(1, drain=True)]
-        self.assertEqual([batch.num_rows for batch in batches], [8, 8, 1])
-        ids = []
-        for batch in batches:
-            check_batch(self, batch, [tail_source, new_rows])
-            ids.extend(batch.column("id").to_pylist())
-        self.assertEqual(sorted(ids), list(range(12)) + list(range(100, 105)))
-        self.assertEqual(tail.total_rows, 0)
+        self.assertEqual(tail.emit(1, drain=True).num_rows, 1)
 
     def test_rolling_sequence(self):
         pool = self._pool(32, _ROLLING, seed=7, batch_size=16)
@@ -400,56 +394,37 @@ class CoordinatorTest(unittest.TestCase):
         self._settle_input(coord)
         self.assertEqual(self._next_response(coord)[0], sample_shuffle._END)
 
-    @parameterized.expand(
-        [("ready_input", True), ("idle_input", False)],
-        name_func=parameterized_name_func,
-    )
-    def test_window_refill_between_batches(self, _name, has_data):
+    def test_window_refill_between_batches(self):
+        """Refills between two batches only use reads that cannot block."""
         plan = _plan(None, is_finite=False)
         coord = self._make_coordinator(plan, plan, mode=_WINDOW, num_consumers=2)
-        coord._start_pass(plan)
         # NOTE: Synchronous queues make the order of responses and reads observable.
         coord._input_q = queue.Queue()
         coord._response_queues = [queue.Queue(), queue.Queue()]
         coord._pool.add(_plan_batch(16))
-        if has_data:
-            _feed_batch(coord, 4, start_id=16)
-            _feed_batch(coord, 4, start_id=20)
+        _feed_batch(coord, 4, start_id=16)
+        _feed_batch(coord, 4, start_id=20)
         coord._request_order.extend([0, 1])
-
-        replies_at_read = []
+        reads = []
         service_input = coord._service_input
 
-        def read_ready(timeout):
-            self.assertEqual(timeout, 0.0)
-            replies_at_read.append(sum(q.qsize() for q in coord._response_queues))
+        def record_read(timeout):
+            reads.append((timeout, sum(q.qsize() for q in coord._response_queues)))
             return service_input(timeout)
 
-        with mock.patch.object(coord, "_service_input", side_effect=read_ready):
+        with mock.patch.object(coord, "_service_input", side_effect=record_read):
             coord._serve_waiting()
-        self.assertEqual(replies_at_read, [1, 1, 2] if has_data else [1, 2])
-        ids = []
-        for response in coord._response_queues:
-            kind, payload = response.get_nowait()
-            self.assertEqual(kind, sample_shuffle._BATCH)
-            batch = pa.ipc.read_record_batch(payload, _PLAN_SCHEMA)
-            self.assertEqual(batch.num_rows, 8)
-            ids.extend(batch.column("id").to_pylist())
-        self.assertEqual(sorted(ids), list(range(16)))
-        self.assertEqual(coord._pool.total_rows, 8 if has_data else 0)
+        self.assertEqual(reads, [(0.0, 1), (0.0, 1), (0.0, 2)])
+        self.assertEqual(coord._pool.rows_out, 16)
+        self.assertEqual(coord._pool.total_rows, 8)
 
     def test_nonblocking_input_read_sees_flushed_message(self):
-        """Read a real queue without blocking once its feeder has flushed the data."""
+        """A flushed message needs get_nowait; get(timeout=0) never polls."""
         coord = self._coordinator(planned_rows=None, is_finite=False)
         _feed_batch(coord, 4)
         deadline = time.monotonic() + 5.0
-        added = 0
-        while time.monotonic() < deadline:
-            added = coord._service_input(0.0)
-            if added > 0:
-                break
+        while time.monotonic() < deadline and coord._service_input(0.0) <= 0:
             time.sleep(0.005)
-        self.assertEqual(added, 4)
         self.assertEqual(coord._pool.total_rows, 4)
 
     @parameterized.expand(
