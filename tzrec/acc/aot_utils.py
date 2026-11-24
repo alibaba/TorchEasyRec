@@ -15,7 +15,8 @@ import operator
 import os
 import platform
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union, cast
 
 import torch
 
@@ -23,6 +24,8 @@ import torch
 # can read it in runtime images where torch does not auto-import it.
 import torch._inductor.codecache  # noqa: F401
 from torch import nn
+from torchrec.sparse import jagged_tensor as _jagged_tensor
+from torchrec.sparse.jagged_tensor import KeyedTensor
 
 from tzrec.acc.utils import (
     canonical_contiguous,
@@ -45,6 +48,134 @@ from tzrec.prompt.assembler import PromptAssembler
 from tzrec.protos import model_pb2
 from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.logging_util import logger
+
+_ORIG_REGROUP_KEYED_TENSORS = _jagged_tensor._regroup_keyed_tensors
+
+
+def _aot_regroup_keyed_tensors(
+    keyed_tensors: List[KeyedTensor], groups: List[List[str]]
+) -> List[torch.Tensor]:
+    """Regroup KeyedTensors via cat + index_select instead of per-key split+cat.
+
+    TorchRec's default ``_regroup_keyed_tensors`` emits one slice+cat entry per
+    key. When the entry count exceeds Inductor's ``max_pointwise_cat_inputs``,
+    AOTI lowers each slice into its own Triton copy kernel, inflating kernel
+    launch overhead and compile time. Gathering all target columns in a single
+    ``index_select`` collapses N copies into one fused kernel.
+
+    Args:
+        keyed_tensors (List[KeyedTensor]): source keyed tensors.
+        groups (List[List[str]]): output group key lists.
+
+    Returns:
+        List[torch.Tensor]: regrouped tensors, one per group.
+    """
+    if not keyed_tensors or not groups:
+        return _ORIG_REGROUP_KEYED_TENSORS(keyed_tensors, groups)
+
+    key_dim = keyed_tensors[0].key_dim()
+    for kt in keyed_tensors:
+        if kt.key_dim() != key_dim:
+            return _ORIG_REGROUP_KEYED_TENSORS(keyed_tensors, groups)
+        for d in kt.length_per_key():
+            if not isinstance(d, int) or isinstance(d, bool):
+                return _ORIG_REGROUP_KEYED_TENSORS(keyed_tensors, groups)
+
+    key_to_src: Dict[str, Tuple[int, int, int]] = {}
+    for kt_idx, kt in enumerate(keyed_tensors):
+        offset = 0
+        for key, length in zip(kt.keys(), kt.length_per_key()):
+            key_to_src[key] = (kt_idx, offset, length)
+            offset += length
+
+    used_kt_indices = sorted(
+        {key_to_src[name][0] for group in groups for name in group}
+    )
+    if not used_kt_indices:
+        return _ORIG_REGROUP_KEYED_TENSORS(keyed_tensors, groups)
+
+    kt_base_offset: Dict[int, int] = {}
+    used_values: List[torch.Tensor] = []
+    total_cols = 0
+    for kt_idx in used_kt_indices:
+        kt = keyed_tensors[kt_idx]
+        kt_base_offset[kt_idx] = total_cols
+        used_values.append(kt.values())
+        total_cols += sum(kt.length_per_key())
+
+    cols: List[int] = []
+    split_lengths: List[int] = []
+    for group in groups:
+        group_length = 0
+        for name in group:
+            kt_idx, local_offset, length = key_to_src[name]
+            start = kt_base_offset[kt_idx] + local_offset
+            cols.extend(range(start, start + length))
+            group_length += length
+        split_lengths.append(group_length)
+
+    merged = (
+        used_values[0] if len(used_values) == 1 else torch.cat(used_values, dim=key_dim)
+    )
+    if not cols:
+        rearranged = merged.narrow(key_dim, 0, 0)
+    elif cols[-1] - cols[0] + 1 == len(cols) and all(
+        c == cols[0] + i for i, c in enumerate(cols)
+    ):
+        if cols[0] == 0 and len(cols) == total_cols:
+            rearranged = merged
+        else:
+            rearranged = merged.narrow(key_dim, cols[0], len(cols))
+    else:
+        col_idx = torch.tensor(cols, dtype=torch.int64, device=merged.device)
+        rearranged = torch.index_select(merged, key_dim, col_idx)
+
+    if len(split_lengths) == 1:
+        return [rearranged]
+    return list(rearranged.split(split_lengths, dim=key_dim))
+
+
+@contextmanager
+def _patch_regroup_for_aot(root: nn.Module) -> Iterator[None]:
+    """Temporarily swap ``_regroup_keyed_tensors`` during ``torch.export``.
+
+    Patches both FX ``GraphModule`` nodes recorded at ``symbolic_trace`` time
+    and ``torchrec.sparse.jagged_tensor._regroup_keyed_tensors`` for any
+    non-FX submodules, restoring all targets in ``finally``.
+
+    Args:
+        root (nn.Module): root module passed to ``torch.export.export``.
+    """
+    patched_gms: List[Tuple[torch.fx.GraphModule, List[torch.fx.Node]]] = []
+    seen_graphs: Set[int] = set()
+    for mod in root.modules():
+        if not isinstance(mod, torch.fx.GraphModule):
+            continue
+        gid = id(mod.graph)
+        if gid in seen_graphs:
+            continue
+        seen_graphs.add(gid)
+        nodes = [
+            node
+            for node in mod.graph.nodes
+            if node.op == "call_function" and node.target is _ORIG_REGROUP_KEYED_TENSORS
+        ]
+        if nodes:
+            for node in nodes:
+                node.target = _aot_regroup_keyed_tensors
+            mod.recompile()
+            patched_gms.append((mod, nodes))
+
+    prev_fn = _jagged_tensor._regroup_keyed_tensors
+    _jagged_tensor._regroup_keyed_tensors = _aot_regroup_keyed_tensors
+    try:
+        yield
+    finally:
+        _jagged_tensor._regroup_keyed_tensors = prev_fn
+        for mod, nodes in patched_gms:
+            for node in nodes:
+                node.target = _ORIG_REGROUP_KEYED_TENSORS
+            mod.recompile()
 
 
 def _aoti_compile_cfg() -> Dict[str, Any]:
@@ -234,8 +365,11 @@ def export_model_aot(
 
     sparse_output = {k: canonical_contiguous(v) for k, v in sparse_output.items()}
     # pre_hook requires running arbitrary code at runtime
-    with torch._inductor.config.patch(
-        {"unsafe_ignore_unsupported_triton_autotune_args": True}
+    with (
+        torch._inductor.config.patch(
+            {"unsafe_ignore_unsupported_triton_autotune_args": True}
+        ),
+        _patch_regroup_for_aot(dense_to_export),
     ):
         exported_pg = torch.export.export(
             dense_to_export,
@@ -704,8 +838,11 @@ def export_unified_model_aot(
     # Export with torch.export (CPU inputs; graph handles its own H2D).
     data = {k: canonical_contiguous(v) for k, v in data.items()}
     logger.info("exporting unified model with torch.export...")
-    with torch._inductor.config.patch(
-        {"unsafe_ignore_unsupported_triton_autotune_args": True}
+    with (
+        torch._inductor.config.patch(
+            {"unsafe_ignore_unsupported_triton_autotune_args": True}
+        ),
+        _patch_regroup_for_aot(full_gm),
     ):
         exported_pg = torch.export.export(
             full_gm,
@@ -1336,8 +1473,11 @@ def export_distributed_dense_model_aot(
         k: canonical_contiguous(v) for k, v in dense_sample_data.items()
     }
     logger.info("exporting distributed dense model with torch.export...")
-    with torch._inductor.config.patch(
-        {"unsafe_ignore_unsupported_triton_autotune_args": True}
+    with (
+        torch._inductor.config.patch(
+            {"unsafe_ignore_unsupported_triton_autotune_args": True}
+        ),
+        _patch_regroup_for_aot(dense_to_export),
     ):
         exported_pg = torch.export.export(
             dense_to_export,
