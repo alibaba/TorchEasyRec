@@ -45,7 +45,6 @@ from tzrec.datasets.kafka_dataset import (
     _build_projection,
     _offsets_for_times_batched,
     _parse_kafka_uri,
-    is_finite_kafka_replay,
 )
 from tzrec.datasets.utils import CKPT_ROW_IDX, DATA_TIMESTAMP
 from tzrec.features.feature import FgMode, create_features
@@ -71,97 +70,40 @@ class ParseKafkaUriTest(unittest.TestCase):
         self.assertNotIn("start.timestamp.ms", params)
         self.assertNotIn("end.timestamp.ms", params)
 
-    def test_parse_with_start_timestamp(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=1711929600000"
-        topic, params, start_ts, end_ts = _parse_kafka_uri(uri)
-        self.assertEqual(topic, "topic")
-        self.assertEqual(start_ts, 1711929600000)
-        self.assertIsNone(end_ts)
-        # start.timestamp.ms should be removed from consumer params
-        self.assertNotIn("start.timestamp.ms", params)
-
-    def test_parse_with_zero_timestamp(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=0"
-        _, _, start_ts, _ = _parse_kafka_uri(uri)
-        self.assertEqual(start_ts, 0)
-
-    def test_parse_with_negative_timestamp_raises(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=-1"
-        with self.assertRaises(ValueError):
-            _parse_kafka_uri(uri)
-
-    def test_parse_with_non_integer_timestamp_raises(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=abc"
-        with self.assertRaises(ValueError):
-            _parse_kafka_uri(uri)
-
-    def test_parse_with_end_timestamp(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&end.timestamp.ms=1712016000000"
-        topic, params, start_ts, end_ts = _parse_kafka_uri(uri)
-        self.assertEqual(topic, "topic")
-        self.assertIsNone(start_ts)
-        self.assertEqual(end_ts, 1712016000000)
-        self.assertNotIn("end.timestamp.ms", params)
-
     @parameterized.expand(
         [
-            # parse_qsl drops blank values, so an explicitly empty endpoint
-            # would otherwise silently consume as an unbounded stream
-            param(
-                "empty_end",
-                "kafka://broker:9092/topic?group.id=g1&end.timestamp.ms=",
-                "must not be empty",
-            ),
-            param(
-                "empty_start_with_end",
-                (
-                    "kafka://broker:9092/topic?group.id=g1"
-                    "&start.timestamp.ms=&end.timestamp.ms=1"
-                ),
-                "must not be empty",
-            ),
+            ("start_only", "start.timestamp.ms=1711929600000", 1711929600000, None),
+            ("end_only", "end.timestamp.ms=1712016000000", None, 1712016000000),
+            ("bounded", "start.timestamp.ms=0&end.timestamp.ms=7", 0, 7),
+            ("empty_window", "start.timestamp.ms=7&end.timestamp.ms=7", 7, 7),
         ],
         name_func=parameterized_name_func,
     )
-    def test_invalid_end_timestamp_params_raise(self, _name, uri, pattern):
-        with self.assertRaisesRegex(ValueError, pattern):
-            _parse_kafka_uri(uri)
-
-    def test_parse_with_start_and_end_timestamp(self):
-        uri = (
-            "kafka://broker:9092/topic?group.id=g1"
-            "&start.timestamp.ms=1711929600000&end.timestamp.ms=1712016000000"
+    def test_timestamp_params(self, _name, query, start, end):
+        _, params, start_ts, end_ts = _parse_kafka_uri(
+            f"kafka://broker/topic?group.id=g1&{query}"
         )
-        _, params, start_ts, end_ts = _parse_kafka_uri(uri)
-        self.assertEqual(start_ts, 1711929600000)
-        self.assertEqual(end_ts, 1712016000000)
+        self.assertEqual((start_ts, end_ts), (start, end))
         self.assertNotIn("start.timestamp.ms", params)
         self.assertNotIn("end.timestamp.ms", params)
+        if end is not None:
+            self.assertEqual(params["enable.partition.eof"], "true")
 
-    def test_parse_start_equals_end_allowed(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=7&end.timestamp.ms=7"
-        _, _, start_ts, end_ts = _parse_kafka_uri(uri)
-        self.assertEqual(start_ts, end_ts)
-
-    def test_parse_start_after_end_raises(self):
-        uri = (
-            "kafka://broker:9092/topic?group.id=g1"
-            "&start.timestamp.ms=200&end.timestamp.ms=100"
-        )
-        with self.assertRaisesRegex(
-            ValueError, "start.timestamp.ms.*must not be greater.*end.timestamp.ms"
-        ):
-            _parse_kafka_uri(uri)
-
-    def test_parse_with_negative_end_timestamp_raises(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&end.timestamp.ms=-1"
+    @parameterized.expand(
+        [
+            ("empty_end", "end.timestamp.ms="),
+            ("empty_start", "start.timestamp.ms=&end.timestamp.ms=1"),
+            ("reversed", "start.timestamp.ms=2&end.timestamp.ms=1"),
+            ("negative_start", "start.timestamp.ms=-1"),
+            ("invalid_start", "start.timestamp.ms=abc"),
+            ("negative_end", "end.timestamp.ms=-1"),
+            ("non_integer", "end.timestamp.ms=soon"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_invalid_window(self, _name, query):
         with self.assertRaises(ValueError):
-            _parse_kafka_uri(uri)
-
-    def test_parse_with_non_integer_end_timestamp_raises(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&end.timestamp.ms=soon"
-        with self.assertRaises(ValueError):
-            _parse_kafka_uri(uri)
+            _parse_kafka_uri(f"kafka://broker/topic?group.id=g1&{query}")
 
 
 def _resolved(partition, offset, topic="t"):
@@ -184,19 +126,6 @@ def _msg(partition, offset, value, rows=1, error=None):
     )
 
 
-def _eof(partition):
-    """Build a partition EOF event."""
-    return mock.Mock(
-        **{
-            "error.return_value": mock.Mock(
-                **{"code.return_value": KafkaError._PARTITION_EOF}
-            ),
-            "partition.return_value": partition,
-            "offset.return_value": -1,
-        }
-    )
-
-
 def _decoded_logs(mock_logger):
     return [
         call.args[0]
@@ -205,8 +134,8 @@ def _decoded_logs(mock_logger):
     ]
 
 
-class KafkaReaderRoundRobinTest(unittest.TestCase):
-    """Round-robin reading with mocked consumers."""
+class KafkaReaderTestCase(unittest.TestCase):
+    """Kafka readers with mocked consumers."""
 
     def _make_reader(
         self,
@@ -215,6 +144,7 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         leaders=None,
         round_robin=True,
         batch_size=1,
+        uri="kafka://broker:9092/topic?group.id=g1",
         **kwargs,
     ):
         leaders = leaders or {partition: 0 for partition in partitions}
@@ -243,12 +173,16 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
             )
         )
         return KafkaReader(
-            "kafka://broker:9092/topic?group.id=g1",
+            uri,
             batch_size,
             input_fields=[pa.field("x", pa.int64())],
             kafka_partition_round_robin=round_robin,
             **kwargs,
         )
+
+
+class KafkaReaderRoundRobinTest(KafkaReaderTestCase):
+    """Round-robin reading with mocked consumers."""
 
     @parameterized.expand(
         [
@@ -579,406 +513,121 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         self.assertIn(DATA_TIMESTAMP, plan.schema.names)
 
 
-class KafkaReaderEndOffsetsTest(unittest.TestCase):
-    """Finite replay bounded by per-partition end offsets, mocked consumers."""
+class KafkaReaderEndOffsetsTest(KafkaReaderTestCase):
+    URI = "KAFKA://kafka/topic?group.id=g&auto.offset.reset=latest&end.timestamp.ms=20"
 
-    def _make_reader(
-        self,
-        consumers,
-        partitions=(0, 1),
-        round_robin=False,
-        batch_size=1,
-        highs=None,
-        ends=None,
-        starts=None,
-        uri=(
-            "kafka://broker:9092/topic?group.id=g1"
-            "&auto.offset.reset=earliest&end.timestamp.ms=120000"
-        ),
-        **kwargs,
-    ):
-        query_consumer = mock.Mock()
-        query_consumer.list_topics.return_value = SimpleNamespace(
-            topics={
-                "topic": SimpleNamespace(
-                    partitions={
-                        partition: SimpleNamespace(leader=0) for partition in partitions
-                    },
-                    error=None,
-                )
-            }
-        )
-        end_timestamp_ms = _parse_kafka_uri(uri)[3]
-
-        def resolve_offsets(request, timeout):
-            offsets = ends if request[0].offset == end_timestamp_ms else starts
-            return [
-                _resolved(tp.partition, (offsets or {}).get(tp.partition, -1), tp.topic)
-                for tp in request
-            ]
-
-        for consumer in consumers:
-            consumer.offsets_for_times.side_effect = resolve_offsets
-            if consumer.get_watermark_offsets.side_effect is None:
-                consumer.get_watermark_offsets.side_effect = lambda tp, **_: (
-                    0,
-                    (highs or {}).get(tp.partition, 0),
-                )
-            if not round_robin:
-                consumer.subscribe.side_effect = (
-                    lambda topics, on_assign, on_revoke, c=consumer: on_assign(
-                        c, [TopicPartition("topic", p) for p in partitions]
-                    )
-                )
-        self.enterContext(
-            mock.patch(
-                "tzrec.datasets.kafka_dataset.Consumer",
-                side_effect=([query_consumer] if round_robin else []) + consumers,
-            )
-        )
-        self.enterContext(
-            mock.patch(
-                "tzrec.datasets.kafka_dataset.dist.is_initialized",
-                return_value=False,
-            )
-        )
-        return KafkaReader(
-            uri,
-            batch_size,
-            input_fields=[pa.field("x", pa.int64())],
-            kafka_partition_round_robin=round_robin,
-            **kwargs,
-        )
-
-    def test_is_finite_replay_follows_the_reader_state(self):
-        self.assertFalse(is_finite_kafka_replay(BaseReader("", batch_size=1)))
-        reader = self._make_reader(
-            [mock.Mock()],
-            uri="kafka://broker:9092/topic?group.id=g1",
-        )
-        self.assertFalse(is_finite_kafka_replay(reader))
-        reader = self._make_reader([mock.Mock()], highs={0: 5, 1: 5}, ends={0: 3, 1: 4})
-        self.assertTrue(is_finite_kafka_replay(reader))
-        reader = self._make_reader(
-            [mock.Mock()],
-            highs={0: 5, 1: 5},
-            ends={0: 3, 1: 4},
-            uri=(
-                "KAFKA://broker:9092/topic?group.id=g1"
-                "&auto.offset.reset=earliest&end.timestamp.ms=120000"
-            ),
-        )
-        self.assertTrue(is_finite_kafka_replay(reader))
-
-    def test_minimal_example_exact_offsets_and_termination(self):
-        # P0 ends at the timestamp offset and P1 at its high watermark.
+    def _subscribed_reader(self, partitions, query=""):
         consumer = mock.Mock()
-        consumer.consume.side_effect = [
-            [_msg(0, 2, 3)],
-            [_msg(1, 0, 11), _msg(1, 1, 12), _msg(1, 2, 13)],
-            [_msg(1, 3, 14)],
-        ]
-        reader = self._make_reader([consumer], highs={0: 5, 1: 4}, ends={0: 3})
-        reader.load_state_dict({"topic:0": 1})
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        observed = [
-            (batch.column("x").to_pylist(), batch.column(CKPT_ROW_IDX).to_pylist())
-            for batch in gen
-        ]
-        self.assertEqual(
-            observed,
-            [
-                ([3], [2]),
-                ([11, 12, 13], [0, 1, 2]),
-                ([14], [3]),
-            ],
+        consumer.get_watermark_offsets.return_value = (0, 5)
+        consumer.subscribe.side_effect = lambda topics, on_assign, on_revoke: on_assign(
+            consumer, [TopicPartition("topic", p) for p in partitions]
         )
-        self.assertEqual(consumer.consume.call_count, 3)
-        consumer.subscribe.assert_called_once()
-        assigned = consumer.assign.call_args.args[0]
-        self.assertEqual([tp.partition for tp in assigned], [0, 1])
-        self.assertEqual([tp.offset for tp in assigned], [2, OFFSET_INVALID])
-        consumer.close.assert_called_once()
+        reader = self._make_reader([consumer], round_robin=False, uri=self.URI + query)
+        return reader, consumer
 
-    def test_boundary_in_one_fetch_across_partitions(self):
-        # One fetch crosses P0's boundary and finishes P1.
-        consumer = mock.Mock()
-        consumer.get_watermark_offsets.side_effect = [(0, 101), (0, 41)]
-        consumer.consume.side_effect = [
-            [_msg(0, 98, 1), _msg(0, 100, 2), _msg(1, 40, 3)],
-        ]
-        reader = self._make_reader(
-            [consumer], highs={0: 101, 1: 41}, ends={0: 100, 1: 41}
-        )
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        observed = [
-            (batch.column("x").to_pylist(), batch.column(CKPT_ROW_IDX).to_pylist())
-            for batch in gen
-        ]
-        self.assertEqual(observed, [([1, 3], [98, 40])])
-        self.assertEqual(consumer.consume.call_count, 1)
-
-    def test_partition_starting_at_end_is_skipped(self):
-        # P1 has no retained records.
-        consumer = mock.Mock()
-        consumer.get_watermark_offsets.side_effect = [(0, 5), (2, 2)]
-        consumer.consume.side_effect = [[_msg(0, 0, 1), _msg(0, 1, 2), _msg(0, 2, 3)]]
-        reader = self._make_reader([consumer], highs={0: 5, 1: 2}, ends={0: 3})
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        observed = [
-            (batch.column("x").to_pylist(), batch.column(CKPT_ROW_IDX).to_pylist())
-            for batch in gen
-        ]
-        self.assertEqual(observed, [([1, 2, 3], [0, 1, 2])])
-        self.assertEqual(consumer.consume.call_count, 1)
-
-    def test_start_equals_end_is_empty(self):
+    @parameterized.expand(
+        [("keep_tail", False, [([14], [4])]), ("drop_tail", True, [])],
+        name_func=parameterized_name_func,
+    )
+    def test_subscribe_replays_current_assignment(self, _name, drop_remainder, tail):
         consumer = mock.Mock()
         reader = self._make_reader(
             [consumer],
-            highs={0: 5, 1: 5},
-            ends={0: 4},
-            uri=(
-                "kafka://broker:9092/topic?group.id=g1"
-                "&auto.offset.reset=earliest&start.timestamp.ms=120000"
-                "&end.timestamp.ms=120000"
-            ),
+            round_robin=False,
+            uri=self.URI + "&start.timestamp.ms=10",
+            batch_size=2,
+            drop_remainder=drop_remainder,
+            min_batch_size=1,
         )
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        with self.assertRaises(StopIteration):
-            next(gen)
-        consumer.consume.assert_not_called()
-
-    def test_start_lookup_miss_uses_group_position(self):
-        consumer = mock.Mock()
-        consumer.consume.side_effect = [
-            [_msg(0, 2, 7), _msg(1, 2, 1), _msg(1, 3, 2)],
+        reader.load_state_dict({"topic:1": 0})
+        consumer.get_watermark_offsets.return_value = (0, 5)
+        consumer.offsets_for_times.side_effect = [
+            [TopicPartition("topic", 1, 3)],
+            [TopicPartition("topic", 0, 8), TopicPartition("topic", 2, -1)],
+            [TopicPartition("topic", 0, 2), TopicPartition("topic", 2, -1)],
         ]
-        reader = self._make_reader(
-            [consumer],
-            highs={0: 3, 1: 5},
-            ends={1: 4},
-            starts={1: 2},
-            uri=(
-                "kafka://broker:9092/topic?group.id=g1"
-                "&auto.offset.reset=earliest&start.timestamp.ms=60000"
-                "&end.timestamp.ms=120000"
-            ),
-        )
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        observed = [
-            (batch.column("x").to_pylist(), batch.column(CKPT_ROW_IDX).to_pylist())
-            for batch in gen
-        ]
-        self.assertEqual(observed, [([7, 1, 2], [2, 2, 3])])
-        assigned = consumer.assign.call_args.args[0]
-        self.assertEqual([tp.offset for tp in assigned], [OFFSET_INVALID, 2])
-
-    def test_latest_reset_uses_kafka_start_position(self):
-        consumer = mock.Mock()
-        reader = self._make_reader(
-            [consumer],
-            partitions=(0,),
-            highs={0: 5},
-            ends={0: 3},
-            uri=(
-                "kafka://broker:9092/topic?group.id=g1"
-                "&auto.offset.reset=latest&end.timestamp.ms=120000"
-            ),
-        )
-        consumer.consume.side_effect = [[_msg(0, 2, 7), _msg(0, 3, 8)]]
-        self.assertEqual(
-            [batch.column("x").to_pylist() for batch in reader._reader()], [[7]]
-        )
-        assigned = consumer.assign.call_args.args[0]
-        self.assertEqual(
-            (assigned[0].partition, assigned[0].offset), (0, OFFSET_INVALID)
-        )
-
-    def test_checkpoint_past_end_completes_immediately(self):
-        consumer = mock.Mock()
-        reader = self._make_reader(
-            [consumer], partitions=(0,), highs={0: 5}, ends={0: 4}
-        )
-        reader.load_state_dict({"topic:0": 9})
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        with self.assertRaises(StopIteration):
-            next(gen)
-        consumer.consume.assert_not_called()
-
-    def test_partition_eof_completes_offset_holes(self):
-        # Offsets 98 and 99 are missing, so EOF completes the window.
-        consumer = mock.Mock()
-        consumer.get_watermark_offsets.side_effect = [(0, 100)]
-        consumer.consume.side_effect = [
-            [_msg(0, 97, 1)],
-            [_eof(0)],
-        ]
-        reader = self._make_reader(
-            [consumer], partitions=(0,), highs={0: 100}, ends={0: 100}
-        )
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        observed = [batch.column("x").to_pylist() for batch in gen]
-        self.assertEqual(observed, [[1]])
-
-    def test_round_robin_end_offsets(self):
-        consumers = [mock.Mock(), mock.Mock()]
-        consumers[0].get_watermark_offsets.side_effect = [(0, 5), (0, 5)]
-        consumers[0].consume.side_effect = [
-            [_msg(0, 0, 1), _msg(0, 1, 2)],
-        ]
-        consumers[1].consume.side_effect = [
-            [_msg(1, 0, 3), _msg(1, 1, 4)],
-            [_msg(1, 2, 5)],
-        ]
-        reader = self._make_reader(
-            consumers,
-            round_robin=True,
-            highs={0: 5, 1: 5},
-            ends={0: 2, 1: 3},
-        )
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        observed = [batch.column("x").to_pylist() for batch in gen]
-        self.assertEqual(observed, [[1, 2], [3, 4], [5]])
-        self.assertEqual(len(consumers[0].consume.call_args_list), 1)
-        self.assertEqual(len(consumers[1].consume.call_args_list), 2)
-
-    def test_round_robin_skips_partition_starting_at_end(self):
-        consumers = [mock.Mock(), mock.Mock()]
-        consumers[0].get_watermark_offsets.side_effect = [(0, 5), (2, 2)]
-        consumers[0].consume.side_effect = [
-            [_msg(0, 0, 1), _msg(0, 1, 2)],
-        ]
-        reader = self._make_reader(
-            consumers,
-            round_robin=True,
-            highs={0: 5, 1: 2},
-            ends={0: 2},
-        )
-        gen = reader._reader(0, 1)
-        self.addCleanup(gen.close)
-        observed = [batch.column("x").to_pylist() for batch in gen]
-        self.assertEqual(observed, [[1, 2]])
-        consumers[1].consume.assert_not_called()
-
-    def test_subscribe_queries_only_current_assignment(self):
-        consumer = mock.Mock()
-        reader = self._make_reader([consumer], highs={0: 5, 1: 5}, ends={0: 4, 1: 2})
-        consumer.offsets_for_times.assert_not_called()
-        consumer.list_topics.assert_not_called()
-        consumer.subscribe.side_effect = None
 
         def polls():
             callbacks = consumer.subscribe.call_args.kwargs
+            first = [TopicPartition("topic", 1)]
             yield []
-            callbacks["on_assign"](consumer, [TopicPartition("topic", 1)])
-            yield [_msg(1, 0, 10)]
-            callbacks["on_revoke"](consumer, [TopicPartition("topic", 1)])
-            yield []
-            callbacks["on_assign"](consumer, [TopicPartition("topic", 0)])
-            yield [_msg(1, 1, 11), _msg(0, 3, 20), _msg(0, 4, 21)]
+            callbacks["on_assign"](consumer, first)
+            self.assertEqual(consumer.assign.call_args.args[0][0].offset, 1)
+            yield [_msg(1, 1, 10)]
+            callbacks["on_revoke"](consumer, first)
+            yield [_msg(1, 2, 11)]
+            second = [TopicPartition("topic", p) for p in (0, 2)]
+            callbacks["on_assign"](consumer, second)
+            assigned = consumer.assign.call_args.args[0]
+            self.assertEqual([tp.offset for tp in assigned], [2, OFFSET_INVALID])
+            yield [_msg(1, 2, 11), _msg(0, 3, 12), _msg(0, 5, 13), _msg(2, 4, 14)]
 
         consumer.consume.side_effect = polls()
-        observed = [batch.column("x").to_pylist() for batch in reader._reader(0, 2)]
-        self.assertEqual(observed, [[10], [20]])
+        observed = [
+            (batch["x"].to_pylist(), batch[CKPT_ROW_IDX].to_pylist())
+            for batch in reader.to_batches(0, 2)
+        ]
+        self.assertEqual(observed, [([10, 12], [1, 3])] + tail)
+        queries = consumer.offsets_for_times.call_args_list
         self.assertEqual(
-            [
-                [tp.partition for tp in call.args[0]]
-                for call in consumer.offsets_for_times.call_args_list
-            ],
-            [[1], [0]],
+            [[tp.partition for tp in q.args[0]] for q in queries], [[1], [0, 2], [0, 2]]
         )
-
-    def test_empty_assignment_finishes_without_offset_queries(self):
-        consumer = mock.Mock()
-        reader = self._make_reader([consumer], partitions=())
-        self.assertEqual(list(reader._reader(0, 2)), [])
-        consumer.offsets_for_times.assert_not_called()
-        consumer.get_watermark_offsets.assert_not_called()
-        consumer.close.assert_called_once()
-
-    def test_snapshot_pins_window_at_assignment_high(self):
-        consumer = mock.Mock()
-        reader = self._make_reader(
-            [consumer], partitions=(0,), highs={0: 50}, ends={0: 99}
-        )
-        consumer.consume.side_effect = [[_msg(0, 49, 1), _msg(0, 50, 2)]]
-        observed = [batch.column("x").to_pylist() for batch in reader._reader()]
-        self.assertEqual(observed, [[1]])
-
-    def test_snapshot_query_failure_raises(self):
-        consumer = mock.Mock()
-        reader = self._make_reader([consumer], partitions=(0,), highs={0: 5})
-        with mock.patch.object(
-            kafka_dataset,
-            "_offsets_for_times_batched",
-            side_effect=KafkaException("timeout"),
-        ):
-            with self.assertRaisesRegex(KafkaException, "timeout"):
-                next(reader._reader())
         consumer.close.assert_called_once()
 
     @parameterized.expand(
         [
-            param("kept", False, 2, [[1, 1, 2, 2], [3, 3, 3]]),
-            param("dropped", True, 0, [[1, 1, 2, 2]]),
+            ("unassigned", [], "", None),
+            ("equal_bounds", [4, -1], "&start.timestamp.ms=20", None),
+            ("checkpoint_past_end", [4], "", {"topic:0": 9}),
         ],
         name_func=parameterized_name_func,
     )
-    def test_tail_batch_respects_min_batch_size(
-        self, _name, drop_remainder, min_batch_size, expected
-    ):
-        consumer = mock.Mock()
-        consumer.get_watermark_offsets.side_effect = [(0, 5), (0, 5)]
-        consumer.consume.side_effect = [
-            [_msg(0, 0, 1, rows=2), _msg(0, 1, 2, rows=2)],
-            [_msg(1, 0, 3, rows=3)],
+    def test_empty_window(self, _name, ends, query, checkpoint):
+        reader, consumer = self._subscribed_reader(range(len(ends)), query)
+        reader.load_state_dict(checkpoint)
+        consumer.offsets_for_times.return_value = [
+            TopicPartition("topic", p, end) for p, end in enumerate(ends)
         ]
-        iterator = self._make_reader(
-            [consumer],
-            batch_size=4,
-            highs={0: 5, 1: 5},
-            ends={0: 2, 1: 1},
-            min_batch_size=min_batch_size,
-            drop_remainder=drop_remainder,
-        ).to_batches(0, 1)
-        self.addCleanup(iterator.close)
-        observed = [data["x"].to_pylist() for data in iterator]
-        self.assertEqual(observed, expected)
+        consumer.consume.side_effect = AssertionError("polled an empty window")
+        self.assertEqual(list(reader._reader()), [])
+        if not ends:
+            consumer.offsets_for_times.assert_not_called()
+            consumer.get_watermark_offsets.assert_not_called()
 
-    def test_read_plan_finite_snapshot_keeps_checkpoint(self):
-        consumer = mock.Mock()
-        reader = self._make_reader(
-            [consumer], partitions=(0, 1), highs={0: 5, 1: 5}, ends={0: 3, 1: 4}
+    def test_round_robin_replays_unfinished_partitions(self):
+        consumers = [mock.Mock() for _ in range(3)]
+        reader = self._make_reader(consumers, partitions=(0, 1, 2), uri=self.URI)
+        consumers[0].get_watermark_offsets.side_effect = [(0, 5), (2, 2), (0, 4)]
+        consumers[0].offsets_for_times.return_value = [
+            TopicPartition("topic", p, end) for p, end in enumerate([2, -1, -1])
+        ]
+        consumers[0].consume.side_effect = [[_msg(0, 1, 1), _msg(0, 2, 2)]]
+        eof = KafkaError(KafkaError._PARTITION_EOF)
+        consumers[2].consume.side_effect = [[_msg(2, 1, 3), _msg(2, 4, 0, error=eof)]]
+        self.assertEqual(
+            [b.column("x").to_pylist() for b in reader._reader()], [[1], [3]]
         )
-        reader.load_state_dict({"topic:0": 12})
-        plan = reader.create_read_plan(1, 2, 2)
+        consumers[1].consume.assert_not_called()
+
+    @mock.patch.dict(os.environ, TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES="0")
+    def test_end_lookup_failure_closes_consumer(self):
+        reader, consumer = self._subscribed_reader([0])
+        consumer.offsets_for_times.side_effect = KafkaException("timeout")
+        with self.assertRaisesRegex(KafkaException, "timeout"):
+            next(reader._reader())
+        consumer.close.assert_called_once()
+
+    def test_finite_plan_preserves_checkpoint(self):
+        reader = self._make_reader([], round_robin=False, uri=self.URI)
+        self.assertFalse(kafka_dataset.is_finite_kafka_replay(BaseReader("", 1)))
+        checkpoint = {"topic:0": 12}
+        reader.load_state_dict(checkpoint)
+        plan = reader.create_read_plan(0, 1, 1)
+        reader.load_state_dict(None)
         self.assertTrue(plan.is_finite)
         self.assertIsNone(plan.planned_rows)
-        self.assertIn(DATA_TIMESTAMP, plan.schema.names)
-        first_readers = [task.kwargs["reader"] for task in plan.tasks]
-        for task_reader in first_readers:
-            self.assertIsNot(task_reader, reader)
-            self.assertEqual(task_reader._checkpoint_state, {"topic:0": 12})
-        # the handle clears the original reader before building the full
-        # plan; the first plan keeps its own resume position
-        reader.load_state_dict(None)
-        for task_reader in first_readers:
-            self.assertEqual(task_reader._checkpoint_state, {"topic:0": 12})
-        full_plan = reader.create_read_plan(1, 2, 2)
-        for task in full_plan.tasks:
-            self.assertIsNone(task.kwargs["reader"]._checkpoint_state)
-        restored = pickle.loads(pickle.dumps(plan))
-        for task in restored.tasks:
-            self.assertEqual(task.kwargs["reader"]._checkpoint_state, {"topic:0": 12})
+        (task,) = pickle.loads(pickle.dumps(plan)).tasks
+        self.assertEqual(task.kwargs["reader"]._checkpoint_state, checkpoint)
 
 
 class KafkaReaderDecodedMessageLogTest(unittest.TestCase):
@@ -1080,6 +729,7 @@ class OffsetsForTimesBatchedTest(unittest.TestCase):
     """Unit tests for _offsets_for_times_batched (broker-free, mocked)."""
 
     START_TS = 1711929600000
+    TIMEOUT = KafkaError(KafkaError._TIMED_OUT)
 
     def test_empty_partitions_returns_empty(self):
         consumer = mock.MagicMock()
@@ -1155,11 +805,8 @@ class OffsetsForTimesBatchedTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("request", KafkaException("persistent timeout")),
-            (
-                "partition",
-                [mock.Mock(offset=-1, error=KafkaError(KafkaError._TIMED_OUT))],
-            ),
+            ("request", KafkaException(TIMEOUT)),
+            ("partition", [mock.Mock(offset=-1, error=TIMEOUT)]),
         ],
         name_func=parameterized_name_func,
     )
@@ -1310,6 +957,7 @@ class KafkaDatasetConfigTest(unittest.TestCase):
                 mode=Mode.TRAIN,
                 expected_shuffle=True,
                 round_robin=True,
+                drop_remainder=True,
             ),
             param(
                 "round_robin_eval",
@@ -1317,25 +965,7 @@ class KafkaDatasetConfigTest(unittest.TestCase):
                 expected_shuffle=False,
                 round_robin=True,
                 log_every_n_messages=1000,
-            ),
-            param(
-                "train_drop_remainder",
-                mode=Mode.TRAIN,
-                expected_shuffle=True,
                 drop_remainder=True,
-            ),
-            param(
-                "train_min_batch_size",
-                mode=Mode.TRAIN,
-                expected_shuffle=True,
-                min_batch_size=2,
-            ),
-            param(
-                "eval_keeps_every_row",
-                mode=Mode.EVAL,
-                expected_shuffle=False,
-                drop_remainder=True,
-                min_batch_size=3,
             ),
         ],
         name_func=parameterized_name_func,
@@ -1348,10 +978,11 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         round_robin=None,
         log_every_n_messages=None,
         drop_remainder=False,
-        min_batch_size=0,
     ):
         data_config = data_pb2.DataConfig(
             batch_size=4,
+            drop_remainder=drop_remainder,
+            min_batch_size=2,
             dataset_type=data_pb2.DatasetType.KafkaDataset,
             fg_mode=data_pb2.FgMode.FG_NONE,
             label_fields=["label"],
@@ -1362,8 +993,6 @@ class KafkaDatasetConfigTest(unittest.TestCase):
                 data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
             ],
         )
-        data_config.drop_remainder = drop_remainder
-        data_config.min_batch_size = min_batch_size
         if round_robin is not None:
             data_config.kafka_partition_round_robin = round_robin
         if log_every_n_messages is not None:
@@ -1397,7 +1026,7 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             dataset._reader._min_batch_size,
-            (4 if drop_remainder else min_batch_size) if mode == Mode.TRAIN else 0,
+            (4 if drop_remainder else 2) if mode == Mode.TRAIN else 0,
         )
 
 
@@ -1730,35 +1359,19 @@ class KafkaDatasetTest(unittest.TestCase):
                 # (equal if we consumed the next message after checkpoint)
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
-    def _produce_sample_batches(
-        self,
-        rows_per_message,
-        messages_per_partition,
-        timestamp_ms,
-        partition_timestamps,
+    def _sample_shuffle_input(
+        self, mode, num_workers, rows_per_message, messages_per_partition, **options
     ):
-        """Produce 4 partitions of raw_c/label batches; map rows to offsets.
-
-        Args:
-            rows_per_message: rows carried by each produced message.
-            messages_per_partition: messages produced per partition.
-            timestamp_ms: base event time in milliseconds.
-            partition_timestamps: maps (partition, offset) to the event
-                time of the produced message.
-
-        Returns:
-            dict: row value to (partition, offset, event time in seconds)
-            as reported by the delivery callbacks.
-        """
         self._create_test_topic()
         producer = Producer({"bootstrap.servers": self.brokers})
         metadata = {}
+        timestamp_ms = int(time.time() * 1000)
 
         def on_delivery(row_start, event_time, error, message):
             self.assertIsNone(error)
             for row in range(row_start, row_start + rows_per_message):
                 metadata[row] = (
-                    message.partition(),
+                    f"{self.test_topic}:{message.partition()}",
                     message.offset(),
                     event_time / 1000.0,
                 )
@@ -1774,7 +1387,7 @@ class KafkaDatasetTest(unittest.TestCase):
                         "label": [0] * rows_per_message,
                     }
                 )
-                event_time = partition_timestamps(partition, offset)
+                event_time = timestamp_ms + offset - partition
                 producer.produce(
                     topic=self.test_topic,
                     partition=partition,
@@ -1784,10 +1397,22 @@ class KafkaDatasetTest(unittest.TestCase):
                 )
         self.assertEqual(producer.flush(30), 0)
         self.assertEqual(len(metadata), 4 * messages_per_partition * rows_per_message)
-        return metadata
-
-    def _arm_sample_timeout(self):
-        """Fail a stuck sample-shuffle pass after 120 seconds."""
+        cfg = utils.sample_data_config(
+            data_pb2.DatasetType.KafkaDataset,
+            mode,
+            num_workers,
+            **options,
+        )
+        cfg.input_fields.extend(
+            [
+                data_pb2.Field(input_name="raw_c", input_type=data_pb2.INT64),
+                data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
+            ]
+        )
+        path = (
+            f"kafka://{self.brokers}/{self.test_topic}"
+            "?group.id=tzrec_sample_shuffle&auto.offset.reset=earliest"
+        )
 
         def alarm(signum, frame):
             raise TimeoutError("timed out waiting for sample-shuffle batches")
@@ -1796,6 +1421,7 @@ class KafkaDatasetTest(unittest.TestCase):
         self.addCleanup(signal.signal, signal.SIGALRM, old_handler)
         self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
         signal.setitimer(signal.ITIMER_REAL, 120)
+        return cfg, path, timestamp_ms, metadata
 
     @parameterized.expand(
         [
@@ -1811,31 +1437,9 @@ class KafkaDatasetTest(unittest.TestCase):
     def test_sample_shuffle_checkpoint_resume(
         self, _name, mode, num_workers, round_robin
     ):
-        timestamp_ms = int(time.time() * 1000)
-        metadata = self._produce_sample_batches(
-            rows_per_message=24,
-            messages_per_partition=16,
-            timestamp_ms=timestamp_ms,
-            partition_timestamps=lambda partition, offset: timestamp_ms + offset,
+        cfg, path, _, metadata = self._sample_shuffle_input(
+            mode, num_workers, 24, 16, kafka_partition_round_robin=round_robin
         )
-        cfg = utils.sample_data_config(
-            data_pb2.DatasetType.KafkaDataset,
-            mode,
-            num_workers,
-            kafka_partition_round_robin=round_robin,
-        )
-        cfg.input_fields.extend(
-            [
-                data_pb2.Field(input_name="raw_c", input_type=data_pb2.INT64),
-                data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
-            ]
-        )
-        path = (
-            f"kafka://{self.brokers}/{self.test_topic}"
-            "?group.id=tzrec_sample_shuffle&auto.offset.reset=earliest"
-        )
-
-        self._arm_sample_timeout()
         state = {}
         seen = set()
         for resume in (False, True):
@@ -1861,8 +1465,7 @@ class KafkaDatasetTest(unittest.TestCase):
                     timestamps = []
                     messages = set()
                     for value in values:
-                        partition, offset, event_time = metadata[value]
-                        source = f"{self.test_topic}:{partition}"
+                        source, offset, event_time = metadata[value]
                         if resume:
                             self.assertGreater(offset, checkpoint[source])
                         expected[source] = max(expected.get(source, -1), offset)
@@ -1884,75 +1487,35 @@ class KafkaDatasetTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("keep_tail", "SAMPLE_ROLLING", 3, [8, 8, 8, 8, 8, 5]),
-            ("drop_tail", "SAMPLE_WINDOW", 7, [8, 8, 8, 8, 8]),
+            ("keep_tail", "SAMPLE_ROLLING", 3, [8] * 6 + [6]),
+            ("drop_tail", "SAMPLE_WINDOW", 7, [8] * 6),
         ],
         name_func=parameterized_name_func,
     )
     @unittest.skipIf(
         os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
     )
-    def test_sample_shuffle_end_timestamp(
-        self, _name, mode, min_batch_size, expected_sizes
-    ):
-        """Drain a resumed window with the configured tail-batch policy."""
-        # P3 has no timestamp match and falls back to its high watermark.
-        timestamp_ms = int(time.time() * 1000)
-        metadata = self._produce_sample_batches(
-            rows_per_message=3,
-            messages_per_partition=8,
-            timestamp_ms=timestamp_ms,
-            partition_timestamps=(
-                lambda partition, offset: (
-                    timestamp_ms + offset
-                    if partition < 3
-                    else timestamp_ms - 100_000 + offset
-                )
-            ),
+    def test_sample_shuffle_end_timestamp(self, _name, mode, min_batch_size, expected):
+        cfg, path, start, metadata = self._sample_shuffle_input(
+            mode, 0, 3, 8, min_batch_size=min_batch_size
         )
-        end_ms = timestamp_ms + 5
-        cfg = utils.sample_data_config(
-            data_pb2.DatasetType.KafkaDataset,
-            mode,
-            num_workers=0,
-            min_batch_size=min_batch_size,
-        )
-        cfg.input_fields.extend(
-            [
-                data_pb2.Field(input_name="raw_c", input_type=data_pb2.INT64),
-                data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
-            ]
-        )
-        path = (
-            f"kafka://{self.brokers}/{self.test_topic}"
-            "?group.id=tzrec_sample_shuffle_end"
-            f"&auto.offset.reset=earliest&end.timestamp.ms={end_ms}"
-        )
-
-        self._arm_sample_timeout()
-        # Resuming at offset 2 leaves (3 * 3 + 6) * 3 = 45 rows.
-        checkpoint = {f"{self.test_topic}:{partition}": 1 for partition in range(4)}
+        end = start + 5
+        checkpoint = {f"{self.test_topic}:{p}": 1 for p in range(4)}
         dataloader = create_dataloader(
             cfg,
             utils.raw_c_features(),
-            path,
+            f"{path}&end.timestamp.ms={end}",
             mode=Mode.TRAIN,
             checkpoint_state=checkpoint,
         )
-        iterator = None
-        try:
-            iterator = dataloader.get_iterator()
-            sizes, values, _ = utils.drain_sample(iterator)
-        finally:
-            utils.stop_sample(dataloader, iterator)
-        seen = set(values)
-        self.assertEqual(sizes, expected_sizes)
-        self.assertEqual(len(seen), len(values))
-        self.assertEqual(len(seen), sum(expected_sizes))
+        self.addCleanup(utils.stop_sample, dataloader, None)
+        sizes, values, _ = utils.drain_sample(dataloader.get_iterator())
+        self.assertEqual(sizes, expected)
+        self.assertEqual(len(set(values)), sum(expected))
         for value in values:
-            partition, offset, _ = metadata[value]
-            self.assertGreater(offset, checkpoint[f"{self.test_topic}:{partition}"])
-            self.assertLess(offset, 5 if partition < 3 else 8)
+            source, offset, event_time = metadata[value]
+            self.assertGreater(offset, checkpoint[source])
+            self.assertLess(event_time, end / 1000.0)
 
     @unittest.skipIf(
         os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
