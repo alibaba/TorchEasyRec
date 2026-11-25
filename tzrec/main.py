@@ -678,6 +678,9 @@ def _train_and_evaluate(
                         dense_ema=dense_ema,
                         lr_schedulers=restore_schedulers,
                     )
+                rocksdb = runtime.rocksdb
+                if rocksdb is not None:
+                    rocksdb.refresh_background_io_rate()
                 if not restore_from_model_dir:
                     # a fine-tune checkpoint's train metric describes the source
                     # model, not the model this job is training.

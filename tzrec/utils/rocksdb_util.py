@@ -107,11 +107,12 @@ def backend_config(
         for field, backend_field in backend_fields.items():
             if config.HasField(field):
                 overrides[backend_field] = getattr(config, field)
+    num_db_shards = overrides.get("num_db_shards", 1)
     base_threads = max(4, cpus)
     overrides.setdefault(
         "io_threads",
         max(
-            overrides.get("num_db_shards", 1),
+            num_db_shards,
             base_threads,
             min(2 * base_threads, 64),
         ),
@@ -121,7 +122,7 @@ def backend_config(
         write_buffer_bytes=WRITE_BUFFER_BYTES,
         staging_buffer_bytes=STAGING_BUFFER_BYTES,
         import_budget_bytes=import_budget_bytes,
-        max_background_jobs=max(2, cpus // 4),
+        max_background_jobs=max(2 * num_db_shards, cpus // 4),
         **overrides,
     )
 

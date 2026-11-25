@@ -175,8 +175,8 @@ message RocksDBConfig {
     // false: each node has its own volume, shared by that node's ranks.
     // true: all ranks share one volume.
     optional bool shared_across_nodes = 3 [default = false];
-    // Target SST data block size in bytes.
-    optional uint64 sst_block_size_bytes = 4 [default = 16384];
+    // Target SST data block size in bytes. Unset uses the backend default.
+    optional uint64 sst_block_size_bytes = 4;
     // Pad SST data blocks to block-size boundaries.
     optional bool block_align = 5 [default = false];
     // Read SST data with direct I/O.

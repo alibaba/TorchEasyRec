@@ -198,7 +198,11 @@ def create_planner(
         fqn_constraints=fqn_constraints,
         global_constraints=global_constraints,
         allow_rocksdb=allow_rocksdb,
-        rocksdb_block_size=cfg.sst_block_size_bytes if cfg is not None else None,
+        rocksdb_block_size=(
+            cfg.sst_block_size_bytes
+            if cfg is not None and cfg.HasField("sst_block_size_bytes")
+            else None
+        ),
     )
     callbacks = None
     if allow_rocksdb:

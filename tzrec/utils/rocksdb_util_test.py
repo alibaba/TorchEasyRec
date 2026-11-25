@@ -182,9 +182,14 @@ class SharedStorageTest(unittest.TestCase):
             background_io_base_rate_per_rank_mib_per_sec=96,
             background_io_max_rate_per_rank_mib_per_sec=512,
         )
-        backend = rocksdb_util.backend_config(
-            1, block_cache_bytes=32 << 20, import_budget_bytes=64 << 20, config=config
-        )
+        with mock.patch("os.sched_getaffinity", return_value=set(range(16))):
+            backend = rocksdb_util.backend_config(
+                1,
+                block_cache_bytes=32 << 20,
+                import_budget_bytes=64 << 20,
+                config=config,
+            )
+        self.assertEqual(backend.max_background_jobs, 8)
         self.assertEqual(backend.io_threads, 24)
         self.assertEqual(backend.num_db_shards, 4)
         self.assertEqual(backend.sst_block_size_bytes, 2048)
