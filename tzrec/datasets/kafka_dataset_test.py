@@ -160,10 +160,11 @@ class KafkaReaderTestCase(unittest.TestCase):
                 )
             }
         )
+        needs_order = round_robin or _parse_kafka_uri(uri)[3] is not None
         self.enterContext(
             mock.patch(
                 "tzrec.datasets.kafka_dataset.Consumer",
-                side_effect=([query_consumer] if round_robin else []) + consumers,
+                side_effect=([query_consumer] if needs_order else []) + consumers,
             )
         )
         self.enterContext(
@@ -516,23 +517,23 @@ class KafkaReaderRoundRobinTest(KafkaReaderTestCase):
 class KafkaReaderEndOffsetsTest(KafkaReaderTestCase):
     URI = "KAFKA://kafka/topic?group.id=g&auto.offset.reset=latest&end.timestamp.ms=20"
 
-    def _subscribed_reader(self, partitions, query=""):
+    def _bounded_reader(self, partitions, query=""):
         consumer = mock.Mock()
         consumer.get_watermark_offsets.return_value = (0, 5)
-        consumer.subscribe.side_effect = lambda topics, on_assign, on_revoke: on_assign(
-            consumer, [TopicPartition("topic", p) for p in partitions]
+        reader = self._make_reader(
+            [consumer], partitions=partitions, round_robin=False, uri=self.URI + query
         )
-        reader = self._make_reader([consumer], round_robin=False, uri=self.URI + query)
         return reader, consumer
 
     @parameterized.expand(
         [("keep_tail", False, [([14], [4])]), ("drop_tail", True, [])],
         name_func=parameterized_name_func,
     )
-    def test_subscribe_replays_current_assignment(self, _name, drop_remainder, tail):
-        consumer = mock.Mock()
+    def test_workers_finish_independently(self, _name, drop_remainder, tail):
+        slow, fast = mock.Mock(), mock.Mock()
         reader = self._make_reader(
-            [consumer],
+            [slow, fast],
+            partitions=(0, 1, 2),
             round_robin=False,
             uri=self.URI + "&start.timestamp.ms=10",
             batch_size=2,
@@ -540,59 +541,60 @@ class KafkaReaderEndOffsetsTest(KafkaReaderTestCase):
             min_batch_size=1,
         )
         reader.load_state_dict({"topic:1": 0})
-        consumer.get_watermark_offsets.return_value = (0, 5)
-        consumer.offsets_for_times.side_effect = [
-            [TopicPartition("topic", 1, 3)],
+        slow.get_watermark_offsets.return_value = (0, 5)
+        slow.offsets_for_times.return_value = [TopicPartition("topic", 1, 5)]
+        slow.consume.side_effect = [[_msg(1, offset, offset)] for offset in range(1, 5)]
+        fast.get_watermark_offsets.return_value = (0, 5)
+        fast.offsets_for_times.side_effect = [
             [TopicPartition("topic", 0, 8), TopicPartition("topic", 2, -1)],
             [TopicPartition("topic", 0, 2), TopicPartition("topic", 2, -1)],
         ]
-
-        def polls():
-            callbacks = consumer.subscribe.call_args.kwargs
-            first = [TopicPartition("topic", 1)]
-            yield []
-            callbacks["on_assign"](consumer, first)
-            self.assertEqual(consumer.assign.call_args.args[0][0].offset, 1)
-            yield [_msg(1, 1, 10)]
-            callbacks["on_revoke"](consumer, first)
-            yield [_msg(1, 2, 11)]
-            second = [TopicPartition("topic", p) for p in (0, 2)]
-            callbacks["on_assign"](consumer, second)
-            assigned = consumer.assign.call_args.args[0]
-            self.assertEqual([tp.offset for tp in assigned], [2, OFFSET_INVALID])
-            yield [_msg(1, 2, 11), _msg(0, 3, 12), _msg(0, 5, 13), _msg(2, 4, 14)]
-
-        consumer.consume.side_effect = polls()
+        fast.consume.side_effect = [
+            [_msg(0, 3, 10), _msg(0, 4, 12)],
+            [_msg(0, 5, 13), _msg(2, 4, 14)],
+        ]
+        slow_batches = reader.to_batches(1, 2)
+        self.addCleanup(slow_batches.close)
+        self.assertEqual(next(slow_batches)["x"].to_pylist(), [1, 2])
         observed = [
             (batch["x"].to_pylist(), batch[CKPT_ROW_IDX].to_pylist())
             for batch in reader.to_batches(0, 2)
         ]
-        self.assertEqual(observed, [([10, 12], [1, 3])] + tail)
-        queries = consumer.offsets_for_times.call_args_list
-        self.assertEqual(
-            [[tp.partition for tp in q.args[0]] for q in queries], [[1], [0, 2], [0, 2]]
-        )
-        consumer.close.assert_called_once()
+        self.assertEqual(observed, [([10, 12], [3, 4])] + tail)
+        fast.close.assert_called_once()
+        slow.close.assert_not_called()
+        self.assertEqual([b["x"].to_pylist() for b in slow_batches], [[3, 4]])
+        for consumer, assigned, queries in (
+            (fast, [(0, 2), (2, OFFSET_INVALID)], [[0, 2], [0, 2]]),
+            (slow, [(1, 1)], [[1]]),
+        ):
+            consumer.subscribe.assert_not_called()
+            consumer.assign.assert_called_once()
+            (partitions,) = consumer.assign.call_args.args
+            self.assertEqual([(p.partition, p.offset) for p in partitions], assigned)
+            calls = consumer.offsets_for_times.call_args_list
+            self.assertEqual([[p.partition for p in c.args[0]] for c in calls], queries)
+
+    def test_worker_without_partitions_finishes(self):
+        reader, consumer = self._bounded_reader([0])
+        self.assertEqual(list(reader._reader(1, 2)), [])
+        self.assertEqual(consumer.method_calls, [mock.call.close()])
 
     @parameterized.expand(
         [
-            ("unassigned", [], "", None),
             ("equal_bounds", [4, -1], "&start.timestamp.ms=20", None),
             ("checkpoint_past_end", [4], "", {"topic:0": 9}),
         ],
         name_func=parameterized_name_func,
     )
     def test_empty_window(self, _name, ends, query, checkpoint):
-        reader, consumer = self._subscribed_reader(range(len(ends)), query)
+        reader, consumer = self._bounded_reader(range(len(ends)), query)
         reader.load_state_dict(checkpoint)
         consumer.offsets_for_times.return_value = [
             TopicPartition("topic", p, end) for p, end in enumerate(ends)
         ]
         consumer.consume.side_effect = AssertionError("polled an empty window")
         self.assertEqual(list(reader._reader()), [])
-        if not ends:
-            consumer.offsets_for_times.assert_not_called()
-            consumer.get_watermark_offsets.assert_not_called()
 
     def test_round_robin_replays_unfinished_partitions(self):
         consumers = [mock.Mock() for _ in range(3)]
@@ -611,7 +613,7 @@ class KafkaReaderEndOffsetsTest(KafkaReaderTestCase):
 
     @mock.patch.dict(os.environ, TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES="0")
     def test_end_lookup_failure_closes_consumer(self):
-        reader, consumer = self._subscribed_reader([0])
+        reader, consumer = self._bounded_reader([0])
         consumer.offsets_for_times.side_effect = KafkaException("timeout")
         with self.assertRaisesRegex(KafkaException, "timeout"):
             next(reader._reader())
@@ -1021,13 +1023,10 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         self.assertEqual(
             dataset._reader._log_every_n_messages, log_every_n_messages or 0
         )
-        self.assertEqual(
-            dataset._reader._drop_remainder, drop_remainder and mode == Mode.TRAIN
-        )
-        self.assertEqual(
-            dataset._reader._min_batch_size,
-            (4 if drop_remainder else 2) if mode == Mode.TRAIN else 0,
-        )
+        training = mode == Mode.TRAIN
+        train_min = 4 if drop_remainder else 2
+        self.assertEqual(dataset._reader._drop_remainder, training and drop_remainder)
+        self.assertEqual(dataset._reader._min_batch_size, train_min if training else 0)
 
 
 class KafkaDatasetTest(unittest.TestCase):

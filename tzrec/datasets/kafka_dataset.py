@@ -80,10 +80,6 @@ def _parse_kafka_uri(
             specified.
         end_timestamp_ms: end timestamp in milliseconds, or ``None`` if not
             specified.
-
-    Raises:
-        ValueError: on a malformed URI, an explicitly empty, non-integer or
-            negative timestamp, or a start timestamp greater than the end timestamp.
     """
     parsed = urlparse(uri)
     if parsed.scheme != "kafka":
@@ -105,6 +101,7 @@ def _parse_kafka_uri(
             raise ValueError(f"{param_name} must not be empty")
     params = {key: value for key, value in params.items() if value != ""}
 
+    # Remove the replay timestamps before passing the config to confluent_kafka.
     start_timestamp_ms: Optional[int] = None
     end_timestamp_ms: Optional[int] = None
     for param_name in ("start.timestamp.ms", "end.timestamp.ms"):
@@ -389,7 +386,7 @@ class KafkaReader(BaseReader):
         _, _, _, self._end_timestamp_ms = _parse_kafka_uri(input_path)
         self._round_robin_partition_order = (
             self._get_round_robin_partition_order()
-            if kafka_partition_round_robin
+            if kafka_partition_round_robin or self._end_timestamp_ms is not None
             else []
         )
 
@@ -527,6 +524,17 @@ class KafkaReader(BaseReader):
                 f"Failed to get kafka partition order for topic {topic}: {error}"
             )
         return partition_order
+
+    def _owned_partitions(
+        self, topic: str, worker_id: int, num_workers: int
+    ) -> List[TopicPartition]:
+        """Return this global worker's share of the ordered partitions."""
+        return [
+            TopicPartition(topic, partition)
+            for partition in sorted(
+                self._round_robin_partition_order[worker_id::num_workers]
+            )
+        ]
 
     def _set_start_offsets(
         self,
@@ -769,13 +777,10 @@ class KafkaReader(BaseReader):
 
         In a multiprocessing child, stop polling when the parent process exits.
 
-        When partition round-robin is enabled the partitions owned by this
-        worker are read in round-robin order by :meth:`_round_robin_reader`.
-        Otherwise the worker subscribes to the topic. A heartbeat thread keeps
-        the consumer in its group during long downstream pauses. Each assignment
-        resolves the start offsets and, with an end timestamp, the exclusive end
-        offsets for just those partitions. The generator ends when its current
-        assignment has no unfinished windows.
+        Bounded and round-robin readers directly assign each worker its share
+        of the partitions. Round-robin uses one consumer per partition, and
+        ordinary bounded replay batches them on one consumer. An ordinary
+        unbounded reader subscribes and keeps its membership during pauses.
 
         Args:
             worker_id: Worker ID
@@ -810,33 +815,25 @@ class KafkaReader(BaseReader):
         batch_size_per_msg: Optional[float] = None
         # None keeps polling. An empty dict ends the replay.
         remaining: Optional[Dict[int, int]] = None
-        heartbeat_error: Optional[Exception] = None
         stop_event = threading.Event()
         consumer_lock = threading.RLock()
         is_paused = [False]
         last_consume_time = [time.monotonic()]
-        stolen_msgs: List[Message] = []
         idle_threshold = max_poll_interval_ms / 1000.0 * 0.8
+        stolen_msgs: List[Message] = []
 
+        # Define on_assign callback to seek to checkpointed offsets
         def on_assign(consumer: Consumer, partitions: List[TopicPartition]) -> None:
-            """Set the read window for the partitions assigned by the group."""
-            nonlocal remaining
-            remaining = self._set_partition_offsets(
-                consumer, partitions, start_timestamp_ms
-            )
-            consumer.assign(partitions)
-            if is_paused[0] and partitions:
-                consumer.pause(partitions)
+            """Set start offsets for the partitions assigned by the group."""
+            self._set_start_offsets(consumer, partitions, start_timestamp_ms)
+            with consumer_lock:
+                consumer.assign(partitions)
+                if is_paused[0] and partitions:
+                    consumer.pause(partitions)
             logger.info(f"{log_prefix} assignment: {partitions}")
-
-        def on_revoke(consumer: Consumer, partitions: List[TopicPartition]) -> None:
-            """Discard buffered messages and windows for revoked partitions."""
-            nonlocal remaining
-            remaining = None
 
         def _heartbeat() -> None:
             """Keep consumer alive when generator is blocked at yield."""
-            nonlocal heartbeat_error
             while not stop_event.is_set():
                 try:
                     elapsed = time.monotonic() - last_consume_time[0]
@@ -858,27 +855,32 @@ class KafkaReader(BaseReader):
                                         f"{elapsed:.1f}s idle"
                                     )
                                 msg = consumer.poll(0)
-                                if msg is not None:
+                                if msg is not None and not msg.error():
                                     stolen_msgs.append(msg)
-                except Exception as e:
-                    if end_timestamp_ms is not None:
-                        heartbeat_error = e
-                        return
+                except Exception:
                     logger.warning(f"{log_prefix} heartbeat error", exc_info=True)
                 stop_event.wait(1.0)
 
-        heartbeat_thread = threading.Thread(
-            target=_heartbeat,
-            name=f"{log_prefix}-hb",
-            daemon=True,
-        )
-        heartbeat_thread.start()
+        heartbeat_thread = None
         try:
             if end_timestamp_ms is None:
                 consumer.subscribe([topic], on_assign=on_assign)
+                heartbeat_thread = threading.Thread(
+                    target=_heartbeat, name=f"{log_prefix}-hb", daemon=True
+                )
+                heartbeat_thread.start()
             else:
-                consumer.subscribe([topic], on_assign=on_assign, on_revoke=on_revoke)
+                partitions = self._owned_partitions(topic, worker_id, num_workers)
+                if not partitions:
+                    return
+                remaining = self._set_partition_offsets(
+                    consumer, partitions, start_timestamp_ms
+                )
+                consumer.assign(partitions)
+                logger.info(f"{log_prefix} assignment: {partitions}")
             while True:
+                if remaining == {}:
+                    break
                 if parent is not None and os.getppid() != parent.pid:
                     logger.error(f"{log_prefix}: owner process gone, exiting")
                     return
@@ -892,10 +894,6 @@ class KafkaReader(BaseReader):
                 # rd_kafka_consume_batch_queue() (used by consume()) is
                 # not thread-safe with concurrent pause/resume/seek.
                 with consumer_lock:
-                    if heartbeat_error is not None:
-                        raise heartbeat_error
-                    if remaining == {}:
-                        break
                     if is_paused[0]:
                         assignment = consumer.assignment()
                         if assignment:
@@ -906,8 +904,8 @@ class KafkaReader(BaseReader):
                     fetched = consumer.consume(num_messages, timeout=1.0)
                     messages = stolen_msgs + fetched
                     stolen_msgs.clear()
-                    if end_timestamp_ms is not None:
-                        messages = self._filter_end_offsets(messages, remaining or {})
+                if remaining is not None:
+                    messages = self._filter_end_offsets(messages, remaining)
                 t, num_decoded = self._decode_messages(messages, topic, projections)
                 if t is None:
                     continue
@@ -926,9 +924,10 @@ class KafkaReader(BaseReader):
             logger.error(f"{log_prefix} exception: {e}")
             raise
         finally:
-            stop_event.set()
-            heartbeat_thread.join(timeout=5.0)
-            if heartbeat_thread.is_alive():
+            if heartbeat_thread is not None and heartbeat_thread.is_alive():
+                stop_event.set()
+                heartbeat_thread.join(timeout=5.0)
+            if heartbeat_thread is not None and heartbeat_thread.is_alive():
                 logger.warning(
                     "Heartbeat thread did not exit within timeout; "
                     "skipping consumer.close() to avoid race."
@@ -981,12 +980,7 @@ class KafkaReader(BaseReader):
                     f"{len(self._round_robin_partition_order)} partition(s), "
                     f"fewer than the {num_workers} dataloader workers; "
                 )
-            owned_partitions = [
-                TopicPartition(topic, partition)
-                for partition in sorted(
-                    self._round_robin_partition_order[worker_id::num_workers]
-                )
-            ]
+            owned_partitions = self._owned_partitions(topic, worker_id, num_workers)
             consumer = Consumer(config)
             consumers.append(consumer)
             remaining = self._set_partition_offsets(
@@ -1098,10 +1092,9 @@ class KafkaReader(BaseReader):
     ) -> ReadPlan:
         """Build a per-rank Kafka read plan.
 
-        Each task carries a reader and a global reader id. Round-robin tasks
-        reuse the parent-resolved partition order; ordinary tasks subscribe
-        to the shared consumer group. Checkpoint state is applied
-        on each assignment, like the BATCH path.
+        Each task carries a reader and a global reader id. Bounded and
+        round-robin tasks use this id to split the parent-resolved partition
+        order. Other tasks subscribe to the shared consumer group.
 
         A shallow copy preserves the finite plan's checkpoint when a later
         pass resets the reader.

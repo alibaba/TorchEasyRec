@@ -1134,7 +1134,7 @@ def train_and_evaluate(
         try:
             if delta_embedding_dumper is not None:
                 delta_embedding_dumper.start()
-            # Cost-based batching can leave ranks with different batch counts.
+            # when slice batch by sample cost, data on all workers may not be balanced
             check_all_workers_data_status = data_config.HasField("batch_cost_size")
             _train_and_evaluate(
                 model,
@@ -1258,7 +1258,7 @@ def evaluate(
         else:
             raise ValueError("Eval checkpoint path should be specified.")
 
-        # Cost-based batching can leave ranks with different batch counts.
+        # when slice batch by sample cost, data on all workers may not be balanced
         check_all_workers_data_status = data_config.HasField("batch_cost_size")
         with (
             SummaryWriter(os.path.join(pipeline_config.model_dir, "eval"))
