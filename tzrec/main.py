@@ -48,6 +48,7 @@ from tzrec.datasets.dataset import (
     create_dataloader,
     create_writer,
 )
+from tzrec.datasets.kafka_dataset import is_finite_kafka_replay
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
     BaseFeature,
@@ -228,14 +229,11 @@ def _evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.eval()
-    # the eval pipeline follows its own loader: a kafka input bounded by
-    # end.timestamp.ms ends the pass for every rank together
-    # pyre-ignore [16]
     eval_reader = eval_dataloader.dataset._reader
     pipeline = create_train_pipeline(
         model,
         check_all_workers_data_status=(
-            check_all_workers_data_status or eval_reader.is_finite_replay
+            check_all_workers_data_status or is_finite_kafka_replay(eval_reader)
         ),
     )
 
@@ -470,7 +468,6 @@ def _train_and_evaluate(
     kafka_baseline_offsets: Dict[str, int] = {}
     # pyre-ignore [16]
     dataset_config = train_dataloader.dataset._data_config
-    # pyre-ignore [16]
     train_reader = train_dataloader.dataset._reader
     kafka_log_enabled = (
         dataset_config.dataset_type == DatasetType.KafkaDataset
@@ -635,12 +632,12 @@ def _train_and_evaluate(
     data_timestamp = -1.0
     try:
         for i_epoch in epoch_iter:
-            # the training pipeline follows its own loader's reader state
             pipeline = create_train_pipeline(
                 model,
                 optimizer,
                 check_all_workers_data_status=(
-                    check_all_workers_data_status or train_reader.is_finite_replay
+                    check_all_workers_data_status
+                    or is_finite_kafka_replay(train_reader)
                 ),
             )
             if plogger is not None:
@@ -1137,12 +1134,7 @@ def train_and_evaluate(
         try:
             if delta_embedding_dumper is not None:
                 delta_embedding_dumper.start()
-            # when slice batch by sample cost, data on all workers may not be
-            # balanced; a kafka input bounded by end.timestamp.ms is finite
-            # too, and the rank that runs out of data first ends the pass for
-            # every rank, its remaining batches may not train.  The pipelines
-            # OR in their own loader's reader state, so train, in-training
-            # eval and standalone eval each follow their own input.
+            # Cost-based batching can leave ranks with different batch counts.
             check_all_workers_data_status = data_config.HasField("batch_cost_size")
             _train_and_evaluate(
                 model,
@@ -1266,8 +1258,7 @@ def evaluate(
         else:
             raise ValueError("Eval checkpoint path should be specified.")
 
-        # when slice batch by sample cost, data on all workers may not be
-        # balanced; the eval pipeline ORs in its own loader's reader state
+        # Cost-based batching can leave ranks with different batch counts.
         check_all_workers_data_status = data_config.HasField("batch_cost_size")
         with (
             SummaryWriter(os.path.join(pipeline_config.model_dir, "eval"))
