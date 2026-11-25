@@ -14,7 +14,7 @@ import os
 import shutil
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Dict, List
 from unittest import mock
@@ -2398,6 +2398,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_multi_gpu_dump_writes_empty_shard_when_rank_has_no_delta(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._lookup_scope = nullcontext
             dumper._output_dir = tmp_dir
             dumper._file_prefix = "delta_embedding"
             dumper._rank = 1
@@ -2430,6 +2431,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_single_gpu_dump_skips_file_when_rank_has_no_delta(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._lookup_scope = nullcontext
             dumper._output_dir = tmp_dir
             dumper._file_prefix = "delta_embedding"
             dumper._rank = 0
@@ -2452,6 +2454,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_completed_upload_state_is_none_in_local_mode(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._lookup_scope = nullcontext
             dumper._output_dir = tmp_dir
             dumper._file_prefix = "delta_embedding"
             dumper._rank = 0
@@ -2489,6 +2492,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_dump_submits_empty_table_to_uploader_when_no_delta_rows(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._lookup_scope = nullcontext
             dumper._output_dir = tmp_dir
             dumper._file_prefix = "delta_embedding"
             dumper._rank = 0
@@ -2514,6 +2518,7 @@ class DeltaEmbeddingDumpValidationTest(unittest.TestCase):
     def test_dump_submits_concatenated_rows_to_uploader(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             dumper = object.__new__(DeltaEmbeddingDumper)
+            dumper._lookup_scope = nullcontext
             dumper._output_dir = tmp_dir
             dumper._file_prefix = "delta_embedding"
             dumper._rank = 0

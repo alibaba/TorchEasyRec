@@ -79,7 +79,8 @@ def create_planner(
         reserve_percent=host_reserve_percent,
     )
     allow_rocksdb = rocksdb is not None
-    if allow_rocksdb:
+    cfg = None
+    if rocksdb is not None:
         cfg = rocksdb.config
         sharing_ranks = (
             dist.get_world_size() if cfg.shared_across_nodes else local_world_size
@@ -105,7 +106,7 @@ def create_planner(
 
     ddr_caps = tuple(d.storage.ddr or 0 for d in topology.devices)
     if allow_rocksdb:
-        shared = rocksdb_util.shared_storage(local_world_size)
+        shared = rocksdb_util.shared_storage(local_world_size, cfg)
         for device_storage in topology.devices:
             if not shared.fits_in(device_storage.storage):
                 available = device_storage.storage
@@ -197,6 +198,7 @@ def create_planner(
         fqn_constraints=fqn_constraints,
         global_constraints=global_constraints,
         allow_rocksdb=allow_rocksdb,
+        rocksdb_block_size=cfg.sst_block_size_bytes if cfg is not None else None,
     )
     callbacks = None
     if allow_rocksdb:
@@ -205,6 +207,7 @@ def create_planner(
                 rocksdb_util.configure_backend,
                 ddr_caps=ddr_caps,
                 local_world_size=local_world_size,
+                config=cfg,
             )
         ]
     planner_type = os.environ.get("TZREC_PLANNER", "dp")

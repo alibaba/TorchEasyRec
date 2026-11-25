@@ -166,6 +166,24 @@ class SharedStorageTest(unittest.TestCase):
             shared.ssd, overheads["compaction_headroom"] + overheads["other_files"]
         )
 
+    def test_io_config_sets_rank_budget_and_increases_per_database_ssd_reserve(self):
+        config = train_pb2.RocksDBConfig(
+            root_dir="/tmp",
+            num_db_shards_per_rank=4,
+            io_threads_per_rank=64,
+            sst_block_size_bytes=2048,
+        )
+        backend = rocksdb_util.backend_config(
+            1, block_cache_bytes=32 << 20, import_budget_bytes=64 << 20, config=config
+        )
+        self.assertEqual(backend.io_threads_per_rank, 64)
+        self.assertEqual(backend.num_db_shards_per_rank, 4)
+        self.assertEqual(backend.sst_block_size_bytes, 2048)
+        sharded = rocksdb_util.shared_storage(1, config)
+        baseline = rocksdb_util.shared_storage(1)
+        self.assertEqual(sharded.ddr, baseline.ddr)
+        self.assertGreater(sharded.ssd, baseline.ssd)
+
     @parameterized.expand(
         [
             ("uneven", [3, 7], 35),

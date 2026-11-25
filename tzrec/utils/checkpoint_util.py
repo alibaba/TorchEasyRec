@@ -19,6 +19,7 @@ import shutil
 import tempfile
 import threading
 import weakref
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from typing import Any, Callable, Container, Dict, List, Optional, Set, Tuple, cast
 
@@ -361,6 +362,7 @@ class CheckpointManager:
             model immediately before a logical DynamicEmb import, so an
             offloading backend can prepare its tables; discovery and
             dense-only restores never call it.
+        save_scope: Optional context factory around checkpoint data writes.
     """
 
     def __init__(
@@ -370,9 +372,11 @@ class CheckpointManager:
         export_config: Optional[export_pb2.ExportConfig] = None,
         eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
         before_dynamicemb_load: Optional[Callable[[nn.Module], None]] = None,
+        save_scope: Callable[[], AbstractContextManager[None]] = nullcontext,
     ) -> None:
         self._model_dir = model_dir
         self._before_dynamicemb_load = before_dynamicemb_load
+        self._save_scope = save_scope
         self._keep_checkpoint_max = keep_checkpoint_max
         self._export_config = export_config
         self._eval_result_filename = eval_result_filename
@@ -408,7 +412,8 @@ class CheckpointManager:
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune."""
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
-        save_model(ckpt_dir, model, optimizer, dense_ema)
+        with self._save_scope():
+            save_model(ckpt_dir, model, optimizer, dense_ema)
         if lr_schedulers is not None:
             save_lr_schedulers(ckpt_dir, lr_schedulers)
         if dataloader_state is not None:

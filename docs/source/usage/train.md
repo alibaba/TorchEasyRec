@@ -236,6 +236,28 @@ export TZREC_MILP_RELATIVE_GAP=0.001
 
 MILP 的求解器超时默认 60 秒，不包含候选枚举、建模与结果校验，求解器退出也可能略超预算。
 
+#### RocksDB I/O 配置
+
+在 `train_config.rocksdb_config` 下配置。省略这些字段时使用单库、自动 I/O 线程数和原有 RocksDB 默认设置。
+
+```protobuf
+rocksdb_config {
+    root_dir: "/mnt/local/rocksdb"
+    sst_block_size_bytes: 2048
+    block_align: true
+    use_direct_reads: true
+    io_threads_per_rank: 256
+    num_db_shards_per_rank: 4
+    background_io_base_rate_per_rank_mib_per_sec: 96
+    background_io_max_rate_per_rank_mib_per_sec: 512
+}
+```
+
+- `sst_block_size_bytes` 默认为 16 KiB。`block_align` 控制 SST 写块对齐。
+- `use_direct_reads` 默认关闭。启用后可指定 `direct_read_alignment_bytes`，例如 512。RocksDB 在工作目录所在挂载上验证显式对齐值。省略时使用 RocksDB 探测结果。
+- `io_threads_per_rank` 是同一 rank 的原生批量 I/O 线程总数。四个 DB 分配 256 个线程时，每库 64 个。`num_db_shards_per_rank` 控制 DB 数，同一张表的主记录和淘汰索引位于同一个 DB。
+- 两个后台限速字段都以 MiB/s 为单位，限制同一 rank 内各 DB 的 flush 和 compaction 流量。只设一个值使用固定档位。两个值都设时，训练期间根据 L0 文件数和待压实量在基础档和最高档之间调整，增量发布取值与 checkpoint 保存期间切换到最高档。
+
 (embedding-sharding-constraints)=
 
 ### Embedding分片约束

@@ -38,7 +38,8 @@ import hashlib
 import os
 import shutil
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, cast
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, cast
 
 from torch import nn
 
@@ -70,6 +71,7 @@ def backend_config(
     *,
     block_cache_bytes: int,
     import_budget_bytes: int,
+    config: Optional[train_pb2.RocksDBConfig] = None,
 ) -> Any:
     """The common backend configuration a plan derives its budgets from.
 
@@ -80,10 +82,25 @@ def backend_config(
         local_world_size: Number of ranks sharing the host's CPUs.
         block_cache_bytes: Block-cache capacity per rank, including metadata.
         import_budget_bytes: Temporary host-memory budget for checkpoint import.
+        config: User settings for the RocksDB backend.
     """
     from tzrec_ext.rocksdb import BackendConfig
 
     cpus = max(1, len(os.sched_getaffinity(0)) // max(local_world_size, 1))
+    overrides = {}
+    if config is not None:
+        for field in (
+            "sst_block_size_bytes",
+            "block_align",
+            "use_direct_reads",
+            "direct_read_alignment_bytes",
+            "io_threads_per_rank",
+            "num_db_shards_per_rank",
+            "background_io_base_rate_per_rank_mib_per_sec",
+            "background_io_max_rate_per_rank_mib_per_sec",
+        ):
+            if config.HasField(field):
+                overrides[field] = getattr(config, field)
     return BackendConfig(
         block_cache_bytes=block_cache_bytes,
         write_buffer_bytes=WRITE_BUFFER_BYTES,
@@ -91,6 +108,7 @@ def backend_config(
         import_budget_bytes=import_budget_bytes,
         io_threads=max(4, cpus),
         max_background_jobs=max(2, cpus // 4),
+        **overrides,
     )
 
 
@@ -99,6 +117,7 @@ def configure_backend(
     *,
     ddr_caps: Tuple[int, ...],
     local_world_size: int,
+    config: Optional[train_pb2.RocksDBConfig] = None,
 ) -> List["ShardingOption"]:
     """Configure the shared RocksDB backend from selected shard budgets.
 
@@ -107,6 +126,7 @@ def configure_backend(
         ddr_caps: Per-rank host budget shares before the shared RocksDB reserve,
             pooled per node to compute the import budget.
         local_world_size: Number of ranks sharing one host.
+        config: User settings for the RocksDB backend.
 
     Returns:
         The selected options with backend configuration attached to their
@@ -144,6 +164,7 @@ def configure_backend(
         local_world_size=local_world_size,
         block_cache_bytes=block_cache_bytes,
         import_budget_bytes=import_budget_bytes,
+        config=config,
     )
     for option in rocksdb_options:
         options = option.dynamicemb_options
@@ -161,18 +182,26 @@ def configure_backend(
     return selected
 
 
-def shared_storage(local_world_size: int) -> Any:
+def shared_storage(
+    local_world_size: int, config: Optional[train_pb2.RocksDBConfig] = None
+) -> Any:
     """Shared per-rank resources reserved before RocksDB candidate enumeration.
 
     DDR covers fixed buffers and host headroom; SSD covers compaction and
     other DB files. Table SSD estimates use SST_FACTOR as an empirical
     allowance for restore spill. Filesystem reserve is deducted separately.
+
+    Args:
+        local_world_size: Number of ranks sharing one host.
+        config: User settings for the RocksDB backend.
     """
     from torchrec.distributed.planner.types import Storage
     from tzrec_ext.rocksdb import disk_overheads
 
     overheads = disk_overheads(
-        backend_config(local_world_size, block_cache_bytes=0, import_budget_bytes=0)
+        backend_config(
+            local_world_size, block_cache_bytes=0, import_budget_bytes=0, config=config
+        )
     )
     return Storage(
         hbm=0,
@@ -303,6 +332,20 @@ class RocksDBRuntime:
         """
         for m in self.groups:
             m.tables.maybe_evict_records()
+
+    @contextmanager
+    def artifact_io_scope(self) -> Iterator[None]:
+        """Give the backend its artifact-phase background I/O budget."""
+        if self.session is None:
+            yield
+        else:
+            with self.session.artifact_io_scope():
+                yield
+
+    def refresh_background_io_rate(self) -> None:
+        """Adjust the training rate according to compaction pressure."""
+        if self.session is not None:
+            self.session.refresh_background_io_rate()
 
     def reset_for_import(self, model: nn.Module) -> None:
         """Start RocksDB tables from a fresh empty DB before ``DynamicEmbLoad``.

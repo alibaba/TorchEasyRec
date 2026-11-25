@@ -103,6 +103,10 @@ class ShardedModelRuntime:
             if mode == "train"
             else {}
         )
+        if backend is not None and train.rocksdb_config.HasField(
+            "background_io_max_rate_per_rank_mib_per_sec"
+        ):
+            manager_kwargs["save_scope"] = backend.artifact_io_scope
         try:
             with closing(
                 CheckpointManager(
@@ -176,6 +180,15 @@ class ShardedModelRuntime:
             self._rocksdb.attach(dmp_model)
         return dmp_model
 
+    @contextmanager
+    def artifact_io_scope(self) -> Iterator[None]:
+        """Enable the configured background I/O rate during artifact lookup."""
+        if self._rocksdb is not None:
+            with self._rocksdb.artifact_io_scope():
+                yield
+        else:
+            yield
+
     def maintain(self, *, global_step: int) -> None:
         """Run synchronous maintenance at a safe training boundary.
 
@@ -187,3 +200,5 @@ class ShardedModelRuntime:
         """
         if self._rocksdb is not None:
             self._rocksdb.evict()
+            if global_step and global_step % 100 == 0:
+                self._rocksdb.refresh_background_io_rate()

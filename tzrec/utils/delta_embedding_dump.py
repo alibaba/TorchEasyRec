@@ -11,11 +11,12 @@
 
 import os
 import time
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -832,6 +833,7 @@ class DeltaEmbeddingDumper:
         model: The model containing embedding tables to track.
         config: Configuration for delta embedding dump behavior.
         model_dir: Base directory for model outputs; used as default output location.
+        lookup_scope: Optional context factory around publication lookup.
         device: Training device; validated to be CUDA.
     """
 
@@ -841,9 +843,12 @@ class DeltaEmbeddingDumper:
         config: DeltaEmbeddingDumpConfig,
         model_dir: str,
         device: torch.device,
+        *,
+        lookup_scope: Callable[[], AbstractContextManager[None]] = nullcontext,
     ) -> None:
         validate_delta_embedding_dump_config(config, device)
         self._model = model
+        self._lookup_scope = lookup_scope
         self._config = config
         self._quant_type = config.quant_type
         self._dump_evicted_tombstones = bool(config.dump_evicted_tombstones)
@@ -1208,13 +1213,14 @@ class DeltaEmbeddingDumper:
         table_weights = self._collect_table_weights()
         dynamic_modules = self._collect_dynamic_modules()
         table_chunks: List[pa.Table] = []
-        num_rows = self._append_model_delta_rows(
-            table_chunks,
-            global_step=global_step,
-            table_weights=table_weights,
-            dynamic_modules=dynamic_modules,
-            dump_evicted_tombstones=self._dump_evicted_tombstones,
-        )
+        with self._lookup_scope():
+            num_rows = self._append_model_delta_rows(
+                table_chunks,
+                global_step=global_step,
+                table_weights=table_weights,
+                dynamic_modules=dynamic_modules,
+                dump_evicted_tombstones=self._dump_evicted_tombstones,
+            )
         output_path: Optional[str] = None
         if write_local and (num_rows > 0 or self._world_size > 1):
             # Multi-rank shard sets stay complete even for an empty rank so
