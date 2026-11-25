@@ -13,7 +13,7 @@
 
 import os
 from contextlib import closing, contextmanager
-from typing import Any, Iterator, Literal, Optional
+from typing import TYPE_CHECKING, Iterator, Literal, Optional
 
 import torch
 from torch import distributed as dist
@@ -29,6 +29,9 @@ from tzrec.utils.dist_util import DistributedModelParallel
 from tzrec.utils.logging_util import logger
 from tzrec.utils.plan_util import create_planner, get_default_sharders
 
+if TYPE_CHECKING:
+    from tzrec.utils.rocksdb_util import RocksDBRuntime
+
 
 class ShardedModelRuntime:
     """Own the checkpoint manager and the sharding setup of one job.
@@ -43,7 +46,7 @@ class ShardedModelRuntime:
         self,
         checkpoints: CheckpointManager,
         global_constraints_cfg: Optional[ParameterConstraints],
-        rocksdb: Optional[Any] = None,
+        rocksdb: Optional["RocksDBRuntime"] = None,
     ) -> None:
         """Initialize around an owned manager and job-wide constraints.
 
@@ -103,17 +106,11 @@ class ShardedModelRuntime:
             if mode == "train"
             else {}
         )
-        if backend is not None and train.rocksdb_config.HasField(
-            "background_io_max_rate_per_rank_mib_per_sec"
-        ):
-            manager_kwargs["save_scope"] = backend.artifact_io_scope
         try:
             with closing(
                 CheckpointManager(
                     pipeline_config.model_dir,
-                    before_dynamicemb_load=(
-                        backend.reset_for_import if backend is not None else None
-                    ),
+                    rocksdb=backend,
                     **manager_kwargs,
                 )
             ) as checkpoints:
@@ -180,14 +177,10 @@ class ShardedModelRuntime:
             self._rocksdb.attach(dmp_model)
         return dmp_model
 
-    @contextmanager
-    def artifact_io_scope(self) -> Iterator[None]:
-        """Enable the configured background I/O rate during artifact lookup."""
-        if self._rocksdb is not None:
-            with self._rocksdb.artifact_io_scope():
-                yield
-        else:
-            yield
+    @property
+    def rocksdb(self) -> Optional["RocksDBRuntime"]:
+        """Return this rank's optional backend for checkpoint and delta I/O."""
+        return self._rocksdb
 
     def maintain(self, *, global_step: int) -> None:
         """Run synchronous maintenance at a safe training boundary.

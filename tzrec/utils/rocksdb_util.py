@@ -49,6 +49,7 @@ from tzrec.utils.logging_util import logger
 if TYPE_CHECKING:
     from dynamicemb import DynamicEmbTableOptions
     from torchrec.distributed.planner.types import ShardingOption
+    from tzrec_ext.rocksdb import IOPhase
 
 # Host memory a rank needs beyond the planned RocksDB budgets (table readers,
 # iterators, pinned blocks, allocator slack).
@@ -347,12 +348,12 @@ class RocksDBRuntime:
             m.tables.maybe_evict_records()
 
     @contextmanager
-    def artifact_io_scope(self) -> Iterator[None]:
-        """Give the backend its artifact-phase background I/O budget."""
+    def io_phase(self, phase: "IOPhase") -> Iterator[None]:
+        """Apply the I/O phase to the bound session."""
         if self.session is None:
             yield
         else:
-            with self.session.artifact_io_scope():
+            with self.session.io_phase(phase):
                 yield
 
     def refresh_background_io_rate(self) -> None:

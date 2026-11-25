@@ -47,7 +47,7 @@ class ShardedModelRuntimeTest(unittest.TestCase):
             with ShardedModelRuntime.open(config, mode="train") as runtime:
                 manager_cls.assert_called_once_with(
                     config.model_dir,
-                    before_dynamicemb_load=None,
+                    rocksdb=None,
                     keep_checkpoint_max=3,
                     export_config=config.export_config,
                 )
@@ -64,9 +64,7 @@ class ShardedModelRuntimeTest(unittest.TestCase):
             "tzrec.utils.runtime.CheckpointManager", return_value=manager
         ) as manager_cls:
             with ShardedModelRuntime.open(config, mode=mode) as runtime:
-                manager_cls.assert_called_once_with(
-                    config.model_dir, before_dynamicemb_load=None
-                )
+                manager_cls.assert_called_once_with(config.model_dir, rocksdb=None)
                 self.assertIs(runtime.checkpoints, manager)
         manager.close.assert_called_once()
 
@@ -165,7 +163,7 @@ class ShardedModelRuntimeTest(unittest.TestCase):
         self.assertTrue(dmp_cls.call_args_list[1].kwargs["init_parameters"])
         self.assertTrue(dmp_cls.call_args_list[1].kwargs["init_data_parallel"])
 
-    def test_open_passes_reset_to_the_manager_and_closes_in_order(self) -> None:
+    def test_open_shares_backend_with_the_manager_and_closes_in_order(self) -> None:
         config = _pipeline_config()
         config.train_config.rocksdb_config.root_dir = "/tmp/tzrec_rocksdb"
         backend, manager = mock.Mock(), mock.Mock()
@@ -185,11 +183,8 @@ class ShardedModelRuntimeTest(unittest.TestCase):
                 factory.assert_called_once_with(
                     config.train_config.rocksdb_config, config.model_dir, "eval"
                 )
-                manager_cls.assert_called_once_with(
-                    config.model_dir,
-                    before_dynamicemb_load=backend.reset_for_import,
-                )
-                self.assertIs(runtime._rocksdb, backend)
+                manager_cls.assert_called_once_with(config.model_dir, rocksdb=backend)
+                self.assertIs(runtime.rocksdb, backend)
                 self.assertEqual(order, [])
             self.assertEqual(order, ["manager", "backend"])
 

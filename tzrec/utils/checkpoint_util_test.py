@@ -16,6 +16,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 import torch
@@ -259,6 +260,31 @@ class CheckpointUtilTest(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
+
+    def test_checkpoint_save_marks_model_writes_as_checkpoint_io(self):
+        phases = []
+
+        @contextmanager
+        def io_phase(phase):
+            phases.append(phase)
+            try:
+                yield
+            finally:
+                phases.pop()
+
+        backend = mock.Mock(io_phase=io_phase)
+        manager = checkpoint_util.CheckpointManager(self.test_dir, rocksdb=backend)
+        self.addCleanup(manager.close)
+
+        def save_model(*_):
+            self.assertEqual(phases, ["checkpoint_save"])
+
+        with mock.patch(
+            "tzrec.utils.checkpoint_util.save_model", side_effect=save_model
+        ):
+            ckpt_dir = manager.save(3, nn.Linear(1, 1))
+        self.assertEqual(phases, [])
+        self.assertTrue(os.path.isfile(os.path.join(ckpt_dir, "_SUCCESS")))
 
     def test_latest_checkpoint_with_model_dir(self):
         os.makedirs(os.path.join(self.test_dir, "model.ckpt-0"))

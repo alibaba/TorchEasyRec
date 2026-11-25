@@ -19,9 +19,20 @@ import shutil
 import tempfile
 import threading
 import weakref
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import nullcontext
 from dataclasses import replace
-from typing import Any, Callable, Container, Dict, List, Optional, Set, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Container,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    cast,
+)
 
 import torch
 import torch.distributed as dist
@@ -48,6 +59,9 @@ from tzrec.protos import export_pb2
 from tzrec.utils import env_util
 from tzrec.utils.dynamicemb_util import has_dynamicemb
 from tzrec.utils.logging_util import logger
+
+if TYPE_CHECKING:
+    from tzrec.utils.rocksdb_util import RocksDBRuntime
 
 # INPUT_TILE=3 load-time fallback from user-side keys to non-user checkpoint keys.
 _INPUT_TILE_USER_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
@@ -358,11 +372,7 @@ class CheckpointManager:
             (by eval metric) is always retained even if older than the kept window.
         eval_result_filename: eval result file (relative to ``model_dir``) used to
             locate the best checkpoint.
-        before_dynamicemb_load: optional callback invoked with the target
-            model immediately before a logical DynamicEmb import, so an
-            offloading backend can prepare its tables; discovery and
-            dense-only restores never call it.
-        save_scope: Optional context factory around checkpoint data writes.
+        rocksdb: optional rank-local backend borrowed from the model runtime.
     """
 
     def __init__(
@@ -371,12 +381,10 @@ class CheckpointManager:
         keep_checkpoint_max: int = 0,
         export_config: Optional[export_pb2.ExportConfig] = None,
         eval_result_filename: str = TRAIN_EVAL_RESULT_FILENAME,
-        before_dynamicemb_load: Optional[Callable[[nn.Module], None]] = None,
-        save_scope: Callable[[], AbstractContextManager[None]] = nullcontext,
+        rocksdb: Optional["RocksDBRuntime"] = None,
     ) -> None:
         self._model_dir = model_dir
-        self._before_dynamicemb_load = before_dynamicemb_load
-        self._save_scope = save_scope
+        self._rocksdb = rocksdb
         self._keep_checkpoint_max = keep_checkpoint_max
         self._export_config = export_config
         self._eval_result_filename = eval_result_filename
@@ -412,7 +420,11 @@ class CheckpointManager:
     ) -> str:
         """Save a checkpoint at the given step, then request an async prune."""
         ckpt_dir = os.path.join(self._model_dir, f"model.ckpt-{step}")
-        with self._save_scope():
+        with (
+            self._rocksdb.io_phase("checkpoint_save")
+            if self._rocksdb is not None
+            else nullcontext()
+        ):
             save_model(ckpt_dir, model, optimizer, dense_ema)
         if lr_schedulers is not None:
             save_lr_schedulers(ckpt_dir, lr_schedulers)
@@ -674,7 +686,9 @@ class CheckpointManager:
             ckpt_param_map_path,
             dense_ema=dense_ema,
             use_dense_ema=use_dense_ema,
-            before_dynamicemb_load=self._before_dynamicemb_load,
+            before_dynamicemb_load=(
+                self._rocksdb.reset_for_import if self._rocksdb is not None else None
+            ),
         )
         if lr_schedulers is not None:
             restore_lr_schedulers(ckpt_path, lr_schedulers)

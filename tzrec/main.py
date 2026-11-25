@@ -1043,7 +1043,7 @@ def train_and_evaluate(
                 train_config.delta_embedding_dump_config,
                 pipeline_config.model_dir,
                 device,
-                lookup_scope=runtime.artifact_io_scope,
+                rocksdb=runtime.rocksdb,
             )
 
         dense_optim_cls, dense_optim_kwargs = optimizer_builder.create_dense_optimizer(
