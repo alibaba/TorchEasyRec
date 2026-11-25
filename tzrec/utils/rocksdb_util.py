@@ -89,23 +89,28 @@ def backend_config(
     cpus = max(1, len(os.sched_getaffinity(0)) // max(local_world_size, 1))
     overrides = {}
     if config is not None:
-        for field in (
-            "sst_block_size_bytes",
-            "block_align",
-            "use_direct_reads",
-            "direct_read_alignment_bytes",
-            "io_threads_per_rank",
-            "num_db_shards_per_rank",
-            "background_io_base_rate_per_rank_mib_per_sec",
-            "background_io_max_rate_per_rank_mib_per_sec",
-        ):
+        backend_fields = {
+            "sst_block_size_bytes": "sst_block_size_bytes",
+            "block_align": "block_align",
+            "use_direct_reads": "use_direct_reads",
+            "direct_read_alignment_bytes": "direct_read_alignment_bytes",
+            "num_db_shards_per_rank": "num_db_shards",
+            "io_threads_per_rank": "io_threads",
+            "background_io_base_rate_per_rank_mib_per_sec": (
+                "background_io_base_rate_mib_per_sec"
+            ),
+            "background_io_max_rate_per_rank_mib_per_sec": (
+                "background_io_max_rate_mib_per_sec"
+            ),
+        }
+        for field, backend_field in backend_fields.items():
             if config.HasField(field):
-                overrides[field] = getattr(config, field)
+                overrides[backend_field] = getattr(config, field)
     base_threads = max(4, cpus)
     overrides.setdefault(
-        "io_threads_per_rank",
+        "io_threads",
         max(
-            overrides.get("num_db_shards_per_rank", 1),
+            overrides.get("num_db_shards", 1),
             base_threads,
             min(2 * base_threads, 64),
         ),

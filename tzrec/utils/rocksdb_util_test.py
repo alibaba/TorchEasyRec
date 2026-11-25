@@ -171,21 +171,25 @@ class SharedStorageTest(unittest.TestCase):
             backend = rocksdb_util.backend_config(
                 2, block_cache_bytes=32 << 20, import_budget_bytes=64 << 20
             )
-        self.assertEqual(backend.io_threads_per_rank, 32)
+        self.assertEqual(backend.io_threads, 32)
 
     def test_io_config_sets_rank_budget_and_increases_per_database_ssd_reserve(self):
         config = train_pb2.RocksDBConfig(
             root_dir="/tmp",
             num_db_shards_per_rank=4,
-            io_threads_per_rank=64,
+            io_threads_per_rank=24,
             sst_block_size_bytes=2048,
+            background_io_base_rate_per_rank_mib_per_sec=96,
+            background_io_max_rate_per_rank_mib_per_sec=512,
         )
         backend = rocksdb_util.backend_config(
             1, block_cache_bytes=32 << 20, import_budget_bytes=64 << 20, config=config
         )
-        self.assertEqual(backend.io_threads_per_rank, 64)
-        self.assertEqual(backend.num_db_shards_per_rank, 4)
+        self.assertEqual(backend.io_threads, 24)
+        self.assertEqual(backend.num_db_shards, 4)
         self.assertEqual(backend.sst_block_size_bytes, 2048)
+        self.assertEqual(backend.background_io_base_rate_mib_per_sec, 96)
+        self.assertEqual(backend.background_io_max_rate_mib_per_sec, 512)
         sharded = rocksdb_util.shared_storage(1, config)
         baseline = rocksdb_util.shared_storage(1)
         self.assertEqual(sharded.ddr, baseline.ddr)
