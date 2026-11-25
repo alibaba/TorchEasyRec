@@ -166,6 +166,13 @@ class SharedStorageTest(unittest.TestCase):
             shared.ssd, overheads["compaction_headroom"] + overheads["other_files"]
         )
 
+    def test_default_backend_io_threads_follow_rank_cpu_affinity(self):
+        with mock.patch("os.sched_getaffinity", return_value=set(range(32))):
+            backend = rocksdb_util.backend_config(
+                2, block_cache_bytes=32 << 20, import_budget_bytes=64 << 20
+            )
+        self.assertEqual(backend.io_threads_per_rank, 32)
+
     def test_io_config_sets_rank_budget_and_increases_per_database_ssd_reserve(self):
         config = train_pb2.RocksDBConfig(
             root_dir="/tmp",

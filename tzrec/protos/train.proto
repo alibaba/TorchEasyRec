@@ -183,7 +183,8 @@ message RocksDBConfig {
     optional bool use_direct_reads = 6 [default = false];
     // Explicit direct-read alignment in bytes. Unset uses RocksDB detection.
     optional uint64 direct_read_alignment_bytes = 7;
-    // Total native batch I/O threads across this rank's databases.
+    // Native batch I/O threads across this rank's databases, also the
+    // maximum number of file readers during checkpoint import.
     optional uint32 io_threads_per_rank = 8;
     // Number of local RocksDB databases created by each rank.
     optional uint32 num_db_shards_per_rank = 9 [default = 1];

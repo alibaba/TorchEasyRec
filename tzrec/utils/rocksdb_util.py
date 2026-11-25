@@ -101,12 +101,20 @@ def backend_config(
         ):
             if config.HasField(field):
                 overrides[field] = getattr(config, field)
+    base_threads = max(4, cpus)
+    overrides.setdefault(
+        "io_threads_per_rank",
+        max(
+            overrides.get("num_db_shards_per_rank", 1),
+            base_threads,
+            min(2 * base_threads, 64),
+        ),
+    )
     return BackendConfig(
         block_cache_bytes=block_cache_bytes,
         write_buffer_bytes=WRITE_BUFFER_BYTES,
         staging_buffer_bytes=STAGING_BUFFER_BYTES,
         import_budget_bytes=import_budget_bytes,
-        io_threads=max(4, cpus),
         max_background_jobs=max(2, cpus // 4),
         **overrides,
     )
