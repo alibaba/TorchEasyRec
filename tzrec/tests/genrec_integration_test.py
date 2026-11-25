@@ -419,12 +419,14 @@ class GenRecIntegrationTest(unittest.TestCase):
         for name in ("config.json", "model.safetensors", "tokenizer.json"):
             self.assertTrue(os.path.exists(os.path.join(dist_dir, name)), name)
         with open(os.path.join(dist_dir, "model_acc.json"), "r") as f:
-            self.assertEqual(json.load(f)["DISTRIBUTED_EMBEDDING"], "1")
+            acc_cfg = json.load(f)
+            self.assertEqual(acc_cfg["DISTRIBUTED_EMBEDDING"], "1")
+            self.assertEqual(acc_cfg["INPUT_TILE"], "0")
         with open(os.path.join(dist_dir, "dense_meta.json"), "r") as f:
             dense_meta = json.load(f)
         # collections form per dim, so tags__text joins tag_a's; the dense
         # score member has no sparse-stage entry and rides on its raw values;
-        # all-user DEEP groups are the input-tiled `_user` variant
+        # BaseGenRecModel disables INPUT_TILE so profile__ctx__ebc stays untiled.
         self.assertEqual(
             dense_meta,
             {
@@ -436,7 +438,7 @@ class GenRecIntegrationTest(unittest.TestCase):
                     "tags__tag_b__ec",
                     "tags__tag_b__lengths",
                 ],
-                "profile__ctx__ebc_user": [
+                "profile__ctx__ebc": [
                     "age__ebc",
                     "city__ebc",
                     "home_city__ebc",
@@ -444,6 +446,51 @@ class GenRecIntegrationTest(unittest.TestCase):
                 ],
             },
         )
+
+    @unittest.skipIf(*gpu_unavailable)
+    @mark_ci_scope("gpu")
+    def test_genrec_distributed_aoti_export_predict(self):
+        """Export a GenRec model with distributed AOTI and run predict."""
+        trained = self._train_eval_export()
+        dist_aot_dir = os.path.join(self.test_dir, "export_dist_aot")
+        self.success = False
+        self.success = utils.test_export(
+            trained,
+            self.test_dir,
+            export_dir=dist_aot_dir,
+            env_str="USE_DISTRIBUTED_EMBEDDING=1 ENABLE_AOT=2 QUANT_EMB=0",
+        )
+        self.assertTrue(self.success)
+        self.success = False
+
+        self.assertTrue(
+            os.path.exists(os.path.join(dist_aot_dir, "aoti/aoti_model.pt2"))
+        )
+        self.assertTrue(os.path.exists(os.path.join(dist_aot_dir, "dense_meta.json")))
+        with open(os.path.join(dist_aot_dir, "model_acc.json"), "r") as f:
+            aot_acc_cfg = json.load(f)
+        self.assertEqual(aot_acc_cfg.get("DISTRIBUTED_EMBEDDING"), "1")
+        self.assertEqual(aot_acc_cfg.get("INPUT_TILE"), "0")
+        self.assertEqual(aot_acc_cfg.get("ENABLE_AOT"), "2")
+
+        predict_dir = os.path.join(self.test_dir, "predict_dist_aot")
+        self.success = utils.test_predict(
+            dist_aot_dir,
+            self.data_glob,
+            predict_dir,
+            "answer",
+            "generated_sids",
+            self.test_dir,
+        )
+        self.assertTrue(self.success)
+        predicted = pq.read_table(predict_dir)
+        self.assertIn("answer", predicted.column_names)
+        sids = predicted.column("generated_sids").to_pylist()
+        self.assertEqual(len(sids), 8)
+        for row in sids:
+            self.assertEqual([len(beam) for beam in row], [3, 3])
+            for beam in row:
+                self.assertTrue(all(0 <= c < n for c, n in zip(beam, _CODEBOOK)), beam)
 
 
 if __name__ == "__main__":

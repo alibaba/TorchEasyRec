@@ -16,11 +16,13 @@ import json
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
-from tzrec.models.match_model import MatchModel
-from tzrec.models.tdm import TDM
+import torch
+
+from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.protos.models.match_model_pb2 import DSSM, TDM
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.tools.online_dense_export import (
     CURRENT_JSON,
     _prune_old_dense_versions,
@@ -37,7 +39,8 @@ class OnlineDenseExportTest(unittest.TestCase):
             pipeline_config_path = os.path.join(tmp_dir, "pipeline.config")
             open(pipeline_config_path, "w").close()
 
-            def fake_export_dense_model_cpu(**kwargs):
+            def fake_export_dense_model(**kwargs):
+                self.assertEqual(kwargs["device"], torch.device("cpu"))
                 self.assertNotIn("dense_only", kwargs)
                 save_dir = kwargs["save_dir"]
                 os.makedirs(save_dir, exist_ok=True)
@@ -46,11 +49,7 @@ class OnlineDenseExportTest(unittest.TestCase):
                 with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
                     json.dump({"group": ["feature__ebc"]}, f)
 
-            dummy_config = SimpleNamespace(
-                feature_configs=[],
-                data_config=SimpleNamespace(label_fields=[]),
-                model_config=SimpleNamespace(),
-            )
+            dummy_config = EasyRecConfig()
             dummy_model = mock.Mock()
 
             with (
@@ -76,8 +75,8 @@ class OnlineDenseExportTest(unittest.TestCase):
                     side_effect=lambda model: model,
                 ),
                 mock.patch(
-                    "tzrec.tools.online_dense_export.export_dense_model_cpu",
-                    side_effect=fake_export_dense_model_cpu,
+                    "tzrec.tools.online_dense_export.export_dense_model",
+                    side_effect=fake_export_dense_model,
                 ),
             ):
                 payload = export_online_dense_model(
@@ -162,7 +161,8 @@ class OnlineDenseExportTest(unittest.TestCase):
             own_tmp = f"20260101000002.tmp.{os.getpid()}"
             os.makedirs(os.path.join(versions_root, own_tmp))
 
-            def fake_export_dense_model_cpu(**kwargs):
+            def fake_export_dense_model(**kwargs):
+                self.assertEqual(kwargs["device"], torch.device("cpu"))
                 save_dir = kwargs["save_dir"]
                 os.makedirs(save_dir, exist_ok=True)
                 with open(os.path.join(save_dir, "scripted_model.pt"), "w") as f:
@@ -170,11 +170,7 @@ class OnlineDenseExportTest(unittest.TestCase):
                 with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
                     json.dump({}, f)
 
-            dummy_config = SimpleNamespace(
-                feature_configs=[],
-                data_config=SimpleNamespace(label_fields=[]),
-                model_config=SimpleNamespace(),
-            )
+            dummy_config = EasyRecConfig()
 
             with (
                 mock.patch.dict(
@@ -202,8 +198,8 @@ class OnlineDenseExportTest(unittest.TestCase):
                     side_effect=lambda model: model,
                 ),
                 mock.patch(
-                    "tzrec.tools.online_dense_export.export_dense_model_cpu",
-                    side_effect=fake_export_dense_model_cpu,
+                    "tzrec.tools.online_dense_export.export_dense_model",
+                    side_effect=fake_export_dense_model,
                 ),
             ):
                 export_online_dense_model(
@@ -306,17 +302,16 @@ class OnlineDenseExportTest(unittest.TestCase):
 
     def test_rejects_match_model_and_tdm(self) -> None:
         """MatchModel/TDM need per-tower/per-module export; reject them."""
-        for spec in (MatchModel, TDM):
+        cases = (
+            (EasyRecConfig(model_config=ModelConfig(dssm=DSSM())), "DSSM"),
+            (EasyRecConfig(model_config=ModelConfig(tdm=TDM())), "TDM"),
+        )
+        for cfg, expected_name in cases:
             with tempfile.TemporaryDirectory() as tmp_dir:
                 checkpoint_path = os.path.join(tmp_dir, "model.ckpt-10")
                 os.makedirs(checkpoint_path)
                 pipeline_config_path = os.path.join(tmp_dir, "pipeline.config")
                 open(pipeline_config_path, "w").close()
-                dummy_config = SimpleNamespace(
-                    feature_configs=[],
-                    data_config=SimpleNamespace(label_fields=[]),
-                    model_config=SimpleNamespace(),
-                )
                 with (
                     mock.patch.dict(
                         os.environ,
@@ -325,24 +320,22 @@ class OnlineDenseExportTest(unittest.TestCase):
                     ),
                     mock.patch(
                         "tzrec.tools.online_dense_export.config_util.load_pipeline_config",
-                        return_value=dummy_config,
+                        return_value=cfg,
                     ),
                     mock.patch(
-                        "tzrec.tools.online_dense_export._create_features",
-                        return_value=[],
-                    ),
-                    mock.patch(
-                        "tzrec.tools.online_dense_export._create_model",
-                        return_value=mock.Mock(spec=spec),
-                    ),
+                        "tzrec.tools.online_dense_export._create_model"
+                    ) as create_model_mock,
                 ):
-                    with self.assertRaisesRegex(RuntimeError, "does not support"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, f"does not support {expected_name}"
+                    ):
                         export_online_dense_model(
                             pipeline_config_path=pipeline_config_path,
                             checkpoint_path=checkpoint_path,
                             model_dir=tmp_dir,
                             version="20260623174705",
                         )
+                    create_model_mock.assert_not_called()
 
     def test_export_online_dense_model_honors_online_dense_export_dir(self) -> None:
         """ONLINE_DENSE_EXPORT_DIR redirects the publish root away from model_dir."""
@@ -353,7 +346,8 @@ class OnlineDenseExportTest(unittest.TestCase):
             open(pipeline_config_path, "w").close()
             override_root = os.path.join(tmp_dir, "serving_root")
 
-            def fake_export_dense_model_cpu(**kwargs):
+            def fake_export_dense_model(**kwargs):
+                self.assertEqual(kwargs["device"], torch.device("cpu"))
                 save_dir = kwargs["save_dir"]
                 os.makedirs(save_dir, exist_ok=True)
                 with open(os.path.join(save_dir, "scripted_model.pt"), "w") as f:
@@ -361,11 +355,7 @@ class OnlineDenseExportTest(unittest.TestCase):
                 with open(os.path.join(save_dir, "dense_meta.json"), "w") as f:
                     json.dump({}, f)
 
-            dummy_config = SimpleNamespace(
-                feature_configs=[],
-                data_config=SimpleNamespace(label_fields=[]),
-                model_config=SimpleNamespace(),
-            )
+            dummy_config = EasyRecConfig()
             with (
                 mock.patch.dict(
                     os.environ,
@@ -392,8 +382,8 @@ class OnlineDenseExportTest(unittest.TestCase):
                     side_effect=lambda model: model,
                 ),
                 mock.patch(
-                    "tzrec.tools.online_dense_export.export_dense_model_cpu",
-                    side_effect=fake_export_dense_model_cpu,
+                    "tzrec.tools.online_dense_export.export_dense_model",
+                    side_effect=fake_export_dense_model,
                 ),
             ):
                 export_online_dense_model(

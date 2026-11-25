@@ -32,7 +32,6 @@ from tzrec.protos.model_pb2 import FeatureGroupType
 HOLE_KEYS = "hole_keys"
 
 
-@torch.jit.script
 def mix64(z: torch.Tensor) -> torch.Tensor:
     """A SplitMix64-shaped avalanche over int64, wrapping.
 
@@ -109,10 +108,15 @@ class HoleKeyBuilder(nn.Module):
         # sample of a DEEP slot; a dense member has one row per hole either way
         first = batch[members[0] + ".values"]
         if first.is_floating_point():
-            num_holes = int(first.size(0))
+            num_holes = first.size(0)
+        elif is_sequence:
+            kl_key = members[0] + ".key_lengths"
+            if kl_key in batch:
+                num_holes = batch[kl_key].numel()
+            else:
+                num_holes = first.numel()
         else:
-            lengths = batch[members[0] + ".lengths"].to(torch.int64)
-            num_holes = int(torch.sum(lengths)) if is_sequence else int(lengths.numel())
+            num_holes = batch[members[0] + ".lengths"].numel()
         # seeded with the salt, not zero: a hole no value reaches -- an empty
         # DEEP member, a zero-length item -- is still that slot's hole
         keys = torch.full((num_holes,), salt, dtype=torch.int64, device=first.device)
@@ -140,12 +144,27 @@ class HoleKeyBuilder(nn.Module):
                     + 2 * torch.isneginf(floats).to(torch.int64)
                 )
                 values = torch.where(finite, encoded, special).reshape(-1)
-                hole = torch.arange(
-                    rows, dtype=torch.int64, device=raw.device
-                ).repeat_interleave(width)
+                hole = (
+                    (
+                        torch.cumsum(
+                            torch.ones((rows, 1), dtype=torch.int64, device=raw.device),
+                            dim=0,
+                        )
+                        - 1
+                    )
+                    .expand(rows, width)
+                    .reshape(-1)
+                )
                 local = (
-                    torch.arange(width, dtype=torch.int64, device=raw.device)
-                    .unsqueeze(0)
+                    (
+                        torch.cumsum(
+                            torch.ones(
+                                (1, width), dtype=torch.int64, device=raw.device
+                            ),
+                            dim=1,
+                        )
+                        - 1
+                    )
                     .expand(rows, width)
                     .reshape(-1)
                 )
@@ -154,20 +173,31 @@ class HoleKeyBuilder(nn.Module):
                 key_length_key = member + ".key_lengths"
                 if not is_sequence:
                     lengths = batch[member + ".lengths"].to(torch.int64)
-                    hole = _row_ids(lengths)
-                    local = _within_row_index(lengths)
+                    # Relies on parser contract: sum(lengths) == values.numel().
+                    output_size = values.numel()
+                    hole = _row_ids(lengths, output_size=output_size)
+                    local = _within_row_index(lengths, output_size=output_size)
                 elif key_length_key in batch:
                     key_lengths = batch[key_length_key].to(torch.int64).reshape(-1)
-                    hole = _row_ids(key_lengths)
-                    local = _within_row_index(key_lengths)
+                    # Relies on parser contract: sum(key_lengths) == values.numel().
+                    output_size = values.numel()
+                    hole = _row_ids(key_lengths, output_size=output_size)
+                    local = _within_row_index(key_lengths, output_size=output_size)
                 else:
-                    hole = torch.arange(
-                        values.numel(), dtype=torch.int64, device=values.device
-                    )
+                    hole = torch.cumsum(torch.ones_like(values), dim=0) - 1
                     local = torch.zeros_like(hole)
 
-            local = local + member_index * self.MEMBER_STRIDE
-            mixed = mix64(values * self.C_VALUE + local * self.C_INDEX + salt)
+            # Break SymPy IndexPropagation before adding the 2**32 member
+            # offset so Inductor casts local to int64 instead of int32.
+            local = (local ^ 0) + member_index * self.MEMBER_STRIDE
+            c_idx = torch.full(
+                (), self.C_INDEX, dtype=torch.int64, device=values.device
+            )
+            c_val = torch.full(
+                (), self.C_VALUE, dtype=torch.int64, device=values.device
+            )
+            slot_salt = torch.full((), salt, dtype=torch.int64, device=values.device)
+            mixed = mix64(values * c_val + local * c_idx + slot_salt)
             keys.index_add_(0, hole, mixed)
         return keys
 

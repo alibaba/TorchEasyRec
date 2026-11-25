@@ -188,7 +188,7 @@ class ParquetReader(BaseReader):
             batch_cost_size=batch_cost_size,
             **kwargs,
         )
-        self._pg = dist_util.get_dataset_process_group()
+        self._pg = dist_util.get_dataset_process_group(self._world_size)
         self._rebalance = rebalance
 
         self._ordered_cols = None
@@ -210,8 +210,8 @@ class ParquetReader(BaseReader):
             self._schema = parquet_file.schema_arrow
         parquet_file.close()
 
-        rank = int(os.environ.get("RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        rank = self._rank
+        world_size = self._world_size
 
         # get parquet metadata
         self._parquet_metas = {}
@@ -220,7 +220,8 @@ class ParquetReader(BaseReader):
         if self._rebalance:
             with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
                 for k, v in executor.map(
-                    _get_metadata, self._input_files[rank::world_size]
+                    _get_metadata,
+                    self._input_files[rank::world_size],
                 ):
                     parquet_metas_per_rank[k] = v
             if self._pg is not None:

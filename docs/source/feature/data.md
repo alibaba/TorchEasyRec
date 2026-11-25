@@ -118,7 +118,12 @@ data_config {
       - `TZREC_KAFKA_OFFSETS_FOR_TIMES_TIMEOUT`: 每次`offsets_for_times`请求的超时时间（秒），默认`30.0`
       - `TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES`: 每批请求失败后的重试次数，默认`2`
 
-  - 如需按分区严格轮询读取，可设置`data_config.kafka_partition_round_robin: true`，默认为false
+  - 支持`end.timestamp.ms`参数，可单独使用，也可与`start.timestamp.ms`组合成有限回放的时间窗口。
+
+    - 示例:
+      - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest&start.timestamp.ms=1711929600000&end.timestamp.ms=1712016000000`
+
+  - 如需按分区轮询读取，可设置`data_config.kafka_partition_round_robin: true`，默认为false
 
   - 如需观察各worker的读取量，可设置`data_config.kafka_log_every_n_messages`，默认为0
 
@@ -266,11 +271,11 @@ pipeline.global-job-parameters: |
     - --ODPS_CONFIG_FILE_PATH: 该环境变量指向的是odpscmd的配置文件
   - 在[DataWorks](https://workbench.data.aliyun.com/)的独享资源组中安装pyfg，「资源组列表」- 在一个调度资源组的「操作」栏 点「运维助手」-「创建命令」（选手动输入）-「运行命令」
     ```shell
-    /home/tops/bin/pip3 install http://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg108-1.0.8-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
+    /home/tops/bin/pip3 install http://tzrec.oss-accelerate.aliyuncs.com/third_party/pyfg109-1.0.9-cp37-cp37m-linux_x86_64.whl --index-url=https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.cloud.aliyuncs.com
     ```
   - 在DataWorks中建立`PyODPS 3`节点运行FG，节点调度参数中配置好bizdate参数
     ```
-    from pyfg108 import offline_pyfg
+    from pyfg109 import offline_pyfg
     offline_pyfg.run(
       o,
       input_table="YOU_PROJECT.TABLE_NAME",
@@ -373,7 +378,8 @@ pipeline.global-job-parameters: |
 
 ### kafka_partition_round_robin
 
-- 仅对KafkaDataset生效，默认为false；开启后启动时按leader排序分区并分发到各worker（有效全局worker数为`world_size * max(data_config.num_workers, 1)`），每个worker为自己负责的分区各创建一个consumer，每次一条Kafka消息，轮流分区读取，当前分区没有消息时持续等待
+- 仅对KafkaDataset生效，默认为false；开启后启动时按leader排序分区并分发到各worker（有效全局worker数为`world_size * max(data_config.num_workers, 1)`），每个worker为自己负责的分区各创建一个consumer
+- 每次从当前分区读取最多N条消息。N按消息平均行数估算，使各分区轮完一轮约凑满一个batch；根据缓存的水位跳过空分区和已追平的分区
 - 分区归属依据启动时的leader排序，运行期间固定；每个worker的consumer数量等于其负责的分区数
 
 ### kafka_log_every_n_messages

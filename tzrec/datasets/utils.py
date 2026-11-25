@@ -331,7 +331,10 @@ def batch_to_dict(
             tensor_dict[k + ".lengths"] = split_lengths[i]
     for k, v in sequence_dense_features.items():
         tensor_dict[k + ".values"] = v.values()
-        tensor_dict[k + ".lengths"] = v.lengths()
+        lengths = v.lengths()
+        if sparse_dtype is not None:
+            lengths = lengths.to(sparse_dtype)
+        tensor_dict[k + ".lengths"] = lengths
     if batch_size is not None:
         tensor_dict["batch_size"] = batch_size
     for k, v in additional_infos.items():

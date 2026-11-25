@@ -26,6 +26,7 @@ import pyarrow as pa
 import torch
 from parameterized import param, parameterized
 
+from tzrec.acc import utils as acc_utils
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.main import (
     _create_model,
@@ -142,8 +143,8 @@ class MainTest(unittest.TestCase):
             env_at_calls.append(
                 (
                     "features",
-                    os.environ.get("USE_DISTRIBUTED_EMBEDDING"),
-                    os.environ.get("INPUT_TILE"),
+                    "1" if acc_utils.use_distributed_embedding() else "0",
+                    acc_utils.get_input_tile(),
                 )
             )
             return []
@@ -152,8 +153,8 @@ class MainTest(unittest.TestCase):
             env_at_calls.append(
                 (
                     "model",
-                    os.environ.get("USE_DISTRIBUTED_EMBEDDING"),
-                    os.environ.get("INPUT_TILE"),
+                    "1" if acc_utils.use_distributed_embedding() else "0",
+                    acc_utils.get_input_tile(),
                 )
             )
             return mock.Mock()
@@ -1477,6 +1478,82 @@ class OnlineLearningHandoverTest(unittest.TestCase):
         dumper.final_dump.assert_called_once_with(2)
         dumper.close.assert_called_once()
         exporter.finalize_publish.assert_called_once()
+
+    def test_predict_rejects_batch_size_gt_one_for_input_tile_3_online(self) -> None:
+        from google.protobuf import text_format
+
+        cfg = EasyRecConfig()
+        cfg.data_config.batch_size = 1
+        with open(os.path.join(self.test_dir, "pipeline.config"), "w") as f:
+            f.write(text_format.MessageToString(cfg))
+        with open(os.path.join(self.test_dir, "model_acc.json"), "w") as f:
+            import json
+
+            json.dump({"INPUT_TILE_3_ONLINE": "1"}, f)
+        with (
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.acc_utils.allow_tf32_for_export"),
+            self.assertRaisesRegex(ValueError, "INPUT_TILE_3_ONLINE=1"),
+        ):
+            predict(
+                predict_input_path="unused",
+                predict_output_path="unused",
+                scripted_model_path=self.test_dir,
+                batch_size=2,
+            )
+
+    def test_predict_clears_stale_model_acc_json_before_remote_download(self) -> None:
+        import json
+
+        from google.protobuf import text_format
+
+        cache_dir = os.path.join(self.test_dir, "local_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        stale_acc = os.path.join(cache_dir, "model_acc.json")
+        with open(stale_acc, "w") as f:
+            json.dump({"INPUT_TILE_3_ONLINE": "1"}, f)
+
+        fake_fs = mock.Mock()
+
+        def _fake_download(src: str, dst: str, recursive: bool = True) -> None:
+            del src, recursive
+            self.assertFalse(os.path.exists(stale_acc))
+            cfg = EasyRecConfig()
+            cfg.data_config.batch_size = 4
+            with open(os.path.join(dst, "pipeline.config"), "w") as out:
+                out.write(text_format.MessageToString(cfg))
+            with open(os.path.join(dst, "model_acc.json"), "w") as out:
+                json.dump({"SPARSE_INT64": "1"}, out)
+
+        fake_fs.download.side_effect = _fake_download
+        with (
+            mock.patch.dict(
+                os.environ, {"LOCAL_CACHE_DIR": cache_dir, "LOCAL_RANK": "0"}
+            ),
+            mock.patch(
+                "tzrec.main.init_process_group",
+                return_value=(torch.device("cpu"), "gloo"),
+            ),
+            mock.patch("tzrec.main.url_to_fs", return_value=(fake_fs, "bucket/model")),
+            mock.patch("tzrec.main.dist.barrier"),
+            mock.patch("tzrec.main.acc_utils.allow_tf32_for_export"),
+            mock.patch("tzrec.main._create_features", return_value=[]),
+            mock.patch(
+                "tzrec.main.create_dataloader",
+                side_effect=RuntimeError("stop_after_acc"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "stop_after_acc"),
+        ):
+            predict(
+                predict_input_path="unused",
+                predict_output_path="unused",
+                scripted_model_path="oss://bucket/model",
+                batch_size=4,
+            )
+        fake_fs.download.assert_called_once()
 
 
 if __name__ == "__main__":

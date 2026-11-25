@@ -9,21 +9,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2026, Alibaba Group;
-# Licensed under the Apache License, Version 2.0 (the "License");
-
 import datetime
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from contextlib import contextmanager
-from types import SimpleNamespace
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from unittest import mock
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -35,17 +34,39 @@ from torch.distributed._shard.sharded_tensor.metadata import (
 )
 from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed.device_mesh import init_device_mesh
+from torch.utils._pytree import treespec_loads
 
+from tzrec.acc import utils as acc_utils
+from tzrec.features.feature import create_features
+from tzrec.models.model import ScriptWrapper
+from tzrec.models.multi_tower import MultiTower
 from tzrec.optim.ema import DenseEMA
-from tzrec.utils import misc_util
+from tzrec.protos import (
+    data_pb2,
+    export_pb2,
+    feature_pb2,
+    loss_pb2,
+    model_pb2,
+    module_pb2,
+    tower_pb2,
+    train_pb2,
+)
+from tzrec.protos.models import rank_model_pb2
+from tzrec.protos.pipeline_pb2 import EasyRecConfig
+from tzrec.tools.online_dense_export import export_online_dense_model
+from tzrec.tools.online_dense_export import main as online_dense_export_main
+from tzrec.utils import checkpoint_util, config_util, misc_util
 from tzrec.utils.online_dense_export_util import (
     OnlineDenseExportManager,
     _atomic_write_json,
     _make_monotonic_version,
     _read_current_version,
+    _warn_if_export_tf32_differs,
     make_version,
     resolve_dense_export_root,
 )
+from tzrec.utils.state_dict_util import init_parameters
+from tzrec.utils.test_util import gpu_unavailable, mark_ci_scope
 
 
 def _base_env(tmp_dir: str, **extra: str) -> Dict[str, str]:
@@ -59,6 +80,28 @@ def _base_env(tmp_dir: str, **extra: str) -> Dict[str, str]:
         "LOCAL_WORLD_SIZE": "1",
     }
     env.update(extra)
+    return env
+
+
+_GPU_HERMETIC_STRIP_KEYS = (
+    "INPUT_TILE",
+    "INPUT_TILE_3_ONLINE",
+    "HARD_SEARCH_INPUT_TILE",
+    "ENABLE_AOT",
+    "UNIFIED_AOT",
+    "ENABLE_TRT",
+    "USE_RTP",
+    "USE_DISTRIBUTED_EMBEDDING",
+    "ONLINE_DENSE_EXPORT",
+    "ONLINE_DENSE_EXPORT_DIR",
+    "ONLINE_DENSE_EXPORT_KEEP_VERSIONS",
+    "ONLINE_DENSE_EXPORT_TIMEOUT",
+)
+
+
+def _hermetic_gpu_env(overrides: Dict[str, str]) -> Dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _GPU_HERMETIC_STRIP_KEYS}
+    env.update(overrides)
     return env
 
 
@@ -96,12 +139,8 @@ class _TinyModel(nn.Module):
 _BUILD_PATCHES = "tzrec.utils.online_dense_export_util.{}"
 
 
-def _dummy_pipeline_config() -> SimpleNamespace:
-    return SimpleNamespace(
-        feature_configs=[],
-        data_config=SimpleNamespace(label_fields=[]),
-        model_config=SimpleNamespace(),
-    )
+def _dummy_pipeline_config() -> EasyRecConfig:
+    return EasyRecConfig()
 
 
 class OnlineDenseExportUtilTest(unittest.TestCase):
@@ -212,10 +251,13 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
 
         def fake_warmup(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             seen["world_size"] = os.environ.get("WORLD_SIZE")
+            seen["data_world_size"] = acc_utils.get_world_size()
+            seen["data_rank"] = acc_utils.get_rank()
             return {}
 
         def fake_finalize(*args: Any, **kwargs: Any) -> None:
-            seen["input_tile"] = os.environ.get("INPUT_TILE")
+            seen["input_tile"] = acc_utils.get_input_tile()
+            seen["env_input_tile"] = os.environ.get("INPUT_TILE")
 
         fake_gm = mock.Mock()
         fake_gm.state_dict.return_value = {}
@@ -253,7 +295,10 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
                     )
                     mgr.close()
                 self.assertEqual(seen["input_tile"], "3")
-                self.assertEqual(seen["world_size"], "1")
+                self.assertIsNone(seen["env_input_tile"])
+                self.assertEqual(seen["data_world_size"], 1)
+                self.assertEqual(seen["data_rank"], 0)
+                self.assertEqual(seen["world_size"], "4")
                 self.assertNotIn("INPUT_TILE", os.environ)
                 self.assertEqual(os.environ["WORLD_SIZE"], "4")
 
@@ -1217,6 +1262,637 @@ class OnlineDenseExportUtilTest(unittest.TestCase):
             with open(missing, "w") as f:
                 json.dump({"version": "20260101000001"}, f)
             self.assertEqual(_read_current_version(missing), "20260101000001")
+
+    # --- AOTI online export (CPU validation + GPU end-to-end) ---
+
+    def test_init_aot_requires_cuda(self) -> None:
+        """ENABLE_AOT with ONLINE_DENSE_EXPORT or bootstrap fails fast without CUDA."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with (
+                mock.patch.dict(
+                    os.environ, _base_env(tmp_dir, ENABLE_AOT="2"), clear=True
+                ),
+                mock.patch("torch.cuda.is_available", return_value=False),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "CUDA"):
+                    OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model({}),
+                    )
+                with self.assertRaisesRegex(RuntimeError, "CUDA"):
+                    export_online_dense_model(
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        checkpoint_path=os.path.join(tmp_dir, "model.ckpt-1"),
+                        model_dir=tmp_dir,
+                    )
+
+    def test_aot_build_and_worker_preserve_tf32_and_mixed_precision(self) -> None:
+        """AOTI build and worker apply export AMP without mutating TF32 globals."""
+        cfg = EasyRecConfig(
+            train_config=train_pb2.TrainConfig(
+                cudnn_allow_tf32=True, cuda_matmul_allow_tf32=True
+            ),
+            export_config=export_pb2.ExportConfig(
+                mixed_precision="BF16",
+                cudnn_allow_tf32=False,
+                cuda_matmul_allow_tf32=False,
+            ),
+        )
+        fake_gm = _TinyModel()
+        observed: List[Dict[str, Any]] = []
+
+        def fake_finalize(*args: Any, **kwargs: Any) -> Any:
+            observed.append(
+                {
+                    "device": args[4],
+                    "mixed_precision": kwargs.get("mixed_precision"),
+                    "has_dense_model_traced": "dense_model_traced" in kwargs,
+                    "dense_model_traced": kwargs.get("dense_model_traced"),
+                    "use_dist_emb": acc_utils.use_distributed_embedding(),
+                    "input_tile": acc_utils.is_input_tile(),
+                    "input_tile_3_online": acc_utils.is_input_tile_3_online(),
+                    "cudnn_tf32": torch.backends.cudnn.allow_tf32,
+                    "matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
+                }
+            )
+            return fake_gm
+
+        @contextmanager
+        def fake_stream_ctx(_stream: Any) -> Iterator[None]:
+            yield
+
+        fake_stream = mock.Mock()
+        prev_cudnn = torch.backends.cudnn.allow_tf32
+        prev_matmul = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                env = _base_env(tmp_dir, ENABLE_AOT="2", INPUT_TILE_3_ONLINE="1")
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch("torch.cuda.is_available", return_value=True),
+                    mock.patch("torch.cuda.set_device"),
+                    mock.patch("torch.cuda.synchronize") as mock_cuda_sync,
+                    mock.patch(
+                        "torch.cuda.Stream", return_value=fake_stream
+                    ) as mock_stream_cls,
+                    mock.patch("torch.cuda.stream", side_effect=fake_stream_ctx),
+                    mock.patch(
+                        _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                        return_value=cfg,
+                    ),
+                    mock.patch("tzrec.main._create_features", return_value=[]),
+                    mock.patch("tzrec.main._create_model", return_value=mock.Mock()),
+                    mock.patch(
+                        "tzrec.models.model.ScriptWrapper", side_effect=lambda m: m
+                    ),
+                    mock.patch(
+                        _BUILD_PATCHES.format("create_dense_export_warmup_data"),
+                        return_value={},
+                    ),
+                    mock.patch(
+                        _BUILD_PATCHES.format("build_dense_graph_module"),
+                        return_value=(fake_gm, mock.Mock(), {}),
+                    ) as mock_build,
+                    mock.patch(
+                        _BUILD_PATCHES.format("finalize_dense_export"),
+                        side_effect=fake_finalize,
+                    ),
+                ):
+                    state = {"w": torch.ones(2)}
+                    mgr = OnlineDenseExportManager(
+                        model_dir=tmp_dir,
+                        pipeline_config_path=os.path.join(tmp_dir, "pipeline.config"),
+                        model=_mock_model(state),
+                    )
+                    try:
+                        self.assertTrue(mgr._is_aot)
+                        self.assertIs(mgr._dense_model_traced, fake_gm)
+                        self.assertTrue(torch.backends.cudnn.allow_tf32)
+                        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+                        self.assertEqual(
+                            mock_build.call_args.kwargs["mixed_precision"], "BF16"
+                        )
+                        mgr.maybe_export(5, 42.0, _mock_model(state), force=True)
+                        self.assertTrue(_wait_for(lambda: mgr._ready is not None))
+                        mgr.maybe_export(10, 84.0, _mock_model(state), force=True)
+                        self.assertTrue(
+                            _wait_for(
+                                lambda: (
+                                    mgr._ready is not None and mgr._ready["step"] == 10
+                                )
+                            )
+                        )
+                        self.assertTrue(torch.backends.cudnn.allow_tf32)
+                        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+                    finally:
+                        mgr.close()
+                self.assertEqual(len(observed), 3)
+                for call in observed:
+                    self.assertEqual(call["device"], torch.device("cuda:0"))
+                    self.assertEqual(call["mixed_precision"], "BF16")
+                    self.assertTrue(call["cudnn_tf32"])
+                    self.assertTrue(call["matmul_tf32"])
+                self.assertFalse(observed[0]["has_dense_model_traced"])
+                self.assertIs(observed[1]["dense_model_traced"], fake_gm)
+                self.assertIs(observed[2]["dense_model_traced"], fake_gm)
+                for call in observed:
+                    self.assertIs(call["use_dist_emb"], True)
+                    self.assertIs(call["input_tile"], True)
+                    self.assertIs(call["input_tile_3_online"], True)
+                mock_stream_cls.assert_called_once_with(device=torch.device("cuda:0"))
+                mock_cuda_sync.assert_called_once_with(torch.device("cuda:0"))
+                self.assertEqual(fake_stream.synchronize.call_count, 2)
+        finally:
+            torch.backends.cudnn.allow_tf32 = prev_cudnn
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul
+
+    def test_warn_if_export_tf32_differs(self) -> None:
+        prev_cudnn = torch.backends.cudnn.allow_tf32
+        prev_matmul = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            cfg = EasyRecConfig(
+                train_config=train_pb2.TrainConfig(
+                    cudnn_allow_tf32=True, cuda_matmul_allow_tf32=True
+                ),
+                export_config=export_pb2.ExportConfig(cudnn_allow_tf32=False),
+            )
+            with mock.patch(_BUILD_PATCHES.format("logger.warning")) as warn:
+                _warn_if_export_tf32_differs(cfg)
+            self.assertEqual(warn.call_count, 2)
+            self.assertEqual(
+                warn.call_args_list[0].args[1:], ("cudnn_allow_tf32", True, False)
+            )
+            self.assertEqual(
+                warn.call_args_list[1].args[1:],
+                ("cuda_matmul_allow_tf32", False, True),
+            )
+            self.assertTrue(torch.backends.cudnn.allow_tf32)
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+
+            matching_cfg = EasyRecConfig(
+                train_config=train_pb2.TrainConfig(
+                    cudnn_allow_tf32=False, cuda_matmul_allow_tf32=False
+                ),
+                export_config=export_pb2.ExportConfig(cudnn_allow_tf32=True),
+            )
+            with mock.patch(_BUILD_PATCHES.format("logger.warning")) as warn:
+                _warn_if_export_tf32_differs(matching_cfg)
+            warn.assert_not_called()
+        finally:
+            torch.backends.cudnn.allow_tf32 = prev_cudnn
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul
+
+    def _create_aot_test_fixture(
+        self, tmp_dir: str
+    ) -> Tuple[EasyRecConfig, str, List[Any]]:
+        """Create a real pipeline.config and parquet data for GPU AOTI tests."""
+        data_dir = os.path.join(tmp_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        pq.write_table(
+            pa.table(
+                {
+                    "u_id": pa.array([1, 2, 1, 2], type=pa.int64()),
+                    "i_id": pa.array([3, 4, 5, 6], type=pa.int64()),
+                    "u_dense": pa.array([[0.2, -0.1]] * 4, type=pa.list_(pa.float32())),
+                    "i_dense": pa.array(
+                        [[0.3, 0.4], [0.5, 0.6], [0.7, 0.8], [0.9, 1.0]],
+                        type=pa.list_(pa.float32()),
+                    ),
+                }
+            ),
+            os.path.join(data_dir, "part-0.parquet"),
+        )
+        cfgs = [
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="u_id",
+                    expression="user:u_id",
+                    embedding_dim=4,
+                    num_buckets=8,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                id_feature=feature_pb2.IdFeature(
+                    feature_name="i_id",
+                    expression="item:i_id",
+                    embedding_dim=4,
+                    num_buckets=8,
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="u_dense", expression="user:u_dense", value_dim=2
+                )
+            ),
+            feature_pb2.FeatureConfig(
+                raw_feature=feature_pb2.RawFeature(
+                    feature_name="i_dense", expression="item:i_dense", value_dim=2
+                )
+            ),
+        ]
+        fgs = [
+            model_pb2.FeatureGroupConfig(
+                group_name="deep",
+                feature_names=["u_id", "i_id", "u_dense", "i_dense"],
+                group_type=model_pb2.DEEP,
+            )
+        ]
+        pipeline_config = EasyRecConfig(
+            train_input_path=os.path.join(data_dir, "*.parquet"),
+            data_config=data_pb2.DataConfig(
+                batch_size=2,
+                dataset_type=data_pb2.DatasetType.ParquetDataset,
+                fg_mode=data_pb2.FgMode.FG_DAG,
+                num_workers=1,
+            ),
+            feature_configs=cfgs,
+            model_config=model_pb2.ModelConfig(
+                feature_groups=fgs,
+                multi_tower=rank_model_pb2.MultiTower(
+                    towers=[
+                        tower_pb2.Tower(
+                            input="deep", mlp=module_pb2.MLP(hidden_units=[8])
+                        )
+                    ],
+                    final=module_pb2.MLP(hidden_units=[4]),
+                ),
+                losses=[
+                    loss_pb2.LossConfig(
+                        binary_cross_entropy=loss_pb2.BinaryCrossEntropy()
+                    )
+                ],
+            ),
+            train_config=train_pb2.TrainConfig(
+                cudnn_allow_tf32=True,
+                cuda_matmul_allow_tf32=True,
+            ),
+            export_config=export_pb2.ExportConfig(
+                cudnn_allow_tf32=False,
+                cuda_matmul_allow_tf32=False,
+            ),
+        )
+        pipeline_config_path = os.path.join(tmp_dir, "pipeline.config")
+        config_util.save_message(pipeline_config, pipeline_config_path)
+        features = create_features(
+            list(pipeline_config.feature_configs), pipeline_config.data_config
+        )
+        return pipeline_config, pipeline_config_path, features
+
+    def _build_serving_inputs(
+        self, version_dir: str, pt2_model: Any, device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        with open(os.path.join(version_dir, "dense_meta.json")) as f:
+            dense_meta = json.load(f)
+        in_spec = treespec_loads(pt2_model.loader.get_call_spec()[0])
+        key_order = list(in_spec.child(0).child(0).context)
+        for raw_key in ("u_id.values", "u_id.lengths", "i_id.values", "i_id.lengths"):
+            self.assertNotIn(raw_key, key_order)
+        ebc_item_key = next(
+            k for k in dense_meta if k != "sequence__ec" and not k.endswith("_user")
+        )
+        ebc_user_key = next(k for k in dense_meta if k.endswith("_user"))
+        user_bs, item_bs = 1, 3
+        torch.manual_seed(7)
+        serving_inputs = {
+            ebc_item_key: torch.randn(
+                item_bs, 4 * len(dense_meta[ebc_item_key]), device=device
+            ),
+            ebc_user_key: torch.randn(
+                user_bs, 4 * len(dense_meta[ebc_user_key]), device=device
+            ),
+            "u_dense.values": torch.randn(user_bs, 2, device=device),
+            "i_dense.values": torch.randn(item_bs, 2, device=device),
+            "batch_size": torch.tensor(
+                item_bs // user_bs, dtype=torch.int64, device=device
+            ),
+        }
+        return {k: serving_inputs[k] for k in key_order}
+
+    @mark_ci_scope("gpu")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_online_dense_export_manager_aot_v1_v2_publish(self) -> None:
+        """Manager builds, gates, and publishes v1->v2 .pt2 versions."""
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                pipeline_config, pipeline_config_path, features = (
+                    self._create_aot_test_fixture(tmp_dir)
+                )
+                device = torch.device("cuda:0")
+                torch.cuda.set_device(device)
+                inner = MultiTower(pipeline_config.model_config, features, labels=[])
+                init_parameters(inner, device)
+                live_model = ScriptWrapper(inner).to(device).eval()
+
+                with torch.no_grad():
+                    for p in live_model.parameters():
+                        p.fill_(0.05)
+                    live_model.model.output_mlp.bias.fill_(-2.0)
+
+                model_dir = os.path.join(tmp_dir, "train_dir")
+                os.makedirs(model_dir, exist_ok=True)
+                env = _hermetic_gpu_env(_base_env(tmp_dir, ENABLE_AOT="2"))
+                with mock.patch.dict(os.environ, env, clear=True):
+                    mgr = OnlineDenseExportManager(
+                        model_dir=model_dir,
+                        pipeline_config_path=pipeline_config_path,
+                        model=live_model,
+                    )
+                    try:
+                        self.assertTrue(mgr.enabled)
+                        self.assertTrue(mgr._is_aot)
+                        self.assertIsNotNone(mgr._dense_model_traced)
+
+                        versions_root = _versions_root(tmp_dir)
+                        current_path = _current_path(tmp_dir)
+
+                        # Export v1 and verify watermark gating before poll_publish.
+                        mgr.maybe_export(5, 100.0, live_model, force=True)
+                        self.assertTrue(
+                            _wait_for(lambda: mgr._ready is not None, timeout=120.0)
+                        )
+                        assert mgr._ready is not None
+                        v1 = mgr._ready["version"]
+                        v1_dir = os.path.join(versions_root, v1)
+                        v1_pt2 = os.path.join(v1_dir, "aoti", "aoti_model.pt2")
+                        self.assertTrue(os.path.exists(v1_pt2))
+                        self.assertTrue(
+                            os.path.exists(os.path.join(v1_dir, "dense_meta.json"))
+                        )
+                        self.assertTrue(os.path.exists(os.path.join(v1_dir, "READY")))
+                        self.assertFalse(
+                            os.path.exists(os.path.join(v1_dir, "scripted_model.pt"))
+                        )
+                        self.assertFalse(os.path.exists(current_path))
+
+                        mgr.poll_publish((4, []))
+                        self.assertFalse(os.path.exists(current_path))
+                        mgr.poll_publish((5, []))
+                        self.assertTrue(os.path.exists(current_path))
+                        with open(current_path) as f:
+                            payload_v1 = json.load(f)
+                        self.assertEqual(payload_v1["version"], v1)
+                        self.assertEqual(payload_v1["checkpoint_step"], 5)
+                        self.assertEqual(payload_v1["sparse_step"], 5)
+
+                        assert mgr._gm is not None
+                        pt2_v1 = torch._inductor.aoti_load_package(v1_pt2)
+                        serving_inputs = self._build_serving_inputs(
+                            v1_dir, pt2_v1, device
+                        )
+                        with torch.no_grad():
+                            eager_v1 = mgr._gm(serving_inputs, device)
+                            out_v1 = pt2_v1(serving_inputs)
+                        torch.testing.assert_close(
+                            out_v1["probs"], eager_v1["probs"], atol=1e-4, rtol=1e-4
+                        )
+
+                        # Update live weights for v2 and verify published .pt2 changes.
+                        with torch.no_grad():
+                            live_model.model.output_mlp.bias.fill_(2.0)
+                        mgr.maybe_export(10, 200.0, live_model, force=True)
+                        self.assertTrue(
+                            _wait_for(lambda: mgr._ready is not None, timeout=120.0)
+                        )
+                        assert mgr._ready is not None
+                        v2 = mgr._ready["version"]
+                        self.assertNotEqual(v2, v1)
+                        v2_dir = os.path.join(versions_root, v2)
+                        v2_pt2 = os.path.join(v2_dir, "aoti", "aoti_model.pt2")
+                        self.assertTrue(os.path.exists(v2_pt2))
+                        self.assertTrue(
+                            os.path.exists(os.path.join(v2_dir, "dense_meta.json"))
+                        )
+                        self.assertTrue(os.path.exists(os.path.join(v2_dir, "READY")))
+                        self.assertFalse(
+                            os.path.exists(os.path.join(v2_dir, "scripted_model.pt"))
+                        )
+
+                        mgr.poll_publish((9, []))
+                        with open(current_path) as f:
+                            self.assertEqual(json.load(f)["version"], v1)
+                        mgr.poll_publish((10, []))
+                        with open(current_path) as f:
+                            payload_v2 = json.load(f)
+                        self.assertEqual(payload_v2["version"], v2)
+                        self.assertEqual(payload_v2["checkpoint_step"], 10)
+                        self.assertEqual(payload_v2["sparse_step"], 10)
+
+                        pt2_v2 = torch._inductor.aoti_load_package(v2_pt2)
+                        with torch.no_grad():
+                            eager_v2 = mgr._gm(serving_inputs, device)
+                            out_v2 = pt2_v2(serving_inputs)
+                        torch.testing.assert_close(
+                            out_v2["probs"], eager_v2["probs"], atol=1e-4, rtol=1e-4
+                        )
+                        self.assertFalse(
+                            torch.allclose(out_v1["probs"], out_v2["probs"], atol=1e-2)
+                        )
+                        self.assertTrue(torch.backends.cudnn.allow_tf32)
+                        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+                    finally:
+                        mgr.close()
+        finally:
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+
+    @mark_ci_scope("gpu")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_export_online_dense_model_bootstrap_aot(self) -> None:
+        """Bootstrap CLI exports aoti/aoti_model.pt2 and flips current.json."""
+        prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                pipeline_config, pipeline_config_path, features = (
+                    self._create_aot_test_fixture(tmp_dir)
+                )
+                inner = MultiTower(pipeline_config.model_config, features, labels=[])
+                init_parameters(inner, torch.device("cpu"))
+                ckpt_model = ScriptWrapper(inner)
+                with torch.no_grad():
+                    for p in ckpt_model.parameters():
+                        p.fill_(0.05)
+                    ckpt_model.model.output_mlp.bias.fill_(1.5)
+
+                ckpt_dir = os.path.join(tmp_dir, "model.ckpt-12")
+                with mock.patch("tzrec.utils.checkpoint_util.has_dynamicemb", False):
+                    checkpoint_util.save_model(ckpt_dir, ckpt_model)
+
+                model_dir = os.path.join(tmp_dir, "train_dir")
+                serving_root = os.path.join(tmp_dir, "serving_root")
+                version = "20261117010203"
+                env = {
+                    "USE_DISTRIBUTED_EMBEDDING": "1",
+                    "ENABLE_AOT": "2",
+                    "ONLINE_DENSE_EXPORT_DIR": serving_root,
+                }
+                argv = [
+                    "online_dense_export",
+                    "--pipeline_config_path",
+                    pipeline_config_path,
+                    "--checkpoint_path",
+                    ckpt_dir,
+                    "--model_dir",
+                    model_dir,
+                    "--version",
+                    version,
+                    "--data_timestamp",
+                    "123.0",
+                ]
+                with (
+                    mock.patch.dict(os.environ, _hermetic_gpu_env(env), clear=True),
+                    mock.patch.object(sys, "argv", argv),
+                ):
+                    online_dense_export_main()
+
+                version_dir = os.path.join(
+                    serving_root, "dense_hot_export", "versions", version
+                )
+                pt2_path = os.path.join(version_dir, "aoti", "aoti_model.pt2")
+                self.assertTrue(os.path.exists(pt2_path))
+                self.assertTrue(
+                    os.path.exists(os.path.join(version_dir, "dense_meta.json"))
+                )
+                self.assertTrue(os.path.exists(os.path.join(version_dir, "READY")))
+                self.assertFalse(
+                    os.path.exists(os.path.join(version_dir, "scripted_model.pt"))
+                )
+
+                current_path = os.path.join(
+                    serving_root, "dense_hot_export", "current.json"
+                )
+                with open(current_path) as f:
+                    payload = json.load(f)
+                self.assertEqual(payload["version"], version)
+                self.assertEqual(payload["checkpoint_step"], 12)
+                self.assertEqual(payload["sparse_step"], 12)
+                self.assertEqual(payload["data_timestamp"], 123.0)
+                self.assertEqual(payload["sparse_probes"], [])
+
+                device = torch.device("cuda:0")
+                pt2_model = torch._inductor.aoti_load_package(pt2_path)
+                serving_inputs = self._build_serving_inputs(
+                    version_dir, pt2_model, device
+                )
+                with torch.no_grad():
+                    out = pt2_model(serving_inputs)
+                self.assertEqual(out["probs"].shape, torch.Size([3]))
+                self.assertTrue(torch.all(out["probs"] > 0.7))
+        finally:
+            torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+
+    def test_rejects_genrec_before_create_model(self) -> None:
+        from tzrec.protos import pipeline_pb2, prompt_pb2
+        from tzrec.protos.models import genrec_model_pb2, match_model_pb2
+        from tzrec.tools import online_dense_export as online_dense_export_tool
+
+        prompt_cfg = pipeline_pb2.EasyRecConfig(prompt_config=prompt_pb2.PromptConfig())
+        genrec_model_cfg = pipeline_pb2.EasyRecConfig(
+            model_config=model_pb2.ModelConfig(
+                genrec_causal_lm_model=genrec_model_pb2.GenRecCausalLMModel()
+            )
+        )
+        match_model_cfg = pipeline_pb2.EasyRecConfig(
+            model_config=model_pb2.ModelConfig(dssm=match_model_pb2.DSSM())
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _base_env(tmp_dir)
+            for name, cfg, expected_msg in (
+                ("prompt_config", prompt_cfg, "does not support prompt_config"),
+                (
+                    "genrec_causal_lm_model",
+                    genrec_model_cfg,
+                    "does not support GenRecCausalLMModel",
+                ),
+                ("dssm", match_model_cfg, "does not support DSSM"),
+            ):
+                with self.subTest(case=name):
+                    with (
+                        mock.patch.dict(os.environ, env, clear=True),
+                        mock.patch(
+                            _BUILD_PATCHES.format("config_util.load_pipeline_config"),
+                            return_value=cfg,
+                        ),
+                        mock.patch(
+                            "tzrec.tools.online_dense_export."
+                            "config_util.load_pipeline_config",
+                            return_value=cfg,
+                        ),
+                        mock.patch("tzrec.main._create_model") as create_model_mock,
+                        mock.patch(
+                            "tzrec.tools.online_dense_export._create_model"
+                        ) as cli_create_model_mock,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, expected_msg):
+                            OnlineDenseExportManager(
+                                model_dir=tmp_dir,
+                                pipeline_config_path=os.path.join(
+                                    tmp_dir, "pipeline.config"
+                                ),
+                                model=_mock_model({}),
+                            )
+                        create_model_mock.assert_not_called()
+
+                        with self.assertRaisesRegex(RuntimeError, expected_msg):
+                            online_dense_export_tool.export_online_dense_model(
+                                pipeline_config_path=os.path.join(
+                                    tmp_dir, "pipeline.config"
+                                ),
+                                checkpoint_path=tmp_dir,
+                                model_dir=tmp_dir,
+                            )
+                        cli_create_model_mock.assert_not_called()
+
+    def test_export_online_dense_model_version_validation(self) -> None:
+        from tzrec.tools import online_dense_export as online_dense_export_tool
+
+        invalid_versions = ["../bad", ".bad", "bad/ver", "bad ver", "a" * 241]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for bad in invalid_versions:
+                with self.subTest(version=bad):
+                    with (
+                        mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                        self.assertRaisesRegex(
+                            ValueError, "Invalid dense export version"
+                        ),
+                    ):
+                        online_dense_export_tool.export_online_dense_model(
+                            pipeline_config_path="unused",
+                            checkpoint_path="unused",
+                            model_dir=tmp_dir,
+                            version=bad,
+                        )
+
+            # Valid versions (including the 240-char ceiling) reach config load.
+            for good in ("v1.0_alpha-2", "a" * 240):
+                with self.subTest(version_len=len(good)):
+                    with (
+                        mock.patch.dict(os.environ, _base_env(tmp_dir), clear=True),
+                        mock.patch(
+                            "tzrec.tools.online_dense_export."
+                            "config_util.load_pipeline_config",
+                            side_effect=RuntimeError("reached_config_load"),
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "reached_config_load"
+                        ):
+                            online_dense_export_tool.export_online_dense_model(
+                                pipeline_config_path="unused",
+                                checkpoint_path="unused",
+                                model_dir=tmp_dir,
+                                version=good,
+                            )
 
 
 if __name__ == "__main__":

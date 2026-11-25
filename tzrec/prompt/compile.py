@@ -615,6 +615,8 @@ def _static_prefix_len(segments: Sequence[Segment]) -> int:
 
 def _validate(plan: PromptPlan) -> None:
     """Apply the checks that need the whole plan."""
+    if not any(isinstance(seg, SlotSeg) for seg in plan.segments):
+        raise ValueError("prompt_config.prompt must contain at least one feature slot.")
     if plan.max_length and plan.max_total_length is not None:
         if plan.max_total_length > plan.max_length:
             raise ValueError(

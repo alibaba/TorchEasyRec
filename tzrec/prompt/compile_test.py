@@ -475,6 +475,14 @@ class CompilePromptTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "response is required"):
             self._compile(cfg, [_feature(_HIST)])
 
+    def test_static_prompt_body_without_slot_is_rejected(self) -> None:
+        cfg = self._config(prompt="Predict :", response="{{answer}}")
+        cfg.sid_space.codebook.extend([4, 4, 4])
+        with self.assertRaisesRegex(
+            ValueError, "must contain at least one feature slot"
+        ):
+            self._compile(cfg, [_feature(_HIST)])
+
     def test_a_grouped_feature_inherits_the_group_cap(self) -> None:
         # a SequenceFeature member never sets its own sequence_length; the cap
         # comes from the group, so reading .config here would say UNBOUNDED

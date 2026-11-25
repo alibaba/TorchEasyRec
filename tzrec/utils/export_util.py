@@ -17,8 +17,10 @@ import operator
 import os
 import re
 import shutil
+import tempfile
 import traceback
 from collections import OrderedDict, defaultdict
+from collections.abc import Iterable
 from queue import Queue
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -54,20 +56,27 @@ from torchrec.quant.embedding_modules import (
 )
 from torchrec.sparse import jagged_tensor
 
+from tzrec.acc import aot_utils
 from tzrec.acc import utils as acc_utils
 from tzrec.acc.aot_utils import export_model_aot, export_unified_model_aot
 from tzrec.acc.trt_utils import export_model_trt
 from tzrec.constant import TARGET_REPEAT_INTERLEAVE_KEY, Mode
-from tzrec.datasets.data_parser import _tile_size
+from tzrec.datasets.data_parser import (
+    _infer_tile_size,
+    _tile_size,
+)
 from tzrec.datasets.dataset import (
     create_dataloader,
 )
 from tzrec.features.feature import (
     BaseFeature,
+    InvalidFgInputError,
     create_feature_configs,
     create_fg_json,
     get_hard_search_input_tile_features,
 )
+from tzrec.models.genrec_model import BaseGenRecModel, GenRecFrontEnd
+from tzrec.modules.embedding import _expand_hard_search_input_tile
 from tzrec.modules.utils import BaseModule
 from tzrec.protos import model_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
@@ -81,6 +90,7 @@ from tzrec.utils.feature_store_uploader import FeatureStoreFullUploader
 from tzrec.utils.filesystem_util import url_to_fs
 from tzrec.utils.fx_util import (
     UNTRACEABLE_MODULES,
+    eliminate_dense_dead_code,
     fx_mark_keyed_tensor,
     fx_mark_seq_ec_jt,
     fx_mark_seq_len,
@@ -122,27 +132,108 @@ def _has_dynamicemb_in_pipeline_config(
     return False
 
 
+def _is_genrec_export(
+    pipeline_config: Optional[EasyRecConfig] = None,
+    model: Optional[nn.Module] = None,
+) -> bool:
+    """Return whether export targets a GenRec model or GenRecFrontEnd module."""
+    if pipeline_config is not None:
+        has_prompt_config = (
+            pipeline_config.HasField("prompt_config")
+            if hasattr(pipeline_config, "HasField")
+            else bool(getattr(pipeline_config, "prompt_config", None))
+        )
+        model_cfg = getattr(pipeline_config, "model_config", None)
+        is_genrec_model = (
+            model_cfg is not None
+            and hasattr(model_cfg, "WhichOneof")
+            and model_cfg.WhichOneof("model") == "genrec_causal_lm_model"
+        )
+        if has_prompt_config or is_genrec_model:
+            return True
+    genrec_types = (BaseGenRecModel, GenRecFrontEnd)
+    return isinstance(model, genrec_types) or isinstance(
+        getattr(model, "model", None), genrec_types
+    )
+
+
+def _has_candidate_non_user_features(
+    features: Optional[List[BaseFeature]],
+) -> Optional[bool]:
+    """Return whether non-stub features include any candidate non-user feature."""
+    if isinstance(features, (str, bytes)) or not isinstance(features, Iterable):
+        return None
+    non_stub = [f for f in features if not getattr(f, "stub_type", False)]
+    if not non_stub:
+        return None
+    for feat in non_stub:
+        try:
+            if not feat.is_user_feat:
+                return True
+        except InvalidFgInputError:
+            return True
+    return False
+
+
+def _should_disable_input_tile(
+    root: Optional[nn.Module] = None,
+    features: Optional[List[BaseFeature]] = None,
+    pipeline_config: Optional[EasyRecConfig] = None,
+) -> bool:
+    """Return whether user-item tiling must stay disabled for export."""
+    if _is_genrec_export(pipeline_config=pipeline_config, model=root):
+        return True
+    return _has_candidate_non_user_features(features) is False
+
+
 def ensure_input_tile_for_distributed_embedding(
     pipeline_config: Optional[EasyRecConfig] = None,
-) -> None:
-    """Ensure distributed embedding export uses INPUT_TILE=3.
+    model: Optional[nn.Module] = None,
+    features: Optional[List[BaseFeature]] = None,
+    use_distributed_embedding: Optional[bool] = None,
+    input_tile: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Resolve distributed embedding and INPUT_TILE flags without mutating env.
 
     When ``pipeline_config`` contains any feature configured with ``dynamicemb``
-    and RTP export is not active, automatically sets
-    ``USE_DISTRIBUTED_EMBEDDING=1`` before enforcing ``INPUT_TILE=3``. Passing
-    ``pipeline_config=None`` skips dynamicemb detection.
+    and RTP export is not active, automatically resolves
+    ``use_distributed_embedding=True``. For ``BaseGenRecModel`` /
+    ``GenRecFrontEnd``, explicit ``INPUT_TILE=2/3`` is rejected and ``"0"`` is
+    returned so serving sets ``is_input_tile_ = false``. Models or towers that
+    have non-stub features and lack candidate non-user features (e.g. a
+    ``MatchModel`` user tower) also resolve ``"0"`` under distributed
+    embedding instead of forcing ``"3"``.
 
     Args:
         pipeline_config: Optional pipeline config to inspect for ``dynamicemb``
-            features.
+            and model type.
+        model: Optional model or tower wrapper being exported.
+        features: Optional feature list for detecting pure user-only models.
+        use_distributed_embedding: Optional explicit distributed-embedding
+            override.
+        input_tile: Optional explicit ``INPUT_TILE`` override.
+
+    Returns:
+        Tuple of ``(resolved_use_distributed_embedding, resolved_input_tile)``.
+
+    Raises:
+        ValueError: If a GenRec export receives explicit ``INPUT_TILE=2`` or
+            ``"3"``.
     """
+    use_rtp = env_util.use_rtp()
+    if use_distributed_embedding is None:
+        raw_dist_emb = os.environ.get("USE_DISTRIBUTED_EMBEDDING")
+        resolved_dist_emb = acc_utils.use_distributed_embedding()
+    else:
+        raw_dist_emb = "1" if use_distributed_embedding else "0"
+        resolved_dist_emb = use_distributed_embedding
+
     if (
-        not acc_utils.use_distributed_embedding()
+        not resolved_dist_emb
         and _has_dynamicemb_in_pipeline_config(pipeline_config)
-        and not env_util.use_rtp()
+        and not use_rtp
     ):
-        current_dist_emb = os.environ.get("USE_DISTRIBUTED_EMBEDDING")
-        if current_dist_emb is None:
+        if raw_dist_emb is None:
             logger.info(
                 "Detected dynamicemb feature in pipeline_config; "
                 "automatically enabling USE_DISTRIBUTED_EMBEDDING=1."
@@ -150,30 +241,51 @@ def ensure_input_tile_for_distributed_embedding(
         else:
             logger.warning(
                 "dynamicemb requires USE_DISTRIBUTED_EMBEDDING=1, "
-                f"got USE_DISTRIBUTED_EMBEDDING={current_dist_emb}. "
+                f"got USE_DISTRIBUTED_EMBEDDING={raw_dist_emb}. "
                 "Overriding to 1."
             )
-        os.environ["USE_DISTRIBUTED_EMBEDDING"] = "1"
+        resolved_dist_emb = True
 
-    if not acc_utils.use_distributed_embedding():
-        return
+    resolved_input_tile = (
+        acc_utils.get_input_tile() if input_tile is None else input_tile
+    )
+    if _is_genrec_export(pipeline_config=pipeline_config, model=model):
+        if resolved_input_tile and resolved_input_tile[0] in ("2", "3"):
+            raise ValueError(
+                f"BaseGenRecModel / GenRecFrontEnd export does not support "
+                f"INPUT_TILE={resolved_input_tile}; unset INPUT_TILE or set "
+                "INPUT_TILE=0."
+            )
+        return resolved_dist_emb, "0"
 
-    # Distributed embedding export only supports INPUT_TILE=3.
-    # Default to 3 when unset; warn and override if set to anything else.
-    current_input_tile = os.environ.get("INPUT_TILE")
-    if current_input_tile is None:
-        os.environ["INPUT_TILE"] = "3"
-    elif current_input_tile != "3":
+    if features is None and model is not None:
+        features = cast(Optional[List[BaseFeature]], getattr(model, "features", None))
+    has_candidate = _has_candidate_non_user_features(features)
+
+    if not resolved_dist_emb:
+        return False, resolved_input_tile
+
+    if has_candidate is False:
+        if resolved_input_tile and resolved_input_tile[0] in ("2", "3"):
+            logger.warning(
+                "Distributed embedding export disables INPUT_TILE=%s for "
+                "model/tower without candidate non-user features; overriding "
+                "to 0.",
+                resolved_input_tile,
+            )
+        return True, "0"
+
+    # Distributed embedding export defaults/forces INPUT_TILE=3 when candidate
+    # features are present (or unknown).
+    if resolved_input_tile is None:
+        resolved_input_tile = "3"
+    elif resolved_input_tile != "3":
         logger.warning(
             "USE_DISTRIBUTED_EMBEDDING=1 requires INPUT_TILE=3, "
-            f"got INPUT_TILE={current_input_tile}. Overriding to 3."
+            f"got INPUT_TILE={resolved_input_tile}. Overriding to 3."
         )
-        os.environ["INPUT_TILE"] = "3"
-
-
-def _is_input_tile_user_keyed_tensor(name: str) -> bool:
-    """Whether a split KeyedTensor is the INPUT_TILE=3 user sparse side."""
-    return name.endswith("__ebc_user") or name.endswith("__mc_ebc_user")
+        resolved_input_tile = "3"
+    return True, resolved_input_tile
 
 
 def _dedup_key_files_by_realpath(key_files: List[str]) -> List[str]:
@@ -204,12 +316,14 @@ def export_model(
     assets: Optional[List[str]] = None,
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
+    use_distributed_embedding: Optional[bool] = None,
+    input_tile: Optional[str] = None,
 ) -> None:
     """Export an EasyRec model, or a sub-module of a model in PipelineConfig.
 
     If ``pipeline_config`` configures any ``dynamicemb`` feature and RTP export
-    is not active, ``USE_DISTRIBUTED_EMBEDDING=1`` (and ``INPUT_TILE=3``) is
-    automatically enabled via ``ensure_input_tile_for_distributed_embedding``.
+    is not active, distributed embedding export is automatically enabled via
+    ``ensure_input_tile_for_distributed_embedding``.
 
     Args:
         pipeline_config: Full pipeline configuration.
@@ -221,11 +335,15 @@ def export_model(
             ``model_acc.json``.
         data_input_path: Optional override for the predict-mode dataloader input
             path; falls back to ``pipeline_config.train_input_path`` when None.
+        use_distributed_embedding: Optional explicit distributed-embedding
+            override.
+        input_tile: Optional explicit ``INPUT_TILE`` override.
 
     Raises:
-        ValueError: If ``dlrm_hstu``/``ultra_hstu`` is missing ``cand_seq_pk``, or
+        ValueError: If ``dlrm_hstu``/``ultra_hstu`` is missing ``cand_seq_pk``,
             if ``export_config.dynamic_embedding`` is configured with RTP export
-            or without ``USE_DISTRIBUTED_EMBEDDING=1``.
+            or without distributed embedding, or if GenRec receives
+            ``INPUT_TILE=2/3``.
     """
     model_type = pipeline_config.model_config.WhichOneof("model")
     if model_type in ("dlrm_hstu", "ultra_hstu") and (
@@ -237,8 +355,17 @@ def export_model(
         )
 
     use_rtp = env_util.use_rtp()
-    ensure_input_tile_for_distributed_embedding(pipeline_config)
-    use_dist_embedding = acc_utils.use_distributed_embedding()
+    use_dist_embedding, resolved_input_tile = (
+        ensure_input_tile_for_distributed_embedding(
+            pipeline_config,
+            model=model,
+            features=cast(
+                Optional[List[BaseFeature]], getattr(model, "features", None)
+            ),
+            use_distributed_embedding=use_distributed_embedding,
+            input_tile=input_tile,
+        )
+    )
     if pipeline_config.export_config.HasField("dynamic_embedding"):
         if use_rtp or not use_dist_embedding:
             raise ValueError(
@@ -253,26 +380,73 @@ def export_model(
         impl = export_model_normal
     fs, local_path = url_to_fs(save_dir)
     use_local_cache_dir = False
+    config_asset_dir: Optional[str] = None
+    is_rank_zero = int(os.environ.get("RANK", 0)) == 0
+    is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if fs is not None:
         # scripted model and safetensors use io in cpp,
         # so that we can not use fsspec to patch cpp io operations.
-        local_path = os.environ.get("LOCAL_CACHE_DIR", local_path)
+        cache_root = os.environ.get("LOCAL_CACHE_DIR")
+        # NOTE: keep asset_dir at cache_root/local_path so predict() flat
+        # downloads into LOCAL_CACHE_DIR can locate feature assets.
+        config_asset_dir = cache_root or local_path
+        if cache_root:
+            os.makedirs(cache_root, exist_ok=True)
+        if use_rtp:
+            local_path = os.path.join(
+                cache_root or tempfile.gettempdir(), f"tzrec_rtp_export_{os.getppid()}"
+            )
+            if is_local_rank_zero:
+                # Clear stale shards from a prior failed run under the same ppid.
+                shutil.rmtree(local_path, ignore_errors=True)
+                os.makedirs(local_path, exist_ok=True)
+            if dist.is_initialized():
+                dist.barrier()
+        else:
+            local_path = tempfile.mkdtemp(
+                dir=cache_root or None, prefix="tzrec_export_"
+            )
         use_local_cache_dir = True
-    impl(
-        pipeline_config=pipeline_config,
-        model=model,
-        checkpoint_path=checkpoint_path,
-        save_dir=local_path,
-        assets=assets,
-        use_local_cache_dir=use_local_cache_dir,
-        additional_export_config=additional_export_config,
-        data_input_path=data_input_path,
-    )
-    if use_local_cache_dir and int(os.environ.get("LOCAL_RANK", 0)) == 0:
-        logger.info(f"uploading {local_path} to {save_dir}.")
-        fs.upload(local_path, save_dir, recursive=True, file_thread_num=os.cpu_count())
-        logger.info(f"finish upload {local_path} to {save_dir}.")
-        shutil.rmtree(local_path)
+
+    with acc_utils.export_env_scope(
+        use_distributed_embedding=use_dist_embedding,
+        input_tile=resolved_input_tile,
+    ):
+        try:
+            impl(
+                pipeline_config=pipeline_config,
+                model=model,
+                checkpoint_path=checkpoint_path,
+                save_dir=local_path,
+                assets=assets,
+                use_local_cache_dir=use_local_cache_dir,
+                additional_export_config=additional_export_config,
+                data_input_path=data_input_path,
+                config_asset_dir=config_asset_dir,
+            )
+            if use_local_cache_dir:
+                if use_rtp and dist.is_initialized():
+                    dist.barrier()
+                upload_err: Optional[BaseException] = None
+                if is_local_rank_zero and (use_rtp or is_rank_zero):
+                    try:
+                        logger.info(f"uploading {local_path} to {save_dir}.")
+                        fs.upload(
+                            local_path,
+                            save_dir,
+                            recursive=True,
+                            file_thread_num=os.cpu_count(),
+                        )
+                        logger.info(f"finish upload {local_path} to {save_dir}.")
+                    except BaseException as exc:
+                        upload_err = exc
+                if use_rtp and dist.is_initialized():
+                    dist.barrier()
+                if upload_err is not None:
+                    raise upload_err
+        finally:
+            if use_local_cache_dir and (not use_rtp or is_local_rank_zero):
+                shutil.rmtree(local_path, ignore_errors=True)
 
 
 def _move_quantized_modules_to_device(model: nn.Module, device: torch.device) -> None:
@@ -310,22 +484,37 @@ def export_model_normal(
     assets: Optional[List[str]] = None,
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
+    use_local_cache_dir: bool = False,
+    config_asset_dir: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
-    """Export a EasyRec model on aliyun."""
+    """Export an EasyRec model on a single rank.
+
+    Args:
+        pipeline_config: Full pipeline configuration.
+        model: Inference-wrapped model or module to export.
+        checkpoint_path: Checkpoint directory to restore from.
+        save_dir: Local directory (or remote cache staging directory) for
+            exported artifacts.
+        assets: Optional extra asset file paths to copy into ``save_dir``.
+        additional_export_config: Optional extra key/value pairs written into
+            ``model_acc.json``.
+        data_input_path: Optional warm-up dataloader input path override.
+        use_local_cache_dir: Unused for non-RTP local exports; accepted for
+            shared exporter dispatch signature compatibility.
+        config_asset_dir: Optional final asset directory written into exported
+            ``pipeline.config`` feature configs when ``save_dir`` is a temporary
+            remote-upload cache directory.
+        **kwargs: Ignored extra keyword arguments for dispatcher compatibility.
+    """
+    del use_local_cache_dir, kwargs
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     if not is_rank_zero:
         logger.warning("Only first rank will be used for export now.")
         return
-    else:
-        if os.environ.get("WORLD_SIZE") != "1":
-            logger.warning(
-                "export only support WORLD_SIZE=1 now, we set WORLD_SIZE to 1."
-            )
-            os.environ["WORLD_SIZE"] = "1"
 
     if not dist.is_initialized():
-        dist.init_process_group("gloo")
+        dist.init_process_group("gloo", rank=0, world_size=1)
 
     # make dataparser to get user feats before create model
     data_config = copy.deepcopy(pipeline_config.data_config)
@@ -339,114 +528,148 @@ def export_model_normal(
         logger.info("using new batch_size: %s in export", inference_batch_size)
     data_config.num_workers = 1
     input_path = data_input_path or pipeline_config.train_input_path
-    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
+    with acc_utils.export_env_scope(world_size=1, rank=0):
+        dataloader = create_dataloader(
+            data_config,
+            features,
+            input_path,
+            mode=Mode.PREDICT,
+        )
 
     if not checkpoint_path:
         raise ValueError("checkpoint path should be specified.")
 
-    if is_rank_zero:
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-        init_parameters(model, torch.device("cpu"))
-        checkpoint_util.restore_model(
-            checkpoint_path,
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    init_parameters(model, torch.device("cpu"))
+    checkpoint_util.restore_model(
+        checkpoint_path,
+        model,
+        use_dense_ema=config_util.use_dense_ema(
+            pipeline_config.export_config,
+            pipeline_config.train_config,
+        ),
+    )
+    # for mc modules, fix output_segments_tensor is a meta tensor.
+    fix_mch_state(model)
+
+    batch = next(dataloader.get_iterator())  # pyre-ignore[16]
+
+    # Quantize on CPU before moving to CUDA. The fbgemm CUDA kernel
+    # for nbit quantization uses int32 pointer arithmetic which
+    # overflows for large embedding tables. The CPU kernel uses
+    # int64 and is safe for any table size.
+    if acc_utils.is_quant() or acc_utils.is_ec_quant():
+        logger.info("quantize embeddings...")
+        additional_qconfig_spec_keys = []
+        additional_mapping = {}
+        cache_order_types = [EmbeddingBagCollection]
+        if acc_utils.is_ec_quant():
+            additional_qconfig_spec_keys.append(EmbeddingCollection)
+            additional_mapping[EmbeddingCollection] = QuantEmbeddingCollection
+            cache_order_types.append(EmbeddingCollection)
+        # Cache the feature-permute order as an on-device buffer instead of
+        # rebuilding `torch.tensor(order, device=cuda)` (a blocking H2D copy)
+        # on every forward. Must run before quantize_embeddings so the quant
+        # modules pick it up via `from_float`.
+        quant_prep_enable_cache_features_order(model, cache_order_types)
+        quantize_embeddings(
             model,
-            use_dense_ema=config_util.use_dense_ema(
-                pipeline_config.export_config,
-                pipeline_config.train_config,
+            dtype=acc_utils.quant_dtype(),
+            inplace=True,
+            additional_qconfig_spec_keys=additional_qconfig_spec_keys,
+            additional_mapping=additional_mapping,
+        )
+        logger.info("finish quantize embeddings...")
+
+    if acc_utils.is_cuda_export():
+        _move_quantized_modules_to_device(model, torch.device("cuda:0"))
+        model = model.cuda()
+
+    model.eval()
+
+    data = batch.to_dict(sparse_dtype=torch.int64)
+    mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
+    autocast_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
+    if acc_utils.is_trt() or acc_utils.is_aot():
+        data = OrderedDict(sorted(data.items()))
+        # no_grad: avoid retaining activations that OOM AOTI autotune.
+        with (
+            torch.no_grad(),
+            torch.amp.autocast(
+                device_type="cuda",
+                dtype=autocast_dtype,
+                enabled=autocast_dtype is not None,
             ),
-        )
-        # for mc modules, fix output_segments_tensor is a meta tensor.
-        fix_mch_state(model)
-
-        batch = next(dataloader.get_iterator())  # pyre-ignore[16]
-
-        # Quantize on CPU before moving to CUDA. The fbgemm CUDA kernel
-        # for nbit quantization uses int32 pointer arithmetic which
-        # overflows for large embedding tables. The CPU kernel uses
-        # int64 and is safe for any table size.
-        if acc_utils.is_quant() or acc_utils.is_ec_quant():
-            logger.info("quantize embeddings...")
-            additional_qconfig_spec_keys = []
-            additional_mapping = {}
-            cache_order_types = [EmbeddingBagCollection]
-            if acc_utils.is_ec_quant():
-                additional_qconfig_spec_keys.append(EmbeddingCollection)
-                additional_mapping[EmbeddingCollection] = QuantEmbeddingCollection
-                cache_order_types.append(EmbeddingCollection)
-            # Cache the feature-permute order as an on-device buffer instead of
-            # rebuilding `torch.tensor(order, device=cuda)` (a blocking H2D copy)
-            # on every forward. Must run before quantize_embeddings so the quant
-            # modules pick it up via `from_float`.
-            quant_prep_enable_cache_features_order(model, cache_order_types)
-            quantize_embeddings(
-                model,
-                dtype=acc_utils.quant_dtype(),
-                inplace=True,
-                additional_qconfig_spec_keys=additional_qconfig_spec_keys,
-                additional_mapping=additional_mapping,
+        ):
+            result = model(data, "cuda:0")
+        result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
+        logger.info(f"Model Outputs: {result_info}")
+        del result
+        torch.cuda.empty_cache()
+        if acc_utils.is_trt():
+            sparse, dense, meta_info = split_model(data, model, save_dir)
+            export_model_trt(
+                sparse,
+                dense,
+                data,
+                save_dir,
+                mixed_precision=mixed_precision,
             )
-            logger.info("finish quantize embeddings...")
-
-        if acc_utils.is_cuda_export():
-            _move_quantized_modules_to_device(model, torch.device("cuda:0"))
-            model = model.cuda()
-
-        model.eval()
-
-        data = batch.to_dict(sparse_dtype=torch.int64)
-        mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
-        autocast_dtype = acc_utils.mixed_precision_to_dtype(mixed_precision)
-        if acc_utils.is_trt() or acc_utils.is_aot():
-            data = OrderedDict(sorted(data.items()))
-            # no_grad: avoid retaining activations that OOM AOTI autotune.
-            with (
-                torch.no_grad(),
-                torch.amp.autocast(
-                    device_type="cuda",
-                    dtype=autocast_dtype,
-                    enabled=autocast_dtype is not None,
-                ),
-            ):
-                result = model(data, "cuda:0")
-            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            logger.info(f"Model Outputs: {result_info}")
-            del result
-            torch.cuda.empty_cache()
-            if acc_utils.is_trt():
-                sparse, dense, meta_info = split_model(data, model, save_dir)
-                export_model_trt(
-                    sparse, dense, data, save_dir, mixed_precision=mixed_precision
-                )
-            elif acc_utils.is_unified_aot():
-                export_unified_model_aot(
-                    model, data, save_dir, mixed_precision=mixed_precision
-                )
-            else:
-                sparse, dense, meta_info = split_model(data, model, save_dir)
-                export_model_aot(
-                    sparse,
-                    dense,
-                    data,
-                    meta_info,
-                    save_dir,
-                    mixed_precision=mixed_precision,
-                )
+        elif acc_utils.is_unified_aot():
+            export_unified_model_aot(
+                model, data, save_dir, mixed_precision=mixed_precision
+            )
         else:
-            result = model(data)
-            result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
-            logger.info(f"Model Outputs: {result_info}")
+            sparse, dense, meta_info = split_model(data, model, save_dir)
+            export_model_aot(
+                sparse,
+                dense,
+                data,
+                meta_info,
+                save_dir,
+                mixed_precision=mixed_precision,
+            )
+    else:
+        result = model(data)
+        result_info = {k: (v.size(), v.dtype) for k, v in result.items()}
+        logger.info(f"Model Outputs: {result_info}")
 
-            gm = symbolic_trace(model)
-            with open(os.path.join(save_dir, "gm.code"), "w") as f:
-                f.write(gm.code)
+        gm = symbolic_trace(model)
+        with open(os.path.join(save_dir, "gm.code"), "w") as f:
+            f.write(gm.code)
 
-            scripted_model = torch.jit.script(gm)
-            scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
+        scripted_model = torch.jit.script(gm)
+        scripted_model.save(os.path.join(save_dir, "scripted_model.pt"))
 
-        _write_export_metadata(
-            pipeline_config, features, save_dir, assets, additional_export_config
-        )
+    _write_export_metadata(
+        pipeline_config,
+        features,
+        save_dir,
+        assets,
+        additional_export_config,
+        config_asset_dir=config_asset_dir,
+    )
+
+
+def _rewrite_feature_asset_dir(
+    feature_configs: List[Any], old_dir: str, new_dir: str
+) -> None:
+    """Point staged asset_dir fields on exported feature configs to new_dir."""
+    for fc in feature_configs:
+        kind = fc.WhichOneof("feature")
+        if not kind:
+            continue
+        sub = getattr(fc, kind)
+        if kind == "sequence_feature":
+            _rewrite_feature_asset_dir(list(sub.features), old_dir, new_dir)
+            continue
+        if (
+            "asset_dir" in sub.DESCRIPTOR.fields_by_name
+            and sub.HasField("asset_dir")
+            and sub.asset_dir == old_dir
+        ):
+            sub.asset_dir = new_dir
 
 
 def _write_export_metadata(
@@ -455,9 +678,12 @@ def _write_export_metadata(
     save_dir: str,
     assets: Optional[List[str]],
     additional_export_config: Optional[Dict[str, Union[bool, str]]],
+    config_asset_dir: Optional[str] = None,
 ) -> None:
     """Write serving metadata and assets without mutating the training config."""
     feature_configs = create_feature_configs(features, asset_dir=save_dir)
+    if config_asset_dir and config_asset_dir != save_dir:
+        _rewrite_feature_asset_dir(feature_configs, save_dir, config_asset_dir)
     export_config = copy.deepcopy(pipeline_config)
     export_config.ClearField("feature_configs")
     export_config.feature_configs.extend(feature_configs)
@@ -487,32 +713,12 @@ def _write_export_metadata(
 
 
 def _prepare_single_rank_distributed_embedding_export() -> bool:
-    """Force distributed-embedding export to run as a single rank."""
-    rank = int(os.environ.get("RANK", 0))
-    if rank != 0:
+    """Return whether distributed-embedding export should run on this rank."""
+    if int(os.environ.get("RANK", 0)) != 0:
         logger.warning(
             "Only first rank will be used for distributed embedding export now."
         )
         return False
-
-    forced_env = {
-        "RANK": "0",
-        "LOCAL_RANK": "0",
-        "WORLD_SIZE": "1",
-        "LOCAL_WORLD_SIZE": "1",
-    }
-    changed = [
-        f"{key}={value}"
-        for key, value in forced_env.items()
-        if os.environ.get(key) != value
-    ]
-    if changed:
-        logger.warning(
-            "distributed embedding export only supports single-rank export now, "
-            "we set %s.",
-            ", ".join(changed),
-        )
-    os.environ.update(forced_env)
     return True
 
 
@@ -650,6 +856,169 @@ def _infer_keyed_tensor_attrs_from_module(
     return keys, length_per_key
 
 
+def _classify_serving_batch_node(
+    key: str,
+    feat_by_name: Dict[str, BaseFeature],
+    hsk_feats: Set[str],
+) -> Optional[str]:
+    """Classify a serving placeholder key as 'item', 'user', or None."""
+    if key.endswith("__ebc") or key.endswith("__mc_ebc"):
+        return "item"
+    if acc_utils.is_input_tile_user_keyed_tensor(key):
+        return "user"
+    if key.endswith("__lengths"):
+        raw_name = key[: -len("__lengths")].split("@", 1)[0]
+        if raw_name in hsk_feats:
+            return None
+        feat = feat_by_name.get(raw_name)
+        if feat is not None and feat.is_user_feat:
+            return "user"
+        return "item"
+    if key.endswith("__inverse_indices"):
+        seq_name = key[: -len("__inverse_indices")]
+        return "item" if seq_name else None
+    if key.endswith(".values"):
+        feat_name = key[: -len(".values")]
+        if feat_name in hsk_feats:
+            return None
+        feat = feat_by_name.get(feat_name)
+        if feat is not None and not feat.is_sparse and not feat.is_sequence:
+            return "user" if feat.is_user_feat else "item"
+        return None
+    if key.endswith(".lengths"):
+        feat_name = key[: -len(".lengths")]
+        if feat_name in hsk_feats:
+            return None
+        feat = feat_by_name.get(feat_name)
+        if feat is None:
+            return None
+        if not feat.is_sparse:
+            if feat.is_sequence:
+                return "user" if feat.is_user_feat else "item"
+            return None
+        if feat.is_sequence and feat.value_dim != 1:
+            return "user" if feat.is_user_feat else "item"
+        return None
+    return None
+
+
+def _rewrite_tile_size_nodes(
+    graph: torch.fx.Graph,
+    root: torch.nn.Module,
+    input_node: torch.fx.Node,
+    features: List[BaseFeature],
+    hsk_feats: Set[str],
+    disable_input_tile: bool = False,
+) -> None:
+    """Replace remaining _tile_size / _infer_tile_size calls cleanly."""
+    tile_nodes = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function" and node.target in (_tile_size, _infer_tile_size)
+    ]
+    if not tile_nodes:
+        return
+    if disable_input_tile or _should_disable_input_tile(root=root, features=features):
+        for tile_node in tile_nodes:
+            tile_node.replace_all_uses_with(1)
+        return
+
+    feat_by_name = {f.name: f for f in features}
+    item_t: Optional[torch.fx.Node] = None
+    user_t: Optional[torch.fx.Node] = None
+    for node in graph.nodes:
+        if (
+            node.op == "call_function"
+            and node.target == operator.getitem
+            and len(node.args) == 2
+            and node.args[0] is input_node
+            and isinstance(node.args[1], str)
+            and len(node.users) > 0
+        ):
+            side = _classify_serving_batch_node(node.args[1], feat_by_name, hsk_feats)
+            if side == "item" and item_t is None:
+                item_t = node
+            elif side == "user" and user_t is None:
+                user_t = node
+        if item_t is not None and user_t is not None:
+            break
+
+    last_placeholder = [n for n in graph.nodes if n.op == "placeholder"][-1]
+    if item_t is not None and user_t is not None:
+        # Place item_t, user_t and _infer_tile_size right after placeholders so
+        # the unified tile factor dominates all consumers in topological order.
+        last_placeholder.append(item_t)
+        item_t.append(user_t)
+        with graph.inserting_after(user_t):
+            unified_tile_node = graph.call_function(
+                _infer_tile_size, args=(item_t, user_t)
+            )
+    else:
+        if acc_utils.is_input_tile_3_online():
+            missing_side = "item" if item_t is None else "user"
+            raise ValueError(
+                "INPUT_TILE_3_ONLINE=1 requires both user and item inputs in "
+                f"the dense graph to infer a dynamic tile factor, but no "
+                f"{missing_side} input remained."
+            )
+        with graph.inserting_after(last_placeholder):
+            batch_size_node = graph.call_function(
+                operator.getitem, args=(input_node, "batch_size")
+            )
+        with graph.inserting_after(batch_size_node):
+            unified_tile_node = graph.call_function(_tile_size, args=(batch_size_node,))
+
+    # Keep wrapped tile helpers opaque across downstream symbolic_trace(gm).
+    unified_tile_node.meta["is_wrapped"] = True
+    for tile_node in tile_nodes:
+        tile_node.replace_all_uses_with(unified_tile_node)
+
+
+def _verify_no_raw_sparse_keys(
+    graph: torch.fx.Graph,
+    root: torch.nn.Module,
+    input_node: torch.fx.Node,
+    features: List[BaseFeature],
+) -> None:
+    """Ensure raw sparse keys are eliminated from non-GenRec dense graphs."""
+    if any(
+        type(mod).__name__ in ("PromptAssembler", "HoleKeyBuilder")
+        for mod in root.modules()
+    ):
+        return
+    disallowed: Set[str] = set()
+    for feat in features:
+        if not feat.is_sparse or feat.stub_type:
+            continue
+        disallowed.add(f"{feat.name}.values")
+        disallowed.add(f"{feat.name}.weights")
+        if not (feat.is_sequence and feat.value_dim != 1):
+            disallowed.add(f"{feat.name}.lengths")
+    if not disallowed:
+        return
+
+    leftover = sorted(
+        {
+            cast(str, node.args[1])
+            for node in graph.nodes
+            if (
+                node.op == "call_function"
+                and node.target == operator.getitem
+                and len(node.args) == 2
+                and node.args[0] is input_node
+                and isinstance(node.args[1], str)
+                and len(node.users) > 0
+                and node.args[1] in disallowed
+            )
+        }
+    )
+    if leftover:
+        raise RuntimeError(
+            "Unexpected raw sparse keys remain in dense serving graph: "
+            + ", ".join(leftover)
+        )
+
+
 def _rewrite_dense_serving_graph(
     full_graph: torch.fx.Graph,
     root: torch.nn.Module,
@@ -691,6 +1060,8 @@ def _rewrite_dense_serving_graph(
             graph.erase_node(node)
     input_node = next(node for node in graph.nodes if node.op == "placeholder")
 
+    features = cast(List[BaseFeature], getattr(root, "features", []) or [])
+    disable_input_tile = _should_disable_input_tile(root=root, features=features)
     dense_graph_config["sequence__ec"] = []
     for node in list(graph.nodes):
         if node.op == "call_function" and node.target == fx_mark_keyed_tensor:
@@ -703,13 +1074,16 @@ def _rewrite_dense_serving_graph(
                     operator.getitem, args=(input_node, name)
                 )
                 values_node = getitem_node
-                if _is_input_tile_user_keyed_tensor(name):
+                if not disable_input_tile and acc_utils.is_input_tile_user_keyed_tensor(
+                    name
+                ):
                     batch_size_node = graph.call_function(
                         operator.getitem, args=(input_node, "batch_size")
                     )
                     tile_size_node = graph.call_function(
                         _tile_size, args=(batch_size_node,)
                     )
+                    tile_size_node.meta["is_wrapped"] = True
                     values_node = graph.call_method(
                         "tile", args=(getitem_node, tile_size_node, 1)
                     )
@@ -743,10 +1117,47 @@ def _rewrite_dense_serving_graph(
             emb_name = name + "__ec"
             dense_graph_config["sequence__ec"].append(emb_name)
             dense_graph_config["sequence__ec"].append(name + "__lengths")
+        elif (
+            node.op == "call_function" and node.target == _expand_hard_search_input_tile
+        ):
+            blocks = (
+                node.args[1] if len(node.args) > 1 else node.kwargs.get("blocks", [])
+            )
+            if not blocks:
+                node.replace_all_uses_with(node.args[0])
+            else:
+                required_keys = {block[2] for block in blocks if block[2]}
+                if len(node.args) > 2 and isinstance(node.args[2], dict):
+                    new_args = list(node.args)
+                    new_args[2] = {
+                        k: v for k, v in node.args[2].items() if k in required_keys
+                    }
+                    node.args = tuple(new_args)
+                elif isinstance(node.kwargs.get("additional_infos"), dict):
+                    new_kwargs = dict(node.kwargs)
+                    new_kwargs["additional_infos"] = {
+                        k: v
+                        for k, v in new_kwargs["additional_infos"].items()
+                        if k in required_keys
+                    }
+                    node.kwargs = new_kwargs
 
     graph.output(dict(zip(output_keys, output_values)))
+    eliminate_dense_dead_code(graph)
+    hsk_feats = (
+        set(get_hard_search_input_tile_features(features).keys()) if features else set()
+    )
+    _rewrite_tile_size_nodes(
+        graph,
+        root,
+        input_node,
+        features,
+        hsk_feats,
+        disable_input_tile=disable_input_tile,
+    )
+    eliminate_dense_dead_code(graph)
+    _verify_no_raw_sparse_keys(graph, root, input_node, features)
     gm = torch.fx.GraphModule(root, graph)
-    _eliminate_dense_dead_code(gm.graph)
     gm = _prune_unused_param_and_buffer(gm)
 
     init_parameters(gm, device)
@@ -816,24 +1227,6 @@ def _add_module_by_dotted_path(
             parent.add_module(p, nn.Module())  # create empty container
         parent = getattr(parent, p)
     parent.add_module(parts[-1], module)
-
-
-def _eliminate_dense_dead_code(graph: torch.fx.Graph) -> None:
-    """Drop every node the dense graph's output does not depend on.
-
-    A dense graph is a pruned view of the full traced graph: the marked sparse
-    outputs are rewired to read the sparse model's output dict, which leaves the
-    original lookup subtree unreachable. Plain ``eliminate_dead_code`` no longer
-    removes it, because torch>=2.13 resolves an ``OpOverloadPacket`` target to
-    its default overload when deciding purity, so the zero-user
-    ``fbgemm.bounds_check_indices`` left behind by a quantized lookup now counts
-    as impure and pins the whole subtree -- which then reads raw feature keys
-    that exist only in the sparse model's input. The sparse half runs in the
-    sparse model, so here only placeholders and the output are anchors.
-    """
-    graph.eliminate_dead_code(
-        is_impure_node=lambda node: node.op in ("placeholder", "output")
-    )
 
 
 def _prune_unused_param_and_buffer(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -1398,7 +1791,7 @@ def export_rtp_model(
                 raise RuntimeError(f"{node.target} op is not supported by rtp")
     graph.output(tuple(output_values))
     gm = torch.fx.GraphModule(unwrap_model, graph)
-    _eliminate_dense_dead_code(gm.graph)
+    eliminate_dense_dead_code(gm.graph)
     gm = _prune_unused_param_and_buffer(gm)
     init_parameters(gm, device)
     gm.to(device)
@@ -1601,7 +1994,7 @@ def split_model(
 
             node_t.replace_all_uses_with(get_node)
     dense_gm = torch.fx.GraphModule(model, graph)
-    _eliminate_dense_dead_code(dense_gm.graph)
+    eliminate_dense_dead_code(dense_gm.graph)
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
     seq_share_groups = _compute_seq_share_groups(
@@ -1625,6 +2018,7 @@ def export_distributed_embedding(
     use_local_cache_dir: bool = False,
     additional_export_config: Optional[Dict[str, Union[bool, str]]] = None,
     data_input_path: Optional[str] = None,
+    config_asset_dir: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export dense and sparse artifacts for distributed embedding serving.
@@ -1633,7 +2027,23 @@ def export_distributed_embedding(
     and ZCH state are restored on CPU and exported before dense graph tracing
     shrinks their tables. Dynamic embedding settings only tune chunking and
     optional full upload; all models use this export path.
+
+    Args:
+        pipeline_config: Full pipeline configuration.
+        model: Inference-wrapped model or module to export.
+        checkpoint_path: Checkpoint directory to restore from.
+        save_dir: Local output or remote-upload staging directory.
+        assets: Optional extra asset file paths to copy into ``save_dir``.
+        use_local_cache_dir: Accepted for shared exporter dispatch compatibility.
+        additional_export_config: Optional extra key/value pairs written into
+            ``model_acc.json``.
+        data_input_path: Optional warm-up dataloader input path override.
+        config_asset_dir: Optional final asset directory written into exported
+            ``pipeline.config`` feature configs when ``save_dir`` is a temporary
+            remote-upload cache directory.
+        **kwargs: Ignored extra keyword arguments for dispatcher compatibility.
     """
+    del use_local_cache_dir, kwargs
     if not _prepare_single_rank_distributed_embedding_export():
         return
     if not checkpoint_path:
@@ -1690,7 +2100,10 @@ def export_distributed_embedding(
             sharded_dynamic_arrays = part_arrays
             dynamic_export = (part_arrays[0], dynamic_meta)
         else:
-            dynamic_export = (part_arrays[0] if part_arrays else {}, dynamic_meta)
+            dynamic_export = (
+                part_arrays[0] if part_arrays else {},
+                dynamic_meta,
+            )
     missing_tables = expected_dynamic - dynamic_export[1].keys()
     if missing_tables:
         raise ValueError(
@@ -1699,8 +2112,8 @@ def export_distributed_embedding(
         )
     total_records = sum(meta["shape"][0] for meta in dynamic_export[1].values())
     logger.info(
-        "Distributed embedding export: dynamic_tables=%s rows=%s read_chunk_size_mb=%s "
-        "feature_store_upload=%s",
+        "Distributed embedding export: dynamic_tables=%s rows=%s "
+        "read_chunk_size_mb=%s feature_store_upload=%s",
         len(dynamic_export[1]),
         total_records,
         settings.read_chunk_size_mb,
@@ -1720,26 +2133,36 @@ def export_distributed_embedding(
                 bag_infos,
                 features,
                 dynamic_export=dynamic_export,
+                rank=0,
             )
         )
+        dense_device = torch.device("cpu")
+        if (
+            pipeline_config.model_config.kernel != model_pb2.PYTORCH
+            or acc_utils.is_aot()
+        ):
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "TRITON/CUTLASS/AOT dense export requires a CUDA device"
+                )
+            dense_device = torch.device("cuda:0")
+            torch.cuda.set_device(dense_device)
+        if acc_utils.is_aot():
+            acc_utils.allow_tf32_for_export(pipeline_config)
+        mixed_precision = acc_utils.mixed_precision_for_export(pipeline_config)
         sparse_dir = os.path.join(save_dir, "sparse")
         os.makedirs(sparse_dir, exist_ok=True)
         npz_util.savez_streaming(
             os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"), sparse_arrays
         )
-        dense_device = torch.device("cpu")
-        if pipeline_config.model_config.kernel != model_pb2.PYTORCH:
-            if not torch.cuda.is_available():
-                raise RuntimeError("TRITON/CUTLASS dense export requires a CUDA device")
-            dense_device = torch.device("cuda:0")
-            torch.cuda.set_device(dense_device)
-        _export_dense_model_on_device(
+        export_dense_model(
             pipeline_config,
             model,
             checkpoint_path,
             save_dir,
             dense_device,
             data_input_path=data_input_path,
+            mixed_precision=mixed_precision,
         )
         if uploader is not None:
             zch_tables = {
@@ -1786,6 +2209,7 @@ def export_distributed_embedding(
         save_dir,
         assets,
         additional_export_config,
+        config_asset_dir=config_asset_dir,
     )
     logger.info("Completed distributed embedding export to %s", save_dir)
 
@@ -2012,24 +2436,32 @@ def _run_dense_graph_sanity_check(
     gm: torch.fx.GraphModule,
     data: Dict[str, torch.Tensor],
     device: torch.device,
-) -> None:
-    """Run the pre-surgery graph once before scripting.
+    mixed_precision: Optional[str] = None,
+) -> Tuple[Dict[str, KeyedTensor], Dict[str, JaggedTensor]]:
+    """Run the pre-surgery graph once before scripting or AOTI export.
 
     Executes the full graph via an Interpreter to validate that the model
-    runs end-to-end on the warm-up batch. The pruned-graph forward is
-    skipped to avoid OOM on large models (see comment below).
+    runs end-to-end on the warm-up batch and returns captured sparse outputs.
+    The pruned-graph forward is skipped to avoid OOM on large models.
     """
     sparse_kts: Dict[str, KeyedTensor] = {}
     seq_jts: Dict[str, JaggedTensor] = {}
     capture_gm = torch.fx.GraphModule(model, copy.deepcopy(full_graph))
-    with torch.no_grad():
+    autocast_dtype = (
+        acc_utils.mixed_precision_to_dtype(mixed_precision)
+        if device.type == "cuda"
+        else None
+    )
+    with (
+        torch.no_grad(),
+        torch.amp.autocast(
+            device_type=device.type,
+            dtype=autocast_dtype,
+            enabled=autocast_dtype is not None,
+        ),
+    ):
         _SparseMarkCapture(capture_gm, sparse_kts, seq_jts).run(data, device)
-    # The pruned-graph forward (gm on captured sparse outputs) is skipped:
-    # the captured outputs (~660 MB for large models) are kept alive as the
-    # placeholder value for the entire forward, and the dense-layer
-    # intermediates on top exceed available host memory. The capture
-    # forward above already validated the full graph end-to-end, and
-    # torch.jit.script still validates the pruned graph's structure.
+    return sparse_kts, seq_jts
 
 
 def _isolate_kafka_export_group(input_path: str) -> str:
@@ -2059,13 +2491,89 @@ def _isolate_kafka_export_group(input_path: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(params)))
 
 
+def _ensure_min_export_batch_rows(
+    data: Dict[str, torch.Tensor],
+    features: List[BaseFeature],
+) -> Dict[str, torch.Tensor]:
+    """Duplicate single-row AOT warm-up batches so item batch dim >= 2."""
+    user_feats = {f.name for f in features if f.is_user_feat}
+    hsk_feats = set(get_hard_search_input_tile_features(features).keys())
+    is_tiled = acc_utils.is_input_tile()
+    is_online = acc_utils.is_input_tile_3_online()
+    preserve_user_1 = is_tiled and is_online
+
+    item_rows: Optional[int] = None
+    for feat in features:
+        if feat.stub_type or feat.name in user_feats or feat.name in hsk_feats:
+            continue
+        if f"{feat.name}.lengths" in data:
+            item_rows = int(data[f"{feat.name}.lengths"].numel())
+            break
+        if (
+            not feat.is_sparse
+            and not feat.is_sequence
+            and f"{feat.name}.values" in data
+        ):
+            item_rows = int(data[f"{feat.name}.values"].size(0))
+            break
+    if item_rows is None:
+        for key, val in data.items():
+            if key.endswith("__inverse_indices") and val.dim() >= 1:
+                item_rows = int(val.size(0))
+                break
+    if item_rows is None and not preserve_user_1:
+        for feat in features:
+            if feat.stub_type:
+                continue
+            if f"{feat.name}.lengths" in data:
+                item_rows = int(data[f"{feat.name}.lengths"].numel())
+                break
+            if (
+                not feat.is_sparse
+                and not feat.is_sequence
+                and f"{feat.name}.values" in data
+            ):
+                item_rows = int(data[f"{feat.name}.values"].size(0))
+                break
+    if item_rows is None and not features:
+        for key, val in data.items():
+            if key != "batch_size" and val.dim() >= 1:
+                item_rows = int(val.size(0))
+                break
+
+    if item_rows is None or item_rows >= 2 or item_rows <= 0:
+        return data
+
+    new_data: Dict[str, torch.Tensor] = {}
+    for key, val in data.items():
+        if key == "batch_size":
+            new_data[key] = val * 2 if preserve_user_1 else val
+        elif key.endswith("__inverse_indices"):
+            new_data[key] = (
+                torch.cat([val, val + 1], dim=0) if val.numel() == 1 else val
+            )
+        else:
+            prefix = key
+            for suffix in (".values", ".lengths", ".weights", ".key_lengths"):
+                if key.endswith(suffix):
+                    prefix = key[: -len(suffix)]
+                    break
+            if preserve_user_1 and prefix in user_feats:
+                new_data[key] = val
+            elif val.dim() >= 1:
+                new_data[key] = torch.cat([val, val], dim=0)
+            else:
+                new_data[key] = val
+    return new_data
+
+
 def create_dense_export_warmup_data(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
     device: torch.device,
     data_input_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build one warm-up batch for CPU dense export.
+    """Build one warm-up batch for dense export.
 
     One batch from ``data_input_path`` (or ``pipeline_config.train_input_path``)
     materializes lazy-module shapes before FX tracing. Its sparse lookup
@@ -2093,14 +2601,32 @@ def create_dense_export_warmup_data(
         # isolate the export's Kafka group when falling back to train_input_path
         input_path = _isolate_kafka_export_group(input_path)
     data_config = copy.deepcopy(pipeline_config.data_config)
+    if acc_utils.is_aot():
+        inference_batch_size = max(
+            2,
+            min(
+                config_util.get_inference_batch_size(data_config),
+                acc_utils.get_max_export_batch_size(),
+            ),
+        )
+        config_util.set_inference_batch_size(data_config, inference_batch_size)
     data_config.num_workers = 1
     features = cast(List[BaseFeature], model.features)
-    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
+    with acc_utils.export_env_scope(world_size=1, rank=0):
+        dataloader = create_dataloader(
+            data_config,
+            features,
+            input_path,
+            mode=Mode.PREDICT,
+        )
     batch = next(iter(dataloader))
     batch = batch.to(device)
     for kjt in batch.sparse_features.values():
         kjt.values().zero_()
-    return batch.to_dict(sparse_dtype=torch.int64)
+    data = batch.to_dict(sparse_dtype=torch.int64)
+    if acc_utils.is_aot():
+        data = _ensure_min_export_batch_rows(data, features)
+    return data
 
 
 def _shrink_sparse_embedding_tables(model: nn.Module) -> None:
@@ -2186,6 +2712,7 @@ def build_dense_graph_module(
     model: BaseModule,
     data: Dict[str, Any],
     device: torch.device,
+    mixed_precision: Optional[str] = None,
 ) -> Tuple[torch.fx.GraphModule, torch.fx.Graph, Dict[str, Any]]:
     """Trace the model and rewrite it into the serving-style dense graph.
 
@@ -2199,6 +2726,7 @@ def build_dense_graph_module(
         model: model to export, switched to inference mode in place.
         data: warm-up batch dict (see create_dense_export_warmup_data).
         device: device the traced graph module lives on.
+        mixed_precision: optional ``"BF16"``, ``"FP16"``, or None.
 
     Returns:
         Tuple of (gm, full_graph, dense_graph_config): the rewritten dense
@@ -2221,7 +2749,19 @@ def build_dense_graph_module(
     # Materialize meta params; real weights are loaded by the caller.
     init_parameters(model, device)
     model.to(device)
-    with torch.no_grad():
+    autocast_dtype = (
+        acc_utils.mixed_precision_to_dtype(mixed_precision)
+        if device.type == "cuda"
+        else None
+    )
+    with (
+        torch.no_grad(),
+        torch.amp.autocast(
+            device_type=device.type,
+            dtype=autocast_dtype,
+            enabled=autocast_dtype is not None,
+        ),
+    ):
         model(data, device=device)
 
     leaf_modules = (
@@ -2288,13 +2828,15 @@ def finalize_dense_export(
     save_dir: str,
     dense_graph_config: Dict[str, Any],
     dense_model_traced: Optional[torch.fx.GraphModule] = None,
+    mixed_precision: Optional[str] = None,
 ) -> torch.fx.GraphModule:
-    """Sanity-check and script a dense graph carrying its final weights.
+    """Sanity-check and script or AOTI-compile a dense graph carrying final weights.
 
     Runs the rewritten graph once on serving-style inputs rebuilt from the
     warm-up batch (so graph surgery or KeyedTensor regroup errors surface at
     export time instead of at serving time), then writes dense_meta.json,
-    the graph dumps and the scripted model under ``save_dir``.
+    the graph dumps and either ``aoti/aoti_model.pt2`` (under ``is_aot()``) or
+    ``scripted_model.pt`` under ``save_dir``.
 
     FX tracing patches ``torch.nn.Module.__call__`` process-wide for its
     duration, so it is not safe to run concurrently with eager forwards.
@@ -2313,17 +2855,27 @@ def finalize_dense_export(
         device: device of ``gm``.
         save_dir: directory the export artifacts are written to.
         dense_graph_config: dense_meta config from build_dense_graph_module.
-        dense_model_traced: pre-traced ``gm`` to script; traced here if None.
+        dense_model_traced: pre-traced ``gm`` to export/script; traced here if None.
+        mixed_precision: optional ``"BF16"``, ``"FP16"``, or None.
 
     Returns:
-        The traced module that was scripted, so a caller can reuse it across
-        exports without re-tracing.
+        The traced module, so a caller can reuse it across exports without
+        re-tracing.
     """
     graph_dir = os.path.join(save_dir, "graph")
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(graph_dir, exist_ok=True)
 
-    _run_dense_graph_sanity_check(model, full_graph, gm, data, device)
+    is_aot = acc_utils.is_aot()
+    if is_aot:
+        sparse_kts, seq_jts = _run_dense_graph_sanity_check(
+            model, full_graph, gm, data, device, mixed_precision=mixed_precision
+        )
+    else:
+        _run_dense_graph_sanity_check(
+            model, full_graph, gm, data, device, mixed_precision=mixed_precision
+        )
+        sparse_kts, seq_jts = {}, {}
 
     with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
         f.write(str(full_graph))
@@ -2334,6 +2886,24 @@ def finalize_dense_export(
 
     if dense_model_traced is None:
         dense_model_traced = symbolic_trace(gm)
+        if isinstance(dense_model_traced, torch.fx.GraphModule):
+            eliminate_dense_dead_code(dense_model_traced.graph)
+            dense_model_traced.recompile()
+
+    if is_aot:
+        aot_utils.export_distributed_dense_model_aot(
+            model=model,
+            dense_model_traced=dense_model_traced,
+            data=data,
+            sparse_kts=sparse_kts,
+            seq_jts=seq_jts,
+            dense_graph_config=dense_graph_config,
+            save_dir=save_dir,
+            device=device,
+            mixed_precision=mixed_precision,
+        )
+        return dense_model_traced
+
     with open(os.path.join(save_dir, "gm_dense.code"), "w") as f:
         f.write(dense_model_traced.code)
     dense_model_scripted = torch.jit.script(dense_model_traced)
@@ -2341,50 +2911,40 @@ def finalize_dense_export(
     return dense_model_traced
 
 
-def export_dense_model_cpu(
+def export_dense_model(
     pipeline_config: EasyRecConfig,
     model: BaseModule,
     checkpoint_path: Optional[str],
     save_dir: str,
-    assets: Optional[List[str]] = None,
-    use_local_cache_dir: bool = False,
-    data_input_path: Optional[str] = None,
-    **kwargs: Any,
-) -> None:
-    """Export only the dense model on CPU without DMP or GPU usage.
-
-    One batch from ``data_input_path`` (or ``pipeline_config.train_input_path``)
-    warms up lazy modules before tracing and sanity-runs the rewritten graph
-    before scripting; restore fails on any checkpoint-missing state so the
-    exported model can never carry uninitialized weights.
-    """
-    del assets, use_local_cache_dir, kwargs
-    if not checkpoint_path:
-        raise ValueError("checkpoint path should be specified.")
-
-    _export_dense_model_on_device(
-        pipeline_config,
-        model,
-        checkpoint_path,
-        save_dir,
-        torch.device("cpu"),
-        data_input_path,
-    )
-
-
-def _export_dense_model_on_device(
-    pipeline_config: EasyRecConfig,
-    model: BaseModule,
-    checkpoint_path: str,
-    save_dir: str,
     device: torch.device,
     data_input_path: Optional[str] = None,
+    mixed_precision: Optional[str] = None,
 ) -> None:
-    """Build and restore a dense graph on the device its configured kernels need."""
+    """Export only the dense model from a checkpoint on ``device``.
+
+    Args:
+        pipeline_config: Pipeline configuration for input and export settings.
+        model: Model instance to trace into a dense serving graph.
+        checkpoint_path: Path to the checkpoint storing dense weights.
+        save_dir: Destination directory for the exported dense artifacts.
+        device: Target device for graph building, restoration, and export.
+        data_input_path: Optional override path for warm-up batch reading.
+        mixed_precision: Optional mixed precision mode for dense AOTI export.
+    """
+    if not checkpoint_path:
+        raise ValueError("checkpoint path should be specified.")
+    if acc_utils.is_aot() and device.type != "cuda":
+        raise ValueError("AOTI dense export requires a CUDA device.")
+
     data = create_dense_export_warmup_data(
-        pipeline_config, model, device, data_input_path
+        pipeline_config,
+        model,
+        device,
+        data_input_path,
     )
-    gm, full_graph, dense_graph_config = build_dense_graph_module(model, data, device)
+    gm, full_graph, dense_graph_config = build_dense_graph_module(
+        model, data, device, mixed_precision=mixed_precision
+    )
     checkpoint_util.restore_model(
         checkpoint_path,
         gm,
@@ -2396,7 +2956,14 @@ def _export_dense_model_on_device(
         load_dynamicemb=False,
     )
     finalize_dense_export(
-        model, full_graph, gm, data, device, save_dir, dense_graph_config
+        model,
+        full_graph,
+        gm,
+        data,
+        device,
+        save_dir,
+        dense_graph_config,
+        mixed_precision=mixed_precision,
     )
 
 
@@ -2604,6 +3171,7 @@ def _get_sparse_embedding_tensor(
     dynamic_export: Optional[
         Tuple[Dict[str, npz_util.StreamingArray], Dict[str, Dict[str, Any]]]
     ] = None,
+    rank: Optional[int] = None,
 ) -> Tuple[
     Dict[str, Any],
     Dict[str, Any],
@@ -2627,6 +3195,8 @@ def _get_sparse_embedding_tensor(
             contain single-use iterators that the NPZ writer must consume once.
             When None, scan all checkpoint shards with a 64 MiB read budget and
             the quantization format selected by DIST_QUANT.
+        rank: Optional rank override for single-rank export without reading
+            ``os.environ["RANK"]``.
 
     Returns:
         out: regular sparse embedding tensors keyed by table FQN.
@@ -2726,7 +3296,7 @@ def _get_sparse_embedding_tensor(
     # zch tables serve a trained default row on key miss, plain dynamic tables
     # have no such row, so this entry is optional.
     dynamic_default_value_names: Dict[str, List[str]] = defaultdict(list)
-    rank = int(os.environ.get("RANK", 0))
+    resolved_rank = int(os.environ.get("RANK", 0)) if rank is None else rank
     zch_tables: Dict[str, MCHManagedCollisionModule] = _get_zch_export_tables(
         model, emb_name_to_emb_dim
     )
@@ -2802,7 +3372,7 @@ def _get_sparse_embedding_tensor(
                 for _idx, shards_meta in enumerate(values.metadata().shards_metadata):
                     placement = shards_meta.placement
                     assert placement is not None
-                    if placement.rank() == rank:
+                    if placement.rank() == resolved_rank:
                         # name = name + f"/part_{idx}_{num_shards}"
                         if list(values.shape)[-1] == emb_dim:
                             # dynamicemb may have a dummy tensor in state_dict, skip it.

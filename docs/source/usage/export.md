@@ -50,20 +50,20 @@ torchrun --master_addr=localhost --master_port=32555 \
   - **HARD_SEARCH_INPUT_TILE=0**：每个候选分别进行历史侧的 FG 和 embedding 计算。
   - **HARD_SEARCH_INPUT_TILE=1**：相同候选 key 共享历史侧计算，attention 仍按各自候选计算。
   - 当前仅支持在 `INPUT_TILE=2/3` 下开启，具体用法和限制见 [hard-search](#hard-search)。
-- INPUT_TILE_3_ONLINE: 配合INPUT_TILE=3使用，对User侧序列特征使用在线推理模式，序列特征在线模型服务中推理性能更好，但导出的模型无法用于离线预测
+- INPUT_TILE_3_ONLINE: 配合INPUT_TILE=3使用，对User侧序列特征使用在线推理模式，序列特征在线模型服务中推理性能更好，离线预测仅支持 `batch_size=1`（`tzrec.predict` 在 `batch_size > 1` 时会直接报错）
   - **INPUT_TILE_3_ONLINE=1**：启用序列特征的在线推理模式
-- USE_DISTRIBUTED_EMBEDDING: 开启分布式 embedding 导出模式，导出 dense graph 与分片 sparse embedding 参数；该模式会自动使用 `INPUT_TILE=3`
+- USE_DISTRIBUTED_EMBEDDING: 开启分布式 embedding 导出模式，导出 dense graph 与分片 sparse embedding 参数；默认启用 `INPUT_TILE=3`（GenRec 模型与不含候选非 user 特征的纯 user 塔，如 `MatchModel` 的 `user_tower`，会自动使用 `INPUT_TILE=0`）
   - **USE_DISTRIBUTED_EMBEDDING=1**：启用分布式 embedding 导出；配置了 `dynamicemb` 的特征会在非 RTP 导出时自动开启该模式
   - 普通 sparse、ZCH 和原生 dynemb 模型使用统一导出流程；`dynamic_embedding` 仅调整 dynemb 读取和上传参数
   - 配置了 zch 的特征会自动转换为动态表导出，详见 [零冲突Hash Embedding](../feature/zch.md) 的分布式 Embedding 导出章节
-  - PYTORCH dense 图使用 CPU 导出，TRITON/CUTLASS dense 图需要 CUDA；导出目录保留 full/dense graph 调试文件，不再生成 `graph/gm_sparse.graph`
-  - 导出的模型可用 `tzrec.predict` 离线预测，详见 [离线预测](./predict.md#predict-distributed-embedding)
 - DIST_QUANT: 分布式 embedding 导出模式下的 sparse embedding 参数量化开关，默认关闭；当前仅支持 INT8，与普通导出的 `QUANT_EMB` / `QUANT_EC_EMB` 不同
   - **USE_DISTRIBUTED_EMBEDDING=1 DIST_QUANT=INT8**：启用分布式 sparse embedding INT8 量化
   - 未设置 **DIST_QUANT** 时，不启用分布式 sparse embedding 量化
 - ENABLE_AOT: 使用AOT(Ahead Of Time)编译优化导出的模型，可显著提升推理性能。**AOT 编译产物与导出机器的 GPU 架构强绑定，在线服务的 GPU 类型必须与导出时使用的 GPU 类型完全一致**，详见下文 [在 PAI 上导出 AOT 模型](#export-aot-on-pai) 章节
-  - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（sparse 部分用 JIT，dense 部分用 AOTI）
-  - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化 (sparse + dense 融合为单一 .pt2) [experimental]
+  - **ENABLE_AOT=1**: 使用AOT编译优化导出模型（普通导出下 sparse 部分用 JIT，dense 部分用 AOTI；在 `USE_DISTRIBUTED_EMBEDDING=1` 下与 `ENABLE_AOT=2` 行为一致）
+  - **ENABLE_AOT=2**: 使用统一 AOTI 模型编译优化（普通导出下 sparse + dense 融合为单一 `.pt2`，支持 `INPUT_TILE`、`HARD_SEARCH_INPUT_TILE` 和空序列特征，其中非 GenRec 模型的 `JAGGED_SEQUENCE` 特征组在预测时仍要求每个 batch 的序列总长度至少为 1）
+- TORCHINDUCTOR_CACHE_DIR: 指定 TorchInductor 与 Triton 编译缓存目录。开启 `ENABLE_AOT` 时，建议挂载容器本地持久化路径以复用已编译算子内核，显著缩短重编译耗时
+- AOTI_PORTABLE_CPU / AOTI_CPU_MARCH: 可选配置。默认情况下 AOTI C++ 包装库使用 `-march=native` 编译，若导出机 CPU 具备高阶指令集（如 `AMX_TILE` / `AVX-512`）而线上推理节点 CPU 机型异构，可能引发 `SIGILL` 非法指令崩溃；跨机型部署时可设置 **AOTI_PORTABLE_CPU=1**（x86_64 默认采用 `core-avx2` 与 256-bit SIMD，避开 `AVX-512`/`AMX_TILE`），或通过 **AOTI_CPU_MARCH**（如 `core-avx2`、`x86-64`）及可选 **AOTI_CPU_SIMDLEN** 显式指定目标指令集
 
 (dynamic-embedding-full-export)=
 
@@ -118,7 +118,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
 
 ## 在线学习 dense 模型热导出
 
-在 `USE_DISTRIBUTED_EMBEDDING=1` 的在线学习场景下，sparse embedding 通过增量 embedding dump（`train_config.delta_embedding_dump_config`）持续上传 FeatureStore，训练进程可以在训练过程中同步导出 dense 图，供推理 Processor 热切换。该能力**不依赖 checkpoint**：rank 0 在训练启动时一次性构建 serving 侧 dense 图，之后每次触发时全体 rank 从内存中的 DMP 模型收集 dense 权重（仅收集 dense 图实际携带的参数，不涉及 sparse/dynamicemb/MCH 状态），rank 0 在后台线程热替换权重、script 并构建新版本目录，训练主流程不阻塞在导出上。
+在 `USE_DISTRIBUTED_EMBEDDING=1` 的在线学习场景下，sparse embedding 通过增量 embedding dump（`train_config.delta_embedding_dump_config`）持续上传 FeatureStore，训练进程可以在训练过程中同步导出 dense 图，供推理 Processor 热切换。该能力**不依赖 checkpoint**：rank 0 在训练启动时一次性构建 serving 侧 dense 图，之后每次触发时全体 rank 从内存中的 DMP 模型收集 dense 权重（仅收集 dense 图实际携带的参数，不涉及 sparse/dynamicemb/MCH 状态），rank 0 在后台线程热替换权重、重新导出模型并构建新版本目录，训练主流程不阻塞在导出上。
 
 dense 导出触发与增量 embedding dump 的粗粒度边界统一：每个 `paired_dump_interval_steps` / `paired_dump_interval_minutes` 边界执行一次 delta dump 并触发一次 dense 导出，同一训练步的 (dense, sparse) 严格成对。粗粒度参数为**必选**（steps 与 minutes 二选一）。在此基础上可选配置更细粒度的 `sparse_dump_interval_steps` / `sparse_dump_interval_minutes`（维度必须与粗粒度一致且数值严格更小）：细粒度边界只执行 delta dump 与 FeatureStore 上传、不导出 dense，让线上 embedding 以更高频率更新，而 dense 版本仍按粗粒度节奏发布；两个边界落在同一训练步时粗粒度优先，只 dump 一次。训练正常结束时若存在尾部增量，也会成对补一次最终导出（尾部若恰好落在某个 dump 边界上，则不重复 dump，最终导出与该步配对）。dense 版本构建完成后**不会立即生效**：`current.json` 仅在该步的 sparse 增量在所有 rank 上都完成 FeatureStore 上传后才原子翻转（联合发布），保证推理侧绝不出现 dense 领先 sparse——sparse 领先 dense 是唯一允许的偏斜方向。
 
@@ -140,11 +140,14 @@ train_config {
 }
 ```
 
-训练命令前加上以下环境变量即可（`ONLINE_DENSE_EXPORT_DIR` 为必填）：
+训练命令前加上以下环境变量即可（`ONLINE_DENSE_EXPORT_DIR` 为必填）；如需热导出 AOTInductor（`.pt2`）版本，追加 `ENABLE_AOT=2`（兼容 `ENABLE_AOT=1`）、`CUDA_HOME` 及 `TORCHINDUCTOR_CACHE_DIR`：
 
 ```bash
 ONLINE_DENSE_EXPORT=1 \
 ONLINE_DENSE_EXPORT_DIR=/mnt/data/serving \
+ENABLE_AOT=2 \
+CUDA_HOME=/usr/local/cuda-12 \
+TORCHINDUCTOR_CACHE_DIR=/tmp/inductor_cache \
 torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
     --nnodes=$WORLD_SIZE --nproc-per-node=$NPROC_PER_NODE --node_rank=$RANK \
     -m tzrec.train_eval \
@@ -157,27 +160,32 @@ torchrun --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
   - **ONLINE_DENSE_EXPORT=1**：启用（要求同时设置 `USE_DISTRIBUTED_EMBEDDING=1`，并在 `train_config` 中配置带 `feature_store_config` 的 `delta_embedding_dump_config`；仅本地落盘的 dump 没有上传水位可供门控，缺少任一项训练启动即报错）
 - ONLINE_DENSE_EXPORT_DIR: 在线服务读取的根目录（必填）。导出产物发布在 `<ONLINE_DENSE_EXPORT_DIR>/dense_hot_export` 下，必须为本地路径（发布依赖 `os.rename` 原子换版）；`model_dir` 可以是远端（如 OSS）
 - ONLINE_DENSE_EXPORT_KEEP_VERSIONS: 保留的历史版本数，默认 0（不删除任何已导出的版本）。大于 0 时保留最新 K 个版本，且 K 最小为 3（serving 需要当前版本 + 上一版本用于原子切换）。`current.json` 指向的版本永远不被清理
-- ONLINE_DENSE_EXPORT_TIMEOUT: 单次导出的预算秒数，默认 3600。超时不会中断导出线程，仅打印告警，并用于训练结束时 drain 的等待上限
+- ONLINE_DENSE_EXPORT_TIMEOUT: 单次导出的预算秒数，默认 3600。超时不会中断导出线程，仅打印告警，并用于训练结束时 drain 与启动阶段冷编译试运行
+- **`ENABLE_AOT`** 在 `ONLINE_DENSE_EXPORT=1` 时设置 `ENABLE_AOT=2`，启用 CUDA AOTInductor 热导出。导出与服务的 GPU SM 架构必须一致，同一服务进程应使用统一的模型格式。详见[在 PAI 上导出 AOT 模型](#export-aot-on-pai)。
+- TORCHINDUCTOR_CACHE_DIR: 建议在 `ONLINE_DENSE_EXPORT=1` + `ENABLE_AOT=2` 下指向本地持久化缓存目录，利用启动试运行预热 Triton/C++ 编译缓存以加速后续各轮重打包
 
 ### 运行与排障说明
 
-- 仅 rank 0 执行建图与发布；启动时会对整条建图 + script 链路做一次试运行，任何 trace/script 失败会在训练开始前就暴露（fail-fast）。
+- 仅 rank 0 执行建图与发布；启动时会对整条建图 + script/AOTI 链路做一次试运行，任何 trace/script/AOTI 编译失败会在训练开始前就暴露（fail-fast）。
 - 启动时还会校验 dense 图的每个参数都能在训练模型 state dict 中找到来源（INPUT_TILE=3 的 user 侧孪生模块自动回落到非 user 侧权重），校验失败训练不会启动。
 - 导出在后台线程执行，dense 版本构建失败（日志中 `online dense export task failed`）只跳过该版本、不翻转 `current.json`，训练继续，由后续版本取代；FeatureStore 上传失败则会使训练报错退出，指针同样不翻转。两种失败下推理侧都停留在上一个自洽版本。
 - 两次导出间隔小于单次导出耗时时，排队中的旧任务被最新版本顶替（latest-wins），不产生积压；水位到达后也只发布最新的就绪版本，被顶替的未发布版本目录会被直接删除，不占用 `ONLINE_DENSE_EXPORT_KEEP_VERSIONS` 的保留配额。
 - 新鲜度预算：dump/发布间隔必须大于单次增量上传耗时的 p99（可通过监控上传耗时占发布间隔的比例确认），否则全局水位持续落后于配对步，`current.json` 长期不翻转。
 - 建议周期性做全量再基线（anti-entropy）：停训后用离线全量导出 + FeatureStore 全量导入，再用下述 bootstrap 命令发布配对的 dense 版本，以清理 crash 重启死时间线残留的旧值、僵尸 tombstone 等漂移。全量导入必须以重启式切换进行，不能在增量流写入的同时在线叠写。
-- MatchModel（向量召回）与 TDM 模型的完整导出按 user/item（或按模块）分目录，与单体 dense 热导出的布局不兼容，启用会直接报错，请使用完整的 `tzrec.export`。
+- MatchModel（向量召回）、TDM 与 BaseGenRecModel（`prompt_config`）模型的完整导出与单体 dense 热导出的产物布局不兼容，启用会直接报错，请使用完整的 `tzrec.export`。
 - 手动/离线从某个 checkpoint 导出一个版本（bootstrap，与训练内导出发布到同一目录结构）。该命令不经过水位门控、直接翻转 `current.json`，manifest 中 `sparse_step` 等于 `checkpoint_step`（`--checkpoint_step` 省略时从 `model.ckpt-<step>` 路径解析）、`sparse_probes` 为空（Processor 跳过探针验证），前提是 FeatureStore 中的全量 embedding 与该 checkpoint 同源：
 
 ```bash
-USE_DISTRIBUTED_EMBEDDING=1 ONLINE_DENSE_EXPORT_DIR=/mnt/data/serving \
+USE_DISTRIBUTED_EMBEDDING=1 ENABLE_AOT=2 CUDA_HOME=/usr/local/cuda-12 \
+ONLINE_DENSE_EXPORT_DIR=/mnt/data/serving \
 python -m tzrec.tools.online_dense_export \
     --pipeline_config_path experiments/online_learning/pipeline.config \
     --checkpoint_path /mnt/data/model/model.ckpt-1200 \
     --model_dir /mnt/data/model \
     --checkpoint_step 1200
 ```
+
+（未设置 `ENABLE_AOT` 时导出 TorchScript `scripted_model.pt`。）
 
 (export-aot-on-pai)=
 
@@ -311,5 +319,5 @@ export HARD_SEARCH_INPUT_TILE=1
 
 ### 使用限制
 
-- 当前支持 FX/TorchScript 和 distributed embedding，不支持 AOT/TRT、RTP、HSTU。
+- 当前支持 FX/TorchScript、统一 AOT（ENABLE_AOT=2）和 distributed embedding（含搭配 ENABLE_AOT=2/1），不支持普通导出下的 ENABLE_AOT=1、TRT、RTP、HSTU。
 - 历史派生特征只能依赖同一份 hard-search 历史及共享用户输入或常量。若还依赖候选自身的 `item:` / `context:` 字段，或另一组历史，不能开启 `HARD_SEARCH_INPUT_TILE`。

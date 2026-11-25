@@ -9,7 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union, cast
@@ -34,7 +33,7 @@ from torchrec.modules.mc_modules import (
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
-from tzrec.acc.utils import is_input_tile, is_input_tile_emb
+from tzrec.acc.utils import is_input_tile, is_input_tile_3_online, is_input_tile_emb
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature, get_hard_search_input_tile_features
 from tzrec.modules.dense_embedding_collection import (
@@ -51,12 +50,14 @@ from tzrec.utils.fx_util import (
     fx_mark_seq_len,
     fx_mark_seq_tensor,
     fx_mark_tensor,
+    fx_nonneg_int_item,
 )
 
 EMPTY_KJT = KeyedJaggedTensor.empty()
 
 
 torch.fx.wrap(fx_int_item)
+torch.fx.wrap(fx_nonneg_int_item)
 torch.fx.wrap(fx_mark_keyed_tensor)
 torch.fx.wrap(fx_mark_tensor)
 torch.fx.wrap(fx_mark_seq_tensor)
@@ -243,10 +244,21 @@ class HardSearchInputTileExpander(nn.Module):
 def _pool_sequence_values(
     values: torch.Tensor, lengths: torch.Tensor, pooling: str
 ) -> torch.Tensor:
-    """Pool sequence steps, including a batch with no steps at all."""
-    if lengths.numel() == 0:
+    """Pool sequence values, including a batch with empty lengths."""
+    exporting = False
+    if not torch.jit.is_scripting():
+        exporting = torch.compiler.is_exporting()
+
+    if exporting:
+        # Trailing 0-length segment keeps empty and non-empty lengths on one
+        # path during torch.export; [:-1] drops the sentinel output.
+        lengths = torch.nn.functional.pad(lengths, (0, 1))
+    elif lengths.numel() == 0:
         return values[:0]
+
     pooled = torch.segment_reduce(values, pooling, lengths=lengths)
+    if exporting:
+        pooled = pooled[:-1]
     if pooling == "mean":
         pooled = torch.nan_to_num(pooled, nan=0.0)
     return pooled
@@ -1903,10 +1915,15 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 fx_mark_tensor(f"{group_name}__query", query_cat_t, keys=query_t_keys)
                 results[f"{group_name}.query"] = query_cat_t
 
+        tile3_online = is_input_tile_3_online()
         for group_name, v in self._group_to_shared_sequence.items():
             seq_t_list = []
             seq_t_keys = []
 
+            is_jagged = self._group_to_is_jagged[group_name]
+            need_padded_len = not is_jagged and not all(
+                tile3_online and info.is_user for info in v
+            )
             group_sequence_length = 1
             for i, info in enumerate(v):
                 # when is_user is True
@@ -1922,7 +1939,10 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                 jt = jt_dict[info.name]
                 if i == 0:
                     sequence_length = jt.lengths()
-                    group_sequence_length = fx_int_item(torch.max(sequence_length))
+                    if need_padded_len:
+                        group_sequence_length = fx_nonneg_int_item(
+                            torch.max(sequence_length)
+                        )
 
                     if need_tile:
                         sequence_length = sequence_length.tile(tile_size)
@@ -1934,9 +1954,7 @@ class SequenceEmbeddingGroupImpl(nn.Module):
                     fx_mark_seq_len(f"{group_name}", sequence_length)
                     results[f"{group_name}.sequence_length"] = sequence_length
 
-                if (
-                    int(os.getenv("INPUT_TILE_3_ONLINE", "0")) == 1 and info.is_user
-                ) or self._group_to_is_jagged[group_name]:
+                if (tile3_online and info.is_user) or is_jagged:
                     seq_t = jt.values()
                 else:
                     seq_t = jt.to_padded_dense(group_sequence_length)
