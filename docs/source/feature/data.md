@@ -118,6 +118,11 @@ data_config {
       - `TZREC_KAFKA_OFFSETS_FOR_TIMES_TIMEOUT`: 每次`offsets_for_times`请求的超时时间（秒），默认`30.0`
       - `TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES`: 每批请求失败后的重试次数，默认`2`
 
+  - 支持`end.timestamp.ms`参数，可单独使用，也可与`start.timestamp.ms`组合成有限回放的时间窗口。
+
+    - 示例:
+      - `kafka://broker:9092/topic?group.id=consumer_group&auto.offset.reset=earliest&start.timestamp.ms=1711929600000&end.timestamp.ms=1712016000000`
+
   - 如需按分区轮询读取，可设置`data_config.kafka_partition_round_robin: true`，默认为false
 
   - 如需观察各worker的读取量，可设置`data_config.kafka_log_every_n_messages`，默认为0

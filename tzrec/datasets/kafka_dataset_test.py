@@ -26,13 +26,19 @@ from alibabacloud_alikafka20190916.client import Client as AliKafkaClient
 from alibabacloud_credentials.client import Client as CredClient
 from alibabacloud_tea_openapi import models as openapi_models
 from alibabacloud_tea_util import models as util_models
-from confluent_kafka import KafkaException, Producer, TopicPartition
+from confluent_kafka import (
+    OFFSET_INVALID,
+    KafkaError,
+    KafkaException,
+    Producer,
+    TopicPartition,
+)
 from parameterized import param, parameterized
 from torch.utils.data import DataLoader
 
 from tzrec.constant import Mode
 from tzrec.datasets import kafka_dataset
-from tzrec.datasets.dataset import create_dataloader
+from tzrec.datasets.dataset import BaseReader, create_dataloader
 from tzrec.datasets.kafka_dataset import (
     KafkaDataset,
     KafkaReader,
@@ -40,7 +46,7 @@ from tzrec.datasets.kafka_dataset import (
     _offsets_for_times_batched,
     _parse_kafka_uri,
 )
-from tzrec.datasets.utils import DATA_TIMESTAMP
+from tzrec.datasets.utils import CKPT_ROW_IDX, DATA_TIMESTAMP
 from tzrec.features.feature import FgMode, create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.tests import utils
@@ -55,35 +61,49 @@ class ParseKafkaUriTest(unittest.TestCase):
 
     def test_parse_without_start_timestamp(self):
         uri = "kafka://broker:9092/topic?group.id=g1&auto.offset.reset=earliest"
-        topic, params, start_ts = _parse_kafka_uri(uri)
+        topic, params, start_ts, end_ts = _parse_kafka_uri(uri)
         self.assertEqual(topic, "topic")
         self.assertEqual(params["bootstrap.servers"], "broker:9092")
         self.assertEqual(params["group.id"], "g1")
         self.assertIsNone(start_ts)
+        self.assertIsNone(end_ts)
         self.assertNotIn("start.timestamp.ms", params)
+        self.assertNotIn("end.timestamp.ms", params)
 
-    def test_parse_with_start_timestamp(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=1711929600000"
-        topic, params, start_ts = _parse_kafka_uri(uri)
-        self.assertEqual(topic, "topic")
-        self.assertEqual(start_ts, 1711929600000)
-        # start.timestamp.ms should be removed from consumer params
+    @parameterized.expand(
+        [
+            ("start_only", "start.timestamp.ms=1711929600000", 1711929600000, None),
+            ("end_only", "end.timestamp.ms=1712016000000", None, 1712016000000),
+            ("bounded", "start.timestamp.ms=0&end.timestamp.ms=7", 0, 7),
+            ("empty_window", "start.timestamp.ms=7&end.timestamp.ms=7", 7, 7),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_timestamp_params(self, _name, query, start, end):
+        _, params, start_ts, end_ts = _parse_kafka_uri(
+            f"kafka://broker/topic?group.id=g1&{query}"
+        )
+        self.assertEqual((start_ts, end_ts), (start, end))
         self.assertNotIn("start.timestamp.ms", params)
+        self.assertNotIn("end.timestamp.ms", params)
+        if end is not None:
+            self.assertEqual(params["enable.partition.eof"], "true")
 
-    def test_parse_with_zero_timestamp(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=0"
-        _, _, start_ts = _parse_kafka_uri(uri)
-        self.assertEqual(start_ts, 0)
-
-    def test_parse_with_negative_timestamp_raises(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=-1"
+    @parameterized.expand(
+        [
+            ("empty_end", "end.timestamp.ms="),
+            ("empty_start", "start.timestamp.ms=&end.timestamp.ms=1"),
+            ("reversed", "start.timestamp.ms=2&end.timestamp.ms=1"),
+            ("negative_start", "start.timestamp.ms=-1"),
+            ("invalid_start", "start.timestamp.ms=abc"),
+            ("negative_end", "end.timestamp.ms=-1"),
+            ("non_integer", "end.timestamp.ms=soon"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_invalid_window(self, _name, query):
         with self.assertRaises(ValueError):
-            _parse_kafka_uri(uri)
-
-    def test_parse_with_non_integer_timestamp_raises(self):
-        uri = "kafka://broker:9092/topic?group.id=g1&start.timestamp.ms=abc"
-        with self.assertRaises(ValueError):
-            _parse_kafka_uri(uri)
+            _parse_kafka_uri(f"kafka://broker/topic?group.id=g1&{query}")
 
 
 def _resolved(partition, offset, topic="t"):
@@ -114,8 +134,8 @@ def _decoded_logs(mock_logger):
     ]
 
 
-class KafkaReaderRoundRobinTest(unittest.TestCase):
-    """Round-robin reading with mocked consumers."""
+class KafkaReaderTestCase(unittest.TestCase):
+    """Kafka readers with mocked consumers."""
 
     def _make_reader(
         self,
@@ -124,6 +144,7 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         leaders=None,
         round_robin=True,
         batch_size=1,
+        uri="kafka://broker:9092/topic?group.id=g1",
         **kwargs,
     ):
         leaders = leaders or {partition: 0 for partition in partitions}
@@ -139,10 +160,11 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
                 )
             }
         )
+        needs_order = round_robin or _parse_kafka_uri(uri)[3] is not None
         self.enterContext(
             mock.patch(
                 "tzrec.datasets.kafka_dataset.Consumer",
-                side_effect=([query_consumer] if round_robin else []) + consumers,
+                side_effect=([query_consumer] if needs_order else []) + consumers,
             )
         )
         self.enterContext(
@@ -152,12 +174,16 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
             )
         )
         return KafkaReader(
-            "kafka://broker:9092/topic?group.id=g1",
+            uri,
             batch_size,
             input_fields=[pa.field("x", pa.int64())],
             kafka_partition_round_robin=round_robin,
             **kwargs,
         )
+
+
+class KafkaReaderRoundRobinTest(KafkaReaderTestCase):
+    """Round-robin reading with mocked consumers."""
 
     @parameterized.expand(
         [
@@ -488,6 +514,124 @@ class KafkaReaderRoundRobinTest(unittest.TestCase):
         self.assertIn(DATA_TIMESTAMP, plan.schema.names)
 
 
+class KafkaReaderEndOffsetsTest(KafkaReaderTestCase):
+    URI = "KAFKA://kafka/topic?group.id=g&auto.offset.reset=latest&end.timestamp.ms=20"
+
+    def _bounded_reader(self, partitions, query=""):
+        consumer = mock.Mock()
+        consumer.get_watermark_offsets.return_value = (0, 5)
+        reader = self._make_reader(
+            [consumer], partitions=partitions, round_robin=False, uri=self.URI + query
+        )
+        return reader, consumer
+
+    @parameterized.expand(
+        [("keep_tail", False, [([14], [4])]), ("drop_tail", True, [])],
+        name_func=parameterized_name_func,
+    )
+    def test_workers_finish_independently(self, _name, drop_remainder, tail):
+        slow, fast = mock.Mock(), mock.Mock()
+        reader = self._make_reader(
+            [slow, fast],
+            partitions=(0, 1, 2),
+            round_robin=False,
+            uri=self.URI + "&start.timestamp.ms=10",
+            batch_size=2,
+            drop_remainder=drop_remainder,
+            min_batch_size=1,
+        )
+        reader.load_state_dict({"topic:1": 0})
+        slow.get_watermark_offsets.return_value = (0, 5)
+        slow.offsets_for_times.return_value = [TopicPartition("topic", 1, 5)]
+        slow.consume.side_effect = [[_msg(1, offset, offset)] for offset in range(1, 5)]
+        fast.get_watermark_offsets.return_value = (0, 5)
+        fast.offsets_for_times.side_effect = [
+            [TopicPartition("topic", 0, 8), TopicPartition("topic", 2, -1)],
+            [TopicPartition("topic", 0, 2), TopicPartition("topic", 2, -1)],
+        ]
+        fast.consume.side_effect = [
+            [_msg(0, 3, 10), _msg(0, 4, 12)],
+            [_msg(0, 5, 13), _msg(2, 4, 14)],
+        ]
+        slow_batches = reader.to_batches(1, 2)
+        self.addCleanup(slow_batches.close)
+        self.assertEqual(next(slow_batches)["x"].to_pylist(), [1, 2])
+        observed = [
+            (batch["x"].to_pylist(), batch[CKPT_ROW_IDX].to_pylist())
+            for batch in reader.to_batches(0, 2)
+        ]
+        self.assertEqual(observed, [([10, 12], [3, 4])] + tail)
+        fast.close.assert_called_once()
+        slow.close.assert_not_called()
+        self.assertEqual([b["x"].to_pylist() for b in slow_batches], [[3, 4]])
+        for consumer, assigned, queries in (
+            (fast, [(0, 2), (2, OFFSET_INVALID)], [[0, 2], [0, 2]]),
+            (slow, [(1, 1)], [[1]]),
+        ):
+            consumer.subscribe.assert_not_called()
+            consumer.assign.assert_called_once()
+            (partitions,) = consumer.assign.call_args.args
+            self.assertEqual([(p.partition, p.offset) for p in partitions], assigned)
+            calls = consumer.offsets_for_times.call_args_list
+            self.assertEqual([[p.partition for p in c.args[0]] for c in calls], queries)
+
+    def test_worker_without_partitions_finishes(self):
+        reader, consumer = self._bounded_reader([0])
+        self.assertEqual(list(reader._reader(1, 2)), [])
+        self.assertEqual(consumer.method_calls, [mock.call.close()])
+
+    @parameterized.expand(
+        [
+            ("equal_bounds", [4, -1], "&start.timestamp.ms=20", None),
+            ("checkpoint_past_end", [4], "", {"topic:0": 9}),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_empty_window(self, _name, ends, query, checkpoint):
+        reader, consumer = self._bounded_reader(range(len(ends)), query)
+        reader.load_state_dict(checkpoint)
+        consumer.offsets_for_times.return_value = [
+            TopicPartition("topic", p, end) for p, end in enumerate(ends)
+        ]
+        consumer.consume.side_effect = AssertionError("polled an empty window")
+        self.assertEqual(list(reader._reader()), [])
+
+    def test_round_robin_replays_unfinished_partitions(self):
+        consumers = [mock.Mock() for _ in range(3)]
+        reader = self._make_reader(consumers, partitions=(0, 1, 2), uri=self.URI)
+        consumers[0].get_watermark_offsets.side_effect = [(0, 5), (2, 2), (0, 4)]
+        consumers[0].offsets_for_times.return_value = [
+            TopicPartition("topic", p, end) for p, end in enumerate([2, -1, -1])
+        ]
+        consumers[0].consume.side_effect = [[_msg(0, 1, 1), _msg(0, 2, 2)]]
+        eof = KafkaError(KafkaError._PARTITION_EOF)
+        consumers[2].consume.side_effect = [[_msg(2, 1, 3), _msg(2, 4, 0, error=eof)]]
+        self.assertEqual(
+            [b.column("x").to_pylist() for b in reader._reader()], [[1], [3]]
+        )
+        consumers[1].consume.assert_not_called()
+
+    @mock.patch.dict(os.environ, TZREC_KAFKA_OFFSETS_FOR_TIMES_RETRIES="0")
+    def test_end_lookup_failure_closes_consumer(self):
+        reader, consumer = self._bounded_reader([0])
+        consumer.offsets_for_times.side_effect = KafkaException("timeout")
+        with self.assertRaisesRegex(KafkaException, "timeout"):
+            next(reader._reader())
+        consumer.close.assert_called_once()
+
+    def test_finite_plan_preserves_checkpoint(self):
+        reader = self._make_reader([], round_robin=False, uri=self.URI)
+        self.assertFalse(kafka_dataset.is_finite_kafka_replay(BaseReader("", 1)))
+        checkpoint = {"topic:0": 12}
+        reader.load_state_dict(checkpoint)
+        plan = reader.create_read_plan(0, 1, 1)
+        reader.load_state_dict(None)
+        self.assertTrue(plan.is_finite)
+        self.assertIsNone(plan.planned_rows)
+        (task,) = pickle.loads(pickle.dumps(plan)).tasks
+        self.assertEqual(task.kwargs["reader"]._checkpoint_state, checkpoint)
+
+
 class KafkaReaderDecodedMessageLogTest(unittest.TestCase):
     """Decoded-message counting and periodic logging in normal consumption."""
 
@@ -569,8 +713,9 @@ class KafkaReaderDecodedMessageLogTest(unittest.TestCase):
         gen = reader._reader(0, 1)
         self.addCleanup(gen.close)
         next(gen)
-        on_assign = consumer.subscribe.call_args.kwargs["on_assign"]
-        on_assign(consumer, [TopicPartition("topic", 0)])
+        callbacks = consumer.subscribe.call_args.kwargs
+        self.assertNotIn("on_revoke", callbacks)
+        callbacks["on_assign"](consumer, [TopicPartition("topic", 0)])
         # the callback re-seeks to the offset after the checkpointed one
         consumer.assign.assert_called_once()
         (tp,) = consumer.assign.call_args.args[0]
@@ -586,6 +731,7 @@ class OffsetsForTimesBatchedTest(unittest.TestCase):
     """Unit tests for _offsets_for_times_batched (broker-free, mocked)."""
 
     START_TS = 1711929600000
+    TIMEOUT = KafkaError(KafkaError._TIMED_OUT)
 
     def test_empty_partitions_returns_empty(self):
         consumer = mock.MagicMock()
@@ -659,10 +805,17 @@ class OffsetsForTimesBatchedTest(unittest.TestCase):
         self.assertEqual(consumer.offsets_for_times.call_count, 2)
         self.assertEqual(sleep_fn.call_count, 1)
 
-    def test_retry_exhausted_raises(self):
+    @parameterized.expand(
+        [
+            ("request", KafkaException(TIMEOUT)),
+            ("partition", [mock.Mock(offset=-1, error=TIMEOUT)]),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_retry_exhausted_raises(self, _name, response):
         sleep_fn = mock.MagicMock()
         consumer = mock.MagicMock()
-        consumer.offsets_for_times.side_effect = KafkaException("persistent timeout")
+        consumer.offsets_for_times.side_effect = [response] * 4
         parts = [TopicPartition("t", 0)]
         with self.assertRaises(KafkaException):
             _offsets_for_times_batched(
@@ -806,6 +959,7 @@ class KafkaDatasetConfigTest(unittest.TestCase):
                 mode=Mode.TRAIN,
                 expected_shuffle=True,
                 round_robin=True,
+                drop_remainder=True,
             ),
             param(
                 "round_robin_eval",
@@ -813,6 +967,7 @@ class KafkaDatasetConfigTest(unittest.TestCase):
                 expected_shuffle=False,
                 round_robin=True,
                 log_every_n_messages=1000,
+                drop_remainder=True,
             ),
         ],
         name_func=parameterized_name_func,
@@ -824,9 +979,12 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         expected_shuffle,
         round_robin=None,
         log_every_n_messages=None,
+        drop_remainder=False,
     ):
         data_config = data_pb2.DataConfig(
             batch_size=4,
+            drop_remainder=drop_remainder,
+            min_batch_size=2,
             dataset_type=data_pb2.DatasetType.KafkaDataset,
             fg_mode=data_pb2.FgMode.FG_NONE,
             label_fields=["label"],
@@ -865,6 +1023,10 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         self.assertEqual(
             dataset._reader._log_every_n_messages, log_every_n_messages or 0
         )
+        training = mode == Mode.TRAIN
+        train_min = 4 if drop_remainder else 2
+        self.assertEqual(dataset._reader._drop_remainder, training and drop_remainder)
+        self.assertEqual(dataset._reader._min_batch_size, train_min if training else 0)
 
 
 class KafkaDatasetTest(unittest.TestCase):
@@ -1196,24 +1358,11 @@ class KafkaDatasetTest(unittest.TestCase):
                 # (equal if we consumed the next message after checkpoint)
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
-    @parameterized.expand(
-        [
-            ("rolling", "SAMPLE_ROLLING", 2, False),
-            ("window", "SAMPLE_WINDOW", 2, False),
-            ("round_robin_no_workers", "SAMPLE_ROLLING", 0, True),
-        ],
-        name_func=parameterized_name_func,
-    )
-    @unittest.skipIf(
-        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
-    )
-    def test_sample_shuffle_checkpoint_resume(
-        self, _name, mode, num_workers, round_robin
+    def _sample_shuffle_input(
+        self, mode, num_workers, rows_per_message, messages_per_partition, **options
     ):
         self._create_test_topic()
         producer = Producer({"bootstrap.servers": self.brokers})
-        rows_per_message = 24
-        messages_per_partition = 16
         metadata = {}
         timestamp_ms = int(time.time() * 1000)
 
@@ -1237,12 +1386,13 @@ class KafkaDatasetTest(unittest.TestCase):
                         "label": [0] * rows_per_message,
                     }
                 )
+                event_time = timestamp_ms + offset - partition
                 producer.produce(
                     topic=self.test_topic,
                     partition=partition,
                     value=record_batch.serialize(),
-                    timestamp=timestamp_ms + offset,
-                    on_delivery=partial(on_delivery, row_start, timestamp_ms + offset),
+                    timestamp=event_time,
+                    on_delivery=partial(on_delivery, row_start, event_time),
                 )
         self.assertEqual(producer.flush(30), 0)
         self.assertEqual(len(metadata), 4 * messages_per_partition * rows_per_message)
@@ -1250,7 +1400,7 @@ class KafkaDatasetTest(unittest.TestCase):
             data_pb2.DatasetType.KafkaDataset,
             mode,
             num_workers,
-            kafka_partition_round_robin=round_robin,
+            **options,
         )
         cfg.input_fields.extend(
             [
@@ -1270,6 +1420,25 @@ class KafkaDatasetTest(unittest.TestCase):
         self.addCleanup(signal.signal, signal.SIGALRM, old_handler)
         self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
         signal.setitimer(signal.ITIMER_REAL, 120)
+        return cfg, path, timestamp_ms, metadata
+
+    @parameterized.expand(
+        [
+            ("rolling", "SAMPLE_ROLLING", 2, False),
+            ("window", "SAMPLE_WINDOW", 2, False),
+            ("round_robin_no_workers", "SAMPLE_ROLLING", 0, True),
+        ],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipIf(
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
+    )
+    def test_sample_shuffle_checkpoint_resume(
+        self, _name, mode, num_workers, round_robin
+    ):
+        cfg, path, _, metadata = self._sample_shuffle_input(
+            mode, num_workers, 24, 16, kafka_partition_round_robin=round_robin
+        )
         state = {}
         seen = set()
         for resume in (False, True):
@@ -1314,6 +1483,38 @@ class KafkaDatasetTest(unittest.TestCase):
             finally:
                 utils.stop_sample(dataloader, iterator)
         self.assertEqual(len(state), 4)
+
+    @parameterized.expand(
+        [
+            ("keep_tail", "SAMPLE_ROLLING", 3, [8] * 6 + [6]),
+            ("drop_tail", "SAMPLE_WINDOW", 7, [8] * 6),
+        ],
+        name_func=parameterized_name_func,
+    )
+    @unittest.skipIf(
+        os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
+    )
+    def test_sample_shuffle_end_timestamp(self, _name, mode, min_batch_size, expected):
+        cfg, path, start, metadata = self._sample_shuffle_input(
+            mode, 0, 3, 8, min_batch_size=min_batch_size
+        )
+        end = start + 5
+        checkpoint = {f"{self.test_topic}:{p}": 1 for p in range(4)}
+        dataloader = create_dataloader(
+            cfg,
+            utils.raw_c_features(),
+            f"{path}&end.timestamp.ms={end}",
+            mode=Mode.TRAIN,
+            checkpoint_state=checkpoint,
+        )
+        self.addCleanup(utils.stop_sample, dataloader, None)
+        sizes, values, _ = utils.drain_sample(dataloader.get_iterator())
+        self.assertEqual(sizes, expected)
+        self.assertEqual(len(set(values)), sum(expected))
+        for value in values:
+            source, offset, event_time = metadata[value]
+            self.assertGreater(offset, checkpoint[source])
+            self.assertLess(event_time, end / 1000.0)
 
     @unittest.skipIf(
         os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."

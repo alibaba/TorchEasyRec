@@ -48,6 +48,7 @@ from tzrec.datasets.dataset import (
     create_dataloader,
     create_writer,
 )
+from tzrec.datasets.kafka_dataset import is_finite_kafka_replay
 from tzrec.datasets.utils import Batch, RecordBatchTensor
 from tzrec.features.feature import (
     BaseFeature,
@@ -228,8 +229,12 @@ def _evaluate(
     is_rank_zero = int(os.environ.get("RANK", 0)) == 0
     is_local_rank_zero = int(os.environ.get("LOCAL_RANK", 0)) == 0
     model.eval()
+    eval_reader = eval_dataloader.dataset._reader
     pipeline = create_train_pipeline(
-        model, check_all_workers_data_status=check_all_workers_data_status
+        model,
+        check_all_workers_data_status=(
+            check_all_workers_data_status or is_finite_kafka_replay(eval_reader)
+        ),
     )
 
     use_step = eval_config.num_steps and eval_config.num_steps > 0
@@ -463,6 +468,7 @@ def _train_and_evaluate(
     kafka_baseline_offsets: Dict[str, int] = {}
     # pyre-ignore [16]
     dataset_config = train_dataloader.dataset._data_config
+    train_reader = train_dataloader.dataset._reader
     kafka_log_enabled = (
         dataset_config.dataset_type == DatasetType.KafkaDataset
         and dataset_config.kafka_log_every_n_messages > 0
@@ -629,7 +635,10 @@ def _train_and_evaluate(
             pipeline = create_train_pipeline(
                 model,
                 optimizer,
-                check_all_workers_data_status=check_all_workers_data_status,
+                check_all_workers_data_status=(
+                    check_all_workers_data_status
+                    or is_finite_kafka_replay(train_reader)
+                ),
             )
             if plogger is not None:
                 plogger.set_description(f"Training Epoch {i_epoch}")

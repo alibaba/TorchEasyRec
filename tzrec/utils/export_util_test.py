@@ -2504,7 +2504,7 @@ class ExportUtilTest(unittest.TestCase):
 
         uri = "kafka://broker:9092/topic?group.id=training&auto.offset.reset=earliest"
         isolated = _isolate_kafka_export_group(uri)
-        topic, params, _ = _parse_kafka_uri(isolated)
+        topic, params, _, _ = _parse_kafka_uri(isolated)
         self.assertEqual(topic, "topic")
         self.assertEqual(params["group.id"], "training__dense_export")
         self.assertEqual(params.get("auto.offset.reset"), "earliest")
