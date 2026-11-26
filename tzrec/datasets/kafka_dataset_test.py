@@ -1428,7 +1428,6 @@ class KafkaDatasetTest(unittest.TestCase):
         path = (
             f"kafka://{self.brokers}/{self.test_topic}"
             f"?group.id={self.test_topic}&auto.offset.reset=earliest"
-            "&session.timeout.ms=10000"
         )
 
         def alarm(signum, frame):
