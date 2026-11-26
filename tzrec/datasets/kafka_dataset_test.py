@@ -1425,10 +1425,9 @@ class KafkaDatasetTest(unittest.TestCase):
                 data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
             ]
         )
-        # Reuse the consumer group provisioned for the Kafka integration tests.
         path = (
             f"kafka://{self.brokers}/{self.test_topic}"
-            "?group.id=tzrec_test_group&auto.offset.reset=earliest"
+            f"?group.id={self.test_topic}&auto.offset.reset=earliest"
             "&session.timeout.ms=10000"
         )
 
