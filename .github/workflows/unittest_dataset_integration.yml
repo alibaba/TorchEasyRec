@@ -1,0 +1,77 @@
+name: Dataset Integration CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dataset-integration:
+    if: github.ref == 'refs/heads/master'
+    runs-on:
+      # Restrict this runner group to this workflow on refs/heads/master.
+      group: tzrec-dsw-dataset
+      labels: tzrec-ci-cpu
+    timeout-minutes: 360
+    steps:
+      - name: FetchCommit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: run_${{ github.run_id }}
+      - name: RunDatasetIntegration
+        id: tests
+        env:
+          CI_ODPS_PROJECT_NAME: ${{ vars.DSW_CI_ODPS_PROJECT_NAME }}
+          CI_ALIKAFKA_INSTANCE_ID: ${{ vars.DSW_CI_ALIKAFKA_INSTANCE_ID }}
+          CI_ALIKAFKA_BROKERS: ${{ vars.DSW_CI_ALIKAFKA_BROKERS }}
+        run: |
+          : "${ALIBABA_CLOUD_CREDENTIALS_URI:?DSW credential URI is required}"
+          : "${CI_ODPS_PROJECT_NAME:?ODPS project is required}"
+          : "${CI_ALIKAFKA_INSTANCE_ID:?Kafka instance is required}"
+          : "${CI_ALIKAFKA_BROKERS:?Kafka brokers are required}"
+          export CI_REGION="${REGION:?DSW REGION is required}"
+          if [[ "$CI_REGION" != cn-wulanchabu ]]; then
+            printf '%s\n' "Dataset integration requires a Ulanqab runner" >&2
+            exit 1
+          fi
+          export ODPS_ENDPOINT="http://service.${CI_REGION}-vpc.maxcompute.aliyun-inc.com/api"
+          WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
+          rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}/tmp/ci-failures"
+          docker run --rm --pull=always --network host --name "dataset-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --label "tzrec-ci.node=${TZREC_CI_NODE:?}" --label "tzrec-ci.role=${TZREC_CI_ROLE:?}" \
+            --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
+            --cpus=64 --memory=256g --shm-size=64g --ulimit memlock=-1 \
+            -e GITHUB_ACTIONS=true -e CI=true \
+            -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -e ALIBABA_CLOUD_CREDENTIALS_URI -e ALIBABA_CLOUD_ECS_METADATA_DISABLED=true \
+            -e CI_ODPS_PROJECT_NAME -e ODPS_ENDPOINT -e CI_ALIKAFKA_INSTANCE_ID -e CI_ALIKAFKA_BROKERS -e CI_REGION \
+            -e CUDA_VISIBLE_DEVICES= -e NVIDIA_VISIBLE_DEVICES=void -e PIP_CACHE_DIR=/root/.cache/pip \
+            -v "$WORK_ROOT":/__w \
+            mybigpai-public-registry.cn-beijing.cr.aliyuncs.com/easyrec/tzrec-devel:1.5-cpu \
+            bash -eo pipefail -c '
+              if ! python -c "from alibabacloud_credentials.client import Client; Client().get_credential()" >/dev/null 2>&1; then
+                printf "%s\n" "Unable to obtain DSW credentials inside the test container" >&2
+                exit 1
+              fi
+              exec bash -eo pipefail scripts/ci/ci_test_cpu.sh --test-dir tzrec/datasets --pattern "*dataset_test.py" --capacity 32 --timeout 18000
+            '
+      - name: StopDockerContainer
+        if: always()
+        run: |
+          docker stop --timeout=30 "dataset-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+          docker rm -f "dataset-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
+      - name: Upload failed group logs
+        id: artifacts
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/run_${{ github.run_id }}/tmp/ci-failures/*/*.log
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Clean checkout
+        if: always() && (steps.artifacts.outcome == 'success' || steps.artifacts.outcome == 'skipped')
+        run: rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}"
