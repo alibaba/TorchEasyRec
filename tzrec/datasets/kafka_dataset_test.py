@@ -1359,12 +1359,20 @@ class KafkaDatasetTest(unittest.TestCase):
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
     def _sample_shuffle_input(
-        self, mode, num_workers, rows_per_message, messages_per_partition, **options
+        self,
+        mode,
+        num_workers,
+        rows_per_message,
+        messages_per_partition,
+        *,
+        split_at=None,
+        **options,
     ):
         self._create_test_topic()
         producer = Producer({"bootstrap.servers": self.brokers})
         metadata = {}
-        timestamp_ms = int(time.time() * 1000)
+        timestamp_ms = time.time_ns() // 1_000_000
+        end_timestamp_ms = None
 
         def on_delivery(row_start, event_time, error, message):
             self.assertIsNone(error)
@@ -1375,25 +1383,34 @@ class KafkaDatasetTest(unittest.TestCase):
                     event_time / 1000.0,
                 )
 
-        for partition in range(4):
-            for offset in range(messages_per_partition):
-                row_start = (
-                    partition * messages_per_partition + offset
-                ) * rows_per_message
-                record_batch = pa.record_batch(
-                    {
-                        "raw_c": list(range(row_start, row_start + rows_per_message)),
-                        "label": [0] * rows_per_message,
-                    }
-                )
-                event_time = timestamp_ms + offset - partition
-                producer.produce(
-                    topic=self.test_topic,
-                    partition=partition,
-                    value=record_batch.serialize(),
-                    timestamp=event_time,
-                    on_delivery=partial(on_delivery, row_start, event_time),
-                )
+        messages = sorted(
+            (offset - partition, partition, offset)
+            for partition in range(4)
+            for offset in range(messages_per_partition)
+        )
+        for position, partition, offset in messages:
+            if position == split_at and end_timestamp_ms is None:
+                # Separate the writes so broker-side timestamps straddle the cutoff.
+                self.assertEqual(producer.flush(30), 0)
+                time.sleep(1)
+                end_timestamp_ms = time.time_ns() // 1_000_000
+                time.sleep(1)
+                timestamp_ms = time.time_ns() // 1_000_000
+            row_start = (partition * messages_per_partition + offset) * rows_per_message
+            record_batch = pa.record_batch(
+                {
+                    "raw_c": list(range(row_start, row_start + rows_per_message)),
+                    "label": [0] * rows_per_message,
+                }
+            )
+            event_time = timestamp_ms + position
+            producer.produce(
+                topic=self.test_topic,
+                partition=partition,
+                value=record_batch.serialize(),
+                timestamp=event_time,
+                on_delivery=partial(on_delivery, row_start, event_time),
+            )
         self.assertEqual(producer.flush(30), 0)
         self.assertEqual(len(metadata), 4 * messages_per_partition * rows_per_message)
         cfg = utils.sample_data_config(
@@ -1408,9 +1425,11 @@ class KafkaDatasetTest(unittest.TestCase):
                 data_pb2.Field(input_name="label", input_type=data_pb2.INT64),
             ]
         )
+        # Reuse the consumer group provisioned for the Kafka integration tests.
         path = (
             f"kafka://{self.brokers}/{self.test_topic}"
-            "?group.id=tzrec_sample_shuffle&auto.offset.reset=earliest"
+            "?group.id=tzrec_test_group&auto.offset.reset=earliest"
+            "&session.timeout.ms=10000"
         )
 
         def alarm(signum, frame):
@@ -1420,7 +1439,7 @@ class KafkaDatasetTest(unittest.TestCase):
         self.addCleanup(signal.signal, signal.SIGALRM, old_handler)
         self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
         signal.setitimer(signal.ITIMER_REAL, 120)
-        return cfg, path, timestamp_ms, metadata
+        return cfg, path, end_timestamp_ms, metadata
 
     @parameterized.expand(
         [
@@ -1495,10 +1514,10 @@ class KafkaDatasetTest(unittest.TestCase):
         os.environ.get("CI_ALIKAFKA_INSTANCE_ID", "") == "", "ci kafka is not exists."
     )
     def test_sample_shuffle_end_timestamp(self, _name, mode, min_batch_size, expected):
-        cfg, path, start, metadata = self._sample_shuffle_input(
-            mode, 0, 3, 8, min_batch_size=min_batch_size
+        cfg, path, end, metadata = self._sample_shuffle_input(
+            mode, 0, 3, 8, split_at=5, min_batch_size=min_batch_size
         )
-        end = start + 5
+        assert end is not None
         checkpoint = {f"{self.test_topic}:{p}": 1 for p in range(4)}
         dataloader = create_dataloader(
             cfg,
