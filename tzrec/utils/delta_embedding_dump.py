@@ -11,10 +11,11 @@
 
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import (
+    TYPE_CHECKING,
     Any,
     Dict,
     Iterable,
@@ -68,6 +69,9 @@ from tzrec.utils.zch_util import (
     iter_zch_tables,
     register_post_zch_event_tracker_fn,
 )
+
+if TYPE_CHECKING:
+    from tzrec.utils.rocksdb_util import RocksDBRuntime
 
 _CONSUMER = "delta_embedding_dump"
 
@@ -833,6 +837,7 @@ class DeltaEmbeddingDumper:
         config: Configuration for delta embedding dump behavior.
         model_dir: Base directory for model outputs; used as default output location.
         device: Training device; validated to be CUDA.
+        rocksdb: Optional rank-local backend borrowed from the model runtime.
     """
 
     def __init__(
@@ -841,9 +846,12 @@ class DeltaEmbeddingDumper:
         config: DeltaEmbeddingDumpConfig,
         model_dir: str,
         device: torch.device,
+        *,
+        rocksdb: Optional["RocksDBRuntime"] = None,
     ) -> None:
         validate_delta_embedding_dump_config(config, device)
         self._model = model
+        self._rocksdb = rocksdb
         self._config = config
         self._quant_type = config.quant_type
         self._dump_evicted_tombstones = bool(config.dump_evicted_tombstones)
@@ -1208,13 +1216,18 @@ class DeltaEmbeddingDumper:
         table_weights = self._collect_table_weights()
         dynamic_modules = self._collect_dynamic_modules()
         table_chunks: List[pa.Table] = []
-        num_rows = self._append_model_delta_rows(
-            table_chunks,
-            global_step=global_step,
-            table_weights=table_weights,
-            dynamic_modules=dynamic_modules,
-            dump_evicted_tombstones=self._dump_evicted_tombstones,
-        )
+        with (
+            self._rocksdb.io_phase("publish_lookup")
+            if self._rocksdb is not None
+            else nullcontext()
+        ):
+            num_rows = self._append_model_delta_rows(
+                table_chunks,
+                global_step=global_step,
+                table_weights=table_weights,
+                dynamic_modules=dynamic_modules,
+                dump_evicted_tombstones=self._dump_evicted_tombstones,
+            )
         output_path: Optional[str] = None
         if write_local and (num_rows > 0 or self._world_size > 1):
             # Multi-rank shard sets stay complete even for an empty rank so

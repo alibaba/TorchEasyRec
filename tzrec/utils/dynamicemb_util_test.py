@@ -25,7 +25,7 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.optim import optimizers, rowwise_adagrad
 
 from tzrec.optim.optimizer import FTRL, has_fbgemm_ftrl
-from tzrec.protos import feature_pb2
+from tzrec.protos import feature_pb2, train_pb2
 from tzrec.utils import dynamicemb_util, rocksdb_util
 from tzrec.utils.dynamicemb_util import DynamicEmbTableStorage
 from tzrec.utils.test_util import (
@@ -927,6 +927,59 @@ class RocksDBTableTest(unittest.TestCase):
 
     NUM_EMBEDDINGS = 1 << 20
     EMBEDDING_DIM = 16
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required.")
+    def test_publish_after_rocksdb_maintenance(self):
+        from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+        from dynamicemb.dynamicemb_config import EvictedItemMode
+        from fbgemm_gpu.split_embedding_configs import EmbOptimType
+        from tzrec_ext.rocksdb import BackendConfig, RocksDBSession
+        from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
+
+        root = make_test_dir()
+        runtime = rocksdb_util.RocksDBRuntime(
+            train_pb2.RocksDBConfig(root_dir=root), root, "train"
+        )
+        self.addCleanup(runtime.close)
+        config = BackendConfig(32 << 20, 32 << 20, 1 << 20, 64 << 20, io_threads=2)
+        session = RocksDBSession(config, os.path.join(root, "db"))
+        self.addCleanup(session.close)
+        opt = _table_options(8, 8, score_strategy="STEP")
+        opt.dim, opt.embedding_dtype, opt.index_type = 8, torch.float32, torch.int64
+        opt.caching, opt.local_hbm_for_values = True, 64
+        opt.evicted_item_mode = EvictedItemMode.RETAIN_KEY
+        opt.external_storage = RocksDBStorageFactory(config, "t", session)
+        module = BatchedDynamicEmbeddingTablesV2(
+            table_options=[opt],
+            table_names=["t"],
+            feature_table_map=[0],
+            optimizer=EmbOptimType.EXACT_SGD,
+        )
+        runtime.attach(module)
+        key = torch.tensor([7], device="cuda")
+        offsets = torch.tensor([0, 1], device="cuda")
+        module(key, offsets).sum().backward()
+        module.flush()
+        before, _ = dynamicemb_util.lookup_embeddings_for_publish(module, key, 0)
+        # Two low-score DB records will be reclaimed; key 7 also lives in cache.
+        ids = torch.arange(100, 101 + opt.max_capacity, device="cuda")
+        scores = torch.full_like(ids, 1000)
+        scores[0] = 0
+        module.tables.insert(
+            ids,
+            torch.zeros_like(ids),
+            torch.ones(ids.numel(), 8, device="cuda"),
+            scores,
+        )
+        runtime.evict()
+        evicted = module.pop_evicted_keys()["t"].to(device="cuda", dtype=torch.int64)
+        self.assertEqual(sorted(evicted.tolist()), [7, 100])
+        chunks, missing = dynamicemb_util.lookup_embeddings_for_publish(
+            module, evicted, 0
+        )
+        self.assertEqual(missing.tolist(), [100])
+        self.assertEqual(chunks[0][0].tolist(), [7])
+        torch.testing.assert_close(chunks[0][1], before[0][1])
 
     @parameterized.expand([("indexed", "STEP"), ("not_indexed", "NO_EVICTION")])
     @mock.patch.dict(os.environ, {"WORLD_SIZE": "2"})

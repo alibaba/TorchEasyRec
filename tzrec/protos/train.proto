@@ -159,7 +159,7 @@ message DeltaEmbeddingDumpConfig {
 }
 
 // Adds RocksDB-backed dynamicemb candidates to embedding planning. Each rank
-// shares one working database under root_dir across its offloaded tables.
+// shares its working databases under root_dir across its offloaded tables.
 // An explicit partial cache_load_factor also pins the RocksDB cache budget;
 // the 0.5 ceiling applies only to automatic search. CUSTOMIZED scores stay in memory.
 message RocksDBConfig {
@@ -175,6 +175,26 @@ message RocksDBConfig {
     // false: each node has its own volume, shared by that node's ranks.
     // true: all ranks share one volume.
     optional bool shared_across_nodes = 3 [default = false];
+    // Target SST data block size in bytes. Unset uses the backend default.
+    optional uint64 sst_block_size_bytes = 4;
+    // Pad SST data blocks to block-size boundaries.
+    optional bool block_align = 5 [default = false];
+    // Read SST data with direct I/O.
+    optional bool use_direct_reads = 6 [default = false];
+    // Explicit direct-read alignment in bytes. Unset uses RocksDB detection.
+    optional uint64 direct_read_alignment_bytes = 7;
+    // Native batch I/O threads across this rank's databases, also the
+    // maximum number of file readers during checkpoint import.
+    optional uint32 io_threads_per_rank = 8;
+    // Number of local RocksDB databases created by each rank.
+    optional uint32 num_db_shards_per_rank = 9 [default = 1];
+    // Shared flush and compaction I/O rate in MiB/s during low-debt training.
+    // When only the base rate is set, all phases use that fixed rate.
+    optional uint64 background_io_base_rate_per_rank_mib_per_sec = 10;
+    // Shared peak rate in MiB/s during compaction backlog, checkpoint save,
+    // or publication lookup. When only the peak rate is set, all phases use
+    // that fixed rate. Omitting both rates leaves background I/O unlimited.
+    optional uint64 background_io_max_rate_per_rank_mib_per_sec = 11;
 }
 
 message TrainConfig {
