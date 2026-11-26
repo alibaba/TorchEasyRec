@@ -61,7 +61,9 @@ def _aot_regroup_keyed_tensors(
     key. When the entry count exceeds Inductor's ``max_pointwise_cat_inputs``,
     AOTI lowers each slice into its own Triton copy kernel, inflating kernel
     launch overhead and compile time. Gathering all target columns in a single
-    ``index_select`` collapses N copies into one fused kernel.
+    ``index_select`` collapses N copies into one fused kernel; identity and
+    contiguous column layouts skip ``index_select`` and return the merged tensor
+    or a ``narrow`` view directly.
 
     Args:
         keyed_tensors (List[KeyedTensor]): source keyed tensors.
@@ -74,12 +76,25 @@ def _aot_regroup_keyed_tensors(
         return _ORIG_REGROUP_KEYED_TENSORS(keyed_tensors, groups)
 
     key_dim = keyed_tensors[0].key_dim()
+    kt_lengths: List[int] = []
     for kt in keyed_tensors:
         if kt.key_dim() != key_dim:
             return _ORIG_REGROUP_KEYED_TENSORS(keyed_tensors, groups)
-        for d in kt.length_per_key():
-            if not isinstance(d, int) or isinstance(d, bool):
+        lengths = kt.length_per_key()
+        if len(kt.keys()) != len(lengths):
+            return _ORIG_REGROUP_KEYED_TENSORS(keyed_tensors, groups)
+        kt_len = 0
+        for d in lengths:
+            if not isinstance(d, int) or isinstance(d, bool) or d < 0:
                 return _ORIG_REGROUP_KEYED_TENSORS(keyed_tensors, groups)
+            kt_len += d
+        values = kt.values()
+        if not (-values.dim() <= key_dim < values.dim()):
+            return _ORIG_REGROUP_KEYED_TENSORS(keyed_tensors, groups)
+        values_dim = values.size(key_dim)
+        if not isinstance(values_dim, int) or values_dim != kt_len:
+            return _ORIG_REGROUP_KEYED_TENSORS(keyed_tensors, groups)
+        kt_lengths.append(kt_len)
 
     key_to_src: Dict[str, Tuple[int, int, int]] = {}
     for kt_idx, kt in enumerate(keyed_tensors):
@@ -101,7 +116,7 @@ def _aot_regroup_keyed_tensors(
         kt = keyed_tensors[kt_idx]
         kt_base_offset[kt_idx] = total_cols
         used_values.append(kt.values())
-        total_cols += sum(kt.length_per_key())
+        total_cols += kt_lengths[kt_idx]
 
     cols: List[int] = []
     split_lengths: List[int] = []
@@ -140,35 +155,37 @@ def _patch_regroup_for_aot(root: nn.Module) -> Iterator[None]:
     """Temporarily swap ``_regroup_keyed_tensors`` during ``torch.export``.
 
     Patches both FX ``GraphModule`` nodes recorded at ``symbolic_trace`` time
-    and ``torchrec.sparse.jagged_tensor._regroup_keyed_tensors`` for any
-    non-FX submodules, restoring all targets in ``finally``.
+    and the process-wide ``torchrec.sparse.jagged_tensor._regroup_keyed_tensors``
+    attribute (covering non-FX submodules), restoring all targets in ``finally``.
 
     Args:
         root (nn.Module): root module passed to ``torch.export.export``.
     """
     patched_gms: List[Tuple[torch.fx.GraphModule, List[torch.fx.Node]]] = []
     seen_graphs: Set[int] = set()
-    for mod in root.modules():
-        if not isinstance(mod, torch.fx.GraphModule):
-            continue
-        gid = id(mod.graph)
-        if gid in seen_graphs:
-            continue
-        seen_graphs.add(gid)
-        nodes = [
-            node
-            for node in mod.graph.nodes
-            if node.op == "call_function" and node.target is _ORIG_REGROUP_KEYED_TENSORS
-        ]
-        if nodes:
-            for node in nodes:
-                node.target = _aot_regroup_keyed_tensors
-            mod.recompile()
-            patched_gms.append((mod, nodes))
-
+    # NOTE: Process-wide swap is not thread-safe; export runs single-threaded.
     prev_fn = _jagged_tensor._regroup_keyed_tensors
-    _jagged_tensor._regroup_keyed_tensors = _aot_regroup_keyed_tensors
     try:
+        for mod in root.modules():
+            if not isinstance(mod, torch.fx.GraphModule):
+                continue
+            gid = id(mod.graph)
+            if gid in seen_graphs:
+                continue
+            seen_graphs.add(gid)
+            nodes = [
+                node
+                for node in mod.graph.nodes
+                if node.op == "call_function"
+                and node.target is _ORIG_REGROUP_KEYED_TENSORS
+            ]
+            if nodes:
+                patched_gms.append((mod, nodes))
+                for node in nodes:
+                    node.target = _aot_regroup_keyed_tensors
+                mod.recompile()
+
+        _jagged_tensor._regroup_keyed_tensors = _aot_regroup_keyed_tensors
         yield
     finally:
         _jagged_tensor._regroup_keyed_tensors = prev_fn

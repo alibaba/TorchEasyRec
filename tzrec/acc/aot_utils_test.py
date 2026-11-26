@@ -14,7 +14,7 @@ import operator
 import os
 import shutil
 import unittest
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
 import torch
@@ -1008,6 +1008,84 @@ class AotUtilsTest(unittest.TestCase):
             actual = loaded(test_in, device)
             for key in ("activation", "pooled"):
                 torch.testing.assert_close(actual[key], expected[key])
+
+    def test_export_model_aot_patches_regroup_during_export(self) -> None:
+        class _SparseStage(nn.Module):
+            def forward(
+                self,
+                data: Dict[str, torch.Tensor],
+                device: str,
+            ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+                del device
+                return data, data
+
+        class _DenseRegroupStage(nn.Module):
+            def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+                kt0 = KeyedTensor(
+                    keys=["a", "b"], length_per_key=[2, 2], values=data["v0"]
+                )
+                kt1 = KeyedTensor(keys=["c"], length_per_key=[2], values=data["v1"])
+                return KeyedTensor.regroup_as_dict(
+                    [kt0, kt1], [["c", "a"], ["b", "a"]], ["g0", "g1"]
+                )
+
+        dense_gm = fx.symbolic_trace(_DenseRegroupStage())
+
+        def _regroup_targets(mod: fx.GraphModule) -> List[object]:
+            return [
+                n.target
+                for n in mod.graph.nodes
+                if n.op == "call_function"
+                and n.target
+                in (_ORIG_REGROUP_KEYED_TENSORS, _aot_regroup_keyed_tensors)
+            ]
+
+        self.assertEqual(_regroup_targets(dense_gm), [_ORIG_REGROUP_KEYED_TENSORS])
+
+        observed: Dict[str, object] = {}
+        real_export = torch.export.export
+
+        def _capture_export(mod, args=(), kwargs=None, *, dynamic_shapes=None, **kw):
+            observed["targets"] = _regroup_targets(dense_gm)
+            observed["global_fn"] = _jagged_tensor._regroup_keyed_tensors
+            return real_export(
+                mod,
+                args=args,
+                kwargs=kwargs,
+                dynamic_shapes=dynamic_shapes,
+                **kw,
+            )
+
+        def _capture_compile(exported_pg, save_dir: str) -> str:
+            observed["exported_pg"] = exported_pg
+            return os.path.join(save_dir, "aoti", "aoti_model.pt2")
+
+        sample_data = {"v0": torch.randn(4, 4), "v1": torch.randn(4, 2)}
+        save_dir = os.path.join(self.test_dir, "export_model_aot_regroup")
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(
+                aot_utils, "_compile_and_package_aoti", side_effect=_capture_compile
+            ),
+            mock.patch.object(torch.export, "export", side_effect=_capture_export),
+        ):
+            export_model_aot(_SparseStage(), dense_gm, sample_data, {}, save_dir)
+
+        self.assertEqual(observed["targets"], [_aot_regroup_keyed_tensors])
+        self.assertIs(observed["global_fn"], _aot_regroup_keyed_tensors)
+        self.assertEqual(_regroup_targets(dense_gm), [_ORIG_REGROUP_KEYED_TENSORS])
+        self.assertIs(
+            _jagged_tensor._regroup_keyed_tensors, _ORIG_REGROUP_KEYED_TENSORS
+        )
+        exported_pg = observed["exported_pg"]
+        assert isinstance(exported_pg, torch.export.ExportedProgram)
+        index_select_count = sum(
+            1
+            for n in exported_pg.graph.nodes
+            if n.op == "call_function"
+            and n.target is torch.ops.aten.index_select.default
+        )
+        self.assertEqual(index_select_count, 1)
 
 
 class DistributedDenseAotUtilsTest(unittest.TestCase):
@@ -2422,12 +2500,28 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
             self.assertEqual(a.shape, r.shape)
             self.assertTrue(torch.equal(a, r))
 
-        # Identity fast path on single KT and contiguous slice across KTs.
+        # Identity and narrow fast paths on a single KT.
         for g in ([["a", "b"], ["c", "z"]], [["b", "c"]]):
             ref_id = _ORIG_REGROUP_KEYED_TENSORS([kt0], g)
             act_id = _aot_regroup_keyed_tensors([kt0], g)
             for a, r in zip(act_id, ref_id):
                 self.assertTrue(torch.equal(a, r))
+
+        # Contiguous slice spanning multiple KTs (cols 6..10 across kt0 and kt1).
+        ref_cross = _ORIG_REGROUP_KEYED_TENSORS([kt0, kt1], [["c", "z", "d"]])
+        act_cross = _aot_regroup_keyed_tensors([kt0, kt1], [["c", "z", "d"]])
+        self.assertEqual(len(act_cross), 1)
+        self.assertEqual(act_cross[0].shape, ref_cross[0].shape)
+        self.assertEqual(act_cross[0].dtype, ref_cross[0].dtype)
+        self.assertTrue(torch.equal(act_cross[0], ref_cross[0]))
+
+        # All-zero-length used key group.
+        ref_zero = _ORIG_REGROUP_KEYED_TENSORS([kt0], [["z"]])
+        act_zero = _aot_regroup_keyed_tensors([kt0], [["z"]])
+        self.assertEqual(len(act_zero), 1)
+        self.assertEqual(act_zero[0].shape, ref_zero[0].shape)
+        self.assertEqual(act_zero[0].dtype, ref_zero[0].dtype)
+        self.assertTrue(torch.equal(act_zero[0], ref_zero[0]))
 
         # Single output group.
         ref_single = _ORIG_REGROUP_KEYED_TENSORS([kt0, kt1], [["d", "a"]])
@@ -2470,6 +2564,33 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
         for a, r in zip(act_3d, ref_3d):
             self.assertTrue(torch.equal(a, r))
 
+        # Mismatched length_per_key vs values.size(key_dim) must fail at export time.
+        for bad_lengths in ([2, 5], [2, 3]):
+            bad_kt = KeyedTensor(
+                keys=["a", "b"],
+                length_per_key=bad_lengths,
+                values=torch.randn(5, 6),
+            )
+            with self.assertRaises(RuntimeError):
+                _aot_regroup_keyed_tensors([bad_kt], [["b", "a"]])
+
+            class _BadKTMod(nn.Module):
+                def __init__(self, lengths: List[int]) -> None:
+                    super().__init__()
+                    self.lengths = lengths
+
+                def forward(self, v: torch.Tensor) -> List[torch.Tensor]:
+                    kt = KeyedTensor(
+                        keys=["a", "b"], length_per_key=self.lengths, values=v
+                    )
+                    return _aot_regroup_keyed_tensors([kt], [["b", "a"]])
+
+            with self.assertRaises((RuntimeError, ValueError)):
+                torch.export.export(
+                    _BadKTMod(bad_lengths),
+                    (torch.randn(5, 6),),
+                )
+
     def test_patch_regroup_for_aot_restores_graph_and_global(self) -> None:
         class _RegroupMod(nn.Module):
             def forward(self, v0: torch.Tensor, v1: torch.Tensor):
@@ -2506,6 +2627,38 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
                 self.assertEqual(_regroup_targets(gm), [_aot_regroup_keyed_tensors])
                 raise RuntimeError("boom")
         self.assertEqual(_regroup_targets(gm), [_ORIG_REGROUP_KEYED_TENSORS])
+        self.assertIs(
+            _jagged_tensor._regroup_keyed_tensors, _ORIG_REGROUP_KEYED_TENSORS
+        )
+
+        # Partial setup failure (e.g., recompile raises) must roll back.
+        gm1 = fx.symbolic_trace(_RegroupMod())
+        gm2 = fx.symbolic_trace(_RegroupMod())
+
+        class _ParentMod(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.m1 = gm1
+                self.m2 = gm2
+
+        parent = _ParentMod()
+        orig_recompile = gm2.recompile
+        recompile_calls = 0
+
+        def _flaky_recompile(*args, **kwargs):
+            nonlocal recompile_calls
+            recompile_calls += 1
+            if recompile_calls == 1:
+                raise RuntimeError("recompile boom")
+            return orig_recompile(*args, **kwargs)
+
+        with mock.patch.object(gm2, "recompile", side_effect=_flaky_recompile):
+            with self.assertRaisesRegex(RuntimeError, "recompile boom"):
+                with _patch_regroup_for_aot(parent):
+                    pass
+
+        self.assertEqual(_regroup_targets(gm1), [_ORIG_REGROUP_KEYED_TENSORS])
+        self.assertEqual(_regroup_targets(gm2), [_ORIG_REGROUP_KEYED_TENSORS])
         self.assertIs(
             _jagged_tensor._regroup_keyed_tensors, _ORIG_REGROUP_KEYED_TENSORS
         )
@@ -2571,7 +2724,30 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
             "sequence__ec": [],
         }
         save_dir = os.path.join(self.test_dir, "regroup_collapse")
-        with mock.patch.dict(os.environ, {"ENABLE_AOT": "2", "INPUT_TILE": "0"}):
+        regroup_calls = 0
+        orig_aot_regroup = aot_utils._aot_regroup_keyed_tensors
+
+        def _counting_regroup(keyed_tensors, groups):
+            nonlocal regroup_calls
+            regroup_calls += 1
+            return orig_aot_regroup(keyed_tensors, groups)
+
+        captured: Dict[str, torch.export.ExportedProgram] = {}
+        orig_compile_and_package = aot_utils._compile_and_package_aoti
+
+        def _capturing_compile(exported_pg: torch.export.ExportedProgram, out_dir: str):
+            captured["ep"] = exported_pg
+            return orig_compile_and_package(exported_pg, out_dir)
+
+        with (
+            mock.patch.dict(os.environ, {"ENABLE_AOT": "2", "INPUT_TILE": "0"}),
+            mock.patch.object(
+                aot_utils, "_aot_regroup_keyed_tensors", _counting_regroup
+            ),
+            mock.patch.object(
+                aot_utils, "_compile_and_package_aoti", _capturing_compile
+            ),
+        ):
             export_distributed_dense_model_aot(
                 model=dense_mod,
                 dense_model_traced=dense_gm,
@@ -2593,6 +2769,15 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
                 save_dir=save_dir,
                 device=device,
             )
+
+        self.assertGreaterEqual(regroup_calls, 1)
+        index_select_count = sum(
+            1
+            for n in captured["ep"].graph.nodes
+            if n.op == "call_function"
+            and n.target is torch.ops.aten.index_select.default
+        )
+        self.assertEqual(index_select_count, 1)
 
         aoti_mod = torch._inductor.aoti_load_package(
             os.path.join(save_dir, "aoti", "aoti_model.pt2")
@@ -2616,6 +2801,7 @@ class DistributedDenseAotUtilsTest(unittest.TestCase):
         kernel_count = sum(
             evt.count for evt in prof.key_averages() if evt.device_time_total > 0
         )
+        self.assertGreaterEqual(kernel_count, 1)
         self.assertLessEqual(kernel_count, 4)
 
 
