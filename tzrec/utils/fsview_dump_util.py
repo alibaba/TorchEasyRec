@@ -11,6 +11,7 @@
 
 """Dump a FeatureDB DynamicEmbedding FeatureView and merge with baseline NPZs."""
 
+import contextlib
 import copy
 import datetime
 import json
@@ -18,6 +19,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +33,7 @@ import torch
 import torch.distributed as dist
 
 from tzrec.protos.train_pb2 import DeltaEmbeddingQuantType
-from tzrec.utils import config_util, npz_util
+from tzrec.utils import config_util, filesystem_util, npz_util
 from tzrec.utils.feature_store_uploader import (
     FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
     FEATURE_STORE_EMBEDDING_TYPE_UINT8,
@@ -56,10 +58,16 @@ FEATURE_STORE_SCORE_FIELD = "score"
 _DEFAULT_READ_TIMEOUT_SECS = 600
 _DEFAULT_READ_CHUNK_SIZE_MB = 64
 _DEFAULT_KEEP_VERSIONS = 3
+_STALE_INCOMPLETE_VERSION_SECS = 3600
 _VERSION_TIME_FORMAT = "%Y%m%d%H%M%S"
 _STATIC_NPZ_PATTERN = re.compile(r"^sparse_embeddings-\d+-of-\d+\.npz$")
 _DYNAMIC_NPZ_PATTERN = re.compile(r"^sparse_dynamic_embedding-\d+-of-\d+\.npz$")
 _INT64_MAX = int(np.iinfo(np.int64).max)
+_NP_TO_TORCH_DTYPE = {
+    np.dtype(np.uint8): torch.uint8,
+    np.dtype(np.float16): torch.float16,
+    np.dtype(np.float32): torch.float32,
+}
 
 
 @dataclass(frozen=True)
@@ -144,10 +152,12 @@ def _allocate_dump_version(
     versions_root: str,
     current_path: str,
     now: Optional[datetime.datetime] = None,
+    existing_versions: Optional[Sequence[str]] = None,
 ) -> str:
     """Allocate a strictly monotonic timestamp version directory name."""
     now = now or datetime.datetime.now()
     dt = now
+    taken = set(existing_versions or ())
     last_version = _read_current_version(current_path)
     if last_version:
         try:
@@ -158,9 +168,16 @@ def _allocate_dump_version(
             pass
     while True:
         candidate = dt.strftime(_VERSION_TIME_FORMAT)
-        if not os.path.exists(os.path.join(versions_root, candidate)):
+        if candidate not in taken and not os.path.exists(
+            os.path.join(versions_root, candidate)
+        ):
             return candidate
         dt = dt + datetime.timedelta(seconds=1)
+
+
+def _is_temp_artifact_name(name: str) -> bool:
+    """Return True if *name* is a staging/temp file or directory."""
+    return ".tmp." in name or name.endswith(".tmp") or ".part." in name
 
 
 def _prune_old_versions(
@@ -168,15 +185,16 @@ def _prune_old_versions(
     versions_root: str,
     keep_versions: int,
     active_version: str,
+    stale_incomplete_secs: float = _STALE_INCOMPLETE_VERSION_SECS,
 ) -> None:
-    """Sweep stale temp artifacts and prune old versions beyond *keep_versions*."""
+    """Sweep stale temp artifacts and prune READY versions beyond *keep_versions*."""
     for base in (dump_root, versions_root):
         try:
             entries = os.listdir(base)
         except FileNotFoundError:
             continue
         for name in entries:
-            if ".tmp." not in name and not name.endswith(".tmp"):
+            if not _is_temp_artifact_name(name):
                 continue
             path = os.path.join(base, name)
             try:
@@ -187,20 +205,37 @@ def _prune_old_versions(
             except OSError as exc:
                 logger.warning("Failed to remove stale dump tmp %s: %s", path, exc)
 
-    if keep_versions <= 0:
-        return
     try:
         entries = os.listdir(versions_root)
     except FileNotFoundError:
         return
-    version_dirs = sorted(
-        os.path.join(versions_root, name)
-        for name in entries
-        if os.path.isdir(os.path.join(versions_root, name)) and ".tmp." not in name
-    )
-    if len(version_dirs) <= keep_versions:
+
+    now_ts = time.time()
+    ready_dirs: List[str] = []
+    for name in sorted(entries):
+        if _is_temp_artifact_name(name):
+            continue
+        path = os.path.join(versions_root, name)
+        if not os.path.isdir(path):
+            continue
+        if os.path.isfile(os.path.join(path, READY_FILE)):
+            ready_dirs.append(path)
+            continue
+        if name == active_version:
+            continue
+        try:
+            age_secs = max(0.0, now_ts - os.path.getmtime(path))
+            if age_secs >= stale_incomplete_secs:
+                shutil.rmtree(path)
+                logger.info("Removed stale incomplete dump directory: %s", path)
+        except OSError as exc:
+            logger.warning(
+                "Failed to remove incomplete dump directory %s: %s", path, exc
+            )
+
+    if keep_versions <= 0 or len(ready_dirs) <= keep_versions:
         return
-    for path in version_dirs[:-keep_versions]:
+    for path in ready_dirs[:-keep_versions]:
         if os.path.basename(path) == active_version:
             continue
         try:
@@ -278,18 +313,23 @@ def _load_baseline_contract(
                 )
             storage_dtype = np.dtype(np.uint8)
         else:
-            if dtype_str != "float32":
+            if dtype_str not in ("float32", "float16"):
                 raise ValueError(
                     f"Quantization mismatch for baseline table {name!r}: config "
-                    f"uses FP32 but sparse_embedding.json has dtype={dtype_str!r}"
+                    f"uses unquantized float deltas (expected float32 or float16) "
+                    f"but sparse_embedding.json has dtype={dtype_str!r}"
                 )
+            storage_dtype = (
+                np.dtype(np.float32) if dtype_str == "float32" else np.dtype(np.float16)
+            )
             row_cols = dim
-            row_bytes = int(meta.get("row_bytes", dim * 4))
-            if row_bytes != dim * 4:
+            expected_row_bytes = dim * storage_dtype.itemsize
+            row_bytes = int(meta.get("row_bytes", expected_row_bytes))
+            if row_bytes != expected_row_bytes:
                 raise ValueError(
-                    f"FP32 baseline table {name!r} has invalid row_bytes={row_bytes}"
+                    f"{dtype_str} baseline table {name!r} has invalid "
+                    f"row_bytes={row_bytes}, expected {expected_row_bytes}"
                 )
-            storage_dtype = np.dtype(np.float32)
 
         key_name = str(meta.get("key_name", ""))
         value_name = str(meta.get("value_name", ""))
@@ -403,6 +443,78 @@ def _open_feature_view(
     return _clone_view_for_worker(view, read_timeout_secs), has_score
 
 
+class _WorkerViewPool:
+    """Thread-local cache of cloned views that closes HTTP sessions on exit."""
+
+    def __init__(self, base_view: Any, read_timeout_secs: int) -> None:
+        self._base_view = base_view
+        self._read_timeout_secs = read_timeout_secs
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._sessions: List[Any] = []
+
+    def get(self) -> Any:
+        view = getattr(self._local, "view", None)
+        if view is None:
+            view = _clone_view_for_worker(self._base_view, self._read_timeout_secs)
+            fdb_client = getattr(view, "_featuredb_client", None)
+            session = getattr(fdb_client, "_session", None)
+            if session is not None:
+                with self._lock:
+                    self._sessions.append(session)
+            self._local.view = view
+        return view
+
+    def close(self) -> None:
+        with self._lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for session in sessions:
+            with contextlib.suppress(Exception):
+                session.close()
+
+    def __enter__(self) -> "_WorkerViewPool":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        self.close()
+        return False
+
+
+def _resolve_server_end_ts(
+    view: Any,
+    version: str,
+    base_fields: List[str],
+) -> int:
+    """Obtain FeatureDB's authoritative server timestamp via an incremental probe."""
+    client_ms = max(1, time.time_ns() // 1_000_000)
+    last_exc: Optional[Exception] = None
+    probe_ts = 1
+    for lookback_ms in (5_000, 60_000, 3_600_000):
+        probe_ts = max(1, client_ms - lookback_ms)
+        try:
+            with view.iterate_features(
+                ts=probe_ts,
+                version=version,
+                output_fields=base_fields,
+            ) as stream:
+                for _ in stream:
+                    pass
+                next_ts = int(stream.next_ts)
+        except Exception as exc:
+            last_exc = exc
+            if probe_ts == 1:
+                break
+            continue
+        if next_ts <= 0:
+            raise ValueError(f"FeatureDB returned non-positive Next-Ts: {next_ts}")
+        if next_ts != probe_ts or probe_ts == 1:
+            return next_ts
+    if last_exc is not None:
+        raise last_exc
+    return probe_ts
+
+
 def _clone_view_for_worker(view: Any, read_timeout_secs: int) -> Any:
     """Create a thread-isolated view handle with an enlarged HTTP read timeout."""
     fdb_client = getattr(view, "_featuredb_client", None)
@@ -504,8 +616,8 @@ def _extract_group_values(
     list_col: pa.ListArray,
     indices: Optional[np.ndarray],
     spec: _TableSpec,
-) -> np.ndarray:
-    """Extract contiguous (rows, row_cols) values for one table slice."""
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract contiguous (rows, row_cols) stored values and tombstone flags."""
     sub_col = list_col if indices is None else pc.take(list_col, indices)
     if sub_col.offset != 0 or sub_col.null_count != 0:
         sub_col = cast(pa.ListArray, sub_col)
@@ -520,14 +632,32 @@ def _extract_group_values(
     start = int(offsets[0])
     stop = int(offsets[-1])
     flat = sub_col.values.to_numpy(zero_copy_only=False)[start:stop]
-    values = np.ascontiguousarray(
-        flat.reshape(len(sub_col), spec.row_cols), dtype=spec.storage_dtype
+    if spec.quantized:
+        values = np.ascontiguousarray(
+            flat.reshape(len(sub_col), spec.row_cols), dtype=np.uint8
+        )
+        tombstones = _is_tombstone_rows(values, True)
+        return values, tombstones
+
+    raw_f32 = np.ascontiguousarray(
+        flat.reshape(len(sub_col), spec.row_cols), dtype=np.float32
     )
-    if not spec.quantized and not bool(np.isfinite(values).all()):
+    if not bool(np.isfinite(raw_f32).all()):
         raise ValueError(
             f"FeatureDB FP32 embedding for {spec.name!r} contains NaN or Inf"
         )
-    return values
+    # Check deletion tombstones on raw FP32 before casting to FP16 so subnormal
+    # non-zero FP32 values never underflow into false tombstones.
+    tombstones = _is_tombstone_rows(raw_f32, False)
+    if spec.storage_dtype == np.dtype(np.float16):
+        with np.errstate(over="ignore"):
+            values = np.ascontiguousarray(raw_f32.astype(np.float16))
+        if not bool(np.isfinite(values).all()):
+            raise ValueError(
+                f"FeatureDB FP32 embedding for {spec.name!r} overflows float16"
+            )
+        return values, tombstones
+    return raw_f32, tombstones
 
 
 def _spill_batch_to_shard_dir(
@@ -577,11 +707,15 @@ def _spill_batch_to_shard_dir(
                 f"FeatureDB returned unknown table {pk!r} absent from "
                 "baseline sparse_embedding.json"
             )
-        values = _extract_group_values(emb_col, None, spec)
+        values, tombstones = _extract_group_values(emb_col, None, spec)
         _get_fp(spec.index, "keys").write(sk_arr.tobytes())
         _get_fp(spec.index, "values").write(values.tobytes())
-        if spec.is_dynamic and score_arr is not None:
-            _get_fp(spec.index, "scores").write(score_arr.tobytes())
+        if spec.is_dynamic:
+            _get_fp(spec.index, "tombs").write(
+                np.ascontiguousarray(tombstones, dtype=np.uint8).tobytes()
+            )
+            if score_arr is not None:
+                _get_fp(spec.index, "scores").write(score_arr.tobytes())
         return
 
     pk_arr = np.asarray(pks, dtype=object)
@@ -593,13 +727,17 @@ def _spill_batch_to_shard_dir(
                 "baseline sparse_embedding.json"
             )
         idx = np.flatnonzero(pk_arr == pk)
-        values = _extract_group_values(emb_col, idx, spec)
+        values, tombstones = _extract_group_values(emb_col, idx, spec)
         _get_fp(spec.index, "keys").write(np.ascontiguousarray(sk_arr[idx]).tobytes())
         _get_fp(spec.index, "values").write(values.tobytes())
-        if spec.is_dynamic and score_arr is not None:
-            _get_fp(spec.index, "scores").write(
-                np.ascontiguousarray(score_arr[idx]).tobytes()
+        if spec.is_dynamic:
+            _get_fp(spec.index, "tombs").write(
+                np.ascontiguousarray(tombstones, dtype=np.uint8).tobytes()
             )
+            if score_arr is not None:
+                _get_fp(spec.index, "scores").write(
+                    np.ascontiguousarray(score_arr[idx]).tobytes()
+                )
 
 
 def _is_tombstone_rows(values: np.ndarray, quantized: bool) -> np.ndarray:
@@ -631,20 +769,28 @@ def _compact_dynamic_shard(
     """Deduplicate and filter tombstones in one spilled dynamic shard table."""
     raw_keys_path = os.path.join(shard_dir, f"{spec.index}.keys")
     raw_values_path = os.path.join(shard_dir, f"{spec.index}.values")
+    raw_tombs_path = os.path.join(shard_dir, f"{spec.index}.tombs")
     raw_scores_path = os.path.join(shard_dir, f"{spec.index}.scores")
     if not os.path.exists(raw_keys_path) or os.path.getsize(raw_keys_path) == 0:
         return _DynamicShardStats(live_rows=0, touched_keys=np.empty(0, dtype=np.int64))
 
     raw_keys = np.fromfile(raw_keys_path, dtype=np.int64)
+    num_raw = len(raw_keys)
+    raw_tombs = np.fromfile(raw_tombs_path, dtype=np.uint8)
+    if len(raw_tombs) != num_raw:
+        raise ValueError(
+            f"Truncated raw tombstones file {raw_tombs_path}: expected "
+            f"{num_raw} rows, got {len(raw_tombs)}"
+        )
     dedup_pos = _dedup_last_positions(raw_keys)
     touched_keys = np.sort(raw_keys[dedup_pos])
+    live_pos = dedup_pos[raw_tombs[dedup_pos] == 0]
 
     live_keys_path = os.path.join(shard_dir, f"{spec.index}.live.keys")
     live_values_path = os.path.join(shard_dir, f"{spec.index}.live.values")
     live_scores_path = os.path.join(shard_dir, f"{spec.index}.live.scores")
 
-    live_rows = 0
-    num_raw = len(raw_keys)
+    live_rows = int(len(live_pos))
     pos_cursor = 0
 
     with (
@@ -677,22 +823,16 @@ def _compact_dynamic_shard(
                     raw_scores = np.frombuffer(raw_score_bytes, dtype=np.int64)
                 else:
                     raw_scores = None
-                next_cursor = int(np.searchsorted(dedup_pos, chunk_end, side="left"))
+                next_cursor = int(np.searchsorted(live_pos, chunk_end, side="left"))
                 if next_cursor == pos_cursor:
                     continue
-                local_idx = dedup_pos[pos_cursor:next_cursor] - chunk_start
+                kept_idx = live_pos[pos_cursor:next_cursor] - chunk_start
                 pos_cursor = next_cursor
 
-                vals = raw_vals[local_idx]
-                live_mask = ~_is_tombstone_rows(vals, spec.quantized)
-                if not bool(live_mask.any()):
-                    continue
-                kept_idx = local_idx[live_mask]
-                live_rows += int(len(kept_idx))
                 lkf.write(
                     np.ascontiguousarray(raw_keys[chunk_start + kept_idx]).tobytes()
                 )
-                lvf.write(np.ascontiguousarray(vals[live_mask]).tobytes())
+                lvf.write(np.ascontiguousarray(raw_vals[kept_idx]).tobytes())
                 if lsf is not None and raw_scores is not None:
                     lsf.write(np.ascontiguousarray(raw_scores[kept_idx]).tobytes())
         finally:
@@ -701,7 +841,7 @@ def _compact_dynamic_shard(
             if lsf is not None:
                 lsf.close()
 
-    for path in (raw_keys_path, raw_values_path, raw_scores_path):
+    for path in (raw_keys_path, raw_values_path, raw_tombs_path, raw_scores_path):
         if os.path.exists(path):
             os.remove(path)
     return _DynamicShardStats(live_rows=live_rows, touched_keys=touched_keys)
@@ -736,7 +876,7 @@ def _read_static_shard_updates(shard_dir: str, spec: _TableSpec) -> _StaticShard
 
 def _pull_and_compact_shard(
     shard_id: int,
-    base_view: Any,
+    view_pool: _WorkerViewPool,
     version: str,
     end_ts: int,
     output_fields: List[str],
@@ -745,12 +885,11 @@ def _pull_and_compact_shard(
     expected_value_dtype: np.dtype,
     tmp_root: str,
     read_chunk_bytes: int,
-    read_timeout_secs: int,
 ) -> Tuple[int, Dict[str, _DynamicShardStats], Dict[str, _StaticShardUpdates]]:
     """Pull one FeatureDB shard, compact dynamic rows, and collect static updates."""
     shard_dir = os.path.join(tmp_root, f"shard_{shard_id}")
     os.makedirs(shard_dir, exist_ok=True)
-    worker_view = _clone_view_for_worker(base_view, read_timeout_secs)
+    worker_view = view_pool.get()
     open_files: Dict[Tuple[int, str], Any] = {}
     try:
         with worker_view.iterate_features(
@@ -856,7 +995,7 @@ def _gather_static_updates_to_rank0(
                 dist.send(v_t, dst=0)
             elif rank == 0:
                 k_t = torch.empty(remote_n, dtype=torch.int64)
-                v_dtype = torch.uint8 if spec.quantized else torch.float32
+                v_dtype = _NP_TO_TORCH_DTYPE[spec.storage_dtype]
                 v_t = torch.empty((remote_n, spec.row_cols), dtype=v_dtype)
                 dist.recv(k_t, src=src_rank)
                 dist.recv(v_t, src=src_rank)
@@ -914,6 +1053,45 @@ def _load_default_value_arrays(
     return defaults
 
 
+def _compute_default_live_scores(
+    base_dynamic_files: Sequence[str],
+    dynamic_specs: Sequence[_TableSpec],
+    read_chunk_bytes: int,
+    world_size: int,
+    rank: int,
+) -> Dict[str, int]:
+    """Compute fallback live scores above baseline max when view lacks score."""
+    if not dynamic_specs:
+        return {}
+    min_i64 = int(np.iinfo(np.int64).min)
+    local_max = {spec.name: min_i64 for spec in dynamic_specs}
+    for idx, path in enumerate(base_dynamic_files):
+        if idx % world_size != rank:
+            continue
+        with zipfile.ZipFile(path, "r") as zf:
+            names = set(zf.namelist())
+            for spec in dynamic_specs:
+                if f"{spec.score_name}.npy" not in names:
+                    continue
+                chunk_rows = max(1, read_chunk_bytes // 8)
+                for chunk in npz_util.iter_npz_entry(zf, spec.score_name, chunk_rows):
+                    if len(chunk) > 0:
+                        local_max[spec.name] = max(
+                            local_max[spec.name], int(chunk.max())
+                        )
+    if world_size > 1:
+        max_tensor = torch.tensor(
+            [local_max[spec.name] for spec in dynamic_specs], dtype=torch.int64
+        )
+        dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
+        for i, spec in enumerate(dynamic_specs):
+            local_max[spec.name] = int(max_tensor[i].item())
+    return {
+        spec.name: min(_INT64_MAX - 1, max(0, local_max[spec.name]) + 1)
+        for spec in dynamic_specs
+    }
+
+
 def _iter_filtered_base_and_live(
     base_zf: Optional[zipfile.ZipFile],
     entry_name: str,
@@ -923,7 +1101,8 @@ def _iter_filtered_base_and_live(
     dtype: np.dtype,
     trailing_shape: Tuple[int, ...],
     chunk_rows: int,
-    fill_zeros_when_missing: bool = False,
+    fill_when_missing: bool = False,
+    missing_fill_value: int = 0,
 ) -> Iterator[np.ndarray]:
     """Yield filtered baseline chunks followed by live FeatureDB chunks."""
     row_cols = trailing_shape[0] if trailing_shape else 1
@@ -960,12 +1139,12 @@ def _iter_filtered_base_and_live(
                         arr = arr.reshape((cur,) + trailing_shape)
                     yield np.ascontiguousarray(arr)
                     remaining -= cur
-        elif fill_zeros_when_missing:
+        elif fill_when_missing:
             remaining = live_rows
             while remaining > 0:
                 cur = min(chunk_rows, remaining)
                 shape = (cur,) + trailing_shape if trailing_shape else (cur,)
-                yield np.zeros(shape, dtype=dtype)
+                yield np.full(shape, missing_fill_value, dtype=dtype)
                 remaining -= cur
         else:
             raise FileNotFoundError(
@@ -983,6 +1162,7 @@ def _write_merged_dynamic_part(
     shard_stats: Mapping[str, _DynamicShardStats],
     shard_dir: Optional[str],
     has_score: bool,
+    default_live_scores: Mapping[str, int],
     default_values: Mapping[str, np.ndarray],
     read_chunk_bytes: int,
 ) -> Dict[str, int]:
@@ -1082,7 +1262,8 @@ def _write_merged_dynamic_part(
                     np.dtype(np.int64),
                     (),
                     chunk_rows,
-                    fill_zeros_when_missing=not has_score,
+                    fill_when_missing=not has_score,
+                    missing_fill_value=default_live_scores.get(spec.name, 1),
                 ),
             )
             if part_idx == 0 and spec.default_value_name:
@@ -1166,6 +1347,159 @@ def _build_updated_embedding_meta(
     return new_meta
 
 
+def _verify_version_npz_files(version_dir: str, num_dynamic_parts: int) -> None:
+    """Ensure rank 0 sees every merged NPZ shard before publishing READY."""
+    static_npz = os.path.join(version_dir, "sparse_embeddings-00-of-01.npz")
+    if not os.path.isfile(static_npz) or os.path.getsize(static_npz) == 0:
+        raise FileNotFoundError(
+            f"Missing or empty merged static NPZ on rank 0: {static_npz}"
+        )
+    if num_dynamic_parts <= 0:
+        return
+    width = max(2, len(str(num_dynamic_parts)))
+    for part_idx in range(num_dynamic_parts):
+        dyn_npz = os.path.join(
+            version_dir,
+            f"sparse_dynamic_embedding-{part_idx:0{width}d}-of-"
+            f"{num_dynamic_parts:0{width}d}.npz",
+        )
+        if not os.path.isfile(dyn_npz) or os.path.getsize(dyn_npz) == 0:
+            raise FileNotFoundError(
+                f"Missing or empty merged dynamic NPZ shard on rank 0: {dyn_npz}. "
+                "Multi-node dump_fsview requires model_dir on a shared filesystem."
+            )
+
+
+def _load_pipeline_config_any(pipeline_config_path: str) -> Any:
+    """Load pipeline config from local path or fsspec URI (e.g. oss://)."""
+    fs, _ = filesystem_util.url_to_fs(pipeline_config_path)
+    if fs is None:
+        return config_util.load_pipeline_config(pipeline_config_path)
+    suffix = ".json" if pipeline_config_path.endswith(".json") else ".config"
+    with fs.open(pipeline_config_path, "r") as rf:
+        content = rf.read()
+    with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=True) as tf:
+        tf.write(content)
+        tf.flush()
+        return config_util.load_pipeline_config(tf.name)
+
+
+@contextlib.contextmanager
+def _resolve_working_model_dir(
+    model_dir: str,
+    rank: int,
+    world_size: int,
+    keep_versions: int,
+) -> Iterator[Tuple[str, List[str], Any]]:
+    """Provide a local POSIX working model_dir, staging oss:// URIs when needed."""
+    fs, _ = filesystem_util.url_to_fs(model_dir)
+    if fs is None:
+        yield model_dir, [], None
+        return
+
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+    if world_size > local_world_size:
+        raise ValueError(
+            f"Multi-node dump_fsview does not support remote URI model_dir "
+            f"({model_dir!r}); mount the bucket on a shared path or run single-node."
+        )
+
+    remote_root = model_dir.rstrip("/")
+    remote_sparse = f"{remote_root}/sparse"
+    remote_dump_root = f"{remote_root}/{SPARSE_FS_DUMP_DIR}"
+    remote_versions = f"{remote_dump_root}/{VERSIONS_DIR}"
+    remote_current = f"{remote_dump_root}/{CURRENT_JSON}"
+
+    stage_dir = ""
+    remote_existing: List[str] = []
+    if rank == 0:
+        cache_base = os.environ.get("LOCAL_CACHE_DIR") or None
+        if cache_base:
+            os.makedirs(cache_base, exist_ok=True)
+        stage_dir = tempfile.mkdtemp(dir=cache_base, prefix="tzrec_dump_stage_")
+        try:
+            if not fs.exists(remote_sparse):
+                raise FileNotFoundError(
+                    f"Remote baseline sparse directory does not exist: {remote_sparse}"
+                )
+            local_sparse = os.path.join(stage_dir, "sparse")
+            os.makedirs(local_sparse, exist_ok=True)
+            for remote_entry in fs.ls(remote_sparse, detail=False):
+                base_name = os.path.basename(remote_entry.rstrip("/"))
+                if not base_name:
+                    continue
+                src_uri = (
+                    remote_entry
+                    if "://" in remote_entry
+                    else f"{remote_sparse}/{base_name}"
+                )
+                with fs.open(src_uri, "rb") as rf:
+                    with open(os.path.join(local_sparse, base_name), "wb") as wf:
+                        shutil.copyfileobj(rf, wf)
+            if fs.exists(remote_current):
+                local_dump_root = os.path.join(stage_dir, SPARSE_FS_DUMP_DIR)
+                os.makedirs(local_dump_root, exist_ok=True)
+                with fs.open(remote_current, "rb") as rf:
+                    with open(os.path.join(local_dump_root, CURRENT_JSON), "wb") as wf:
+                        shutil.copyfileobj(rf, wf)
+            if fs.exists(remote_versions):
+                remote_existing = sorted(
+                    os.path.basename(p.rstrip("/"))
+                    for p in fs.ls(remote_versions, detail=False)
+                    if os.path.basename(p.rstrip("/"))
+                )
+        except BaseException:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            raise
+
+    if world_size > 1:
+        bcast = [stage_dir]
+        dist.broadcast_object_list(bcast, src=0)
+        stage_dir = str(bcast[0])
+
+    def _publish_remote(dump_version: str, payload: Mapping[str, Any]) -> None:
+        local_ver_dir = os.path.join(
+            stage_dir, SPARSE_FS_DUMP_DIR, VERSIONS_DIR, dump_version
+        )
+        remote_ver_dir = f"{remote_versions}/{dump_version}"
+        fs.makedirs(remote_ver_dir, exist_ok=True)
+        # Upload data and metadata before READY so remote readers never see READY
+        # ahead of the NPZ payloads.
+        entries = sorted(os.listdir(local_ver_dir))
+        ordered = [n for n in entries if n != READY_FILE] + [READY_FILE]
+        for name in ordered:
+            local_file = os.path.join(local_ver_dir, name)
+            if not os.path.isfile(local_file):
+                continue
+            with open(local_file, "rb") as lf:
+                with fs.open(f"{remote_ver_dir}/{name}", "wb") as rf:
+                    shutil.copyfileobj(lf, rf)
+        with fs.open(remote_current, "wb") as cf:
+            cf.write((json.dumps(payload, indent=2) + "\n").encode("utf-8"))
+        if keep_versions > 0 and fs.exists(remote_versions):
+            ready_remote: List[str] = []
+            for entry in sorted(fs.ls(remote_versions, detail=False)):
+                vname = os.path.basename(entry.rstrip("/"))
+                if not vname or _is_temp_artifact_name(vname):
+                    continue
+                if fs.exists(f"{remote_versions}/{vname}/{READY_FILE}"):
+                    ready_remote.append(vname)
+            if len(ready_remote) > keep_versions:
+                for old_ver in ready_remote[:-keep_versions]:
+                    if old_ver == dump_version:
+                        continue
+                    with contextlib.suppress(Exception):
+                        fs.rm(f"{remote_versions}/{old_ver}", recursive=True)
+
+    try:
+        yield stage_dir, remote_existing, _publish_remote
+    finally:
+        if world_size > 1 and dist.is_initialized():
+            dist.barrier()
+        if rank == 0 and stage_dir:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+
+
 def dump_fsview(
     pipeline_config_path: str,
     model_dir: str,
@@ -1211,7 +1545,7 @@ def dump_fsview(
         initialized_pg = True
 
     try:
-        pipeline_config = config_util.load_pipeline_config(pipeline_config_path)
+        pipeline_config = _load_pipeline_config_any(pipeline_config_path)
         if edit_config_json:
             config_util.edit_config(pipeline_config, json.loads(edit_config_json))
 
@@ -1244,272 +1578,340 @@ def dump_fsview(
         )
         expected_value_dtype = np.dtype(np.uint8 if is_quantized else np.float32)
 
-        base_sparse_dir = os.path.join(model_dir, "sparse")
-        (
-            base_emb_meta,
-            base_feat_meta,
-            table_specs,
-            base_static_files,
-            base_dynamic_files,
-        ) = _load_baseline_contract(base_sparse_dir, is_quantized)
-        dynamic_specs = [spec for spec in table_specs.values() if spec.is_dynamic]
-        static_specs = [spec for spec in table_specs.values() if not spec.is_dynamic]
-
-        view, has_score = _open_feature_view(
-            fs_settings, expected_field_type, read_timeout_secs
-        )
-
-        dump_root = os.path.join(model_dir, SPARSE_FS_DUMP_DIR)
-        versions_root = os.path.join(dump_root, VERSIONS_DIR)
-        current_path = os.path.join(dump_root, CURRENT_JSON)
-
-        if rank == 0:
-            shard_count = view.get_shard_count()
-            if type(shard_count) is not int or shard_count <= 0:
-                raise ValueError(f"Invalid FeatureDB shard_count: {shard_count!r}")
-            end_ts = time.time_ns() // 1_000_000
-            os.makedirs(versions_root, exist_ok=True)
-            dump_version = _allocate_dump_version(versions_root, current_path)
-            version_dir = os.path.join(versions_root, dump_version)
-            os.makedirs(version_dir, exist_ok=True)
-            broadcast_state: List[Any] = [
-                end_ts,
-                shard_count,
-                dump_version,
-                has_score,
+        with _resolve_working_model_dir(model_dir, rank, world_size, keep_versions) as (
+            working_model_dir,
+            remote_existing_versions,
+            remote_publisher,
+        ):
+            base_sparse_dir = os.path.join(working_model_dir, "sparse")
+            (
+                base_emb_meta,
+                base_feat_meta,
+                table_specs,
+                base_static_files,
+                base_dynamic_files,
+            ) = _load_baseline_contract(base_sparse_dir, is_quantized)
+            dynamic_specs = [spec for spec in table_specs.values() if spec.is_dynamic]
+            static_specs = [
+                spec for spec in table_specs.values() if not spec.is_dynamic
             ]
-        else:
-            broadcast_state = [0, 0, "", False]
 
-        if world_size > 1:
-            dist.broadcast_object_list(broadcast_state, src=0)
-        end_ts = int(broadcast_state[0])
-        shard_count = int(broadcast_state[1])
-        dump_version = str(broadcast_state[2])
-        has_score = bool(broadcast_state[3])
-        version_dir = os.path.join(versions_root, dump_version)
-
-        output_fields = [view.pk_field, view.sk_field, view.embedding_field]
-        if has_score:
-            output_fields.append(FEATURE_STORE_SCORE_FIELD)
-
-        num_output_parts = (
-            max(len(base_dynamic_files), shard_count, 1) if dynamic_specs else 0
-        )
-        my_shards = [s for s in range(shard_count) if s % world_size == rank]
-        my_parts = [p for p in range(num_output_parts) if p % world_size == rank]
-        read_chunk_bytes = int(read_chunk_size_mb) * 1024 * 1024
-
-        if rank == 0:
-            logger.info(
-                "Starting sparse_fs_dump: project=%s view=%s fs_version=%s "
-                "dump_version=%s end_ts=%s shards=%s output_parts=%s has_score=%s",
-                fs_settings.project_name,
-                fs_settings.feature_view_name,
-                fs_settings.version,
-                dump_version,
-                end_ts,
-                shard_count,
-                num_output_parts,
-                has_score,
+            view, has_score = _open_feature_view(
+                fs_settings, expected_field_type, read_timeout_secs
             )
+            base_fields = [view.pk_field, view.sk_field, view.embedding_field]
 
-        with tempfile.TemporaryDirectory(
-            prefix=f"tzrec_dump_fsview_r{rank}_"
-        ) as tmp_root:
-            shard_dyn_stats: Dict[int, Dict[str, _DynamicShardStats]] = {}
-            static_updates_by_shard: Dict[int, Dict[str, _StaticShardUpdates]] = {}
-            if my_shards:
-                pool_size = min(effective_workers, len(my_shards))
-                with ThreadPoolExecutor(max_workers=pool_size) as pool:
-                    futures = [
-                        pool.submit(
-                            _pull_and_compact_shard,
-                            shard_id,
-                            view,
-                            fs_settings.version,
-                            end_ts,
-                            output_fields,
-                            has_score,
-                            table_specs,
-                            expected_value_dtype,
-                            tmp_root,
-                            read_chunk_bytes,
-                            read_timeout_secs,
+            dump_root = os.path.join(working_model_dir, SPARSE_FS_DUMP_DIR)
+            versions_root = os.path.join(dump_root, VERSIONS_DIR)
+            current_path = os.path.join(dump_root, CURRENT_JSON)
+
+            published_ready = False
+            created_version_dir: Optional[str] = None
+
+            try:
+                if rank == 0:
+                    shard_count = view.get_shard_count()
+                    if type(shard_count) is not int or shard_count <= 0:
+                        raise ValueError(
+                            f"Invalid FeatureDB shard_count: {shard_count!r}"
                         )
-                        for shard_id in my_shards
-                    ]
-                    for fut in futures:
-                        shard_id, dyn_stats, static_upd = fut.result()
-                        shard_dyn_stats[shard_id] = dyn_stats
-                        static_updates_by_shard[shard_id] = static_upd
-
-            # Sync touched dynamic keys globally so baseline filtering drops all
-            # updated or tombstoned keys.
-            delta_keys_by_table: Dict[str, np.ndarray] = {}
-            for spec in dynamic_specs:
-                local_keys = _merge_sorted_unique_int64(
-                    [
-                        shard_dyn_stats[s][spec.name].touched_keys
-                        for s in sorted(shard_dyn_stats)
-                    ]
-                )
-                delta_keys_by_table[spec.name] = _gather_global_delta_keys(
-                    local_keys, world_size, rank
-                )
-
-            # Gather static updates per table onto rank 0 preserving shard order.
-            local_static_updates: Dict[str, _StaticShardUpdates] = {}
-            for spec in static_specs:
-                shard_keys = [
-                    static_updates_by_shard[s][spec.name].keys
-                    for s in sorted(static_updates_by_shard)
-                    if len(static_updates_by_shard[s][spec.name].keys) > 0
-                ]
-                shard_vals = [
-                    static_updates_by_shard[s][spec.name].values
-                    for s in sorted(static_updates_by_shard)
-                    if len(static_updates_by_shard[s][spec.name].keys) > 0
-                ]
-                if shard_keys:
-                    local_static_updates[spec.name] = _StaticShardUpdates(
-                        keys=np.concatenate(shard_keys),
-                        values=np.concatenate(shard_vals, axis=0),
+                    end_ts = _resolve_server_end_ts(
+                        view, fs_settings.version, base_fields
                     )
+                    os.makedirs(versions_root, exist_ok=True)
+                    dump_version = _allocate_dump_version(
+                        versions_root,
+                        current_path,
+                        existing_versions=remote_existing_versions,
+                    )
+                    version_dir = os.path.join(versions_root, dump_version)
+                    os.makedirs(version_dir, exist_ok=True)
+                    created_version_dir = version_dir
+                    broadcast_state: List[Any] = [
+                        end_ts,
+                        shard_count,
+                        dump_version,
+                        has_score,
+                    ]
                 else:
-                    local_static_updates[spec.name] = _StaticShardUpdates(
-                        keys=np.empty(0, dtype=np.int64),
-                        values=np.empty((0, spec.row_cols), dtype=spec.storage_dtype),
+                    broadcast_state = [0, 0, "", False]
+
+                if world_size > 1:
+                    dist.broadcast_object_list(broadcast_state, src=0)
+                end_ts = int(broadcast_state[0])
+                shard_count = int(broadcast_state[1])
+                dump_version = str(broadcast_state[2])
+                has_score = bool(broadcast_state[3])
+                version_dir = os.path.join(versions_root, dump_version)
+
+                output_fields = list(base_fields)
+                if has_score:
+                    output_fields.append(FEATURE_STORE_SCORE_FIELD)
+
+                num_output_parts = (
+                    max(len(base_dynamic_files), shard_count, 1) if dynamic_specs else 0
+                )
+                my_shards = [s for s in range(shard_count) if s % world_size == rank]
+                my_parts = [
+                    p for p in range(num_output_parts) if p % world_size == rank
+                ]
+                read_chunk_bytes = int(read_chunk_size_mb) * 1024 * 1024
+
+                if my_parts:
+                    os.makedirs(version_dir, exist_ok=True)
+
+                if rank == 0:
+                    logger.info(
+                        "Starting sparse_fs_dump: project=%s view=%s fs_version=%s "
+                        "dump_version=%s end_ts=%s shards=%s output_parts=%s "
+                        "has_score=%s",
+                        fs_settings.project_name,
+                        fs_settings.feature_view_name,
+                        fs_settings.version,
+                        dump_version,
+                        end_ts,
+                        shard_count,
+                        num_output_parts,
+                        has_score,
                     )
-            gathered_static = _gather_static_updates_to_rank0(
-                local_static_updates, static_specs, world_size, rank
-            )
 
-            default_values = (
-                _load_default_value_arrays(base_dynamic_files, dynamic_specs)
-                if rank == 0 and 0 in my_parts
-                else {}
-            )
+                default_live_scores = (
+                    _compute_default_live_scores(
+                        base_dynamic_files,
+                        dynamic_specs,
+                        read_chunk_bytes,
+                        world_size,
+                        rank,
+                    )
+                    if not has_score
+                    else {}
+                )
 
-            local_table_rows: Dict[str, int] = {spec.name: 0 for spec in dynamic_specs}
-            if my_parts and dynamic_specs:
-                part_pool_size = min(effective_workers, len(my_parts))
-                with ThreadPoolExecutor(max_workers=part_pool_size) as pool:
-                    part_futures = [
-                        pool.submit(
-                            _write_merged_dynamic_part,
-                            part_idx,
-                            num_output_parts,
+                with (
+                    tempfile.TemporaryDirectory(
+                        prefix=f"tzrec_dump_fsview_r{rank}_"
+                    ) as tmp_root,
+                    _WorkerViewPool(view, read_timeout_secs) as view_pool,
+                ):
+                    shard_dyn_stats: Dict[int, Dict[str, _DynamicShardStats]] = {}
+                    static_updates_by_shard: Dict[
+                        int, Dict[str, _StaticShardUpdates]
+                    ] = {}
+                    if my_shards:
+                        pool_size = min(effective_workers, len(my_shards))
+                        with ThreadPoolExecutor(max_workers=pool_size) as pool:
+                            futures = [
+                                pool.submit(
+                                    _pull_and_compact_shard,
+                                    shard_id,
+                                    view_pool,
+                                    fs_settings.version,
+                                    end_ts,
+                                    output_fields,
+                                    has_score,
+                                    table_specs,
+                                    expected_value_dtype,
+                                    tmp_root,
+                                    read_chunk_bytes,
+                                )
+                                for shard_id in my_shards
+                            ]
+                            for fut in futures:
+                                shard_id, dyn_stats, static_upd = fut.result()
+                                shard_dyn_stats[shard_id] = dyn_stats
+                                static_updates_by_shard[shard_id] = static_upd
+
+                    # Sync touched dynamic keys globally so baseline filtering drops all
+                    # updated or tombstoned keys.
+                    delta_keys_by_table: Dict[str, np.ndarray] = {}
+                    for spec in dynamic_specs:
+                        local_keys = _merge_sorted_unique_int64(
+                            [
+                                shard_dyn_stats[s][spec.name].touched_keys
+                                for s in sorted(shard_dyn_stats)
+                            ]
+                        )
+                        delta_keys_by_table[spec.name] = _gather_global_delta_keys(
+                            local_keys, world_size, rank
+                        )
+
+                    # Gather static updates onto rank 0 preserving shard order.
+                    local_static_updates: Dict[str, _StaticShardUpdates] = {}
+                    for spec in static_specs:
+                        shard_keys = [
+                            static_updates_by_shard[s][spec.name].keys
+                            for s in sorted(static_updates_by_shard)
+                            if len(static_updates_by_shard[s][spec.name].keys) > 0
+                        ]
+                        shard_vals = [
+                            static_updates_by_shard[s][spec.name].values
+                            for s in sorted(static_updates_by_shard)
+                            if len(static_updates_by_shard[s][spec.name].keys) > 0
+                        ]
+                        if shard_keys:
+                            local_static_updates[spec.name] = _StaticShardUpdates(
+                                keys=np.concatenate(shard_keys),
+                                values=np.concatenate(shard_vals, axis=0),
+                            )
+                        else:
+                            local_static_updates[spec.name] = _StaticShardUpdates(
+                                keys=np.empty(0, dtype=np.int64),
+                                values=np.empty(
+                                    (0, spec.row_cols), dtype=spec.storage_dtype
+                                ),
+                            )
+                    gathered_static = _gather_static_updates_to_rank0(
+                        local_static_updates, static_specs, world_size, rank
+                    )
+
+                    default_values = (
+                        _load_default_value_arrays(base_dynamic_files, dynamic_specs)
+                        if rank == 0 and 0 in my_parts
+                        else {}
+                    )
+
+                    local_table_rows: Dict[str, int] = {
+                        spec.name: 0 for spec in dynamic_specs
+                    }
+                    if my_parts and dynamic_specs:
+                        part_pool_size = min(effective_workers, len(my_parts))
+                        with ThreadPoolExecutor(max_workers=part_pool_size) as pool:
+                            part_futures = [
+                                pool.submit(
+                                    _write_merged_dynamic_part,
+                                    part_idx,
+                                    num_output_parts,
+                                    version_dir,
+                                    base_dynamic_files[part_idx]
+                                    if part_idx < len(base_dynamic_files)
+                                    else None,
+                                    dynamic_specs,
+                                    delta_keys_by_table,
+                                    shard_dyn_stats.get(part_idx, {}),
+                                    os.path.join(tmp_root, f"shard_{part_idx}")
+                                    if part_idx in shard_dyn_stats
+                                    else None,
+                                    has_score,
+                                    default_live_scores,
+                                    default_values,
+                                    read_chunk_bytes,
+                                )
+                                for part_idx in my_parts
+                            ]
+                            for fut in part_futures:
+                                part_rows = fut.result()
+                                for name, cnt in part_rows.items():
+                                    local_table_rows[name] += cnt
+
+                    if rank == 0:
+                        _write_merged_static_npz(
                             version_dir,
-                            base_dynamic_files[part_idx]
-                            if part_idx < len(base_dynamic_files)
-                            else None,
-                            dynamic_specs,
-                            delta_keys_by_table,
-                            shard_dyn_stats.get(part_idx, {}),
-                            os.path.join(tmp_root, f"shard_{part_idx}")
-                            if part_idx in shard_dyn_stats
-                            else None,
-                            has_score,
-                            default_values,
+                            base_static_files,
+                            static_specs,
+                            gathered_static,
                             read_chunk_bytes,
                         )
-                        for part_idx in my_parts
-                    ]
-                    for fut in part_futures:
-                        part_rows = fut.result()
-                        for name, cnt in part_rows.items():
-                            local_table_rows[name] += cnt
 
-            if rank == 0:
-                _write_merged_static_npz(
-                    version_dir,
-                    base_static_files,
-                    static_specs,
-                    gathered_static,
-                    read_chunk_bytes,
-                )
+                    if dynamic_specs and world_size > 1:
+                        counts_tensor = torch.tensor(
+                            [local_table_rows[spec.name] for spec in dynamic_specs],
+                            dtype=torch.int64,
+                        )
+                        dist.all_reduce(counts_tensor, op=dist.ReduceOp.SUM)
+                        dynamic_total_rows = {
+                            spec.name: int(counts_tensor[i].item())
+                            for i, spec in enumerate(dynamic_specs)
+                        }
+                    else:
+                        dynamic_total_rows = local_table_rows
 
-            if dynamic_specs and world_size > 1:
-                counts_tensor = torch.tensor(
-                    [local_table_rows[spec.name] for spec in dynamic_specs],
-                    dtype=torch.int64,
-                )
-                dist.all_reduce(counts_tensor, op=dist.ReduceOp.SUM)
-                dynamic_total_rows = {
-                    spec.name: int(counts_tensor[i].item())
-                    for i, spec in enumerate(dynamic_specs)
-                }
-            else:
-                dynamic_total_rows = local_table_rows
+                    if world_size > 1:
+                        dist.barrier()
 
-            if world_size > 1:
-                dist.barrier()
+                    result_payload: Optional[Dict[str, Any]] = None
+                    if rank == 0:
+                        _verify_version_npz_files(version_dir, num_output_parts)
+                        new_emb_meta = _build_updated_embedding_meta(
+                            base_emb_meta, dynamic_total_rows, table_specs
+                        )
+                        for filename in (
+                            "sparse_embeddings-00-of-01.json",
+                            "sparse_embedding.json",
+                        ):
+                            _atomic_write_json(
+                                os.path.join(version_dir, filename),
+                                new_emb_meta,
+                                indent=4,
+                                sort_keys=False,
+                            )
+                        _atomic_write_json(
+                            os.path.join(version_dir, "sparse_features.json"),
+                            base_feat_meta,
+                            indent=4,
+                            sort_keys=False,
+                        )
 
-            result_payload: Optional[Dict[str, Any]] = None
-            if rank == 0:
-                new_emb_meta = _build_updated_embedding_meta(
-                    base_emb_meta, dynamic_total_rows, table_specs
-                )
-                for filename in (
-                    "sparse_embeddings-00-of-01.json",
-                    "sparse_embedding.json",
+                        dumped_at = _utc_now()
+                        dump_meta = {
+                            "start_ts": 0,
+                            "end_ts": int(end_ts),
+                            "region": fs_settings.region,
+                            "project_name": fs_settings.project_name,
+                            "feature_view_name": fs_settings.feature_view_name,
+                            "version": fs_settings.version,
+                            "dump_version": dump_version,
+                            "shard_count": int(shard_count),
+                            "num_dynamic_parts": int(num_output_parts),
+                            "quant_type": DeltaEmbeddingQuantType.Name(
+                                delta_cfg.quant_type
+                            ),
+                            "has_score": bool(has_score),
+                            "dumped_at": dumped_at,
+                        }
+                        _atomic_write_json(
+                            os.path.join(version_dir, META_JSON), dump_meta, indent=2
+                        )
+                        _atomic_write_text(os.path.join(version_dir, READY_FILE), "")
+                        published_ready = True
+
+                        result_payload = {
+                            "version": dump_version,
+                            "end_ts": int(end_ts),
+                            "feature_view_name": fs_settings.feature_view_name,
+                            "fs_version": fs_settings.version,
+                            "has_score": bool(has_score),
+                            "created_at": dumped_at,
+                        }
+                        _atomic_write_json(current_path, result_payload, indent=2)
+                        if remote_publisher is not None:
+                            remote_publisher(dump_version, result_payload)
+                        else:
+                            _prune_old_versions(
+                                dump_root,
+                                versions_root,
+                                keep_versions,
+                                dump_version,
+                            )
+                        logger.info(
+                            "Completed sparse_fs_dump version=%s end_ts=%s "
+                            "dynamic_rows=%s",
+                            dump_version,
+                            end_ts,
+                            dynamic_total_rows,
+                        )
+
+                    if world_size > 1:
+                        dist.barrier()
+                    return result_payload
+            except BaseException:
+                if (
+                    rank == 0
+                    and not published_ready
+                    and created_version_dir is not None
+                    and world_size == 1
                 ):
-                    _atomic_write_json(
-                        os.path.join(version_dir, filename),
-                        new_emb_meta,
-                        indent=4,
-                        sort_keys=False,
-                    )
-                _atomic_write_json(
-                    os.path.join(version_dir, "sparse_features.json"),
-                    base_feat_meta,
-                    indent=4,
-                    sort_keys=False,
-                )
-
-                dumped_at = _utc_now()
-                dump_meta = {
-                    "start_ts": 0,
-                    "end_ts": int(end_ts),
-                    "region": fs_settings.region,
-                    "project_name": fs_settings.project_name,
-                    "feature_view_name": fs_settings.feature_view_name,
-                    "version": fs_settings.version,
-                    "dump_version": dump_version,
-                    "shard_count": int(shard_count),
-                    "num_dynamic_parts": int(num_output_parts),
-                    "quant_type": DeltaEmbeddingQuantType.Name(delta_cfg.quant_type),
-                    "has_score": bool(has_score),
-                    "dumped_at": dumped_at,
-                }
-                _atomic_write_json(
-                    os.path.join(version_dir, META_JSON), dump_meta, indent=2
-                )
-                _atomic_write_text(os.path.join(version_dir, READY_FILE), "")
-
-                result_payload = {
-                    "version": dump_version,
-                    "end_ts": int(end_ts),
-                    "feature_view_name": fs_settings.feature_view_name,
-                    "fs_version": fs_settings.version,
-                    "has_score": bool(has_score),
-                    "created_at": dumped_at,
-                }
-                _atomic_write_json(current_path, result_payload, indent=2)
-                _prune_old_versions(
-                    dump_root, versions_root, keep_versions, dump_version
-                )
-                logger.info(
-                    "Completed sparse_fs_dump version=%s end_ts=%s dynamic_rows=%s",
-                    dump_version,
-                    end_ts,
-                    dynamic_total_rows,
-                )
-
-            if world_size > 1:
-                dist.barrier()
-            return result_payload
+                    shutil.rmtree(created_version_dir, ignore_errors=True)
+                raise
     finally:
         if initialized_pg and dist.is_initialized():
             dist.destroy_process_group()

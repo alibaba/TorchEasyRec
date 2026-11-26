@@ -77,6 +77,7 @@ class _FakeDynamicEmbeddingView:
         embedding_field_type: str = FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
         additional_fields: Optional[Dict[str, str]] = None,
         next_ts_override: Optional[int] = None,
+        server_now_ms: Optional[int] = None,
     ) -> None:
         self._shards = shards
         self.pk_field = "embedding_name"
@@ -85,6 +86,7 @@ class _FakeDynamicEmbeddingView:
         self.embedding_field_type = embedding_field_type
         self.additional_fields = dict(additional_fields or {})
         self.next_ts_override = next_ts_override
+        self.server_now_ms = server_now_ms
         self.calls: List[Dict[str, Any]] = []
 
     def get_shard_count(self) -> int:
@@ -98,6 +100,13 @@ class _FakeDynamicEmbeddingView:
         shard_id: Optional[int] = None,
         output_fields: Optional[List[str]] = None,
     ) -> _FakeEKKVStream:
+        if ts > 0 and shard_id is None and end_ts is None:
+            server_ts = (
+                self.server_now_ms
+                if self.server_now_ms is not None
+                else max(1, fsview_dump_util.time.time_ns() // 1_000_000)
+            )
+            return _FakeEKKVStream([], server_ts)
         assert ts == 0
         assert shard_id is not None
         self.calls.append(
@@ -695,6 +704,7 @@ class FsviewDumpUtilTest(unittest.TestCase):
         _create_fp32_baseline(model_dir)
         _write_pipeline_config(config_path)
 
+        server_ts_iter = iter([1000, 2000, 3000])
         view = _FakeDynamicEmbeddingView(
             {
                 0: [
@@ -708,14 +718,20 @@ class FsviewDumpUtilTest(unittest.TestCase):
             embedding_field_type=FEATURE_STORE_EMBEDDING_TYPE_FLOAT,
             additional_fields={},
         )
-        with (
-            mock.patch.object(
-                fsview_dump_util, "_open_feature_view", return_value=(view, False)
-            ),
-            mock.patch(
-                "tzrec.utils.fsview_dump_util.time.time_ns",
-                side_effect=[1_000_000_000, 2_000_000_000, 3_000_000_000],
-            ),
+        orig_iter = view.iterate_features
+
+        def _seq_iterate(ts: int, *args: Any, **kwargs: Any) -> _FakeEKKVStream:
+            if (
+                ts > 0
+                and kwargs.get("shard_id") is None
+                and kwargs.get("end_ts") is None
+            ):
+                return _FakeEKKVStream([], next(server_ts_iter))
+            return orig_iter(ts, *args, **kwargs)
+
+        view.iterate_features = _seq_iterate  # type: ignore[method-assign]
+        with mock.patch.object(
+            fsview_dump_util, "_open_feature_view", return_value=(view, False)
         ):
             p1 = dump_fsview(config_path, model_dir, keep_versions=2)
             p2 = dump_fsview(config_path, model_dir, keep_versions=2)
@@ -742,9 +758,132 @@ class FsviewDumpUtilTest(unittest.TestCase):
                 merged["ebc.embedding_bags.dyn_a"]["scores"],
             )
         }
-        # Baseline scores preserved; newly pulled key defaults to 0.
+        # Baseline scores preserved; newly pulled key outranks max baseline score (50).
         self.assertEqual(scores_by_key[1], 10)
-        self.assertEqual(scores_by_key[77], 0)
+        self.assertEqual(scores_by_key[77], 51)
+
+    def test_fp16_baseline_server_clock_skew_and_incomplete_retention(self) -> None:
+        model_dir = os.path.join(self.test_dir, "model_fp16")
+        sparse_dir = os.path.join(model_dir, "sparse")
+        os.makedirs(sparse_dir, exist_ok=True)
+        config_path = os.path.join(self.test_dir, "pipeline.config")
+        _write_pipeline_config(config_path)
+
+        npz_util.savez_streaming(
+            os.path.join(sparse_dir, "sparse_embeddings-00-of-01.npz"),
+            {
+                "ebc.embedding_bags.stat_fp16": np.array(
+                    [[1.0, 2.0], [3.0, 4.0]], dtype=np.float16
+                )
+            },
+        )
+        npz_util.savez_streaming(
+            os.path.join(sparse_dir, "sparse_dynamic_embedding-00-of-01.npz"),
+            {
+                "ebc.embedding_bags.dyn_fp16.keys": np.array([10, 20], dtype=np.int64),
+                "ebc.embedding_bags.dyn_fp16.values": np.array(
+                    [[1.5, 2.5], [3.5, 4.5]], dtype=np.float16
+                ),
+                "ebc.embedding_bags.dyn_fp16.scores": np.array([5, 8], dtype=np.int64),
+            },
+        )
+        emb_meta = {
+            "ebc.embedding_bags.stat_fp16": {
+                "feat_name_impl": ["sf__ebc"],
+                "dense": False,
+                "is_dynamic": False,
+                "dimension": 2,
+                "dtype": "float16",
+                "memory": 8,
+                "shape": [2, 2],
+            },
+            "ebc.embedding_bags.dyn_fp16": {
+                "feat_name_impl": ["df__ebc"],
+                "dense": False,
+                "is_dynamic": True,
+                "dimension": 2,
+                "dtype": "float16",
+                "memory": 8,
+                "shape": [2, 2],
+                "key_dtype": "int64",
+                "score_dtype": "int64",
+                "key_name": "ebc.embedding_bags.dyn_fp16.keys",
+                "value_name": "ebc.embedding_bags.dyn_fp16.values",
+                "score_name": "ebc.embedding_bags.dyn_fp16.scores",
+            },
+        }
+        for name in ("sparse_embedding.json", "sparse_embeddings-00-of-01.json"):
+            with open(os.path.join(sparse_dir, name), "w") as f:
+                json.dump(emb_meta, f)
+        with open(os.path.join(sparse_dir, "sparse_features.json"), "w") as f:
+            json.dump(
+                {
+                    "sf__ebc": {"embedding_name": "ebc.embedding_bags.stat_fp16"},
+                    "df__ebc": {"embedding_name": "ebc.embedding_bags.dyn_fp16"},
+                },
+                f,
+            )
+
+        # Subnormal FP32 (1e-8) underflows to 0.0 in FP16, yet must NOT be treated
+        # as a deletion tombstone; key 10 ([0.0, 0.0] in FP32) IS a tombstone.
+        shards = {
+            0: [
+                _make_arrow_batch(
+                    [
+                        "ebc.embedding_bags.stat_fp16",
+                        "ebc.embedding_bags.dyn_fp16",
+                        "ebc.embedding_bags.dyn_fp16",
+                    ],
+                    [1, 10, 30],
+                    np.array(
+                        [[6.5, 7.5], [0.0, 0.0], [1e-8, 0.0]],
+                        dtype=np.float32,
+                    ),
+                )
+            ]
+        }
+        # Client clock is 45s AHEAD of FeatureDB server clock (100_000 ms).
+        view = _FakeDynamicEmbeddingView(shards, server_now_ms=100_000)
+        with (
+            mock.patch.object(
+                fsview_dump_util, "_open_feature_view", return_value=(view, False)
+            ),
+            mock.patch(
+                "tzrec.utils.fsview_dump_util.time.time_ns",
+                return_value=145_000_000_000,
+            ),
+        ):
+            p1 = dump_fsview(config_path, model_dir, keep_versions=1)
+
+        assert p1 is not None
+        self.assertEqual(p1["end_ts"], 100_000)
+        v1_dir = os.path.join(
+            model_dir, SPARSE_FS_DUMP_DIR, VERSIONS_DIR, p1["version"]
+        )
+        with np.load(os.path.join(v1_dir, "sparse_embeddings-00-of-01.npz")) as st:
+            arr = st["ebc.embedding_bags.stat_fp16"]
+            self.assertEqual(arr.dtype, np.float16)
+            np.testing.assert_allclose(arr[1], [6.5, 7.5])
+        merged = _collect_dynamic_entries(v1_dir)["ebc.embedding_bags.dyn_fp16"]
+        self.assertEqual(merged["values"].dtype, np.float16)
+        self.assertEqual(set(merged["keys"].tolist()), {20, 30})
+        with open(os.path.join(v1_dir, "sparse_embedding.json")) as f:
+            dmeta = json.load(f)["ebc.embedding_bags.dyn_fp16"]
+        self.assertEqual(dmeta["memory"], 2 * 4)
+
+        # Plant two incomplete newer directories without READY; pruning with
+        # keep_versions=1 must NOT count them or delete the valid READY v1!
+        versions_root = os.path.join(model_dir, SPARSE_FS_DUMP_DIR, VERSIONS_DIR)
+        for broken in ("20990101000001", "20990101000002"):
+            os.makedirs(os.path.join(versions_root, broken), exist_ok=True)
+        fsview_dump_util._prune_old_versions(
+            os.path.join(model_dir, SPARSE_FS_DUMP_DIR),
+            versions_root,
+            keep_versions=1,
+            active_version="other_version",
+            stale_incomplete_secs=999999,
+        )
+        self.assertTrue(os.path.isdir(v1_dir))
 
     @parameterized.expand(
         [
@@ -826,6 +965,91 @@ class FsviewDumpUtilTest(unittest.TestCase):
         self.assertEqual(set(dyn_a.keys()), {1, 2, 3, 5, 9})
         self.assertEqual(dyn_a[2], 220)
         self.assertEqual(dyn_a[9], 990)
+
+    def test_oss_uri_staging_and_remote_publish(self) -> None:
+        remote_backing = os.path.join(self.test_dir, "fake_oss_bucket", "exp_model")
+        _create_fp32_baseline(remote_backing)
+        remote_cfg_dir = os.path.join(self.test_dir, "fake_oss_cfg")
+        os.makedirs(remote_cfg_dir, exist_ok=True)
+        local_cfg = os.path.join(remote_cfg_dir, "pipeline.config")
+        _write_pipeline_config(local_cfg)
+
+        class _LocalBackedRemoteFS:
+            def _map(self, uri: str) -> str:
+                assert uri.startswith("oss://test-bucket/")
+                rel = uri[len("oss://test-bucket/") :]
+                return os.path.join(self.root, rel)
+
+            def __init__(self, root: str) -> None:
+                self.root = root
+
+            def exists(self, uri: str) -> bool:
+                return os.path.exists(self._map(uri))
+
+            def ls(self, uri: str, detail: bool = False) -> List[str]:
+                p = self._map(uri)
+                return [f"{uri.rstrip('/')}/{name}" for name in sorted(os.listdir(p))]
+
+            def makedirs(self, uri: str, exist_ok: bool = False) -> None:
+                os.makedirs(self._map(uri), exist_ok=exist_ok)
+
+            def open(self, uri: str, mode: str = "rb") -> Any:
+                p = self._map(uri)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                return open(p, mode)
+
+            def rm(self, uri: str, recursive: bool = False) -> None:
+                p = self._map(uri)
+                if recursive and os.path.isdir(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+
+        fake_fs = _LocalBackedRemoteFS(self.test_dir)
+
+        def _fake_url_to_fs(path: str) -> Any:
+            if isinstance(path, str) and path.startswith("oss://"):
+                return fake_fs, path
+            return None, path
+
+        view = _FakeDynamicEmbeddingView(
+            {
+                0: [
+                    _make_arrow_batch(
+                        ["ebc.embedding_bags.dyn_a"],
+                        [88],
+                        np.array([[8.0, 8.0, 8.0, 8.0]], dtype=np.float32),
+                        scores=[880],
+                    )
+                ]
+            },
+            additional_fields={"score": "INT64"},
+            server_now_ms=777_000,
+        )
+        with (
+            mock.patch.object(
+                fsview_dump_util.filesystem_util,
+                "url_to_fs",
+                side_effect=_fake_url_to_fs,
+            ),
+            mock.patch.object(
+                fsview_dump_util, "_open_feature_view", return_value=(view, True)
+            ),
+        ):
+            payload = dump_fsview(
+                "oss://test-bucket/fake_oss_cfg/pipeline.config",
+                "oss://test-bucket/fake_oss_bucket/exp_model",
+                keep_versions=1,
+            )
+
+        assert payload is not None
+        self.assertEqual(payload["end_ts"], 777_000)
+        remote_ver_dir = os.path.join(
+            remote_backing, SPARSE_FS_DUMP_DIR, VERSIONS_DIR, payload["version"]
+        )
+        self.assertTrue(os.path.isfile(os.path.join(remote_ver_dir, READY_FILE)))
+        with open(os.path.join(remote_backing, SPARSE_FS_DUMP_DIR, CURRENT_JSON)) as f:
+            self.assertEqual(json.load(f)["version"], payload["version"])
 
 
 if __name__ == "__main__":
