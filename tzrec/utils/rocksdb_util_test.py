@@ -22,7 +22,7 @@ from torch.distributed.checkpoint import save
 
 from tzrec.protos import train_pb2
 from tzrec.utils import checkpoint_util, rocksdb_util
-from tzrec.utils.test_util import make_test_dir, parameterized_name_func
+from tzrec.utils.test_util import make_test_dir, mark_ci_scope, parameterized_name_func
 
 
 def _backend_config():
@@ -182,6 +182,7 @@ class RocksDBRuntimeTest(unittest.TestCase):
         self.assertEqual(db.background_io_rate, 96 << 20)
         self.assertEqual(session.writeback_source, "train")
 
+    @mark_ci_scope("gpu")
     @unittest.skipUnless(checkpoint_util.has_dynamicemb, "DynamicEmb is required.")
     def test_checkpoint_restore_replaces_the_db_only_for_dynamicemb(self):
         from tzrec_ext.rocksdb import RocksDBSession
