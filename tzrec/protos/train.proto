@@ -189,9 +189,11 @@ message RocksDBConfig {
     // Number of local RocksDB databases created by each rank.
     optional uint32 num_db_shards_per_rank = 9 [default = 1];
     // Shared flush and compaction I/O rate in MiB/s during low-debt training.
+    // When only the base rate is set, all phases use that fixed rate.
     optional uint64 background_io_base_rate_per_rank_mib_per_sec = 10;
     // Shared peak rate in MiB/s during compaction backlog, checkpoint save,
-    // or publication lookup. A single rate sets a fixed limit.
+    // or publication lookup. When only the peak rate is set, all phases use
+    // that fixed rate. Omitting both rates leaves background I/O unlimited.
     optional uint64 background_io_max_rate_per_rank_mib_per_sec = 11;
 }
 

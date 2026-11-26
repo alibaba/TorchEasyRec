@@ -108,15 +108,7 @@ def backend_config(
             if config.HasField(field):
                 overrides[backend_field] = getattr(config, field)
     num_db_shards = overrides.get("num_db_shards", 1)
-    base_threads = max(4, cpus)
-    overrides.setdefault(
-        "io_threads",
-        max(
-            num_db_shards,
-            base_threads,
-            min(2 * base_threads, 64),
-        ),
-    )
+    overrides.setdefault("io_threads", max(4, cpus, num_db_shards))
     return BackendConfig(
         block_cache_bytes=block_cache_bytes,
         write_buffer_bytes=WRITE_BUFFER_BYTES,
@@ -358,7 +350,7 @@ class RocksDBRuntime:
                 yield
 
     def refresh_background_io_rate(self) -> None:
-        """Adjust the training rate according to compaction pressure."""
+        """Adjust the background I/O rate according to compaction pressure."""
         if self.session is not None:
             self.session.refresh_background_io_rate()
 

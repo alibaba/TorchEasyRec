@@ -928,6 +928,7 @@ class RocksDBTableTest(unittest.TestCase):
     NUM_EMBEDDINGS = 1 << 20
     EMBEDDING_DIM = 16
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required.")
     def test_publish_after_rocksdb_maintenance(self):
         from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
         from dynamicemb.dynamicemb_config import EvictedItemMode

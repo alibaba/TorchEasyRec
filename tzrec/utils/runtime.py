@@ -32,6 +32,9 @@ from tzrec.utils.plan_util import create_planner, get_default_sharders
 if TYPE_CHECKING:
     from tzrec.utils.rocksdb_util import RocksDBRuntime
 
+# Sample compaction debt without querying every database on every step.
+_BACKGROUND_IO_RATE_REFRESH_INTERVAL = 100
+
 
 class ShardedModelRuntime:
     """Own the checkpoint manager and the sharding setup of one job.
@@ -186,12 +189,12 @@ class ShardedModelRuntime:
         """Run synchronous maintenance at a safe training boundary.
 
         Call with no lookup in flight, before publication or saving.
+        Evict on every call and refresh the background I/O rate every 100 steps.
 
         Args:
-            global_step: Current training step. Maintenance currently runs
-                on every call, independent of the step number.
+            global_step: Global training step. Step zero skips the rate refresh.
         """
         if self._rocksdb is not None:
             self._rocksdb.evict()
-            if global_step and global_step % 100 == 0:
+            if global_step and global_step % _BACKGROUND_IO_RATE_REFRESH_INTERVAL == 0:
                 self._rocksdb.refresh_background_io_rate()

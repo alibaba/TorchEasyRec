@@ -251,8 +251,12 @@ class ShardedModelRuntimeTest(unittest.TestCase):
         self.assertEqual(order, ["bind", "dmp"])
         backend.bind.assert_called_once_with(planner.collective_plan.return_value)
         backend.attach.assert_called_once_with(dmp)
-        runtime.maintain(global_step=1)
-        backend.evict.assert_called_once()
+        for step in (0, 99):
+            runtime.maintain(global_step=step)
+        backend.refresh_background_io_rate.assert_not_called()
+        runtime.maintain(global_step=100)
+        backend.refresh_background_io_rate.assert_called_once()
+        self.assertEqual(backend.evict.call_count, 3)
 
     def test_shard_and_maintain_without_backend(self) -> None:
         runtime = ShardedModelRuntime(mock.Mock(), None)

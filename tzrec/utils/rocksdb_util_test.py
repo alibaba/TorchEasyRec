@@ -17,9 +17,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 from parameterized import parameterized
+from torch import nn
+from torch.distributed.checkpoint import save
 
 from tzrec.protos import train_pb2
-from tzrec.utils import rocksdb_util
+from tzrec.utils import checkpoint_util, rocksdb_util
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
@@ -143,6 +145,84 @@ class RocksDBRuntimeTest(unittest.TestCase):
         self.assertFalse(os.path.exists(work))
         self.assertEqual(sorted(os.listdir(rt.rank_dir)), existing)
 
+    def test_checkpoint_save_uses_the_bound_background_io_rate(self):
+        from tzrec_ext.rocksdb import RocksDBSession
+
+        rt = rocksdb_util.RocksDBRuntime(
+            self.train_config.rocksdb_config, self.test_dir, "train"
+        )
+        self.addCleanup(rt.close)
+        manager = checkpoint_util.CheckpointManager(self.test_dir, rocksdb=rt)
+        self.addCleanup(manager.close)
+        model = nn.Linear(1, 1)
+
+        with mock.patch("tzrec.utils.checkpoint_util.save_model"):
+            unbound_checkpoint = manager.save(1, model)
+        self.assertTrue(os.path.isfile(os.path.join(unbound_checkpoint, "_SUCCESS")))
+
+        config = dataclasses.replace(
+            _backend_config(),
+            background_io_base_rate_mib_per_sec=96,
+            background_io_max_rate_mib_per_sec=512,
+        )
+        session = RocksDBSession(config, os.path.join(self.test_dir, "working"))
+        rt.session = session
+        db = session.db
+        self.assertEqual(db.background_io_rate, 96 << 20)
+
+        def save_model(*_):
+            self.assertEqual(db.background_io_rate, 512 << 20)
+            self.assertEqual(session.writeback_source, "checkpoint")
+
+        with mock.patch(
+            "tzrec.utils.checkpoint_util.save_model", side_effect=save_model
+        ):
+            bound_checkpoint = manager.save(2, model)
+        self.assertTrue(os.path.isfile(os.path.join(bound_checkpoint, "_SUCCESS")))
+        self.assertEqual(db.background_io_rate, 96 << 20)
+        self.assertEqual(session.writeback_source, "train")
+
+    @unittest.skipUnless(checkpoint_util.has_dynamicemb, "DynamicEmb is required.")
+    def test_checkpoint_restore_replaces_the_db_only_for_dynamicemb(self):
+        from tzrec_ext.rocksdb import RocksDBSession
+
+        rt = rocksdb_util.RocksDBRuntime(
+            self.train_config.rocksdb_config, self.test_dir, "train"
+        )
+        self.addCleanup(rt.close)
+        session = RocksDBSession(
+            _backend_config(), os.path.join(self.test_dir, "warmup")
+        )
+        rt.session = session
+        warmup_namespaces = session.get_or_create_namespace_ids(["warmup"])
+        old_db = session.db
+        manager = checkpoint_util.CheckpointManager(self.test_dir, rocksdb=rt)
+        self.addCleanup(manager.close)
+
+        checkpoint_dir = os.path.join(self.test_dir, "model.ckpt-1")
+        model = nn.Linear(1, 1)
+        save(model.state_dict(), checkpoint_id=os.path.join(checkpoint_dir, "model"))
+
+        def load_dynamicemb(*_, **__):
+            self.assertEqual(session.all_namespaces(), {})
+            self.assertTrue(old_db.closed)
+
+        with (
+            mock.patch.object(
+                rocksdb_util, "rocksdb_modules", return_value=[mock.Mock()]
+            ),
+            mock.patch(
+                "dynamicemb.dump_load.DynamicEmbLoad", side_effect=load_dynamicemb
+            ) as load_embeddings,
+        ):
+            manager.restore(checkpoint_dir, model)
+            self.assertEqual(session.all_namespaces(), warmup_namespaces)
+            load_embeddings.assert_not_called()
+
+            os.makedirs(os.path.join(checkpoint_dir, "dynamicemb"))
+            manager.restore(checkpoint_dir, model)
+            load_embeddings.assert_called_once()
+
 
 class SharedStorageTest(unittest.TestCase):
     """Shared resources reserved per rank for RocksDB planning."""
@@ -166,12 +246,24 @@ class SharedStorageTest(unittest.TestCase):
             shared.ssd, overheads["compaction_headroom"] + overheads["other_files"]
         )
 
-    def test_default_backend_io_threads_follow_rank_cpu_affinity(self):
-        with mock.patch("os.sched_getaffinity", return_value=set(range(32))):
+    @parameterized.expand(
+        [("master_default", 32, None, 16), ("shard_floor", 8, 8, 8)],
+        name_func=parameterized_name_func,
+    )
+    def test_default_backend_io_threads(self, _, cpus, num_shards, expected):
+        config = (
+            train_pb2.RocksDBConfig(root_dir="/tmp", num_db_shards_per_rank=num_shards)
+            if num_shards is not None
+            else None
+        )
+        with mock.patch("os.sched_getaffinity", return_value=set(range(cpus))):
             backend = rocksdb_util.backend_config(
-                2, block_cache_bytes=32 << 20, import_budget_bytes=64 << 20
+                2,
+                block_cache_bytes=32 << 20,
+                import_budget_bytes=64 << 20,
+                config=config,
             )
-        self.assertEqual(backend.io_threads, 32)
+        self.assertEqual(backend.io_threads, expected)
 
     def test_io_config_sets_rank_budget_and_increases_per_database_ssd_reserve(self):
         config = train_pb2.RocksDBConfig(
@@ -179,6 +271,9 @@ class SharedStorageTest(unittest.TestCase):
             num_db_shards_per_rank=4,
             io_threads_per_rank=24,
             sst_block_size_bytes=2048,
+            block_align=True,
+            use_direct_reads=True,
+            direct_read_alignment_bytes=512,
             background_io_base_rate_per_rank_mib_per_sec=96,
             background_io_max_rate_per_rank_mib_per_sec=512,
         )
@@ -193,12 +288,20 @@ class SharedStorageTest(unittest.TestCase):
         self.assertEqual(backend.io_threads, 24)
         self.assertEqual(backend.num_db_shards, 4)
         self.assertEqual(backend.sst_block_size_bytes, 2048)
+        self.assertTrue(backend.block_align)
+        self.assertTrue(backend.use_direct_reads)
+        self.assertEqual(backend.direct_read_alignment_bytes, 512)
         self.assertEqual(backend.background_io_base_rate_mib_per_sec, 96)
         self.assertEqual(backend.background_io_max_rate_mib_per_sec, 512)
         sharded = rocksdb_util.shared_storage(1, config)
         baseline = rocksdb_util.shared_storage(1)
         self.assertEqual(sharded.ddr, baseline.ddr)
         self.assertGreater(sharded.ssd, baseline.ssd)
+
+    def test_shared_storage_rejects_zero_sst_block_size(self):
+        config = train_pb2.RocksDBConfig(root_dir="/tmp", sst_block_size_bytes=0)
+        with self.assertRaisesRegex(ValueError, "SST block size"):
+            rocksdb_util.shared_storage(1, config)
 
     @parameterized.expand(
         [
