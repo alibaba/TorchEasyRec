@@ -29,23 +29,15 @@ context and have no shell, no `gh`, and no git history to diff against — so
 those files are their only view of what changed. Do not paraphrase the change
 or paste diff text in its place, and never name a tool an agent does not have.
 
-Instruct each to only provide noteworthy feedback. Once they finish, review
-the feedback and post only the feedback that you also deem noteworthy.
+Instruct each subagent to provide only noteworthy feedback. Wait for their
+results within this run, then post only the feedback you also deem noteworthy.
+If a subagent fails, use the available results and name the missing review in
+the summary.
 
-The subagents run in the background and report back as notifications, and this
-review runs headless: when your turn ends with nothing left to do, the run is
-over and any agent still working is killed. So:
-
-- Do not end a turn just to say you are waiting. If you are woken while some
-  agents are still pending, keep doing real work in that same turn — continue
-  reviewing the diff yourself with Read/Grep — so the run stays alive until the
-  rest report back.
-- Post your findings before the run can end. Never finish having posted
-  nothing; if some agents have still not reported by the time you have to
-  wrap up, post what you do have and say which reviews did not finish.
-- Always post at least a short top-level summary, even when nothing is
-  noteworthy, so a completed review is distinguishable from a review that
-  never ran.
+Before ending the run, always post a top-level summary, even when nothing is
+noteworthy. If the invocation supplies `SUMMARY_MARKER`, put its exact value
+on a separate line in the GitHub comment body. The workflow uses the marker
+to confirm that the comment was published for this run.
 
 Use the `create_inline_comment` tool of the `github_inline_comment` MCP server for inline comments on specific lines.
 Use top-level comments for general observations or praise.
