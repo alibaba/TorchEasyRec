@@ -1040,6 +1040,7 @@ class KafkaDatasetTest(unittest.TestCase):
         config.endpoint = f"alikafka.{self.region}.aliyuncs.com"
         self.client = AliKafkaClient(config)
         self.test_topic = f"tzrec_kafka_test_v{random_name()}"
+        self.test_group = self.test_topic + "_group"
 
     def tearDown(self):
         try:
@@ -1201,7 +1202,10 @@ class KafkaDatasetTest(unittest.TestCase):
         dataset = KafkaDataset(
             data_config=data_config,
             features=features,
-            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
+            input_path=(
+                f"kafka://{self.brokers}/{self.test_topic}"
+                f"?group.id={self.test_group}&auto.offset.reset=earliest"
+            ),
         )
         dataloader = DataLoader(
             dataset=dataset,
@@ -1248,7 +1252,10 @@ class KafkaDatasetTest(unittest.TestCase):
                 label_fields=["label"],
             ),
             features=features,
-            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
+            input_path=(
+                f"kafka://{self.brokers}/{self.test_topic}"
+                f"?group.id={self.test_group}&auto.offset.reset=earliest"
+            ),
         )
         dataloader = DataLoader(
             dataset=dataset,
@@ -1295,7 +1302,10 @@ class KafkaDatasetTest(unittest.TestCase):
                 label_fields=["label"],
             ),
             features=features,
-            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
+            input_path=(
+                f"kafka://{self.brokers}/{self.test_topic}"
+                f"?group.id={self.test_group}&auto.offset.reset=earliest"
+            ),
         )
         dataloader1 = DataLoader(
             dataset=dataset1,
@@ -1330,7 +1340,10 @@ class KafkaDatasetTest(unittest.TestCase):
                 label_fields=["label"],
             ),
             features=features,
-            input_path=f"kafka://{self.brokers}/{self.test_topic}?group.id=tzrec_test_group&auto.offset.reset=earliest",
+            input_path=(
+                f"kafka://{self.brokers}/{self.test_topic}"
+                f"?group.id={self.test_group}&auto.offset.reset=earliest"
+            ),
         )
         dataloader2 = DataLoader(
             dataset=dataset2,
@@ -1427,7 +1440,7 @@ class KafkaDatasetTest(unittest.TestCase):
         )
         path = (
             f"kafka://{self.brokers}/{self.test_topic}"
-            f"?group.id={self.test_topic}&auto.offset.reset=earliest"
+            f"?group.id={self.test_group}&auto.offset.reset=earliest"
         )
 
         def alarm(signum, frame):
@@ -1586,7 +1599,7 @@ class KafkaDatasetTest(unittest.TestCase):
             features=features,
             input_path=(
                 f"kafka://{self.brokers}/{self.test_topic}"
-                f"?group.id=tzrec_test_group"
+                f"?group.id={self.test_group}"
                 f"&auto.offset.reset=earliest"
                 f"&start.timestamp.ms={start_ts_ms}"
             ),
@@ -1631,7 +1644,7 @@ class KafkaDatasetTest(unittest.TestCase):
             features=features,
             input_path=(
                 f"kafka://{self.brokers}/{self.test_topic}"
-                f"?group.id=tzrec_test_group"
+                f"?group.id={self.test_group}"
                 f"&auto.offset.reset=earliest"
                 f"&session.timeout.ms=6000"
                 f"&max.poll.interval.ms=10000"
