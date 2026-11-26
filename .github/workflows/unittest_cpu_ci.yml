@@ -25,15 +25,27 @@ jobs:
           path: run_${{ github.run_id }}
       - name: RunUnitTestCI
         id: tests
+        env:
+          CI_ODPS_PROJECT_NAME: ${{ vars.DSW_CI_ODPS_PROJECT_NAME }}
+          CI_ALIKAFKA_INSTANCE_ID: ${{ vars.DSW_CI_ALIKAFKA_INSTANCE_ID }}
+          CI_ALIKAFKA_BROKERS: ${{ vars.DSW_CI_ALIKAFKA_BROKERS }}
         run: |
+          : "${ALIBABA_CLOUD_CREDENTIALS_URI:?DSW credential URI is required}"
+          : "${CI_ODPS_PROJECT_NAME:?DSW_CI_ODPS_PROJECT_NAME is required}"
+          : "${CI_ALIKAFKA_INSTANCE_ID:?DSW_CI_ALIKAFKA_INSTANCE_ID is required}"
+          : "${CI_ALIKAFKA_BROKERS:?DSW_CI_ALIKAFKA_BROKERS is required}"
+          export CI_REGION="${REGION:?DSW REGION is required}"
+          export ODPS_ENDPOINT="http://service.${CI_REGION}-vpc.maxcompute.aliyun-inc.com/api"
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
           rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}/tmp/ci-failures"
-          docker run --rm --pull=always --name "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+          docker run --rm --pull=always --network host --name "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --label "tzrec-ci.node=${TZREC_CI_NODE:?}" --label "tzrec-ci.role=${TZREC_CI_ROLE:?}" \
             --workdir "/__w/TorchEasyRec/TorchEasyRec/run_${GITHUB_RUN_ID}" \
             --cpus=64 --memory=256g --shm-size=64g --ulimit memlock=-1 \
             -e GITHUB_ACTIONS=true -e CI=true \
             -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -e ALIBABA_CLOUD_CREDENTIALS_URI -e ALIBABA_CLOUD_ECS_METADATA_DISABLED=true \
+            -e CI_ODPS_PROJECT_NAME -e ODPS_ENDPOINT -e CI_ALIKAFKA_INSTANCE_ID -e CI_ALIKAFKA_BROKERS -e CI_REGION \
             -e CUDA_VISIBLE_DEVICES= -e NVIDIA_VISIBLE_DEVICES=void \
             -e PIP_CACHE_DIR=/root/.cache/pip \
             -v "$WORK_ROOT":/__w \
