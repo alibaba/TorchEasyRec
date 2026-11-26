@@ -27,12 +27,12 @@ jobs:
         id: tests
         env:
           ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
-          CI_ODPS_PROJECT_NAME: ${{ secrets.CI_ODPS_PROJECT_NAME }}
-          ODPS_ENDPOINT: ${{ secrets.ODPS_ENDPOINT }}
-          CI_ALIKAFKA_INSTANCE_ID: ${{ secrets.CI_ALIKAFKA_INSTANCE_ID }}
-          CI_ALIKAFKA_BROKERS: ${{ secrets.CI_ALIKAFKA_BROKERS }}
-          CI_REGION: ${{ secrets.CI_REGION }}
+          CI_ODPS_PROJECT_NAME: ${{ vars.DSW_CI_ODPS_PROJECT_NAME }}
+          CI_ALIKAFKA_INSTANCE_ID: ${{ vars.DSW_CI_ALIKAFKA_INSTANCE_ID }}
+          CI_ALIKAFKA_BROKERS: ${{ vars.DSW_CI_ALIKAFKA_BROKERS }}
         run: |
+          export CI_REGION="${REGION:?DSW REGION is required}"
+          export ODPS_ENDPOINT="http://service.${CI_REGION}-vpc.maxcompute.aliyun-inc.com/api"
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
           rm -rf -- "${GITHUB_WORKSPACE:?}/run_${GITHUB_RUN_ID:?}/tmp/ci-failures"
           docker run --rm --pull=always --name "cpu-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
