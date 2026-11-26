@@ -25,15 +25,11 @@ jobs:
           path: run_${{ github.run_id }}
       - name: RunUnitTestCI
         id: tests
-        env:
-          CI_ODPS_PROJECT_NAME: ${{ vars.DSW_CI_ODPS_PROJECT_NAME }}
-          CI_ALIKAFKA_INSTANCE_ID: ${{ vars.DSW_CI_ALIKAFKA_INSTANCE_ID }}
-          CI_ALIKAFKA_BROKERS: ${{ vars.DSW_CI_ALIKAFKA_BROKERS }}
         run: |
           : "${ALIBABA_CLOUD_CREDENTIALS_URI:?DSW credential URI is required}"
-          : "${CI_ODPS_PROJECT_NAME:?DSW_CI_ODPS_PROJECT_NAME is required}"
-          : "${CI_ALIKAFKA_INSTANCE_ID:?DSW_CI_ALIKAFKA_INSTANCE_ID is required}"
-          : "${CI_ALIKAFKA_BROKERS:?DSW_CI_ALIKAFKA_BROKERS is required}"
+          : "${CI_ODPS_PROJECT_NAME:?CPU runner must configure CI_ODPS_PROJECT_NAME}"
+          : "${CI_ALIKAFKA_INSTANCE_ID:?CPU runner must configure CI_ALIKAFKA_INSTANCE_ID}"
+          : "${CI_ALIKAFKA_BROKERS:?CPU runner must configure CI_ALIKAFKA_BROKERS}"
           export CI_REGION="${REGION:?DSW REGION is required}"
           export ODPS_ENDPOINT="http://service.${CI_REGION}-vpc.maxcompute.aliyun-inc.com/api"
           WORK_ROOT="$(dirname "$RUNNER_WORKSPACE")"
