@@ -41,6 +41,25 @@ from tzrec.utils.misc_util import get_free_port, random_name
 from tzrec.utils.test_util import ci_resources
 
 
+def _odps_test_configured(*, with_schema: bool = False) -> bool:
+    """Check whether credentials and a project are configured for an ODPS test."""
+    config_file = os.environ.get("ODPS_CONFIG_FILE_PATH")
+    if config_file and not with_schema:
+        return True
+
+    project_var = (
+        "CI_ODPS_SCHEMA_PROJECT_NAME" if with_schema else "CI_ODPS_PROJECT_NAME"
+    )
+    return bool(
+        os.environ.get(project_var)
+        and (
+            config_file
+            or os.environ.get("ALIBABA_CLOUD_ECS_METADATA")
+            or os.environ.get("ALIBABA_CLOUD_CREDENTIALS_URI")
+        )
+    )
+
+
 @ci_resources(split="case", timeout=600)
 class OdpsDatasetTest(unittest.TestCase):
     def setUp(self):
@@ -208,11 +227,7 @@ class OdpsDatasetTest(unittest.TestCase):
             )
             self.assertEqual(len(data_dict["id_a.lengths"]), 8196)
 
-    @unittest.skipIf(
-        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        "odps config not found",
-    )
+    @unittest.skipUnless(_odps_test_configured(), "odps config not found")
     def test_odps_dataset_sample_shuffle_epochs(self):
         account, odps_endpoint = _create_odps_account()
         self.o = ODPS(
@@ -283,30 +298,17 @@ class OdpsDatasetTest(unittest.TestCase):
             utils.stop_sample(dataloader, iterator)
 
     @parameterized.expand([[False], [True]])
-    @unittest.skipIf(
-        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        "odps config not found",
-    )
+    @unittest.skipUnless(_odps_test_configured(), "odps config not found")
     def test_odps_dataset(self, is_orderby_partition=False):
         self._test_odps_dataset(is_orderby_partition=is_orderby_partition)
 
-    @unittest.skipIf(
-        os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", "") == ""
-        or (
-            os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-            and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        ),
-        "schema odps project not found",
+    @unittest.skipUnless(
+        _odps_test_configured(with_schema=True), "schema odps project not found"
     )
     def test_odps_dataset_has_schema(self):
         self._test_odps_dataset(is_orderby_partition=False, schema="rec")
 
-    @unittest.skipIf(
-        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        "odps config not found",
-    )
+    @unittest.skipUnless(_odps_test_configured(), "odps config not found")
     def test_odps_dataset_init_session_multi_rank(self):
         account, odps_endpoint = _create_odps_account()
         self.o = ODPS(
@@ -376,11 +378,7 @@ class OdpsDatasetTest(unittest.TestCase):
         self.assertEqual(len(set(results[0][1])), 3)
         self.assertEqual(results[0][2], [10000, 5000, 3000])
 
-    @unittest.skipIf(
-        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        "odps config not found",
-    )
+    @unittest.skipUnless(_odps_test_configured(), "odps config not found")
     def test_odps_dataset_checkpoint_metadata(self):
         """Test that checkpoint_info is present and has correct format."""
         account, odps_endpoint = _create_odps_account()
@@ -433,11 +431,7 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertIsInstance(value, int)
             self.assertGreaterEqual(value, 0)
 
-    @unittest.skipIf(
-        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        "odps config not found",
-    )
+    @unittest.skipUnless(_odps_test_configured(), "odps config not found")
     def test_odps_dataset_checkpoint_resume(self):
         """Test checkpoint resume functionality."""
         account, odps_endpoint = _create_odps_account()
@@ -520,11 +514,7 @@ class OdpsDatasetTest(unittest.TestCase):
                 # New offset should be less than or equal to acc checkpoint offset
                 self.assertLessEqual(new_offset, checkpoint_state_acc[key])
 
-    @unittest.skipIf(
-        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        "odps config not found",
-    )
+    @unittest.skipUnless(_odps_test_configured(), "odps config not found")
     def test_odps_dataset_checkpoint_resume_orderby_partition(self):
         """Test checkpoint resume with is_orderby_partition=True."""
         account, odps_endpoint = _create_odps_account()
@@ -601,11 +591,7 @@ class OdpsDatasetTest(unittest.TestCase):
             list(first_checkpoint_state.keys())[0].rsplit("#", 1)[1].split(":")[0],
         )
 
-    @unittest.skipIf(
-        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        "odps config not found",
-    )
+    @unittest.skipUnless(_odps_test_configured(), "odps config not found")
     def test_odps_dataset_checkpoint_resume_empty_partition(self):
         """Test checkpoint resume keeps sessions at their partition position."""
         account, odps_endpoint = _create_odps_account()
@@ -759,21 +745,12 @@ class OdpsDatasetTest(unittest.TestCase):
             self.assertEqual(len(data_dict["raw_e.values"]), 8196)
 
     @parameterized.expand([["bigint"], ["string"], ["int"]])
-    @unittest.skipIf(
-        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        "odps config not found",
-    )
+    @unittest.skipUnless(_odps_test_configured(), "odps config not found")
     def test_odps_dataset_with_sampler(self, id_type="bigint"):
         self._test_odps_dataset_with_sampler(id_type=id_type)
 
-    @unittest.skipIf(
-        os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", "") == ""
-        or (
-            os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-            and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        ),
-        "schema odps project not found",
+    @unittest.skipUnless(
+        _odps_test_configured(with_schema=True), "schema odps project not found"
     )
     def test_odps_dataset_with_sampler_has_schema(self):
         self._test_odps_dataset_with_sampler(id_type="bigint", schema="rec")
@@ -803,11 +780,7 @@ class OdpsWriterTest(unittest.TestCase):
         [["", 2, 2], ["/dt=20240401", 2, 2], ["/dt=20240401", 2, 1]],
         name_func=test_util.parameterized_name_func,
     )
-    @unittest.skipIf(
-        os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-        and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        "odps config not found",
-    )
+    @unittest.skipUnless(_odps_test_configured(), "odps config not found")
     def test_odps_writer(self, partition_spec, default_world_size, writer_world_size):
         account, odps_endpoint = _create_odps_account()
         self.o = ODPS(
@@ -860,13 +833,8 @@ class OdpsWriterTest(unittest.TestCase):
         with t.open_reader(partition=partition) as reader:
             self.assertEqual(reader.count, 1280)
 
-    @unittest.skipIf(
-        os.environ.get("CI_ODPS_SCHEMA_PROJECT_NAME", "") == ""
-        or (
-            os.environ.get("ODPS_CONFIG_FILE_PATH", "") == ""
-            and os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "") == "",
-        ),
-        "schema odps project not found",
+    @unittest.skipUnless(
+        _odps_test_configured(with_schema=True), "schema odps project not found"
     )
     def test_odps_writer_has_schema(self):
         partition_spec = "/dt=20240401"
