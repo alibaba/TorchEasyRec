@@ -238,9 +238,7 @@ class SharedStorageTest(unittest.TestCase):
         from tzrec_ext.rocksdb import disk_overheads
 
         shared = rocksdb_util.shared_storage(local_world_size=1)
-        backend = rocksdb_util.backend_config(
-            1, block_cache_bytes=1 << 30, import_budget_bytes=0
-        )
+        backend = rocksdb_util.backend_config(1, import_budget_bytes=0)
         self.assertEqual(shared.hbm, 0)
         self.assertEqual(shared.ddr, 9 * (1 << 28))
         self.assertEqual(shared.ssd, disk_overheads(backend))
@@ -278,7 +276,6 @@ class SharedStorageTest(unittest.TestCase):
         with mock.patch("os.sched_getaffinity", return_value=set(range(cpus))):
             backend = rocksdb_util.backend_config(
                 2,
-                block_cache_bytes=32 << 20,
                 import_budget_bytes=64 << 20,
                 config=config,
             )
@@ -299,7 +296,6 @@ class SharedStorageTest(unittest.TestCase):
         with mock.patch("os.sched_getaffinity", return_value=set(range(16))):
             backend = rocksdb_util.backend_config(
                 1,
-                block_cache_bytes=32 << 20,
                 import_budget_bytes=64 << 20,
                 config=config,
             )

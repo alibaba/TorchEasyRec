@@ -51,12 +51,8 @@ if TYPE_CHECKING:
     from torchrec.distributed.planner.types import ShardingOption
     from tzrec_ext.rocksdb import BackendConfig, IOPhase
 
-# Planned host budgets that do not depend on the tables: the memtables, the
-# pinned staging of one storage call (larger calls are split) and the data
-# share of the block cache (other data blocks are left to the page cache).
-WRITE_BUFFER_BYTES = 1 << 30
+# Pinned staging budget for one storage chunk.
 STAGING_BUFFER_BYTES = 256 << 20
-BLOCK_CACHE_DATA_BYTES = 1 << 30
 
 # Empirical SSD allowance for SST overhead and restore spill, not a peak bound.
 SST_FACTOR = 1.1
@@ -64,18 +60,11 @@ SST_FACTOR = 1.1
 SSD_RESERVE_BYTES = 16 << 30
 
 
-def _block_cache_data_bytes(config: Optional[train_pb2.RocksDBConfig]) -> int:
-    """Resolve the per-rank allowance for SST data blocks."""
-    if config is not None and config.HasField("block_cache_data_bytes_per_rank"):
-        return config.block_cache_data_bytes_per_rank
-    return BLOCK_CACHE_DATA_BYTES
-
-
 def backend_config(
     local_world_size: int,
     *,
-    block_cache_bytes: int,
     import_budget_bytes: int,
+    metadata_bytes_per_rank: int = 0,
     config: Optional[train_pb2.RocksDBConfig] = None,
 ) -> "BackendConfig":
     """Build the common backend configuration for planning.
@@ -85,8 +74,8 @@ def backend_config(
 
     Args:
         local_world_size: Number of ranks sharing the host's CPUs.
-        block_cache_bytes: Block-cache capacity per rank.
         import_budget_bytes: Temporary host-memory budget for checkpoint import.
+        metadata_bytes_per_rank: Estimated SST metadata bytes to add to the cache.
         config: User settings for the RocksDB backend.
 
     Returns:
@@ -94,36 +83,40 @@ def backend_config(
     """
     from tzrec_ext.rocksdb import BackendConfig
 
-    cpus = max(1, len(os.sched_getaffinity(0)) // max(local_world_size, 1))
-    overrides = {"write_buffer_bytes": WRITE_BUFFER_BYTES}
-    if config is not None:
-        backend_fields = {
-            "sst_block_size_bytes": "sst_block_size_bytes",
-            "block_align": "block_align",
-            "use_direct_reads": "use_direct_reads",
-            "direct_read_alignment_bytes": "direct_read_alignment_bytes",
-            "num_db_shards_per_rank": "num_db_shards",
-            "io_threads_per_rank": "io_threads",
-            "background_io_base_rate_per_rank_mib_per_sec": (
-                "background_io_base_rate_mib_per_sec"
-            ),
-            "background_io_max_rate_per_rank_mib_per_sec": (
-                "background_io_max_rate_mib_per_sec"
-            ),
-            "async_writeback": "async_writeback",
-            "score_cache_bytes_per_rank": "score_cache_bytes",
-            "score_cache_bucket_capacity": "score_cache_bucket_capacity",
-            "write_buffer_bytes_per_rank": "write_buffer_bytes",
-        }
-        for field, backend_field in backend_fields.items():
-            if config.HasField(field):
-                overrides[backend_field] = getattr(config, field)
-    if overrides["write_buffer_bytes"] == 0:
+    if config is None:
+        config = train_pb2.RocksDBConfig()
+    if config.write_buffer_bytes_per_rank == 0:
         raise ValueError("write_buffer_bytes_per_rank must be positive")
+
+    cpus = max(1, len(os.sched_getaffinity(0)) // max(local_world_size, 1))
+    backend_fields = {
+        "sst_block_size_bytes": "sst_block_size_bytes",
+        "block_align": "block_align",
+        "use_direct_reads": "use_direct_reads",
+        "direct_read_alignment_bytes": "direct_read_alignment_bytes",
+        "num_db_shards_per_rank": "num_db_shards",
+        "io_threads_per_rank": "io_threads",
+        "background_io_base_rate_per_rank_mib_per_sec": (
+            "background_io_base_rate_mib_per_sec"
+        ),
+        "background_io_max_rate_per_rank_mib_per_sec": (
+            "background_io_max_rate_mib_per_sec"
+        ),
+        "async_writeback": "async_writeback",
+        "score_cache_bytes_per_rank": "score_cache_bytes",
+        "score_cache_bucket_capacity": "score_cache_bucket_capacity",
+    }
+    overrides = {
+        backend_field: getattr(config, field)
+        for field, backend_field in backend_fields.items()
+        if config.HasField(field)
+    }
     num_db_shards = overrides.get("num_db_shards", 1)
     overrides.setdefault("io_threads", max(4, cpus, num_db_shards))
     return BackendConfig(
-        block_cache_bytes=block_cache_bytes,
+        block_cache_bytes=config.block_cache_data_bytes_per_rank
+        + metadata_bytes_per_rank,
+        write_buffer_bytes=config.write_buffer_bytes_per_rank,
         staging_buffer_bytes=STAGING_BUFFER_BYTES,
         import_budget_bytes=import_budget_bytes,
         max_background_jobs=max(2 * num_db_shards, cpus // 4),
@@ -175,10 +168,9 @@ def configure_backend(
     # Import reuses the fresh DB's write and cache budgets.
     backend = backend_config(
         local_world_size,
-        block_cache_bytes=_block_cache_data_bytes(config)
-        + max(metadata_bytes_per_rank),
         import_budget_bytes=min(import_available_per_node) // local_world_size
         - STAGING_BUFFER_BYTES,
+        metadata_bytes_per_rank=max(metadata_bytes_per_rank),
         config=config,
     )
     for option in rocksdb_options:
@@ -218,7 +210,6 @@ def shared_storage(
 
     backend = backend_config(
         local_world_size,
-        block_cache_bytes=_block_cache_data_bytes(config),
         import_budget_bytes=0,
         config=config,
     )

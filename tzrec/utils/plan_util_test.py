@@ -764,7 +764,7 @@ class RocksDBPlannerTest(unittest.TestCase):
         self.assertEqual(config.sst_block_size_bytes, block_size or BLOCK_SIZE)
         self.assertEqual(
             config.block_cache_bytes,
-            rocksdb_util.BLOCK_CACHE_DATA_BYTES
+            rocksdb_config.block_cache_data_bytes_per_rank
             + sum(
                 metadata_cache_bytes(
                     o.max_capacity,

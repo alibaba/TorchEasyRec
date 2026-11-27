@@ -203,11 +203,10 @@ message RocksDBConfig {
     // Number of score cache entries in each bucket. Must be positive.
     optional uint32 score_cache_bucket_capacity = 14 [default = 4];
     // Total memtable budget in bytes across this rank's DBs. Must be positive.
-    // Unset uses 1 GiB.
-    optional uint64 write_buffer_bytes_per_rank = 15;
+    optional uint64 write_buffer_bytes_per_rank = 15 [default = 1073741824];
     // Data-block allowance in bytes for this rank's block cache. The planner
-    // adds the estimated SST metadata capacity. Unset uses 1 GiB.
-    optional uint64 block_cache_data_bytes_per_rank = 16;
+    // adds the estimated SST metadata capacity.
+    optional uint64 block_cache_data_bytes_per_rank = 16 [default = 1073741824];
 }
 
 message TrainConfig {
