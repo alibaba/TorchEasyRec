@@ -1592,7 +1592,7 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
                         expected_frontend[SLOT_EMBEDS].to(embeds.dtype),
                     )
                     _, band_lo, band_hi = sid_bands([4, 4, 4], 40)
-                    expected_codes = generate_codes(
+                    expected_codes, expected_scores = generate_codes(
                         ref_lm,
                         embeds,
                         expected_frontend[CU_SEQLENS],
@@ -1602,6 +1602,8 @@ class DistributedEmbeddingModelTest(unittest.TestCase):
                     )
                 self.assertEqual(actual["generated_sids"].device, device)
                 self.assertTrue(torch.equal(actual["generated_sids"], expected_codes))
+                self.assertEqual(actual["generated_scores"].device, device)
+                torch.testing.assert_close(actual["generated_scores"], expected_scores)
         finally:
             torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
             torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
@@ -1670,7 +1672,7 @@ class GenRecExportModelTest(unittest.TestCase):
                 embeds = embeds.index_copy(
                     0, streams[HOLE_POSITIONS], streams[SLOT_EMBEDS]
                 )
-            expected = generate_codes(
+            expected, expected_scores = generate_codes(
                 self.lm,
                 embeds,
                 streams[CU_SEQLENS],
@@ -1680,9 +1682,14 @@ class GenRecExportModelTest(unittest.TestCase):
             )
         self.assertEqual(out["generated_sids"].shape, (2, widths[-1], 3))
         self.assertTrue(torch.equal(out["generated_sids"], expected))
+        self.assertEqual(out["generated_scores"].shape, (2, widths[-1]))
+        self.assertEqual(out["generated_scores"].dtype, torch.float32)
+        torch.testing.assert_close(out["generated_scores"], expected_scores)
 
     def test_reads_the_exports_pipeline_config(self) -> None:
         self.common.beam_widths[-1] = 1
+        self.common.generated_sids_key = "sid_codes"
+        self.common.generated_scores_key = "sid_scores"
         config_util.save_message(
             self.pipeline_config, os.path.join(self.export_dir, "pipeline.config")
         )
@@ -1693,7 +1700,9 @@ class GenRecExportModelTest(unittest.TestCase):
             model = load_predict_model(self.export_dir, [torch.device("cpu")])
         with torch.no_grad():
             out = model(Batch(), None, torch.device("cpu"))
-        self.assertEqual(out["generated_sids"].shape, (2, 1, 3))
+        self.assertEqual(set(out), {"sid_codes", "sid_scores"})
+        self.assertEqual(out["sid_codes"].shape, (2, 1, 3))
+        self.assertEqual(out["sid_scores"].shape, (2, 1))
 
     def test_needs_the_sid_space(self) -> None:
         self._write_config()

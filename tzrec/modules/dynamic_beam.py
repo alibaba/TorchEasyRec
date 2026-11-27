@@ -50,7 +50,7 @@ def dynamic_beam_search(
     capped_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
     initial_cache: Optional[Cache] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Decode SID answers with a caller-supplied per-level beam width.
 
     Args:
@@ -67,7 +67,8 @@ def dynamic_beam_search(
             because every use of them is a host-side slice bound.
 
     Returns:
-        The SID token tail ``(B * W, num_levels)``, score-ordered best-first.
+        The SID token tail ``(B * W, num_levels)`` and its FP32 cumulative
+        log-probabilities ``(B * W,)``, score-ordered best-first.
         The fixed-length, EOS-free answer needs no finished-sequence bookkeeping.
     """
     device = prompt_embeds.device
@@ -135,4 +136,4 @@ def dynamic_beam_search(
             # the last level never reads the cache; skip the largest reorder copy.
             cache.reorder_cache(parent)
             beam_mask = beam_mask[parent]
-    return seq
+    return seq, beam_scores

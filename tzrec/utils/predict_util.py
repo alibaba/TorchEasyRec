@@ -1666,6 +1666,11 @@ class GenRecExportModel:
         common = pipeline_config.model_config.genrec_causal_lm_model.common
         self._capped_widths = resolve_beam_config(common, sid_space["codebook"])
         self._generated_sids_key = common.generated_sids_key
+        self._generated_scores_key = common.generated_scores_key
+        if self._generated_sids_key == self._generated_scores_key:
+            raise ValueError(
+                "generated_sids_key and generated_scores_key must be different."
+            )
         self._mixed_dtype = acc_utils.mixed_precision_to_dtype(
             acc_utils.mixed_precision_for_export(pipeline_config)
         )
@@ -1725,7 +1730,8 @@ class GenRecExportModel:
 
         Returns:
             ``generated_sids_key``: ``(B, self._capped_widths[-1], num_levels)``
-            local codes, best first.
+            local codes, best first, and ``generated_scores_key``:
+            ``(B, self._capped_widths[-1])`` mean token log-probabilities.
         """
         frontend_outputs = self._frontend(batch, batch_size, device)
         lm = self._lm[device]
@@ -1742,7 +1748,7 @@ class GenRecExportModel:
                     frontend_outputs[HOLE_POSITIONS],
                     frontend_outputs[SLOT_EMBEDS].to(embeds.dtype),
                 )
-            codes = generate_codes(
+            codes, scores = generate_codes(
                 lm,
                 embeds,
                 cu_seqlens,
@@ -1750,7 +1756,10 @@ class GenRecExportModel:
                 self._capped_widths,
                 self._bands,
             )
-        return {self._generated_sids_key: codes}
+        return {
+            self._generated_sids_key: codes,
+            self._generated_scores_key: scores,
+        }
 
 
 def _load_batch_model(
@@ -1833,9 +1842,9 @@ def load_predict_model(
             genrec, decodes with its beam settings, read from the export's own
             pipeline.config when not given.
 
-    Return:
+    Returns:
         a callable of (batch, batch_size input of tiled models, device) returning
-        the predictions, the decoded SIDs for a GenRec export.
+        the predictions, including decoded SIDs and their scores for a GenRec export.
     """
     hf_config_path = os.path.join(model_path, "config.json")
     is_genrec = False

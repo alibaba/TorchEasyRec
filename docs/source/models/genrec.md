@@ -171,13 +171,14 @@ answer = [1, 8194, 16387, 4, 8197, 16390]
 
 ### genrec_causal_lm_model
 
-| 参数                        | 说明                                                                                                           |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `hf_model_name_or_path`     | 可选，预训练骨干模型的 HuggingFace 模型 ID 或本地目录，默认 `Qwen/Qwen2.5-0.5B`                                |
-| `common.lm_parameter_dtype` | 可选，LM 参数精度，`FP32`、`BF16` 或 `FP16`，默认 `FP32`；计算的混合精度由 `train_config.mixed_precision` 控制 |
-| `common.attn_kernel`        | 可选，注意力计算方式，默认 `"sdpa"`，也可使用 `"flash_attention_2"`                                            |
-| `common.beam_widths`        | 必填，长度等于码本层数，各项至少为 `1`；每层均为全局保留数，末层决定返回的 SID 数量；候选不足时返回现有候选    |
-| `common.generated_sids_key` | 可选，预测输出列名，默认 `"generated_sids"`                                                                    |
+| 参数                          | 说明                                                                                                           |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `hf_model_name_or_path`       | 可选，预训练骨干模型的 HuggingFace 模型 ID 或本地目录，默认 `Qwen/Qwen2.5-0.5B`                                |
+| `common.lm_parameter_dtype`   | 可选，LM 参数精度，`FP32`、`BF16` 或 `FP16`，默认 `FP32`；计算的混合精度由 `train_config.mixed_precision` 控制 |
+| `common.attn_kernel`          | 可选，注意力计算方式，默认 `"sdpa"`，也可使用 `"flash_attention_2"`                                            |
+| `common.beam_widths`          | 必填，长度等于码本层数，各项至少为 `1`；每层均为全局保留数，末层决定返回的 SID 数量；候选不足时返回现有候选    |
+| `common.generated_sids_key`   | 可选，预测输出列名，默认 `"generated_sids"`                                                                    |
+| `common.generated_scores_key` | 可选，SID 序列分数输出列名，默认 `"generated_scores"`                                                          |
 
 `hf_model_name_or_path` 指定模型 ID 时，所需配置和预训练权重会自动下载并缓存。
 
@@ -188,6 +189,8 @@ answer = [1, 8194, 16387, 4, 8197, 16390]
 ## 模型输出
 
 默认输出列 `generated_sids` 的每行形状为 `(实际返回数量, 码本层数)`，实际返回数量不超过末层配置宽度和候选池容量，各 SID 按预测得分从高到低排列。例如 `[[3, 5, 7], [8, 4, 12], ...]`。**输出是每层从 0 开始的编码**，应与最终 SID 映射表的 `codebook` 列对齐；若使用 `offset_codebook` 做关联，需先加回层偏移。
+
+`generated_scores` 与 SID 一一对应，表示各层编码的平均对数概率，概率按完整词表归一化，分数越大越优。预测默认输出两列；仅需 SID 时使用 `--output_columns generated_sids`。
 
 生成 SID 的层数与码本层数一致。召回时需查询 SID 到物品的映射表，过滤没有对应物品的 SID，并展开同一 SID 对应的物品列表。
 
