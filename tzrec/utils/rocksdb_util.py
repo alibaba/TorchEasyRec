@@ -103,6 +103,9 @@ def backend_config(
             "background_io_max_rate_per_rank_mib_per_sec": (
                 "background_io_max_rate_mib_per_sec"
             ),
+            "async_writeback": "async_writeback",
+            "score_cache_bytes_per_rank": "score_cache_bytes",
+            "score_cache_bucket_capacity": "score_cache_bucket_capacity",
         }
         for field, backend_field in backend_fields.items():
             if config.HasField(field):
@@ -209,7 +212,11 @@ def shared_storage(
         import_budget_bytes=0,
         config=config,
     )
-    return Storage(hbm=0, ddr=ddr_overheads(backend), ssd=disk_overheads(backend))
+    ddr_bytes = ddr_overheads(backend)
+    if backend.async_writeback:
+        # Each DB can hold one copied write batch beyond the reusable staging.
+        ddr_bytes += backend.num_db_shards * backend.staging_buffer_bytes
+    return Storage(hbm=0, ddr=ddr_bytes, ssd=disk_overheads(backend))
 
 
 def is_rocksdb_options(options: Optional["DynamicEmbTableOptions"]) -> bool:

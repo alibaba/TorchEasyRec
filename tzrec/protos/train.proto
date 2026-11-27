@@ -195,6 +195,13 @@ message RocksDBConfig {
     // or publication lookup. When only the peak rate is set, all phases use
     // that fixed rate. Omitting both rates leaves background I/O unlimited.
     optional uint64 background_io_max_rate_per_rank_mib_per_sec = 11;
+    // Allow one pending background write batch per database.
+    optional bool async_writeback = 12 [default = false];
+    // Total writeback score cache budget in bytes across this rank's DBs.
+    // Zero disables the cache.
+    optional uint64 score_cache_bytes_per_rank = 13 [default = 0];
+    // Number of score cache entries in each bucket. Must be positive.
+    optional uint32 score_cache_bucket_capacity = 14 [default = 4];
 }
 
 message TrainConfig {

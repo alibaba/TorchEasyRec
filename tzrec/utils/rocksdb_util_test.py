@@ -244,13 +244,18 @@ class SharedStorageTest(unittest.TestCase):
         self.assertEqual(shared.hbm, 0)
         self.assertEqual(shared.ddr, 9 * (1 << 28))
         self.assertEqual(shared.ssd, disk_overheads(backend))
-        with_scores = dataclasses.replace(backend, score_cache_bytes=960)
-        with mock.patch.object(
-            rocksdb_util, "backend_config", return_value=with_scores
-        ):
-            self.assertEqual(
-                rocksdb_util.shared_storage(1).ddr, shared.ddr + 8 * 4 * 24
-            )
+        tuned = train_pb2.RocksDBConfig(
+            root_dir="/tmp",
+            num_db_shards_per_rank=2,
+            async_writeback=True,
+            score_cache_bytes_per_rank=3000,
+            score_cache_bucket_capacity=12,
+        )
+        # Each DB has 1500 bytes of score budget, fitting four 12-entry buckets.
+        self.assertEqual(
+            rocksdb_util.shared_storage(1, tuned).ddr,
+            shared.ddr + (512 << 20) + 2 * 4 * 12 * 24,
+        )
 
     @parameterized.expand(
         [("master_default", 32, None, 16), ("shard_floor", 8, 8, 8)],
@@ -324,7 +329,13 @@ class SharedStorageTest(unittest.TestCase):
             self.skipTest(f"tzrec_ext.rocksdb.storage needs {e.name}")
 
         gib = 1 << 30
-        config = train_pb2.RocksDBConfig(root_dir="/tmp", num_db_shards_per_rank=2)
+        config = train_pb2.RocksDBConfig(
+            root_dir="/tmp",
+            num_db_shards_per_rank=2,
+            async_writeback=True,
+            score_cache_bytes_per_rank=3000,
+            score_cache_bucket_capacity=12,
+        )
         selected = [
             SimpleNamespace(
                 fqn=name,
@@ -358,6 +369,9 @@ class SharedStorageTest(unittest.TestCase):
             factory = option.dynamicemb_options.external_storage
             self.assertEqual(factory.table_namespace, option.fqn)
             self.assertEqual(factory.backend_config.num_db_shards, 2)
+            self.assertTrue(factory.backend_config.async_writeback)
+            self.assertEqual(factory.backend_config.score_cache_bytes, 3000)
+            self.assertEqual(factory.backend_config.score_cache_bucket_capacity, 12)
             self.assertEqual(factory.backend_config.block_cache_bytes, 5 * gib // 2)
             self.assertEqual(
                 factory.backend_config.import_budget_bytes, import_quarters * gib // 4
