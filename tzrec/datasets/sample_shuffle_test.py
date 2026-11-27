@@ -262,6 +262,7 @@ class CoordinatorTest(unittest.TestCase):
             batch_size=8,
             min_batch_size=min_batch_size,
             num_consumers=num_consumers,
+            rank=0,
             # NOTE: The coordinator thread shares this process's parent PID.
             trainer_pid=os.getppid(),
         )
@@ -654,6 +655,7 @@ class ReaderProcessTest(unittest.TestCase):
         p = ctx.Process(
             target=_reader_process_main,
             args=(
+                0,
                 0,
                 task_q,
                 input_q,

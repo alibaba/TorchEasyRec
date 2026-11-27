@@ -448,6 +448,7 @@ class SamplePool:
 
 def _reader_process_main(
     reader_id: int,
+    rank: int,
     task_q: Any,
     input_q: Any,
     stop_event: Any,
@@ -506,7 +507,9 @@ def _reader_process_main(
             if not _put((_EOF, reader_id)):
                 return
     except BaseException:
-        logger.error(f"sample-shuffle reader {reader_id} failed", exc_info=True)
+        logger.error(
+            f"[rank={rank}] sample-shuffle reader {reader_id} failed", exc_info=True
+        )
         error_flushed = _put((_ERROR, reader_id, traceback.format_exc()))
     finally:
         if error_flushed:
@@ -538,6 +541,7 @@ class Coordinator:
         batch_size: training batch size.
         min_batch_size: tail batches smaller than this are dropped.
         num_consumers: number of dataloader consumers on this rank.
+        rank: global rank of the trainer.
         trainer_pid: trainer process pid; the coordinator exits when its
             parent changes (trainer died without stopping it).
     """
@@ -555,6 +559,7 @@ class Coordinator:
         batch_size: int,
         min_batch_size: int,
         num_consumers: int,
+        rank: int,
         trainer_pid: int,
     ) -> None:
         self._first_plan = first_plan
@@ -566,6 +571,7 @@ class Coordinator:
         self._batch_size = batch_size
         self._min_batch_size = min_batch_size
         self._num_consumers = num_consumers
+        self._rank = rank
         self._trainer_pid = trainer_pid
         self._capacity_rows = capacity_rows
         self._pool = SamplePool(capacity_rows, mode, batch_size=batch_size)
@@ -595,6 +601,7 @@ class Coordinator:
                 target=_reader_process_main,
                 args=(
                     i,
+                    self._rank,
                     task_q,
                     self._input_q,
                     self._stop_event,
@@ -629,7 +636,9 @@ class Coordinator:
         """Record a fatal failure and make every consumer see it."""
         if self._error is None:
             self._error = message
-            logger.error(f"sample-shuffle coordinator failed: {message}")
+            logger.error(
+                f"[rank={self._rank}] sample-shuffle coordinator failed: {message}"
+            )
 
     def _service_requests(self, timeout: float = 0.0) -> None:
         """Accept queued GET/CANCEL messages.
@@ -817,8 +826,9 @@ class Coordinator:
     def _log_stats(self) -> None:
         """Log pool counters."""
         logger.info(
-            f"sample-shuffle stats: pool {self._pool.total_rows} rows "
-            f"(capacity {self._pool.capacity_rows}), rows in {self._pool.rows_in} "
+            f"[rank={self._rank}] sample-shuffle stats: "
+            f"pool {self._pool.total_rows} rows (capacity {self._pool.capacity_rows}), "
+            f"rows in {self._pool.rows_in} "
             f"out {self._pool.rows_out}, emits {self._pool.num_emits}, "
             f"compactions {self._pool.num_compactions}"
         )
@@ -844,7 +854,10 @@ class Coordinator:
                     time.sleep(0.001)
                 if now - last_watchdog >= _WATCHDOG_TICK_SECS:
                     if os.getppid() != self._trainer_pid:
-                        logger.error("sample-shuffle coordinator orphaned; exiting")
+                        logger.error(
+                            f"[rank={self._rank}] sample-shuffle coordinator "
+                            "orphaned; exiting"
+                        )
                         break
                     self._check_readers()
                     last_watchdog = now
@@ -919,6 +932,7 @@ class SampleShuffleHandle:
         world_size: int,
     ) -> None:
         validate_sample_shuffle_config(data_config)
+        self._rank = rank
         self._num_consumers = max(num_workers, 1)
         self._batch_size = data_config.batch_size
         self._min_batch_size = reader._min_batch_size
@@ -1009,7 +1023,7 @@ class SampleShuffleHandle:
         if self._proc is not None or self._stop_event.is_set():
             return
         logger.info(
-            f"sample-shuffle service starting: "
+            f"[rank={self._rank}] sample-shuffle service starting: "
             f"mode={self._mode} "
             f"capacity={self._capacity_rows} rows, "
             f"consumers={self._num_consumers}, "
@@ -1031,6 +1045,7 @@ class SampleShuffleHandle:
                 batch_size=self._batch_size,
                 min_batch_size=self._min_batch_size,
                 num_consumers=self._num_consumers,
+                rank=self._rank,
                 trainer_pid=os.getpid(),
             ),
             # The coordinator must be non-daemonic to fork reader processes.
@@ -1052,8 +1067,8 @@ class SampleShuffleHandle:
             if not self._stop_event.is_set() and not self._cancel_event.is_set():
                 self._fatal_event.set()
                 logger.error(
-                    f"sample-shuffle coordinator exited unexpectedly "
-                    f"(code {proc.exitcode})"
+                    f"[rank={self._rank}] sample-shuffle coordinator "
+                    f"exited unexpectedly (code {proc.exitcode})"
                 )
 
         threading.Thread(
