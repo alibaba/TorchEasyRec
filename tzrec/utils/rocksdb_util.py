@@ -49,11 +49,8 @@ from tzrec.utils.logging_util import logger
 if TYPE_CHECKING:
     from dynamicemb import DynamicEmbTableOptions
     from torchrec.distributed.planner.types import ShardingOption
-    from tzrec_ext.rocksdb import IOPhase
+    from tzrec_ext.rocksdb import BackendConfig, IOPhase
 
-# Host memory a rank needs beyond the planned RocksDB budgets (table readers,
-# iterators, pinned blocks, allocator slack).
-_HOST_OVERHEAD_BYTES = 2 << 30
 # Planned host budgets that do not depend on the tables: the memtables, the
 # pinned staging of one storage call (larger calls are split) and the data
 # share of the block cache (other data blocks are left to the page cache).
@@ -70,20 +67,24 @@ SSD_RESERVE_BYTES = 16 << 30
 def backend_config(
     local_world_size: int,
     *,
-    block_cache_bytes: int,
-    import_budget_bytes: int,
+    block_cache_bytes: int = BLOCK_CACHE_DATA_BYTES,
+    import_budget_bytes: int = 0,
     config: Optional[train_pb2.RocksDBConfig] = None,
-) -> Any:
-    """The common backend configuration a plan derives its budgets from.
+) -> "BackendConfig":
+    """Build the common backend configuration for planning.
 
-    Threads follow the CPUs one rank may use; the fixed buffers are planned
-    constants. Block-cache and import budgets come from the selected plan.
+    Threads follow the CPUs one rank may use. The defaults reserve the
+    data-block cache before enumerating candidates. The selected plan adds
+    table metadata and sets the import budget.
 
     Args:
         local_world_size: Number of ranks sharing the host's CPUs.
-        block_cache_bytes: Block-cache capacity per rank, including metadata.
+        block_cache_bytes: Block-cache capacity per rank.
         import_budget_bytes: Temporary host-memory budget for checkpoint import.
         config: User settings for the RocksDB backend.
+
+    Returns:
+        Rank-wide RocksDB backend configuration.
     """
     from tzrec_ext.rocksdb import BackendConfig
 
@@ -122,18 +123,18 @@ def backend_config(
 def configure_backend(
     selected: List["ShardingOption"],
     *,
+    base_config: "BackendConfig",
     ddr_caps: Tuple[int, ...],
     local_world_size: int,
-    config: Optional[train_pb2.RocksDBConfig] = None,
 ) -> List["ShardingOption"]:
     """Configure the shared RocksDB backend from selected shard budgets.
 
     Args:
         selected: Selected options with ranks assigned to their shards.
+        base_config: The backend configuration used for shared planning costs.
         ddr_caps: Per-rank host budget shares before the shared RocksDB reserve,
             pooled per node to compute the import budget.
         local_world_size: Number of ranks sharing one host.
-        config: User settings for the RocksDB backend.
 
     Returns:
         The selected options with backend configuration attached to their
@@ -160,18 +161,12 @@ def configure_backend(
     if not rocksdb_options:
         return selected
 
-    block_cache_bytes = BLOCK_CACHE_DATA_BYTES + max(metadata_bytes_per_rank)
-    # Import reuses the empty memtable/cache budgets; built-in tables remain resident.
-    import_budget_bytes = (
-        min(import_available_per_node) // local_world_size
-        - STAGING_BUFFER_BYTES
-        - _HOST_OVERHEAD_BYTES
-    )
-    config = backend_config(
-        local_world_size=local_world_size,
-        block_cache_bytes=block_cache_bytes,
-        import_budget_bytes=import_budget_bytes,
-        config=config,
+    # Import reuses the fresh DB's write and cache budgets.
+    config = dataclasses.replace(
+        base_config,
+        block_cache_bytes=base_config.block_cache_bytes + max(metadata_bytes_per_rank),
+        import_budget_bytes=min(import_available_per_node) // local_world_size
+        - base_config.staging_buffer_bytes,
     )
     for option in rocksdb_options:
         options = option.dynamicemb_options
@@ -189,35 +184,33 @@ def configure_backend(
     return selected
 
 
-def shared_storage(
-    local_world_size: int, config: Optional[train_pb2.RocksDBConfig] = None
-) -> Any:
+def shared_storage(config: "BackendConfig") -> Any:
     """Shared per-rank resources reserved before RocksDB candidate enumeration.
 
-    DDR covers fixed buffers and host headroom; SSD covers compaction and
+    DDR covers the session's shared buffers; SSD covers compaction and
     other DB files. Table SSD estimates use SST_FACTOR as an empirical
     allowance for restore spill. Filesystem reserve is deducted separately.
 
     Args:
-        local_world_size: Number of ranks sharing one host.
-        config: User settings for the RocksDB backend.
+        config: Backend budgets before adding table metadata to the block cache.
+
+    Returns:
+        Shared storage reserved per rank.
     """
     from torchrec.distributed.planner.types import Storage
-    from tzrec_ext.rocksdb import disk_overheads
+    from tzrec_ext import rocksdb
 
-    overheads = disk_overheads(
-        backend_config(
-            local_world_size, block_cache_bytes=0, import_budget_bytes=0, config=config
+    ssd = rocksdb.disk_overheads(config)
+    if isinstance(ssd, dict):
+        # The pinned 0.1.1 wheel returns a breakdown and predates ScoreCache.
+        return Storage(
+            hbm=0,
+            ddr=config.write_buffer_bytes
+            + config.staging_buffer_bytes
+            + config.block_cache_bytes,
+            ssd=sum(ssd.values()),
         )
-    )
-    return Storage(
-        hbm=0,
-        ddr=WRITE_BUFFER_BYTES
-        + STAGING_BUFFER_BYTES
-        + BLOCK_CACHE_DATA_BYTES
-        + _HOST_OVERHEAD_BYTES,
-        ssd=overheads["compaction_headroom"] + overheads["other_files"],
-    )
+    return Storage(hbm=0, ddr=rocksdb.ddr_overheads(config), ssd=ssd)
 
 
 def is_rocksdb_options(options: Optional["DynamicEmbTableOptions"]) -> bool:
