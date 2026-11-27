@@ -49,17 +49,10 @@ from tzrec.utils.logging_util import logger
 if TYPE_CHECKING:
     from dynamicemb import DynamicEmbTableOptions
     from torchrec.distributed.planner.types import ShardingOption
-    from tzrec_ext.rocksdb import IOPhase
+    from tzrec_ext.rocksdb import BackendConfig, IOPhase
 
-# Host memory a rank needs beyond the planned RocksDB budgets (table readers,
-# iterators, pinned blocks, allocator slack).
-_HOST_OVERHEAD_BYTES = 2 << 30
-# Planned host budgets that do not depend on the tables: the memtables, the
-# pinned staging of one storage call (larger calls are split) and the data
-# share of the block cache (other data blocks are left to the page cache).
-WRITE_BUFFER_BYTES = 1 << 30
+# Pinned staging budget for one storage chunk.
 STAGING_BUFFER_BYTES = 256 << 20
-BLOCK_CACHE_DATA_BYTES = 1 << 30
 
 # Empirical SSD allowance for SST overhead and restore spill, not a peak bound.
 SST_FACTOR = 1.1
@@ -70,48 +63,60 @@ SSD_RESERVE_BYTES = 16 << 30
 def backend_config(
     local_world_size: int,
     *,
-    block_cache_bytes: int,
     import_budget_bytes: int,
+    metadata_bytes_per_rank: int = 0,
     config: Optional[train_pb2.RocksDBConfig] = None,
-) -> Any:
-    """The common backend configuration a plan derives its budgets from.
+) -> "BackendConfig":
+    """Build the common backend configuration for planning.
 
-    Threads follow the CPUs one rank may use; the fixed buffers are planned
-    constants. Block-cache and import budgets come from the selected plan.
+    Threads follow the CPUs one rank may use. Block-cache and import budgets
+    depend on whether the planner has selected the tables.
 
     Args:
         local_world_size: Number of ranks sharing the host's CPUs.
-        block_cache_bytes: Block-cache capacity per rank, including metadata.
         import_budget_bytes: Temporary host-memory budget for checkpoint import.
+        metadata_bytes_per_rank: Estimated SST metadata bytes to add to the cache.
         config: User settings for the RocksDB backend.
+
+    Returns:
+        Rank-wide RocksDB backend configuration.
     """
     from tzrec_ext.rocksdb import BackendConfig
 
+    if config is None:
+        config = train_pb2.RocksDBConfig()
+    if config.write_buffer_bytes_per_rank == 0:
+        raise ValueError("write_buffer_bytes_per_rank must be positive")
+
     cpus = max(1, len(os.sched_getaffinity(0)) // max(local_world_size, 1))
-    overrides = {}
-    if config is not None:
-        backend_fields = {
-            "sst_block_size_bytes": "sst_block_size_bytes",
-            "block_align": "block_align",
-            "use_direct_reads": "use_direct_reads",
-            "direct_read_alignment_bytes": "direct_read_alignment_bytes",
-            "num_db_shards_per_rank": "num_db_shards",
-            "io_threads_per_rank": "io_threads",
-            "background_io_base_rate_per_rank_mib_per_sec": (
-                "background_io_base_rate_mib_per_sec"
-            ),
-            "background_io_max_rate_per_rank_mib_per_sec": (
-                "background_io_max_rate_mib_per_sec"
-            ),
-        }
-        for field, backend_field in backend_fields.items():
-            if config.HasField(field):
-                overrides[backend_field] = getattr(config, field)
+    backend_fields = {
+        "sst_block_size_bytes": "sst_block_size_bytes",
+        "block_align": "block_align",
+        "use_direct_reads": "use_direct_reads",
+        "direct_read_alignment_bytes": "direct_read_alignment_bytes",
+        "num_db_shards_per_rank": "num_db_shards",
+        "io_threads_per_rank": "io_threads",
+        "background_io_base_rate_per_rank_mib_per_sec": (
+            "background_io_base_rate_mib_per_sec"
+        ),
+        "background_io_max_rate_per_rank_mib_per_sec": (
+            "background_io_max_rate_mib_per_sec"
+        ),
+        "async_writeback": "async_writeback",
+        "score_cache_bytes_per_rank": "score_cache_bytes",
+        "score_cache_bucket_capacity": "score_cache_bucket_capacity",
+    }
+    overrides = {
+        backend_field: getattr(config, field)
+        for field, backend_field in backend_fields.items()
+        if config.HasField(field)
+    }
     num_db_shards = overrides.get("num_db_shards", 1)
     overrides.setdefault("io_threads", max(4, cpus, num_db_shards))
     return BackendConfig(
-        block_cache_bytes=block_cache_bytes,
-        write_buffer_bytes=WRITE_BUFFER_BYTES,
+        block_cache_bytes=config.block_cache_data_bytes_per_rank
+        + metadata_bytes_per_rank,
+        write_buffer_bytes=config.write_buffer_bytes_per_rank,
         staging_buffer_bytes=STAGING_BUFFER_BYTES,
         import_budget_bytes=import_budget_bytes,
         max_background_jobs=max(2 * num_db_shards, cpus // 4),
@@ -160,23 +165,18 @@ def configure_backend(
     if not rocksdb_options:
         return selected
 
-    block_cache_bytes = BLOCK_CACHE_DATA_BYTES + max(metadata_bytes_per_rank)
-    # Import reuses the empty memtable/cache budgets; built-in tables remain resident.
-    import_budget_bytes = (
-        min(import_available_per_node) // local_world_size
-        - STAGING_BUFFER_BYTES
-        - _HOST_OVERHEAD_BYTES
-    )
-    config = backend_config(
-        local_world_size=local_world_size,
-        block_cache_bytes=block_cache_bytes,
-        import_budget_bytes=import_budget_bytes,
+    # Import reuses the fresh DB's write and cache budgets.
+    backend = backend_config(
+        local_world_size,
+        import_budget_bytes=min(import_available_per_node) // local_world_size
+        - STAGING_BUFFER_BYTES,
+        metadata_bytes_per_rank=max(metadata_bytes_per_rank),
         config=config,
     )
     for option in rocksdb_options:
         options = option.dynamicemb_options
         options.external_storage = dataclasses.replace(
-            options.external_storage, backend_config=config
+            options.external_storage, backend_config=backend
         )
     logger.info(
         "dynamicemb tables offloaded to RocksDB (per rank): "
@@ -184,7 +184,7 @@ def configure_backend(
             f"{option.fqn} cache ratio {option.cache_load_factor}"
             for option in rocksdb_options
         )
-        + f"; backend {config}"
+        + f"; backend {backend}"
     )
     return selected
 
@@ -194,30 +194,30 @@ def shared_storage(
 ) -> Any:
     """Shared per-rank resources reserved before RocksDB candidate enumeration.
 
-    DDR covers fixed buffers and host headroom; SSD covers compaction and
+    DDR covers the session's shared buffers; SSD covers compaction and
     other DB files. Table SSD estimates use SST_FACTOR as an empirical
     allowance for restore spill. Filesystem reserve is deducted separately.
 
     Args:
-        local_world_size: Number of ranks sharing one host.
+        local_world_size: Number of ranks sharing the host's CPUs.
         config: User settings for the RocksDB backend.
+
+    Returns:
+        Shared storage reserved per rank.
     """
     from torchrec.distributed.planner.types import Storage
-    from tzrec_ext.rocksdb import disk_overheads
+    from tzrec_ext.rocksdb import ddr_overheads, disk_overheads
 
-    overheads = disk_overheads(
-        backend_config(
-            local_world_size, block_cache_bytes=0, import_budget_bytes=0, config=config
-        )
+    backend = backend_config(
+        local_world_size,
+        import_budget_bytes=0,
+        config=config,
     )
-    return Storage(
-        hbm=0,
-        ddr=WRITE_BUFFER_BYTES
-        + STAGING_BUFFER_BYTES
-        + BLOCK_CACHE_DATA_BYTES
-        + _HOST_OVERHEAD_BYTES,
-        ssd=overheads["compaction_headroom"] + overheads["other_files"],
-    )
+    ddr_bytes = ddr_overheads(backend)
+    if backend.async_writeback:
+        # Each DB can hold one copied write batch beyond the reusable staging.
+        ddr_bytes += backend.num_db_shards * backend.staging_buffer_bytes
+    return Storage(hbm=0, ddr=ddr_bytes, ssd=disk_overheads(backend))
 
 
 def is_rocksdb_options(options: Optional["DynamicEmbTableOptions"]) -> bool:

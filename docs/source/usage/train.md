@@ -221,7 +221,7 @@ export HOST_MEMORY_RESERVE_PERCENT=0.15
 
 默认仍使用 DP 规划。设置 `TZREC_PLANNER=milp` 可启用 MILP，同时选择每张表的分片候选和各 shard 的 rank，约束各 rank 的 HBM 用量及各 node 的 DDR、SSD 总用量，并优化最慢 rank 的预计耗时。
 
-启用 `train_config.rocksdb_config` 的 RocksDB 后端后，自动使用 MILP。
+启用 `train_config.rocksdb_config` 的 RocksDB 后端后，自动使用 MILP。训练和 checkpoint 恢复的主机内存预算均按 `HOST_MEMORY_RESERVE_PERCENT` 留出余量。
 
 ```bash
 export TZREC_PLANNER=milp
@@ -250,6 +250,11 @@ rocksdb_config {
     num_db_shards_per_rank: 4
     background_io_base_rate_per_rank_mib_per_sec: 96
     background_io_max_rate_per_rank_mib_per_sec: 512
+    async_writeback: true
+    score_cache_bytes_per_rank: 1073741824
+    score_cache_bucket_capacity: 4
+    write_buffer_bytes_per_rank: 2147483648
+    block_cache_data_bytes_per_rank: 4294967296
 }
 ```
 
@@ -258,6 +263,11 @@ rocksdb_config {
 - `io_threads_per_rank` 是同一 rank 的原生批量 I/O 线程总数，也是恢复 checkpoint 时文件读取线程数的上限。省略时根据 CPU 亲和性和本地 rank 数均分 CPU，线程数至少为 4 且不少于 DB 数。
 - `num_db_shards_per_rank` 控制 DB 数，同一张表的主记录和淘汰索引位于同一个 DB。
 - 两个后台限速字段都以 MiB/s 为单位，限制同一 rank 内各 DB 的 flush 和 compaction 流量。只设基础档或只设最高档时，各阶段都使用所设的固定速率。两者都省略时，不启用后台限速。两个值都设时，会在训练过程中动态调整限速。
+- `async_writeback` 默认关闭。启用后，每个 DB 可以有一批待完成的写回，planner 会为每个 DB 额外预留一份写回暂存空间。
+- `score_cache_bytes_per_rank` 是每个 rank 用于缓存旧 score 和记录存在性的总预算，单位为字节，默认 `0` 表示关闭。
+- `score_cache_bucket_capacity` 是每个 ScoreCache 桶的槽数，必须为正整数，默认 `4`。
+- `write_buffer_bytes_per_rank` 是每个 rank 内所有 DB 的 memtable 总预算，单位为字节，必须大于 `0`，默认 1 GiB。
+- `block_cache_data_bytes_per_rank` 是每个 rank 给数据块留的 block cache 额度，单位为字节，默认 1 GiB。
 
 (embedding-sharding-constraints)=
 

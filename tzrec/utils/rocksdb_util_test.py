@@ -238,13 +238,29 @@ class SharedStorageTest(unittest.TestCase):
         from tzrec_ext.rocksdb import disk_overheads
 
         shared = rocksdb_util.shared_storage(local_world_size=1)
+        backend = rocksdb_util.backend_config(1, import_budget_bytes=0)
         self.assertEqual(shared.hbm, 0)
-        self.assertEqual(shared.ddr, int(4.25 * (1 << 30)))
-        overheads = disk_overheads(
-            rocksdb_util.backend_config(1, block_cache_bytes=0, import_budget_bytes=0)
+        self.assertEqual(shared.ddr, 9 * (1 << 28))
+        self.assertEqual(shared.ssd, disk_overheads(backend))
+        tuned = train_pb2.RocksDBConfig(
+            root_dir="/tmp",
+            num_db_shards_per_rank=2,
+            async_writeback=True,
+            score_cache_bytes_per_rank=3000,
+            score_cache_bucket_capacity=12,
+            write_buffer_bytes_per_rank=2 << 30,
+            block_cache_data_bytes_per_rank=3 << 30,
         )
+        tuned_storage = rocksdb_util.shared_storage(1, tuned)
+        # Each DB has 1500 bytes of score budget, fitting four 12-entry buckets.
         self.assertEqual(
-            shared.ssd, overheads["compaction_headroom"] + overheads["other_files"]
+            tuned_storage.ddr,
+            shared.ddr + (3 << 30) + (512 << 20) + 2 * 4 * 12 * 24,
+        )
+        tuned.ClearField("write_buffer_bytes_per_rank")
+        self.assertGreater(
+            tuned_storage.ssd,
+            rocksdb_util.shared_storage(1, tuned).ssd,
         )
 
     @parameterized.expand(
@@ -260,7 +276,6 @@ class SharedStorageTest(unittest.TestCase):
         with mock.patch("os.sched_getaffinity", return_value=set(range(cpus))):
             backend = rocksdb_util.backend_config(
                 2,
-                block_cache_bytes=32 << 20,
                 import_budget_bytes=64 << 20,
                 config=config,
             )
@@ -281,10 +296,11 @@ class SharedStorageTest(unittest.TestCase):
         with mock.patch("os.sched_getaffinity", return_value=set(range(16))):
             backend = rocksdb_util.backend_config(
                 1,
-                block_cache_bytes=32 << 20,
                 import_budget_bytes=64 << 20,
                 config=config,
             )
+            sharded = rocksdb_util.shared_storage(1, config)
+            baseline = rocksdb_util.shared_storage(1)
         self.assertEqual(backend.max_background_jobs, 8)
         self.assertEqual(backend.io_threads, 24)
         self.assertEqual(backend.num_db_shards, 4)
@@ -294,31 +310,51 @@ class SharedStorageTest(unittest.TestCase):
         self.assertEqual(backend.direct_read_alignment_bytes, 512)
         self.assertEqual(backend.background_io_base_rate_mib_per_sec, 96)
         self.assertEqual(backend.background_io_max_rate_mib_per_sec, 512)
-        sharded = rocksdb_util.shared_storage(1, config)
-        baseline = rocksdb_util.shared_storage(1)
         self.assertEqual(sharded.ddr, baseline.ddr)
         self.assertGreater(sharded.ssd, baseline.ssd)
 
-    def test_shared_storage_rejects_zero_sst_block_size(self):
-        config = train_pb2.RocksDBConfig(root_dir="/tmp", sst_block_size_bytes=0)
-        with self.assertRaisesRegex(ValueError, "SST block size"):
+    @parameterized.expand(
+        [
+            ("zero_sst_block_size", {"sst_block_size_bytes": 0}, "SST block size"),
+            (
+                "zero_write_buffer",
+                {"write_buffer_bytes_per_rank": 0},
+                "write_buffer_bytes_per_rank",
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_shared_storage_rejects_invalid_settings(self, _, settings, error):
+        config = train_pb2.RocksDBConfig(root_dir="/tmp", **settings)
+        with self.assertRaisesRegex(ValueError, error):
             rocksdb_util.shared_storage(1, config)
 
     @parameterized.expand(
         [
-            ("uneven", [3, 7], 35),
-            ("borrowed_rank", [20, 0], 15),
-            ("two_nodes", [20, 0, 1, 1], 15),
+            ("uneven", [3, 7], 43, 3),
+            ("borrowed_rank", [20, 0], 23, 0),
+            ("two_nodes", [20, 0, 1, 1], 23, 3),
         ],
         name_func=parameterized_name_func,
     )
-    def test_configure_backend_budgets(self, name, builtin_gib, import_quarters):
+    def test_configure_backend_budgets(
+        self, name, builtin_gib, import_quarters, data_cache_gib
+    ):
         try:
             from tzrec_ext.rocksdb.storage import RocksDBStorageFactory
         except ModuleNotFoundError as e:
             self.skipTest(f"tzrec_ext.rocksdb.storage needs {e.name}")
 
         gib = 1 << 30
+        config = train_pb2.RocksDBConfig(
+            root_dir="/tmp",
+            num_db_shards_per_rank=2,
+            async_writeback=True,
+            score_cache_bytes_per_rank=3000,
+            score_cache_bucket_capacity=12,
+            write_buffer_bytes_per_rank=2 * gib,
+            block_cache_data_bytes_per_rank=data_cache_gib * gib,
+        )
         selected = [
             SimpleNamespace(
                 fqn=name,
@@ -342,13 +378,25 @@ class SharedStorageTest(unittest.TestCase):
             )
         ]
         configured = rocksdb_util.configure_backend(
-            selected, ddr_caps=(16 * gib,) * len(builtin_gib), local_world_size=2
+            selected,
+            ddr_caps=(16 * gib,) * len(builtin_gib),
+            local_world_size=2,
+            config=config,
         )
         self.assertIsNone(configured[0].dynamicemb_options.external_storage)
         for option in configured[1:]:
             factory = option.dynamicemb_options.external_storage
             self.assertEqual(factory.table_namespace, option.fqn)
-            self.assertEqual(factory.backend_config.block_cache_bytes, 5 * gib // 2)
+            self.assertEqual(factory.backend_config.num_db_shards, 2)
+            self.assertTrue(factory.backend_config.async_writeback)
+            self.assertEqual(factory.backend_config.score_cache_bytes, 3000)
+            self.assertEqual(factory.backend_config.score_cache_bucket_capacity, 12)
+            self.assertEqual(factory.backend_config.write_buffer_bytes, 2 * gib)
+            self.assertEqual(factory.backend_config.staging_buffer_bytes, gib // 4)
+            self.assertEqual(
+                factory.backend_config.block_cache_bytes,
+                data_cache_gib * gib + 3 * gib // 2,
+            )
             self.assertEqual(
                 factory.backend_config.import_budget_bytes, import_quarters * gib // 4
             )
