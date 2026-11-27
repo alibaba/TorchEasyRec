@@ -253,6 +253,8 @@ rocksdb_config {
     async_writeback: true
     score_cache_bytes_per_rank: 1073741824
     score_cache_bucket_capacity: 4
+    write_buffer_bytes_per_rank: 2147483648
+    block_cache_data_bytes_per_rank: 4294967296
 }
 ```
 
@@ -264,6 +266,8 @@ rocksdb_config {
 - `async_writeback` 默认关闭。启用后，每个 DB 可以有一批待完成的写回，planner 会为每个 DB 额外预留一份写回暂存空间。
 - `score_cache_bytes_per_rank` 是每个 rank 用于缓存旧 score 和记录存在性的总预算，单位为字节，默认 `0` 表示关闭。预算按 DB 分配后，各 DB 分别将桶数向下取整到 2 的幂。
 - `score_cache_bucket_capacity` 是每个 ScoreCache 桶的槽数，必须为正整数，默认 `4`。
+- `write_buffer_bytes_per_rank` 是每个 rank 内所有 DB 的 memtable 总预算，单位为字节，必须大于 `0`，默认 1 GiB。这个值同时影响 planner 为 compaction 预留的 SSD 空间。
+- `block_cache_data_bytes_per_rank` 是每个 rank 给数据块留的 block cache 额度，单位为字节，默认 1 GiB。Planner 会加上估算的 SST metadata 得到运行时总容量。设为 `0` 时，总容量按 metadata 估算配置。数据块和 metadata 共用这个容量。
 
 (embedding-sharding-constraints)=
 

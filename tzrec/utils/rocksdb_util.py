@@ -64,6 +64,13 @@ SST_FACTOR = 1.1
 SSD_RESERVE_BYTES = 16 << 30
 
 
+def _block_cache_data_bytes(config: Optional[train_pb2.RocksDBConfig]) -> int:
+    """Resolve the per-rank allowance for SST data blocks."""
+    if config is not None and config.HasField("block_cache_data_bytes_per_rank"):
+        return config.block_cache_data_bytes_per_rank
+    return BLOCK_CACHE_DATA_BYTES
+
+
 def backend_config(
     local_world_size: int,
     *,
@@ -88,7 +95,7 @@ def backend_config(
     from tzrec_ext.rocksdb import BackendConfig
 
     cpus = max(1, len(os.sched_getaffinity(0)) // max(local_world_size, 1))
-    overrides = {}
+    overrides = {"write_buffer_bytes": WRITE_BUFFER_BYTES}
     if config is not None:
         backend_fields = {
             "sst_block_size_bytes": "sst_block_size_bytes",
@@ -106,15 +113,17 @@ def backend_config(
             "async_writeback": "async_writeback",
             "score_cache_bytes_per_rank": "score_cache_bytes",
             "score_cache_bucket_capacity": "score_cache_bucket_capacity",
+            "write_buffer_bytes_per_rank": "write_buffer_bytes",
         }
         for field, backend_field in backend_fields.items():
             if config.HasField(field):
                 overrides[backend_field] = getattr(config, field)
+    if overrides["write_buffer_bytes"] == 0:
+        raise ValueError("write_buffer_bytes_per_rank must be positive")
     num_db_shards = overrides.get("num_db_shards", 1)
     overrides.setdefault("io_threads", max(4, cpus, num_db_shards))
     return BackendConfig(
         block_cache_bytes=block_cache_bytes,
-        write_buffer_bytes=WRITE_BUFFER_BYTES,
         staging_buffer_bytes=STAGING_BUFFER_BYTES,
         import_budget_bytes=import_budget_bytes,
         max_background_jobs=max(2 * num_db_shards, cpus // 4),
@@ -166,7 +175,8 @@ def configure_backend(
     # Import reuses the fresh DB's write and cache budgets.
     backend = backend_config(
         local_world_size,
-        block_cache_bytes=BLOCK_CACHE_DATA_BYTES + max(metadata_bytes_per_rank),
+        block_cache_bytes=_block_cache_data_bytes(config)
+        + max(metadata_bytes_per_rank),
         import_budget_bytes=min(import_available_per_node) // local_world_size
         - STAGING_BUFFER_BYTES,
         config=config,
@@ -208,7 +218,7 @@ def shared_storage(
 
     backend = backend_config(
         local_world_size,
-        block_cache_bytes=BLOCK_CACHE_DATA_BYTES,
+        block_cache_bytes=_block_cache_data_bytes(config),
         import_budget_bytes=0,
         config=config,
     )
