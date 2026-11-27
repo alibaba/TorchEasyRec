@@ -609,8 +609,7 @@ class RocksDBPlannerTest(unittest.TestCase):
         """
         planner, model = self._planner(tables, hbm_gib, ddr_gib, **kwargs)
         space = planner._enumerator.enumerate(model, plan_util.get_default_sharders())
-        config = rocksdb_util.backend_config(1, config=kwargs.get("rocksdb_config"))
-        shared = rocksdb_util.shared_storage(config)
+        shared = rocksdb_util.shared_storage(1)
         worst = {}
         for o in space:
             ssd = o.total_storage.ssd or 0
@@ -704,10 +703,9 @@ class RocksDBPlannerTest(unittest.TestCase):
             {"a": self.BIG, "b": self.BIG}, 80, 64
         )
         self.assertEqual(offloaded, {})
-        shared = rocksdb_util.shared_storage(rocksdb_util.backend_config(1))
         self.assertEqual(
             planner._topology.devices[0].storage.ddr,
-            64 * GIB - shared.ddr,
+            64 * GIB - rocksdb_util.shared_storage(1).ddr,
         )
 
     @parameterized.expand(
@@ -789,12 +787,9 @@ class RocksDBPlannerTest(unittest.TestCase):
                 int(r * rows * o.dim * 4) for r in np.geomspace(0.01, 0.5, num=10)
             }
             self.assertIn(o.local_hbm_for_values, budgets)
-        shared = rocksdb_util.shared_storage(
-            rocksdb_util.backend_config(1, config=rocksdb_config)
-        )
         self.assertEqual(
             planner._topology.devices[0].storage.ddr,
-            int(4.75 * GIB) - shared.ddr,
+            int(4.75 * GIB) - rocksdb_util.shared_storage(1).ddr,
         )
 
     def test_rocksdb_preserves_explicit_cache_budget(self):
@@ -995,7 +990,7 @@ class RocksDBPlannerTest(unittest.TestCase):
                 and o.fqn == fqn
             ]
             ssd_cost[fqn] = min(costs, default=0)
-        shared = rocksdb_util.shared_storage(rocksdb_util.backend_config(1))
+        shared = rocksdb_util.shared_storage(1)
         self.assertGreater(ssd_cost["sparse.ebc.a"], ssd_cost["sparse.ebc.b"])
         # A budget that admits "b" plus the shared reserve but not "a"
         # plus it: only the "b" plan can pass the exact SSD check.
@@ -1013,12 +1008,11 @@ class RocksDBPlannerTest(unittest.TestCase):
     def test_infeasible_ssd_leaves_feasible_memory_plan(self):
         # Reject all SSD candidates without changing the input topology.
         tables = {"a": self.BIG, "b": self.BIG}
-        shared = rocksdb_util.shared_storage(rocksdb_util.backend_config(1))
         planner, model = self._planner(
             tables,
             80,
             64,
-            ssd_gib=shared.ssd / GIB + 1,
+            ssd_gib=rocksdb_util.shared_storage(1).ssd / GIB + 1,
             ssd_mem_bw=100 * 1024**3 / 1000,
         )
         before = (
