@@ -53,7 +53,7 @@ from tzrec.tests import utils
 from tzrec.utils.checkpoint_util import update_dataloder_state
 from tzrec.utils.logging_util import logger
 from tzrec.utils.misc_util import random_name
-from tzrec.utils.test_util import parameterized_name_func
+from tzrec.utils.test_util import ci_resources, parameterized_name_func
 
 
 class ParseKafkaUriTest(unittest.TestCase):
@@ -1029,6 +1029,7 @@ class KafkaDatasetConfigTest(unittest.TestCase):
         self.assertEqual(dataset._reader._min_batch_size, train_min if training else 0)
 
 
+@ci_resources(split="case", timeout=600)
 class KafkaDatasetTest(unittest.TestCase):
     def setUp(self):
         credential = CredClient()
