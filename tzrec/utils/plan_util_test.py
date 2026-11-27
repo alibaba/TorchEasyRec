@@ -530,7 +530,15 @@ class RocksDBPlannerTest(unittest.TestCase):
         except ImportError:
             self.skipTest("tzrec_ext.rocksdb is not installed")
 
-    def _planner(self, tables, hbm_gib, ddr_gib, ssd_gib=None, ssd_mem_bw=None):
+    def _planner(
+        self,
+        tables,
+        hbm_gib,
+        ddr_gib,
+        ssd_gib=None,
+        ssd_mem_bw=None,
+        rocksdb_config=None,
+    ):
         """Build the production planner with deterministic resource capacities."""
         model, constraints = _model_and_constraints(tables)
         topo_kwargs = {}
@@ -574,7 +582,9 @@ class RocksDBPlannerTest(unittest.TestCase):
                 device,
                 batch_size=128,
                 model=model,
-                rocksdb=mock.Mock(config=train_pb2.RocksDBConfig(root_dir="unused")),
+                rocksdb=mock.Mock(
+                    config=rocksdb_config or train_pb2.RocksDBConfig(root_dir="unused")
+                ),
             )
         return planner, model
 
@@ -731,16 +741,39 @@ class RocksDBPlannerTest(unittest.TestCase):
         )
         self.assertTrue(offloaded, "the faster mixed plan must win")
 
-    def test_offload_when_memory_is_short(self):
+    @parameterized.expand(
+        [("default_blocks", None), ("small_blocks", 2048)],
+        name_func=parameterized_name_func,
+    )
+    def test_offload_when_memory_is_short(self, _, block_size):
+        from tzrec_ext.rocksdb import logical_row_bytes, metadata_cache_bytes
+        from tzrec_ext.rocksdb.resources import BLOCK_SIZE
+
         tables = {"a": self.BIG, "b": self.BIG, "c": (1 << 20, 64, {})}
-        _, offloaded, planner = self._plan_with_ssd_room(tables, 4, 4.75)
+        rocksdb_config = train_pb2.RocksDBConfig(root_dir="unused")
+        if block_size is not None:
+            rocksdb_config.sst_block_size_bytes = block_size
+        _, offloaded, planner = self._plan_with_ssd_room(
+            tables, 4, 4.75, rocksdb_config=rocksdb_config
+        )
         self.assertTrue(offloaded)
         self.assertNotIn("c", offloaded)
         configs = {o.external_storage.backend_config for o in offloaded.values()}
         self.assertEqual(len(configs), 1)
         (config,) = configs
-        self.assertGreater(
-            config.block_cache_bytes, rocksdb_util.BLOCK_CACHE_DATA_BYTES
+        self.assertEqual(config.sst_block_size_bytes, block_size or BLOCK_SIZE)
+        self.assertEqual(
+            config.block_cache_bytes,
+            rocksdb_util.BLOCK_CACHE_DATA_BYTES
+            + sum(
+                metadata_cache_bytes(
+                    o.max_capacity,
+                    logical_row_bytes(o.dim, 0, 4),
+                    indexed=True,
+                    block_size=config.sst_block_size_bytes,
+                )
+                for o in offloaded.values()
+            ),
         )
         self.assertGreater(config.import_budget_bytes, 0)
         for name, o in offloaded.items():

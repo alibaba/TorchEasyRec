@@ -88,6 +88,7 @@ class DynamicEmbTableStorage(NamedTuple):
         options: "dynamicemb.DynamicEmbTableOptions",
         *,
         ratio: float,
+        rocksdb_block_size: Optional[int] = None,
     ) -> "DynamicEmbTableStorage":
         """Estimate the value budget and HBM, DDR and SSD costs for one shard.
 
@@ -139,6 +140,12 @@ class DynamicEmbTableStorage(NamedTuple):
         NO_EVICTION cannot form a HYBRID group and has zero backing_rows at
         the full endpoint. The storage estimator charges admission counters
         and pipeline I/O separately.
+
+        Args:
+            tensor: Embedding parameter with optimizer metadata.
+            options: Candidate table options.
+            ratio: Fraction of the value budget requested for HBM.
+            rocksdb_block_size: Effective RocksDB SST data block size in bytes.
         """
         caching = options.caching
         rocksdb_backing = rocksdb_util.is_rocksdb_options(options)
@@ -210,7 +217,14 @@ class DynamicEmbTableStorage(NamedTuple):
             )
             index_bytes = index_entry_bytes() if not no_eviction else 0
             storage.ddr = metadata_cache_bytes(
-                shard_rows, record_bytes, not no_eviction
+                shard_rows,
+                record_bytes,
+                not no_eviction,
+                **(
+                    {"block_size": rocksdb_block_size}
+                    if rocksdb_block_size is not None
+                    else {}
+                ),
             )
             live_bytes = shard_rows * (record_bytes + index_bytes)
             storage.ssd = (

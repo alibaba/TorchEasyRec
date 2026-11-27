@@ -137,6 +137,7 @@ def _emit_dynamicemb_variants(
     base_option: ShardingOption,
     unique_id_factor: Optional[float],
     allow_rocksdb: bool = False,
+    rocksdb_block_size: Optional[int] = None,
 ) -> List[ShardingOption]:
     """Expand a DynamicEmb sharding option into caching and non-caching candidates.
 
@@ -168,6 +169,12 @@ def _emit_dynamicemb_variants(
     The caller supplies base_option.dynamicemb_options. Each emitted option
     owns a deep copy of its table options and reports the allocated share as
     its load factor; its storage estimate retains the byte budget for runtime.
+
+    Args:
+        base_option: Unexpanded sharding option.
+        unique_id_factor: Deduplicated working-set estimate.
+        allow_rocksdb: Whether to offer RocksDB candidates.
+        rocksdb_block_size: Effective RocksDB SST data block size in bytes.
     """
     tensor = base_option.tensor
     template = copy.copy(base_option)
@@ -234,7 +241,7 @@ def _emit_dynamicemb_variants(
         options.external_storage = external_storage
         ratio = requested
         dynamicemb_storage = DynamicEmbTableStorage.from_options(
-            tensor, options, ratio=ratio
+            tensor, options, ratio=ratio, rocksdb_block_size=rocksdb_block_size
         )
         if ratio > 0 and dynamicemb_storage.local_hbm_for_values == 0:
             if options.caching:
@@ -303,6 +310,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         global_constraints (Optional[ParameterConstraints]): all parameters provided
             ParameterConstraints.
         allow_rocksdb: Whether to enumerate eligible RocksDB candidates.
+        rocksdb_block_size: Effective RocksDB SST data block size in bytes.
     """
 
     def __init__(
@@ -315,6 +323,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         fqn_constraints: Optional[Dict[str, ParameterConstraints]] = None,
         global_constraints: Optional[ParameterConstraints] = None,
         allow_rocksdb: bool = False,
+        rocksdb_block_size: Optional[int] = None,
     ) -> None:
         if not estimator:
             estimator = [
@@ -327,6 +336,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
         self._fqn_constraints = fqn_constraints
         self._global_constraints = global_constraints
         self.allow_rocksdb = allow_rocksdb
+        self._rocksdb_block_size = rocksdb_block_size
 
     def _get_constraints(
         self, child_path: str, name: str
@@ -494,6 +504,7 @@ class EmbeddingEnumerator(_EmbeddingEnumerator):
                                     sharding_option,
                                     unique_id_factor,
                                     self.allow_rocksdb,
+                                    self._rocksdb_block_size,
                                 )
                             )
                         else:
