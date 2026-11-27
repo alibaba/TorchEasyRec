@@ -198,19 +198,9 @@ def shared_storage(config: "BackendConfig") -> Any:
         Shared storage reserved per rank.
     """
     from torchrec.distributed.planner.types import Storage
-    from tzrec_ext import rocksdb
+    from tzrec_ext.rocksdb import ddr_overheads, disk_overheads
 
-    ssd = rocksdb.disk_overheads(config)
-    if isinstance(ssd, dict):
-        # The pinned 0.1.1 wheel returns a breakdown and predates ScoreCache.
-        return Storage(
-            hbm=0,
-            ddr=config.write_buffer_bytes
-            + config.staging_buffer_bytes
-            + config.block_cache_bytes,
-            ssd=sum(ssd.values()),
-        )
-    return Storage(hbm=0, ddr=rocksdb.ddr_overheads(config), ssd=ssd)
+    return Storage(hbm=0, ddr=ddr_overheads(config), ssd=disk_overheads(config))
 
 
 def is_rocksdb_options(options: Optional["DynamicEmbTableOptions"]) -> bool:

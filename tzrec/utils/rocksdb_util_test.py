@@ -241,15 +241,11 @@ class SharedStorageTest(unittest.TestCase):
         shared = rocksdb_util.shared_storage(config)
         self.assertEqual(shared.hbm, 0)
         self.assertEqual(shared.ddr, 9 * (1 << 28))
-        overheads = disk_overheads(config)
-        if isinstance(overheads, dict):
-            overheads = sum(overheads.values())
-        self.assertEqual(shared.ssd, overheads)
-        if hasattr(config, "score_cache_bytes"):
-            with_scores = dataclasses.replace(config, score_cache_bytes=960)
-            self.assertEqual(
-                rocksdb_util.shared_storage(with_scores).ddr, shared.ddr + 8 * 4 * 24
-            )
+        self.assertEqual(shared.ssd, disk_overheads(config))
+        with_scores = dataclasses.replace(config, score_cache_bytes=960)
+        self.assertEqual(
+            rocksdb_util.shared_storage(with_scores).ddr, shared.ddr + 8 * 4 * 24
+        )
 
     @parameterized.expand(
         [("master_default", 32, None, 16), ("shard_floor", 8, 8, 8)],
