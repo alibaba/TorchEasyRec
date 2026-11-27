@@ -29,18 +29,18 @@ context and have no shell, no `gh`, and no git history to diff against — so
 those files are their only view of what changed. Do not paraphrase the change
 or paste diff text in its place, and never name a tool an agent does not have.
 
-Instruct each subagent to provide only noteworthy feedback. Wait for their
-results within this run, then post only the feedback you also deem noteworthy.
+Instruct each subagent to provide only noteworthy feedback. Dispatch all five
+subagent reviews in a single batch of parallel tool calls, then wait for their
+results within this run. Post only the feedback you also deem noteworthy.
 If a subagent fails, use the available results and name the missing review in
 the summary.
 
-Before ending the run, always post a top-level summary, even when nothing is
-noteworthy. If the invocation supplies `SUMMARY_MARKER`, put its exact value
-on a separate line in the GitHub comment body. The workflow uses the marker
-to confirm that the comment was published for this run.
+Before ending the run, always post a top-level summary via `gh pr comment`,
+even when nothing is noteworthy. If the invocation supplies `SUMMARY_MARKER`,
+put its exact value on a separate line in the body of that top-level summary.
+The workflow uses the marker to confirm publication for this run.
 
 Use the `create_inline_comment` tool of the `github_inline_comment` MCP server for inline comments on specific lines.
 Use top-level comments for general observations or praise.
-Use `gh pr comment` for top-level summary comments.
 Do NOT use `gh api` — it is not available.
 Keep feedback concise.
